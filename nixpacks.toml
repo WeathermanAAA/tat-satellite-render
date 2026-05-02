@@ -1,0 +1,19 @@
+# nixpacks build config for Railway.
+#
+# Wheels on PyPI for cartopy 0.24 / netCDF4 1.7 / shapely 2.x bundle their
+# native deps, so a clean pip install from the wheel cache is enough on
+# manylinux. We still pin Python 3.11 explicitly and add gcc/build-essential
+# as a safety net in case any sdist needs to compile.
+
+[phases.setup]
+nixPkgs = ["python311", "gcc", "pkg-config"]
+
+[phases.install]
+cmds = [
+  "python -m venv /opt/venv",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir --upgrade pip",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir -r requirements.txt",
+]
+
+[start]
+cmd = ". /opt/venv/bin/activate && uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1"
