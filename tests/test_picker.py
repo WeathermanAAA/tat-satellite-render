@@ -25,6 +25,7 @@ from goes import (  # noqa: E402
     CONUS_FOOTPRINT_MODE3,
     CONUS_FOOTPRINT_MODE6,
 )
+from app import compute_downsample_factor, DEG_TO_KM, _native_km_per_pixel  # noqa: E402
 
 
 def test_bucket_picker_boundaries():
@@ -92,11 +93,50 @@ def test_post_mode6_bbox_to_minus_60_accepted():
     print("ok post_mode6_bbox_to_minus_60_accepted")
 
 
+def test_pixel_budget_large_ir_bbox_accepted():
+    """80°×80° IR bbox (channel 13, 2 km native) must be accepted and
+    auto-downsample to a per-axis output ≤4000 px (i.e. ≤16M total)."""
+    bbox = [-100.0, -10.0, -20.0, 70.0]  # 80×80
+    factor = compute_downsample_factor(bbox, channel=13)
+    raw_per_axis = (80.0 * DEG_TO_KM) / _native_km_per_pixel(13)  # 80*111/2 = 4440
+    out_per_axis = raw_per_axis / factor
+    assert factor >= 1, f"factor must be a positive int, got {factor}"
+    assert out_per_axis <= 4000, (
+        f"80° IR: output {out_per_axis:.0f} px/axis exceeds 4000 (factor={factor})"
+    )
+    # Whole-pixel-budget check: total output ≤ 16M pixels.
+    assert (out_per_axis ** 2) <= 16_000_000, (
+        f"80° IR: output {out_per_axis ** 2:.0f} px exceeds 16M budget"
+    )
+    print(f"ok pixel_budget_large_ir_bbox_accepted (factor={factor}, out={out_per_axis:.0f} px/axis)")
+
+
+def test_pixel_budget_large_visible_bbox_accepted():
+    """60°×60° visible bbox (channel 2, 0.5 km native) must be accepted and
+    auto-downsample to a per-axis output ≤4000 px."""
+    bbox = [-100.0, -10.0, -40.0, 50.0]  # 60×60
+    factor = compute_downsample_factor(bbox, channel=2)
+    raw_per_axis = (60.0 * DEG_TO_KM) / _native_km_per_pixel(2)  # 60*111/0.5 = 13320
+    out_per_axis = raw_per_axis / factor
+    assert factor > 1, (
+        f"visible 60° must trigger downsampling, got factor={factor}"
+    )
+    assert out_per_axis <= 4000, (
+        f"60° vis: output {out_per_axis:.0f} px/axis exceeds 4000 (factor={factor})"
+    )
+    assert (out_per_axis ** 2) <= 16_000_000, (
+        f"60° vis: output {out_per_axis ** 2:.0f} px exceeds 16M budget"
+    )
+    print(f"ok pixel_budget_large_visible_bbox_accepted (factor={factor}, out={out_per_axis:.0f} px/axis)")
+
+
 def main():
     test_bucket_picker_boundaries()
     test_conus_footprint_dates()
     test_irma_caribbean_bbox_rejected_for_cmipc()
     test_post_mode6_bbox_to_minus_60_accepted()
+    test_pixel_budget_large_ir_bbox_accepted()
+    test_pixel_budget_large_visible_bbox_accepted()
     print("\nall picker tests passed")
 
 

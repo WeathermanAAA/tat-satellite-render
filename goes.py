@@ -159,8 +159,11 @@ async def bucket_reachable() -> bool:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _bbox_area_sqdeg(bbox: list[float]) -> float:
-    return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+# CMIPM (mesoscale) sectors are ~1000 km on a side — useful only for tightly
+# zoomed renders. Anything larger than this per-axis cap skips meso entirely
+# and starts at CMIPC; CMIPC's own footprint check (_pick_conus) then routes
+# truly-large bboxes (outside the CONUS scan footprint) onward to CMIPF.
+MESO_PER_AXIS_DEG_MAX = 12.0
 
 
 def _bbox_inside(inner: list[float], outer: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
@@ -268,15 +271,17 @@ async def resolve_request(
         nearest_to_target = True
 
     buckets = pick_buckets_for_time(requested_time)
-    area = _bbox_area_sqdeg(bbox)
+    lon_w = bbox[2] - bbox[0]
+    lat_h = bbox[3] - bbox[1]
 
-    # Product preference order is determined by bbox area, same in every bucket
-    if area < 30:
+    # Product preference: try the smallest sector that could plausibly cover
+    # the bbox. CMIPM is only viable for ≤12°×12°; anything larger starts at
+    # CMIPC, whose internal footprint check falls through to CMIPF when the
+    # bbox lies outside the CONUS scan footprint.
+    if lon_w <= MESO_PER_AXIS_DEG_MAX and lat_h <= MESO_PER_AXIS_DEG_MAX:
         candidates = [_pick_meso, _pick_conus, _pick_full_disk]
-    elif area < 200:
-        candidates = [_pick_conus, _pick_full_disk]
     else:
-        candidates = [_pick_full_disk]
+        candidates = [_pick_conus, _pick_full_disk]
 
     last_err: Optional[Exception] = None
     for bucket in buckets:

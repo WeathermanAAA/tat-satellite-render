@@ -71,11 +71,30 @@ def render_png(
     channel: int,
     time_str: str,
     enhancement: str,
+    downsample: int = 1,
 ) -> bytes:
     enh = get_enhancement(enhancement)
 
-    # Normalize the CMI to 0..1 according to channel + enhancement
+    # Pixel-budget stride. App-layer (compute_downsample_factor) sets this
+    # based on raw bbox×channel so output_pixels ≤ PIXEL_BUDGET. This
+    # composes with the goes.py fetch-time stride: both layers cap output
+    # size, the more aggressive of the two wins.
     cmi = data.cmi
+    lats = data.lats
+    lons = data.lons
+    if downsample > 1:
+        log.info(
+            "downsampled bbox by factor %d to stay within pixel budget "
+            "(in shape %s -> out shape %s)",
+            downsample,
+            cmi.shape,
+            cmi[::downsample, ::downsample].shape,
+        )
+        cmi = cmi[::downsample, ::downsample]
+        lats = lats[::downsample, ::downsample]
+        lons = lons[::downsample, ::downsample]
+
+    # Normalize the CMI to 0..1 according to channel + enhancement
     if channel == 2:
         # Visible: reflectance 0..1
         norm = normalize_visible(cmi)
@@ -128,8 +147,8 @@ def render_png(
 
     # Plot pcolormesh with the (lats, lons) arrays we computed via inverse proj
     mesh = ax.pcolormesh(
-        data.lons,
-        data.lats,
+        lons,
+        lats,
         norm,
         cmap=cmap,
         vmin=0.0,
