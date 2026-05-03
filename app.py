@@ -31,10 +31,12 @@ from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from goes import (
-    GOES_BUCKET,
+    GOES_BUCKET_OVERRIDE,
     GOES_DISK_BBOX,
+    PRIMARY_LIVE_BUCKET,
     bucket_reachable,
     fetch_data,
+    pick_buckets_for_time,
     resolve_request,
 )
 from render import render_png
@@ -100,11 +102,12 @@ limiter = Limiter(key_func=real_ip)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info(
-        "startup origins=%s max_concurrent=%d rate=%s bucket=%s",
+        "startup origins=%s max_concurrent=%d rate=%s primary=%s override=%s",
         ALLOWED_ORIGINS,
         MAX_CONCURRENT_RENDERS,
         RATE_LIMIT,
-        GOES_BUCKET,
+        PRIMARY_LIVE_BUCKET,
+        GOES_BUCKET_OVERRIDE or "(none, time-based picker active)",
     )
     yield
     log.info("shutdown")
@@ -119,7 +122,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type"],
-    expose_headers=["X-Cache", "X-Render-Ms", "X-Product"],
+    expose_headers=["X-Cache", "X-Render-Ms", "X-Product", "X-Bucket"],
     allow_credentials=False,
 )
 
@@ -177,15 +180,25 @@ async def health():
     reachable = await bucket_reachable()
     return {
         "status": "ok",
-        "goes_bucket": GOES_BUCKET,
+        # Live/primary bucket — what 'latest' renders use, what /health probes.
+        "goes_bucket": GOES_BUCKET_OVERRIDE or PRIMARY_LIVE_BUCKET,
         "goes_bucket_reachable": reachable,
+        # Buckets currently in rotation for "latest" — gives ops a quick view
+        # of whether time-based picking is active vs forced-override.
+        "buckets_for_latest": pick_buckets_for_time("latest"),
+        "override_active": bool(GOES_BUCKET_OVERRIDE),
         "cache_entries": len(cache),
         "cache_bytes": cache.size_bytes,
     }
 
 
-def _request_key(body: RenderRequest, snapped_iso: str) -> str:
-    raw = f"{body.bbox}|{snapped_iso}|{body.channel}|{body.enhancement}"
+def _request_key(body: RenderRequest, snapped_iso: str, bucket: str) -> str:
+    # Bucket included so an algorithm tweak (e.g. moving the goes19/goes16
+    # boundary date) cleanly invalidates entries that would now resolve
+    # differently. Same scan_start in goes19 and goes16 still produces
+    # different rendered output (different sat-label, possibly different
+    # calibration), so they must cache separately.
+    raw = f"{body.bbox}|{snapped_iso}|{body.channel}|{body.enhancement}|{bucket}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -211,7 +224,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     else:
         snapped = resolved.scan_start.isoformat()
 
-    cache_key = _request_key(body, snapped)
+    cache_key = _request_key(body, snapped, resolved.bucket)
     cached = cache.get(cache_key)
     if cached is not None:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -222,6 +235,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 "X-Cache": "HIT",
                 "X-Render-Ms": str(elapsed_ms),
                 "X-Product": resolved.product,
+                "X-Bucket": resolved.bucket,
             },
         )
 
@@ -238,6 +252,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     "X-Cache": "HIT",
                     "X-Render-Ms": str(elapsed_ms),
                     "X-Product": resolved.product,
+                    "X-Bucket": resolved.bucket,
                 },
             )
 
@@ -262,8 +277,9 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     cache.put(cache_key, png_bytes, ttl_seconds=ttl)
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     log.info(
-        "render ok key=%s product=%s ch=%d enh=%s ms=%d bytes=%d",
+        "render ok key=%s bucket=%s product=%s ch=%d enh=%s ms=%d bytes=%d",
         cache_key[:10],
+        resolved.bucket,
         resolved.product,
         body.channel,
         body.enhancement,
@@ -277,5 +293,6 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             "X-Cache": "MISS",
             "X-Render-Ms": str(elapsed_ms),
             "X-Product": resolved.product,
+            "X-Bucket": resolved.bucket,
         },
     )

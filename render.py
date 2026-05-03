@@ -148,7 +148,7 @@ def render_png(
     title_ax.axis("off")
     title_ax.text(
         0.5, 0.5,
-        f"{goes_sat_label()} ABI Channel {channel:02d} · {time_str} UTC",
+        f"{goes_sat_label(data.bucket)} ABI Channel {channel:02d} · {time_str} UTC",
         ha="center", va="center",
         color=TEXT_COLOR, fontsize=14, fontweight="bold",
         transform=title_ax.transAxes,
@@ -167,7 +167,7 @@ def render_png(
     footer_ax.axis("off")
     footer_ax.text(
         0.5, 0.5,
-        f"@WeathermanAAA_  ·  NOAA {goes_sat_label()} ABI",
+        f"@WeathermanAAA_  ·  NOAA {goes_sat_label(data.bucket)} ABI",
         ha="center", va="center",
         color=TEXT_COLOR, fontsize=8, alpha=0.85,
         transform=footer_ax.transAxes,

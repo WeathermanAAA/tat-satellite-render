@@ -1,8 +1,15 @@
-"""GOES-16 ABI L2 CMIP access on the public NOAA AWS bucket.
+"""GOES ABI L2 CMIP access on the public NOAA AWS Open Data buckets.
 
-Public bucket: s3://noaa-goes16/  (anonymous read)
+Buckets in rotation (anonymous read, all on AWS):
+  s3://noaa-goes19/  - operational GOES-East since 2025-04-04
+  s3://noaa-goes16/  - operational GOES-East 2017-12 -> 2025-04-04, archive
+                       only after that
 
-Product short-codes:
+Bucket selection is time-based — see ``pick_buckets_for_time``. The
+``GOES_BUCKET`` env var, when set, overrides the rotation and forces a
+single bucket (useful for ops/testing).
+
+Product short-codes (same in every bucket):
   CMIPF -> Full Disk (every 10 min)
   CMIPC -> CONUS    (every 5 min)
   CMIPM1, CMIPM2 -> Mesoscale sectors (every 1 min, dynamically positioned)
@@ -29,19 +36,63 @@ import numpy as np
 import s3fs
 import xarray as xr
 
-GOES_BUCKET = os.getenv("GOES_BUCKET", "noaa-goes19")
-# GOES-East operational at 75.2°W (GOES-19 since Apr 2025; GOES-16 before that).
-# For Irma/2017-era historical demos, set GOES_BUCKET=noaa-goes16.
 GOES_DISK_BBOX = (-152.04, -75.0, 6.04, 75.0)  # (lon_min, lat_min, lon_max, lat_max)
 CONUS_BBOX = (-135.0, 13.0, -50.0, 57.0)
 
+# Manual override — when set, forces a single bucket and skips the picker.
+GOES_BUCKET_OVERRIDE = os.getenv("GOES_BUCKET", "").strip()
 
-def goes_sat_label() -> str:
-    """Render a human-friendly label like 'GOES-19' from the bucket name."""
-    s = GOES_BUCKET.split("-")[-1]  # "goes19" -> "goes19"
+# Time boundaries for the time-based picker.
+# 2025-04-04: GOES-19 became operational GOES-East, GOES-16 went to standby.
+# 2018-08-01: per ops spec, before this date GOES-16 archive is the only
+# reliable candidate (GOES-16 was post-launch / pre-operational mid-2017
+# through 2017-12 but the archive there is sparse + uncalibrated, so we
+# still try goes16 — the explicit cutoff just skips the goes19 fallback).
+GOES19_OPERATIONAL = dt.datetime(2025, 4, 4, tzinfo=dt.timezone.utc)
+GOES16_PRIMARY_BEFORE = dt.datetime(2018, 8, 1, tzinfo=dt.timezone.utc)
+PRIMARY_LIVE_BUCKET = "noaa-goes19"
+
+
+def pick_buckets_for_time(requested_time: str) -> list[str]:
+    """Return buckets to try in order based on the requested time.
+
+    Rules (per ops spec):
+      - 'latest' or t >= 2025-04-04: noaa-goes19 only
+      - 2018-08-01 <= t < 2025-04-04: noaa-goes19 then noaa-goes16
+        (overlap window — goes19 may carry late-2024 calibration data; if
+         it doesn't, we fall through to goes16's primary archive)
+      - t < 2018-08-01: noaa-goes16 only
+
+    GOES_BUCKET env var, if set, overrides everything and pins a single
+    bucket. Future west-Pacific support would add goes17/goes18 here.
+    """
+    if GOES_BUCKET_OVERRIDE:
+        return [GOES_BUCKET_OVERRIDE]
+
+    if requested_time == "latest":
+        return ["noaa-goes19"]
+
+    try:
+        t = dt.datetime.fromisoformat(requested_time.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return ["noaa-goes19"]  # unparsable -> assume live
+
+    if t >= GOES19_OPERATIONAL:
+        return ["noaa-goes19"]
+    if t >= GOES16_PRIMARY_BEFORE:
+        return ["noaa-goes19", "noaa-goes16"]
+    return ["noaa-goes16"]
+
+
+def goes_sat_label(bucket: str) -> str:
+    """Render a human-friendly label like 'GOES-19' from a bucket name."""
+    s = bucket.split("-")[-1]  # "noaa-goes19" -> "goes19"
     if s.startswith("goes"):
         return f"GOES-{s[4:]}"
-    return GOES_BUCKET
+    return bucket
+
 
 log = logging.getLogger("tat-satellite.goes")
 
@@ -68,9 +119,17 @@ async def _to_thread(fn, *args, **kwargs):
 
 
 async def bucket_reachable() -> bool:
+    """Probe the primary live bucket. Used by /health.
+
+    We don't probe historical fallbacks here because (a) goes16 is on the
+    same NOAA AWS Open Data CDN and effectively shares an availability
+    fate with goes19, and (b) /health green should mean "live renders
+    work" — historical query failures surface cleanly via /render's 502.
+    """
+    primary = GOES_BUCKET_OVERRIDE or PRIMARY_LIVE_BUCKET
     try:
         fs = _get_fs()
-        await _to_thread(fs.ls, f"{GOES_BUCKET}/ABI-L2-CMIPF/")
+        await _to_thread(fs.ls, f"{primary}/ABI-L2-CMIPF/")
         return True
     except Exception as e:
         log.warning("bucket unreachable: %s", e)
@@ -115,10 +174,10 @@ def _channel_token(channel: int) -> str:
     return f"C{channel:02d}_"
 
 
-def _list_hour(product: str, channel: int, t: dt.datetime) -> list[str]:
+def _list_hour(bucket: str, product: str, channel: int, t: dt.datetime) -> list[str]:
     fs = _get_fs()
     doy = t.strftime("%j")
-    prefix = f"{GOES_BUCKET}/ABI-L2-{product}/{t.year}/{doy}/{t.hour:02d}/"
+    prefix = f"{bucket}/ABI-L2-{product}/{t.year}/{doy}/{t.hour:02d}/"
     try:
         files = fs.ls(prefix)
     except (FileNotFoundError, OSError):
@@ -127,12 +186,12 @@ def _list_hour(product: str, channel: int, t: dt.datetime) -> list[str]:
     return [f for f in files if tok in f]
 
 
-async def _list_files_around(product: str, channel: int, target: dt.datetime) -> list[str]:
+async def _list_files_around(bucket: str, product: str, channel: int, target: dt.datetime) -> list[str]:
     """List the target hour and the previous hour to cover edge cases (e.g. target=00:02 needs prev hour for nearest)."""
     prev = target - dt.timedelta(hours=1)
     a, b = await asyncio.gather(
-        _to_thread(_list_hour, product, channel, prev),
-        _to_thread(_list_hour, product, channel, target),
+        _to_thread(_list_hour, bucket, product, channel, prev),
+        _to_thread(_list_hour, bucket, product, channel, target),
     )
     return a + b
 
@@ -163,6 +222,7 @@ def _check_meso_coverage_sync(s3_key: str, bbox: list[float], buffer_deg: float 
 # ---------------------------------------------------------------------------
 @dataclass
 class ResolvedFile:
+    bucket: str  # "noaa-goes19" | "noaa-goes16" | ...
     s3_key: str
     product: str  # "CMIPF" | "CMIPC" | "CMIPM1" | "CMIPM2"
     scan_start: dt.datetime
@@ -176,6 +236,11 @@ async def resolve_request(
     """Resolve a render request to a concrete S3 file key.
 
     requested_time: "latest" or ISO8601 string.
+
+    Iterates the time-based bucket rotation; the first bucket with a
+    suitable file wins. For dates in the goes19/goes16 overlap window
+    (2018-08-01..2025-04-04), goes19 is tried first and goes16 is the
+    fallback if no files exist in goes19 for that scan time.
     """
     if requested_time == "latest":
         target = dt.datetime.now(dt.timezone.utc)
@@ -186,9 +251,10 @@ async def resolve_request(
             target = target.replace(tzinfo=dt.timezone.utc)
         nearest_to_target = True
 
+    buckets = pick_buckets_for_time(requested_time)
     area = _bbox_area_sqdeg(bbox)
 
-    # Try product preference order based on bbox area
+    # Product preference order is determined by bbox area, same in every bucket
     if area < 30:
         candidates = [_pick_meso, _pick_conus, _pick_full_disk]
     elif area < 200:
@@ -197,23 +263,28 @@ async def resolve_request(
         candidates = [_pick_full_disk]
 
     last_err: Optional[Exception] = None
-    for picker in candidates:
-        try:
-            resolved = await picker(bbox, channel, target, nearest_to_target)
-            if resolved is not None:
-                return resolved
-        except Exception as e:
-            last_err = e
-            log.warning("%s failed: %s", picker.__name__, e)
-            continue
+    for bucket in buckets:
+        for picker in candidates:
+            try:
+                resolved = await picker(bucket, bbox, channel, target, nearest_to_target)
+                if resolved is not None:
+                    log.info("resolved via %s/%s -> %s", bucket, picker.__name__, resolved.product)
+                    return resolved
+            except Exception as e:
+                last_err = e
+                log.warning("%s on %s failed: %s", picker.__name__, bucket, e)
+                continue
+        log.info("no files found in %s for time=%s; trying next bucket", bucket, requested_time)
 
-    raise RuntimeError(f"no GOES file found for bbox/time/channel; last_err={last_err}")
+    raise RuntimeError(
+        f"no GOES file found for bbox/time/channel across buckets {buckets}; last_err={last_err}"
+    )
 
 
-async def _pick_meso(bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
+async def _pick_meso(bucket, bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
     # Try M1 then M2 — first that covers wins
     for sector in ("CMIPM1", "CMIPM2"):
-        files = await _list_files_around(sector, channel, target)
+        files = await _list_files_around(bucket, sector, channel, target)
         if not files:
             continue
         # Sort by scan time, pick most recent <= target if explicit, else most recent
@@ -223,14 +294,14 @@ async def _pick_meso(bbox, channel, target, nearest_to_target) -> Optional[Resol
         else:
             picked = files_with_t[-1]
         if await _to_thread(_check_meso_coverage_sync, picked[0], bbox):
-            return ResolvedFile(picked[0], sector, picked[1])
+            return ResolvedFile(bucket, picked[0], sector, picked[1])
     return None
 
 
-async def _pick_conus(bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
+async def _pick_conus(bucket, bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
     if not _bbox_overlaps(bbox, CONUS_BBOX):
         return None
-    files = await _list_files_around("CMIPC", channel, target)
+    files = await _list_files_around(bucket, "CMIPC", channel, target)
     if not files:
         return None
     files_with_t = sorted([(f, _parse_scan_start(f)) for f in files], key=lambda p: p[1])
@@ -238,11 +309,11 @@ async def _pick_conus(bbox, channel, target, nearest_to_target) -> Optional[Reso
         picked = min(files_with_t, key=lambda p: abs((p[1] - target).total_seconds()))
     else:
         picked = files_with_t[-1]
-    return ResolvedFile(picked[0], "CMIPC", picked[1])
+    return ResolvedFile(bucket, picked[0], "CMIPC", picked[1])
 
 
-async def _pick_full_disk(bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
-    files = await _list_files_around("CMIPF", channel, target)
+async def _pick_full_disk(bucket, bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
+    files = await _list_files_around(bucket, "CMIPF", channel, target)
     if not files:
         return None
     files_with_t = sorted([(f, _parse_scan_start(f)) for f in files], key=lambda p: p[1])
@@ -250,7 +321,7 @@ async def _pick_full_disk(bbox, channel, target, nearest_to_target) -> Optional[
         picked = min(files_with_t, key=lambda p: abs((p[1] - target).total_seconds()))
     else:
         picked = files_with_t[-1]
-    return ResolvedFile(picked[0], "CMIPF", picked[1])
+    return ResolvedFile(bucket, picked[0], "CMIPF", picked[1])
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +372,7 @@ class FetchResult:
     channel: int
     scan_start: dt.datetime
     product: str
+    bucket: str  # source bucket — drives the title strip ("GOES-19" vs "GOES-16")
     units: str  # "K" | "1"
 
 
@@ -409,6 +481,7 @@ def _fetch_data_sync(resolved: ResolvedFile, bbox: list[float], channel: int) ->
             channel=channel,
             scan_start=resolved.scan_start,
             product=resolved.product,
+            bucket=resolved.bucket,
             units=units,
         )
     finally:

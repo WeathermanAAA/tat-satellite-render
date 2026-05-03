@@ -34,6 +34,8 @@ Constraints:
 {
   "status": "ok",
   "goes_bucket": "noaa-goes19",
+  "buckets_for_latest": ["noaa-goes19"],
+  "override_active": false,
   "goes_bucket_reachable": true,
   "cache_entries": 12,
   "cache_bytes": 4823104
@@ -81,12 +83,24 @@ Healthcheck path is wired in `railway.json` → `/health`.
 | Module | Job |
 | --- | --- |
 | `app.py` | FastAPI, CORS, slowapi rate limit, asyncio.Semaphore for concurrency, JSON logging |
-| `goes.py` | s3fs listing of `noaa-goes19`, product selection (Meso → CONUS → Full Disk by bbox area), geos-projection bbox crop |
+| `goes.py` | s3fs listing of `noaa-goes{16,19}`, time-based bucket picker, product selection (Meso → CONUS → Full Disk by bbox area), geos-projection bbox crop |
 | `render.py` | matplotlib + cartopy PlateCarree pipeline, dark theme, dashed gridlines, title/footer |
 | `colormaps.py` | `tat_neon`, `dvorak_bd`, `grayscale` |
 | `cache.py` | byte-budgeted LRU keyed by hash(bbox, snapped_time, channel, enhancement) |
 
 ### Selection logic
+
+**Bucket** (per requested time):
+
+| When | Buckets tried |
+| --- | --- |
+| `"latest"` or t >= 2025-04-04 | `noaa-goes19` |
+| 2018-08-01 ≤ t < 2025-04-04 | `noaa-goes19` → `noaa-goes16` (fallback) |
+| t < 2018-08-01 | `noaa-goes16` |
+
+`GOES_BUCKET` env var, when set, overrides the picker and forces a single bucket for every render. The render's title strip and footer reflect the actual bucket used (`GOES-19` vs `GOES-16`).
+
+**Product** (per bbox area, same logic in every bucket):
 
 | bbox area | Tries (in order) |
 | --- | --- |
