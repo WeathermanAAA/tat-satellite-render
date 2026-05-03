@@ -37,7 +37,27 @@ import s3fs
 import xarray as xr
 
 GOES_DISK_BBOX = (-152.04, -75.0, 6.04, 75.0)  # (lon_min, lat_min, lon_max, lat_max)
-CONUS_BBOX = (-135.0, 13.0, -50.0, 57.0)
+
+# CONUS scan footprint changed when GOES-East switched from Mode 3 to Mode 6
+# (more frequent CONUS, slightly larger scan). Pre-Mode-6 the eastern edge
+# is ~-65°W; post-Mode-6 it's ~-55°W. Picking CMIPC for a bbox that extends
+# past the relevant edge produces a black wedge (no data) on the eastern
+# side of the render — see _pick_conus for the fallback logic.
+CMIPC_MODE6_START = dt.datetime(2019, 4, 2, tzinfo=dt.timezone.utc)
+CONUS_FOOTPRINT_MODE3 = (-135.0, 14.0, -65.0, 50.0)
+CONUS_FOOTPRINT_MODE6 = (-135.0, 14.0, -55.0, 50.0)
+
+
+def _conus_footprint(t: dt.datetime) -> tuple[float, float, float, float]:
+    """Return the approximate CONUS scan footprint for a given UTC time.
+
+    GOES-16 was the first GOES-East with these scan modes, and GOES-19
+    inherited Mode 6 — same footprint either way. The boundary is the
+    Mode 3 -> Mode 6 transition on 2019-04-02.
+    """
+    if t >= CMIPC_MODE6_START:
+        return CONUS_FOOTPRINT_MODE6
+    return CONUS_FOOTPRINT_MODE3
 
 # Manual override — when set, forces a single bucket and skips the picker.
 GOES_BUCKET_OVERRIDE = os.getenv("GOES_BUCKET", "").strip()
@@ -150,10 +170,6 @@ def _bbox_inside(inner: list[float], outer: tuple[float, float, float, float], b
         and inner[2] <= outer[2] + buffer
         and inner[3] <= outer[3] + buffer
     )
-
-
-def _bbox_overlaps(a: list[float], b: tuple[float, float, float, float]) -> bool:
-    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 
 
 def _parse_scan_start(s3_key: str) -> dt.datetime:
@@ -299,7 +315,20 @@ async def _pick_meso(bucket, bbox, channel, target, nearest_to_target) -> Option
 
 
 async def _pick_conus(bucket, bbox, channel, target, nearest_to_target) -> Optional[ResolvedFile]:
-    if not _bbox_overlaps(bbox, CONUS_BBOX):
+    # Validate that the requested bbox is fully inside the CONUS scan
+    # footprint for the selected satellite + date. Overlap-only checks are
+    # not safe — a Caribbean bbox extending east of the scan edge produces
+    # a black wedge in the rendered image (CMIPC sector has no data there).
+    footprint = _conus_footprint(target)
+    if not _bbox_inside(bbox, footprint):
+        sat = goes_sat_label(bucket)
+        mode = "Mode 6" if target >= CMIPC_MODE6_START else "Mode 3"
+        log.info(
+            "bbox lon=%.1f..%.1f lat=%.1f..%.1f outside CONUS footprint "
+            "lon=%.1f..%.1f for %s %s — falling back to CMIPF",
+            bbox[0], bbox[2], bbox[1], bbox[3],
+            footprint[0], footprint[2], sat, mode,
+        )
         return None
     files = await _list_files_around(bucket, "CMIPC", channel, target)
     if not files:

@@ -31,8 +31,8 @@ log = logging.getLogger("tat-satellite.render")
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
-COAST_COLOR = "#e8eef5"
-BORDER_COLOR = "#7eb6c9"
+COAST_COLOR = "#7eb6c9"   # cyan — coastlines stand out against IR/visible
+BORDER_COLOR = "#e8eef5"  # near-white — political borders, slightly subordinate
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
 
@@ -48,6 +48,21 @@ def _gridline_step(span: float) -> float:
     if span <= 25:
         return 5.0
     return 10.0
+
+
+def _coast_resolution(span_deg: float) -> str:
+    """Natural Earth scale matched to bbox size.
+
+    10m on a wide view is the most likely cause of jagged/fragmented
+    coastlines because the dense polyline gets aggressively path-clipped
+    by matplotlib at viewport scale, producing visible polyline gaps and
+    stair-stepping along long edges. Step down to 50m / 110m for wide views.
+    """
+    if span_deg < 5:
+        return "10m"
+    if span_deg < 30:
+        return "50m"
+    return "110m"
 
 
 def render_png(
@@ -97,13 +112,16 @@ def render_png(
     fig_h = max(4.0, fig_w / max(aspect, 0.3))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
 
-    # Layout: title strip on top (~6%), main map, footer (~3%)
+    # Layout: title strip on top (~6%), main map fills the rest with a
+    # small bottom margin for gridline labels. Watermark moved into the
+    # map's top-left corner (see ax.text below) so we no longer reserve a
+    # bottom footer strip.
     title_h = 0.06
-    footer_h = 0.035
-    map_h = 1.0 - title_h - footer_h
+    bottom_pad = 0.04  # leaves room for x-axis gridline labels
+    map_h = 1.0 - title_h - bottom_pad
 
     ax = fig.add_axes(
-        [0.04, footer_h, 0.92, map_h], projection=ccrs.PlateCarree()
+        [0.04, bottom_pad, 0.92, map_h], projection=ccrs.PlateCarree()
     )
     ax.set_facecolor(DARK_BG)
     ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
@@ -121,9 +139,18 @@ def render_png(
         rasterized=True,
     )
 
-    # Coastlines + borders (cartopy 10m)
-    ax.add_feature(cfeature.COASTLINE.with_scale("10m"), linewidth=0.6, edgecolor=COAST_COLOR, alpha=0.9)
-    ax.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=0.5, edgecolor=BORDER_COLOR, alpha=0.7)
+    # Coastlines + borders. Resolution scales with bbox; zorder explicitly
+    # above pcolormesh (which defaults to ~1.5 in cartopy) so cyan coast
+    # never gets painted over by hot cloud tops; full alpha for legibility.
+    coast_scale = _coast_resolution(max(lon_span, lat_span))
+    ax.add_feature(
+        cfeature.COASTLINE.with_scale(coast_scale),
+        linewidth=0.6, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
+    )
+    ax.add_feature(
+        cfeature.BORDERS.with_scale(coast_scale),
+        linewidth=0.5, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
+    )
 
     # Dashed gridlines auto-spaced
     step = _gridline_step(max(lon_span, lat_span))
@@ -161,16 +188,17 @@ def render_png(
         transform=title_ax.transAxes,
     )
 
-    # Footer credit
-    footer_ax = fig.add_axes([0, 0, 1.0, footer_h])
-    footer_ax.set_facecolor(DARK_BG)
-    footer_ax.axis("off")
-    footer_ax.text(
-        0.5, 0.5,
+    # Watermark: top-left of the map axes, mirroring the title strip's
+    # right-aligned product label so the two corners balance visually.
+    # Translucent dark backing rect keeps it legible over hot pixels.
+    ax.text(
+        0.01, 0.99,
         f"@WeathermanAAA_  ·  NOAA {goes_sat_label(data.bucket)} ABI",
-        ha="center", va="center",
-        color=TEXT_COLOR, fontsize=8, alpha=0.85,
-        transform=footer_ax.transAxes,
+        ha="left", va="top",
+        color=ACCENT_COLOR, fontsize=9,
+        transform=ax.transAxes,
+        bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=4),
+        zorder=10,
     )
 
     buf = io.BytesIO()
