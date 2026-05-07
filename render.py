@@ -25,7 +25,7 @@ from colormaps import (
     normalize_ir,
     normalize_visible,
 )
-from satellites import FetchResult, goes_sat_label
+from satellites import FetchResult
 
 log = logging.getLogger("tat-satellite.render")
 
@@ -94,15 +94,16 @@ def render_png(
         lats = lats[::downsample, ::downsample]
         lons = lons[::downsample, ::downsample]
 
-    # Normalize the CMI to 0..1 according to channel + enhancement
-    if channel == 2:
+    # Normalize the CMI to 0..1 according to data kind + enhancement.
+    # We branch on units (not numeric channel) because the visible-red band
+    # is 2 on GOES and 3 on AHI — units="1" tags reflectance regardless.
+    is_visible = data.units == "1"
+    if is_visible:
         # Visible: reflectance 0..1
         norm = normalize_visible(cmi)
-        if enh["kind"] == "ir":
-            # IR colormap on visible doesn't make physical sense; use grayscale instead.
-            cmap = plt.get_cmap("gray")
-        else:
-            cmap = plt.get_cmap("gray")
+        # Visible imagery is rendered grayscale regardless of enhancement;
+        # IR colormaps on reflectance data don't make physical sense.
+        cmap = plt.get_cmap("gray")
     else:
         # IR: brightness temperature in Kelvin (or convert from C if needed)
         bt = cmi
@@ -192,9 +193,12 @@ def render_png(
     title_ax = fig.add_axes([0, 1.0 - title_h, 1.0, title_h])
     title_ax.set_facecolor(DARK_BG)
     title_ax.axis("off")
+    # Sensor label: read off FetchResult so it works for both ABI (GOES) and
+    # AHI (Himawari) without per-family branching here.
+    sensor_label = "AHI" if data.bucket.startswith("noaa-himawari") else "ABI"
     title_ax.text(
         0.5, 0.5,
-        f"{goes_sat_label(data.bucket)} ABI Channel {channel:02d} · {time_str} UTC",
+        f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC",
         ha="center", va="center",
         color=TEXT_COLOR, fontsize=14, fontweight="bold",
         transform=title_ax.transAxes,
@@ -210,9 +214,10 @@ def render_png(
     # Watermark: top-left of the map axes, mirroring the title strip's
     # right-aligned product label so the two corners balance visually.
     # Translucent dark backing rect keeps it legible over hot pixels.
+    source_label = "JMA" if data.bucket.startswith("noaa-himawari") else "NOAA"
     ax.text(
         0.01, 0.99,
-        f"@WeathermanAAA_  ·  NOAA {goes_sat_label(data.bucket)} ABI",
+        f"@WeathermanAAA_  ·  {source_label} {data.sat_name} {sensor_label}",
         ha="left", va="top",
         color=ACCENT_COLOR, fontsize=9,
         transform=ax.transAxes,

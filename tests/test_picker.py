@@ -24,6 +24,7 @@ from satellites import (  # noqa: E402
     CoverageError,
     GENERIC_CHANNELS,
     GOES_EAST,
+    HIMAWARI_PACIFIC,
     _bbox_inside,
     _conus_footprint,
     antimeridian_safe_center_lon,
@@ -192,21 +193,107 @@ def test_pick_satellite_caribbean_2017_resolves_goes16():
     print("ok pick_satellite_caribbean_2017_resolves_goes16")
 
 
-def test_pick_satellite_japan_raises_coverage_error_with_himawari():
-    """Western Pacific bbox (Japan) at a 2026 timestamp must raise CoverageError
-    naming Himawari coming soon — no current satellite covers WPac.
-    """
+def test_pick_satellite_japan_2026_resolves_himawari9():
+    """Japan bbox at 2026 picks HIMAWARI_PACIFIC and resolves to Himawari-9."""
     japan = [130.0, 20.0, 145.0, 40.0]
     when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(japan, when)
+    assert sat is HIMAWARI_PACIFIC, f"Japan 2026 should pick HIMAWARI_PACIFIC, got {sat.family}"
+    resolved = sat.resolve(when)
+    assert resolved.name == "Himawari-9", resolved
+    assert resolved.bucket == "noaa-himawari9", resolved
+    assert resolved.sub_sat_lon == 140.7, resolved
+    print("ok pick_satellite_japan_2026_resolves_himawari9")
+
+
+def test_pick_satellite_japan_2018_resolves_himawari8():
+    """Japan bbox at 2018 picks HIMAWARI_PACIFIC and resolves to Himawari-8 (pre-handover)."""
+    japan = [130.0, 20.0, 145.0, 40.0]
+    when = dt.datetime(2018, 10, 24, 18, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(japan, when)
+    assert sat is HIMAWARI_PACIFIC, f"Japan 2018 should pick HIMAWARI_PACIFIC, got {sat.family}"
+    resolved = sat.resolve(when)
+    assert resolved.name == "Himawari-8", resolved
+    assert resolved.bucket == "noaa-himawari8", resolved
+    print("ok pick_satellite_japan_2018_resolves_himawari8")
+
+
+def test_pick_satellite_hagibis_2019_resolves_himawari8():
+    """Hagibis bbox (138-143°E lat 30-35°N) at 2019-10-12 03Z resolves to H-8."""
+    hagibis = [138.0, 30.0, 143.0, 35.0]
+    when = dt.datetime(2019, 10, 12, 3, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(hagibis, when)
+    assert sat is HIMAWARI_PACIFIC, f"Hagibis 2019 should pick HIMAWARI_PACIFIC, got {sat.family}"
+    resolved = sat.resolve(when)
+    assert resolved.name == "Himawari-8", resolved
+    assert resolved.bucket == "noaa-himawari8", resolved
+    print("ok pick_satellite_hagibis_2019_resolves_himawari8")
+
+
+def test_pick_satellite_h9_handover_boundary():
+    """H-9 promoted 2022-12-13 00:00 UTC; ≥ that instant resolves to H-9."""
+    japan = [130.0, 20.0, 145.0, 40.0]
+    just_before = dt.datetime(2022, 12, 12, 23, 59, tzinfo=dt.timezone.utc)
+    just_after = dt.datetime(2022, 12, 13, 0, 0, tzinfo=dt.timezone.utc)
+    assert pick_satellite(japan, just_before).resolve(just_before).name == "Himawari-8"
+    assert pick_satellite(japan, just_after).resolve(just_after).name == "Himawari-9"
+    print("ok pick_satellite_h9_handover_boundary")
+
+
+def test_pick_satellite_african_bbox_raises_meteosat_coverage_error():
+    """An African / European bbox (lon 0-30°E) is outside both GOES-East and Himawari coverage,
+    and must raise CoverageError that names METEOSAT coming soon.
+    """
+    africa = [0.0, -10.0, 30.0, 20.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
     try:
-        pick_satellite(japan, when)
+        pick_satellite(africa, when)
     except CoverageError as e:
         msg = str(e)
-        assert "Himawari" in msg, f"CoverageError should mention Himawari: {msg!r}"
+        assert "METEOSAT" in msg, f"CoverageError should mention METEOSAT: {msg!r}"
         assert "coming soon" in msg, f"CoverageError should mention coming soon: {msg!r}"
-        print(f"ok pick_satellite_japan_raises_coverage_error_with_himawari ({msg!r})")
+        print(f"ok pick_satellite_african_bbox_raises_meteosat_coverage_error")
         return
-    raise AssertionError("expected CoverageError for Japan bbox, got no exception")
+    raise AssertionError("expected CoverageError for African bbox, got no exception")
+
+
+def test_himawari_can_see_caribbean_false():
+    """Himawari MUST NOT claim coverage of a Caribbean bbox (140° away from sub-sat)."""
+    caribbean = [-78.0, 14.0, -60.0, 25.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    assert HIMAWARI_PACIFIC.can_see(caribbean, when) is False, (
+        "Himawari should not claim coverage of Caribbean — picker would route incorrectly"
+    )
+    print("ok himawari_can_see_caribbean_false")
+
+
+def test_himawari_can_see_antimeridian_crossing():
+    """Himawari should see a bbox that straddles the antimeridian, since its
+    visible disk extends well past +180°."""
+    crossing = [170.0, -20.0, -170.0, 0.0]   # 170°E to 190°E (= -170°E)
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    assert HIMAWARI_PACIFIC.can_see(crossing, when), (
+        "Himawari should see an antimeridian-crossing bbox near +180°"
+    )
+    sat = pick_satellite(crossing, when)
+    assert sat is HIMAWARI_PACIFIC
+    print("ok himawari_can_see_antimeridian_crossing")
+
+
+def test_himawari_generic_to_band():
+    """Himawari clean_ir → 13 (same as GOES); visible_red → 3 (DIFFERENT from GOES band 2)."""
+    assert HIMAWARI_PACIFIC.generic_to_band["clean_ir"] == 13
+    assert HIMAWARI_PACIFIC.generic_to_band["wv_upper"] == 8
+    assert HIMAWARI_PACIFIC.generic_to_band["wv_lower"] == 10
+    assert HIMAWARI_PACIFIC.generic_to_band["shortwave_ir"] == 7
+    assert HIMAWARI_PACIFIC.generic_to_band["ir_window"] == 14
+    assert HIMAWARI_PACIFIC.generic_to_band["visible_red"] == 3, (
+        "AHI band 3 is the 0.64 µm visible — distinct from GOES ABI band 2"
+    )
+    # GENERIC_CHANNELS table must list both mappings for visible_red
+    assert GENERIC_CHANNELS["visible_red"]["goes"] == 2
+    assert GENERIC_CHANNELS["visible_red"]["ahi"] == 3
+    print("ok himawari_generic_to_band")
 
 
 def test_antimeridian_safe_center_lon():
@@ -296,7 +383,14 @@ def main():
     test_pixel_budget_uses_generic_channel_native_km()
     test_pick_satellite_caribbean_2026_resolves_goes19()
     test_pick_satellite_caribbean_2017_resolves_goes16()
-    test_pick_satellite_japan_raises_coverage_error_with_himawari()
+    test_pick_satellite_japan_2026_resolves_himawari9()
+    test_pick_satellite_japan_2018_resolves_himawari8()
+    test_pick_satellite_hagibis_2019_resolves_himawari8()
+    test_pick_satellite_h9_handover_boundary()
+    test_pick_satellite_african_bbox_raises_meteosat_coverage_error()
+    test_himawari_can_see_caribbean_false()
+    test_himawari_can_see_antimeridian_crossing()
+    test_himawari_generic_to_band()
     test_antimeridian_safe_center_lon()
     test_generic_channel_to_band()
     test_normalize_channel_back_compat()

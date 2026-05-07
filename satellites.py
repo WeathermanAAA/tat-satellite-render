@@ -7,13 +7,25 @@ A ``Satellite`` knows how to:
   - open that file and project it onto a regular lat/lon grid.
 
 Generic channels (``clean_ir``, ``wv_upper``, ...) decouple the public API
-from instrument-specific band numbers. A1 ships ``GOES_EAST``; A2 will
-add Himawari (and later METEOSAT) plugged into the same interface.
+from instrument-specific band numbers. A1 shipped ``GOES_EAST``; A2 adds
+``HIMAWARI_PACIFIC`` (H-9 since 2022-12-13, H-8 archive back to 2017-01-01).
 
 This file replaces the legacy ``goes.py``. All GOES-East CMIPM/CMIPC/CMIPF
 picker logic, CONUS scan-footprint validation, and ABI geos crop are
-preserved unchanged inside ``GOESEastSatellite`` — behavior parity is the
-primary goal of this refactor.
+preserved unchanged inside ``GOESEastSatellite``.
+
+Himawari archive cutoff
+-----------------------
+``noaa-himawari8`` AWS Open Data: earliest verified data 2017-01-01 00:00 UTC
+(spot-checked 2025-11). NOAA's bucket distributes two segment layouts:
+
+  - Older H-8 timestamps (Yutu 2018, Hagibis 2019): single-file repack with
+    ``S0101`` suffix — one file per band per timestep.
+  - Recent H-8 + all H-9: native 10-segment FLDK with ``S0110`` ... ``S1010``.
+
+The HSD reader (``vendor/ahi_hsd.py``) is layout-agnostic — it reads
+``total_segments`` and ``first_line_number`` from each segment's Block #7
+and stitches accordingly.
 """
 
 from __future__ import annotations
@@ -39,12 +51,12 @@ log = logging.getLogger("tat-satellite.satellites")
 # Generic channel definitions
 # ---------------------------------------------------------------------------
 GENERIC_CHANNELS: dict[str, dict] = {
-    "visible_red":   {"goes": 2,  "wavelength": "0.64 µm",  "label": "Visible (red)",         "native_km": 0.5},
-    "shortwave_ir":  {"goes": 7,  "wavelength": "3.9 µm",   "label": "Shortwave IR",          "native_km": 2.0},
-    "wv_upper":      {"goes": 8,  "wavelength": "6.2 µm",   "label": "Upper-tropospheric WV", "native_km": 2.0},
-    "wv_lower":      {"goes": 10, "wavelength": "7.3 µm",   "label": "Lower-tropospheric WV", "native_km": 2.0},
-    "clean_ir":      {"goes": 13, "wavelength": "10.4 µm",  "label": "Clean longwave IR",     "native_km": 2.0},
-    "ir_window":     {"goes": 14, "wavelength": "11.2 µm",  "label": "IR window",             "native_km": 2.0},
+    "visible_red":   {"goes": 2,  "ahi": 3,  "wavelength": "0.64 µm",  "label": "Visible (red)",         "native_km": 0.5},
+    "shortwave_ir":  {"goes": 7,  "ahi": 7,  "wavelength": "3.9 µm",   "label": "Shortwave IR",          "native_km": 2.0},
+    "wv_upper":      {"goes": 8,  "ahi": 8,  "wavelength": "6.2 µm",   "label": "Upper-tropospheric WV", "native_km": 2.0},
+    "wv_lower":      {"goes": 10, "ahi": 10, "wavelength": "7.3 µm",   "label": "Lower-tropospheric WV", "native_km": 2.0},
+    "clean_ir":      {"goes": 13, "ahi": 13, "wavelength": "10.4 µm",  "label": "Clean longwave IR",     "native_km": 2.0},
+    "ir_window":     {"goes": 14, "ahi": 14, "wavelength": "11.2 µm",  "label": "IR window",             "native_km": 2.0},
 }
 
 
@@ -219,7 +231,14 @@ class Satellite(abc.ABC):
 # ---------------------------------------------------------------------------
 # GOES-East implementation
 # ---------------------------------------------------------------------------
-GOES_DISK_BBOX = (-152.04, -75.0, 6.04, 75.0)  # (lon_min, lat_min, lon_max, lat_max)
+# GOES-East "well-imageable" rectangle. The literal visible disk from
+# sub-sat -75.2° extends to ~+10°E and ~-160°W, but image quality and
+# limb-distortion grow steep past ±60°. The CoverageError message advertises
+# "-135° to -5°"; we use that as the disk_bbox so the picker's overlap check
+# matches what users see in the message and pushes far-east bboxes (Africa /
+# Europe) into the METEOSAT-coming-soon path instead of grabbing an unusable
+# limb slice from GOES.
+GOES_DISK_BBOX = (-135.0, -75.0, -5.0, 75.0)  # (lon_min, lat_min, lon_max, lat_max)
 
 # CONUS scan footprint changed when GOES-East switched from Mode 3 to Mode 6
 # (more frequent CONUS, slightly larger scan). Pre-Mode-6 the eastern edge
@@ -689,21 +708,283 @@ class GOESEastSatellite(Satellite):
 
 
 # ---------------------------------------------------------------------------
+# Himawari-Pacific implementation
+# ---------------------------------------------------------------------------
+HIMAWARI_SUB_SAT_LON = 140.7
+HIMAWARI_DISK_HALF_LON = 85.0   # geos visible-disk extent from sub-sat point
+HIMAWARI_DISK_LAT_LIMIT = 75.0  # bbox lat must lie strictly inside ±75°
+
+# Hardware boundaries (per ops):
+#   2022-12-13 16:00 UTC: H-9 promoted to operational; H-8 went to standby.
+#   ~2017-01-01 00:00 UTC: earliest H-8 data on the noaa-himawari8 bucket.
+H9_OPERATIONAL_DATE = dt.datetime(2022, 12, 13, 0, 0, tzinfo=dt.timezone.utc)
+H8_ARCHIVE_START = dt.datetime(2017, 1, 1, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def _ahi_latlon_to_colline(
+    lat_deg: np.ndarray, lon_deg: np.ndarray,
+    sub_lon: float, cfac: int, lfac: int, coff: float, loff: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward AHI geos projection: WGS84 lat/lon (deg) -> column/line indices.
+
+    Reference: CGMS LRIT/HRIT Global Specification §4.4 (cited by JMA HSD spec §3).
+    Both ``CFAC`` and ``LFAC`` are positive on AHI, matching the convention
+    where x-scan-angle increases east (col 1 = west) and y-scan-angle
+    increases north (line 1 = south of disk center). Column 1 / line 1 sit
+    in the disk corner; ``COFF`` / ``LOFF`` (~2750.5 for 2 km bands)
+    locate the sub-satellite point.
+    """
+    R_s = 42164.0           # km, satellite-Earth-center distance
+    r_eq = 6378.1370        # km, WGS84
+    r_pol = 6356.7523       # km, WGS84
+
+    lat = np.deg2rad(lat_deg)
+    lon = np.deg2rad(lon_deg)
+    sub_lon_r = np.deg2rad(sub_lon)
+    c_lat = np.arctan((r_pol * r_pol) / (r_eq * r_eq) * np.tan(lat))
+    R_l = r_pol / np.sqrt(1.0 - (1.0 - (r_pol * r_pol) / (r_eq * r_eq)) * np.cos(c_lat) ** 2)
+    R1 = R_s - R_l * np.cos(c_lat) * np.cos(lon - sub_lon_r)
+    R2 = -R_l * np.cos(c_lat) * np.sin(lon - sub_lon_r)
+    R3 = R_l * np.sin(c_lat)
+    R_n = np.sqrt(R1 * R1 + R2 * R2 + R3 * R3)
+
+    with np.errstate(invalid="ignore"):
+        x = np.arctan2(-R2, R1)
+        y = np.arcsin(-R3 / R_n)
+        x_deg = np.rad2deg(x)
+        y_deg = np.rad2deg(y)
+        col = coff + cfac / (2 ** 16) * x_deg
+        line = loff + lfac / (2 ** 16) * y_deg
+    return col, line
+
+
+def _ahi_colline_to_latlon(
+    col: np.ndarray, line: np.ndarray,
+    sub_lon: float, cfac: int, lfac: int, coff: float, loff: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse AHI geos projection: column/line -> WGS84 lat/lon (deg).
+
+    Returns NaN where the (col, line) pair lies outside the visible disk
+    (discriminant < 0).
+    """
+    R_s = 42164.0
+    r_eq = 6378.1370
+    r_pol = 6356.7523
+    ratio_sq = (r_eq * r_eq) / (r_pol * r_pol)
+    sub_lon_r = np.deg2rad(sub_lon)
+
+    x_deg = (col - coff) * (2 ** 16) / cfac
+    y_deg = (line - loff) * (2 ** 16) / lfac
+    x = np.deg2rad(x_deg)
+    y = np.deg2rad(y_deg)
+    cos_x = np.cos(x); sin_x = np.sin(x)
+    cos_y = np.cos(y); sin_y = np.sin(y)
+
+    a = cos_y * cos_y + ratio_sq * sin_y * sin_y
+    b = R_s * cos_x * cos_y
+    sd_sq = b * b - a * (R_s * R_s - r_eq * r_eq)
+    valid = sd_sq >= 0
+
+    with np.errstate(invalid="ignore"):
+        sd = np.sqrt(np.maximum(sd_sq, 0.0))
+        sn = (b - sd) / a
+        s1 = R_s - sn * cos_x * cos_y
+        s2 = sn * sin_x * cos_y
+        s3 = -sn * sin_y
+        sxy = np.sqrt(s1 * s1 + s2 * s2)
+        lon_rad = np.arctan2(s2, s1) + sub_lon_r
+        lat_rad = np.arctan(ratio_sq * s3 / sxy)
+
+    lon_deg = ((np.rad2deg(lon_rad) + 180.0) % 360.0) - 180.0
+    lat_deg = np.rad2deg(lat_rad)
+    return (
+        np.where(valid, lat_deg, np.nan),
+        np.where(valid, lon_deg, np.nan),
+    )
+
+
+class HimawariPacificSatellite(Satellite):
+    family = "Himawari-Pacific"
+    sensor = "AHI"
+    generic_to_band = {
+        "visible_red": 3,
+        "shortwave_ir": 7,
+        "wv_upper": 8,
+        "wv_lower": 10,
+        "clean_ir": 13,
+        "ir_window": 14,
+    }
+    # disk_bbox isn't usable here (the disk crosses ±180° on the east side),
+    # so we override can_see to use angular distance from sub-sat point.
+    disk_bbox = (-180.0, -HIMAWARI_DISK_LAT_LIMIT, 180.0, HIMAWARI_DISK_LAT_LIMIT)
+    primary_live_bucket = "noaa-himawari9"
+
+    def can_see(self, bbox: list[float], time: dt.datetime) -> bool:
+        if bbox[1] < -HIMAWARI_DISK_LAT_LIMIT or bbox[3] > HIMAWARI_DISK_LAT_LIMIT:
+            return False
+        center_lon = antimeridian_safe_center_lon(bbox)
+        lon_offset = abs(((center_lon - HIMAWARI_SUB_SAT_LON + 180.0) % 360.0) - 180.0)
+        return lon_offset < HIMAWARI_DISK_HALF_LON
+
+    def resolve(self, time: dt.datetime) -> ResolvedSatellite:
+        if time >= H9_OPERATIONAL_DATE:
+            return ResolvedSatellite("Himawari-9", "noaa-himawari9", HIMAWARI_SUB_SAT_LON)
+        return ResolvedSatellite("Himawari-8", "noaa-himawari8", HIMAWARI_SUB_SAT_LON)
+
+    async def find_file(
+        self,
+        time: dt.datetime,
+        generic_channel: str,
+        bbox: list[float],
+        nearest_to_target: bool,
+    ) -> ResolvedFile:
+        if generic_channel not in self.generic_to_band:
+            raise ValueError(
+                f"unknown generic channel for {self.family}: {generic_channel!r}"
+            )
+        # AHI cycles every 10 minutes; snap target time to the nearest 10-min slot.
+        snapped = self._snap_10min(time, nearest_to_target)
+        resolved_sat = self.resolve(snapped)
+        # ``s3_key`` holds the time-folder prefix; the loader globs band segments
+        # off that prefix at open() time so that the same ResolvedFile shape works
+        # for both NOAA layouts (1 file or 10 segments per band).
+        prefix = (
+            f"{resolved_sat.bucket}/AHI-L1b-FLDK/"
+            f"{snapped:%Y/%m/%d/%H%M}/"
+        )
+        return ResolvedFile(
+            bucket=resolved_sat.bucket,
+            s3_key=prefix,
+            product="FLDK",
+            scan_start=snapped,
+            sat_name=resolved_sat.name,
+            sub_sat_lon=HIMAWARI_SUB_SAT_LON,
+        )
+
+    @staticmethod
+    def _snap_10min(time: dt.datetime, nearest_to_target: bool) -> dt.datetime:
+        """Snap to the most relevant 10-min slot.
+
+        ``nearest_to_target=True`` rounds to the nearest slot; False (live
+        ``latest`` queries) floors to the most-recent published slot — and
+        backs off another 10 min so that segments have time to land in S3
+        (publishing latency is a few minutes).
+        """
+        base = time.replace(second=0, microsecond=0)
+        floor_min = (base.minute // 10) * 10
+        floored = base.replace(minute=floor_min)
+        if nearest_to_target:
+            if base.minute - floor_min >= 5:
+                return floored + dt.timedelta(minutes=10)
+            return floored
+        return floored - dt.timedelta(minutes=10)
+
+    def open(self, resolved: ResolvedFile):
+        # HimawariPacific overrides ``_fetch_sync`` directly so that the
+        # full-disk calibration + bbox crop happen in one synchronous flow
+        # without the GOES-style (Dataset, tmp_dir) handoff.
+        raise NotImplementedError("HimawariPacificSatellite uses _fetch_sync directly")
+
+    def project_to_latlon(self, ds, bbox, resolved, generic_channel):
+        raise NotImplementedError("HimawariPacificSatellite uses _fetch_sync directly")
+
+    def _fetch_sync(
+        self,
+        resolved: ResolvedFile,
+        bbox: list[float],
+        generic_channel: str,
+    ) -> FetchResult:
+        from vendor.ahi_loader import load_band_sync
+
+        band = self.generic_to_band[generic_channel]
+        fs = _get_fs()
+        # Pass bbox so the loader can drop irrelevant segments before download
+        # — critical for B03 (0.5 km visible), where each segment is ~300 MB.
+        disk = load_band_sync(
+            fs, resolved.bucket, resolved.scan_start, band, bbox=tuple(bbox)
+        )
+
+        # Antimeridian-safe bbox handling: if e < w (crossing), unwrap east edge.
+        lon_min, lat_min, lon_max, lat_max = bbox
+        unwrap = lon_max < lon_min
+        lon_max_uw = lon_max + 360.0 if unwrap else lon_max
+
+        n_sample = 16
+        sample_lons_uw = np.linspace(lon_min, lon_max_uw, n_sample)
+        sample_lons = ((sample_lons_uw + 180.0) % 360.0) - 180.0
+        sample_lats = np.linspace(lat_min, lat_max, n_sample)
+        LON, LAT = np.meshgrid(sample_lons, sample_lats)
+        # Forward projection produces GLOBAL (full-disk) col/line indices.
+        col_g, line_g = _ahi_latlon_to_colline(
+            LAT, LON, disk.sub_lon, disk.cfac, disk.lfac, disk.coff, disk.loff
+        )
+        finite_mask = np.isfinite(col_g) & np.isfinite(line_g)
+        col_g = col_g[finite_mask]
+        line_g = line_g[finite_mask]
+        if col_g.size == 0:
+            raise RuntimeError("bbox has no projection-valid sample points")
+
+        # Convert to local indices for slicing into ``disk.data``.
+        ic_lo = max(0, int(np.floor(col_g.min())) - 5)
+        ic_hi = min(disk.n_columns, int(np.ceil(col_g.max())) + 5)
+        il_lo_g = int(np.floor(line_g.min())) - 5
+        il_hi_g = int(np.ceil(line_g.max())) + 5
+        il_lo = max(0, il_lo_g - disk.line_offset)
+        il_hi = min(disk.n_lines, il_hi_g - disk.line_offset)
+        if ic_hi <= ic_lo or il_hi <= il_lo:
+            raise RuntimeError(
+                f"crop produced empty window (line_offset={disk.line_offset}, "
+                f"global lines {il_lo_g}..{il_hi_g}, local span 0..{disk.n_lines})"
+            )
+
+        MAX_PX_PER_AXIS = 2400
+        x_stride = max(1, (ic_hi - ic_lo) // MAX_PX_PER_AXIS)
+        y_stride = max(1, (il_hi - il_lo) // MAX_PX_PER_AXIS)
+
+        sub_data = disk.data[il_lo:il_hi:y_stride, ic_lo:ic_hi:x_stride]
+        # Inverse projection takes GLOBAL col/line — add line_offset back.
+        sub_cols_global = np.arange(ic_lo, ic_hi, x_stride, dtype=np.float64)[
+            : sub_data.shape[1]
+        ]
+        sub_lines_global = np.arange(
+            il_lo + disk.line_offset, il_hi + disk.line_offset, y_stride, dtype=np.float64
+        )[: sub_data.shape[0]]
+        COL, LINE = np.meshgrid(sub_cols_global, sub_lines_global)
+        lats, lons = _ahi_colline_to_latlon(
+            COL, LINE, disk.sub_lon, disk.cfac, disk.lfac, disk.coff, disk.loff
+        )
+
+        return FetchResult(
+            cmi=sub_data.astype(np.float32),
+            lats=lats.astype(np.float32),
+            lons=lons.astype(np.float32),
+            channel=band,
+            generic_channel=generic_channel,
+            scan_start=resolved.scan_start,
+            product=resolved.product,
+            bucket=resolved.bucket,
+            sat_name=resolved.sat_name,
+            sub_sat_lon=resolved.sub_sat_lon,
+            units=disk.units,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Singletons + picker
 # ---------------------------------------------------------------------------
 GOES_EAST = GOESEastSatellite()
+HIMAWARI_PACIFIC = HimawariPacificSatellite()
 
 # Order matters for ties in pick_satellite: candidates are filtered by can_see
-# then sorted by |sub_sat_lon - center_lon|. With one entry today this is moot,
-# but A2 will append HIMAWARI_PACIFIC here.
-ALL_SATELLITES: list[Satellite] = [GOES_EAST]
+# then sorted by |sub_sat_lon - center_lon|.
+ALL_SATELLITES: list[Satellite] = [GOES_EAST, HIMAWARI_PACIFIC]
 
 
 def pick_satellite(bbox: list[float], time: dt.datetime) -> Satellite:
     """Pick the best satellite for ``bbox`` at ``time``.
 
-    Filter by visible-disk overlap, then break ties by minimum
-    |sub-sat-lon − bbox-center-lon|.
+    Filter by visible-disk overlap, then break ties by minimum angular
+    distance between the satellite's sub-sat-lon and the bbox center.
 
     Raises ``CoverageError`` if no satellite can see the bbox.
     """
@@ -712,10 +993,15 @@ def pick_satellite(bbox: list[float], time: dt.datetime) -> Satellite:
     if not candidates:
         raise CoverageError(
             f"bbox center {center_lon:.1f}° not visible from any active satellite. "
-            f"GOES-East: -135° to -5°. Western Pacific (Himawari) coming soon."
+            f"GOES-East: -135° to -5°. Himawari-Pacific: +60°E to +220°E. "
+            f"METEOSAT (Atlantic east / Africa / Europe) coming soon."
         )
     resolved = [(s, s.resolve(time)) for s in candidates]
-    return min(resolved, key=lambda pair: abs(pair[1].sub_sat_lon - center_lon))[0]
+
+    def _angular_dist(sub_lon: float) -> float:
+        return abs(((sub_lon - center_lon + 180.0) % 360.0) - 180.0)
+
+    return min(resolved, key=lambda pair: _angular_dist(pair[1].sub_sat_lon))[0]
 
 
 # ---------------------------------------------------------------------------
