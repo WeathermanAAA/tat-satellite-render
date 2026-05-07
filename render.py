@@ -25,7 +25,7 @@ from colormaps import (
     normalize_ir,
     normalize_visible,
 )
-from goes import FetchResult, goes_sat_label
+from satellites import FetchResult, goes_sat_label
 
 log = logging.getLogger("tat-satellite.render")
 
