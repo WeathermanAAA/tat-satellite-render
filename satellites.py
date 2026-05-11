@@ -76,6 +76,10 @@ class CoverageError(Exception):
     """No active satellite can see the requested bbox."""
 
 
+class UnsupportedTimeError(Exception):
+    """Requested time falls outside the satellite's archive coverage."""
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -170,6 +174,9 @@ class Satellite(abc.ABC):
     generic_to_band: ClassVar[dict[str, int]]
     disk_bbox: ClassVar[tuple[float, float, float, float]]
     primary_live_bucket: ClassVar[str]
+    # Sub-sat longitude used by ``pick_satellite`` for angular-distance
+    # tie-breaking. Subclasses set this as a class var.
+    sub_sat_lon: ClassVar[float]
 
     def can_see(self, bbox: list[float], time: dt.datetime) -> bool:
         return _bbox_overlaps(bbox, self.disk_bbox)
@@ -229,7 +236,7 @@ class Satellite(abc.ABC):
 
 
 # ---------------------------------------------------------------------------
-# GOES-East implementation
+# Shared GOES (ABI) plumbing — used by both GOES-East and GOES-West
 # ---------------------------------------------------------------------------
 # GOES-East "well-imageable" rectangle. The literal visible disk from
 # sub-sat -75.2° extends to ~+10°E and ~-160°W, but image quality and
@@ -249,17 +256,37 @@ CMIPC_MODE6_START = dt.datetime(2019, 4, 2, tzinfo=dt.timezone.utc)
 CONUS_FOOTPRINT_MODE3 = (-135.0, 14.0, -65.0, 50.0)
 CONUS_FOOTPRINT_MODE6 = (-135.0, 14.0, -55.0, 50.0)
 
+# GOES-West CMIPC ("PACUS") scan footprint. GOES-17/18 both operate in Mode 6
+# from launch, so a single footprint covers all GOES-West-era times. The PACUS
+# sector sits over the eastern Pacific / western Americas; extents below come
+# from NOAA GOES-West product specs (lon ~-152°W to ~-77°W, lat ~14°N to
+# ~51°N). Bboxes outside this rect skip CMIPC and fall through to CMIPF.
+PACUS_FOOTPRINT = (-152.0, 14.0, -77.0, 51.0)
+
 GOES_BUCKET_OVERRIDE = os.getenv("GOES_BUCKET", "").strip()
 
-# Time boundaries for the time-based picker.
+# Time boundaries for the GOES-East time-based picker.
 # 2025-04-04: GOES-19 became operational GOES-East, GOES-16 went to standby.
 # 2018-08-01: per ops spec, before this date GOES-16 archive is the only
 # reliable candidate.
 GOES19_OPERATIONAL = dt.datetime(2025, 4, 4, tzinfo=dt.timezone.utc)
 GOES16_PRIMARY_BEFORE = dt.datetime(2018, 8, 1, tzinfo=dt.timezone.utc)
 
+# Time boundaries for the GOES-West time-based picker.
+# 2023-01-04: GOES-18 became operational GOES-West, GOES-17 went to standby.
+# 2019-02-12: GOES-17 became operational GOES-West (earliest GOES-West time
+# we'll resolve at all).
+GOES18_OPERATIONAL = dt.datetime(2023, 1, 4, tzinfo=dt.timezone.utc)
+GOES17_OPERATIONAL = dt.datetime(2019, 2, 12, tzinfo=dt.timezone.utc)
+
 PRIMARY_LIVE_BUCKET = "noaa-goes19"
 GOES_EAST_SUB_SAT_LON = -75.2
+GOES_WEST_SUB_SAT_LON = -137.2
+
+# Angular distance (deg) from sub-sat point inside which we still consider
+# the GOES-West disk usable. Same 85° threshold the AHI disk model uses.
+GOES_WEST_DISK_HALF_LON = 85.0
+GOES_WEST_DISK_LAT_LIMIT = 75.0
 
 # CMIPM (mesoscale) sectors are ~1000 km on a side — viable only for tightly
 # zoomed renders. Anything larger skips meso entirely and starts at CMIPC.
@@ -275,6 +302,7 @@ def goes_sat_label(bucket: str) -> str:
 
 
 def _conus_footprint(t: dt.datetime) -> tuple[float, float, float, float]:
+    """GOES-East CONUS sector footprint — date-dependent (Mode 3 vs Mode 6)."""
     if t >= CMIPC_MODE6_START:
         return CONUS_FOOTPRINT_MODE6
     return CONUS_FOOTPRINT_MODE3
@@ -336,7 +364,7 @@ def _check_meso_coverage_sync(s3_key: str, bbox: list[float], buffer_deg: float 
 
 
 def _pick_buckets_for_time_dt(t: dt.datetime) -> list[str]:
-    """Bucket fallback chain for a parsed UTC datetime.
+    """GOES-East bucket fallback chain for a parsed UTC datetime.
 
     Rules (per ops spec):
       - t >= 2025-04-04: noaa-goes19 only
@@ -352,8 +380,33 @@ def _pick_buckets_for_time_dt(t: dt.datetime) -> list[str]:
     return ["noaa-goes16"]
 
 
+def _pick_west_buckets_for_time_dt(t: dt.datetime) -> list[str]:
+    """GOES-West bucket fallback chain.
+
+    Rules:
+      - t >= 2023-01-04: noaa-goes18 only
+      - 2019-02-12 <= t < 2023-01-04: noaa-goes17 only
+      - t < 2019-02-12: raises UnsupportedTimeError (handled in resolve()).
+
+    Each operational window owns its bucket exclusively, so no fallback chain
+    is needed (unlike East, which has a goes19/goes16 overlap window).
+    """
+    if t >= GOES18_OPERATIONAL:
+        return ["noaa-goes18"]
+    if t >= GOES17_OPERATIONAL:
+        return ["noaa-goes17"]
+    raise UnsupportedTimeError(
+        f"GOES-West coverage starts 2019-02-12 (GOES-17 operational date); "
+        f"requested {t.isoformat()}"
+    )
+
+
 def pick_buckets_for_time(requested_time: str) -> list[str]:
-    """String form of the bucket picker — used by /health for ops visibility."""
+    """String form of the GOES-East bucket picker — used by /health for ops
+    visibility. Always reports the GOES-East live bucket (primary live render
+    path); GOES-West availability is a separate concern surfaced through the
+    /health ``satellites`` list.
+    """
     if GOES_BUCKET_OVERRIDE:
         return [GOES_BUCKET_OVERRIDE]
     if requested_time == "latest":
@@ -427,8 +480,23 @@ def _xy_to_latlon(
     return lat, lon
 
 
-class GOESEastSatellite(Satellite):
-    family = "GOES-East"
+class GOESBaseSatellite(Satellite):
+    """Shared GOES (ABI) plumbing for GOES-East and GOES-West.
+
+    Both families speak the same NetCDF format, share the same band layout
+    (visible 2 / SWIR 7 / WV 8,10 / clean IR 13 / IR window 14), and use
+    identical CMIPM/CMIPC/CMIPF product structure on their respective NOAA
+    Open Data buckets. The only per-family knobs are:
+
+      * ``sub_sat_lon`` (-75.2 vs -137.2)
+      * which buckets to search at a given time
+      * which CONUS-class sector footprint applies (East has Mode 3/6 cutover;
+        West is Mode 6 from launch)
+      * the visible-disk model used by ``can_see``
+
+    Subclasses override the four hooks marked below.
+    """
+
     sensor = "ABI"
     generic_to_band = {
         "visible_red": 2,
@@ -438,39 +506,48 @@ class GOESEastSatellite(Satellite):
         "clean_ir": 13,
         "ir_window": 14,
     }
-    disk_bbox = GOES_DISK_BBOX
-    primary_live_bucket = PRIMARY_LIVE_BUCKET
+    sub_sat_lon: ClassVar[float]
+
+    # --- per-family hooks --------------------------------------------------
+    def _buckets_for_time(self, t: dt.datetime) -> list[str]:
+        raise NotImplementedError
+
+    def _conus_sector_footprint(self, t: dt.datetime) -> tuple[float, float, float, float]:
+        """The CMIPC sector's geographic footprint for this satellite at
+        ``time``. ``_pick_conus`` rejects bboxes that aren't fully inside
+        this rect (otherwise the render gets a black wedge of no-data).
+        """
+        raise NotImplementedError
+
+    def _conus_sector_label(self, t: dt.datetime) -> str:
+        """Human-readable label for the CMIPC sector — used in fallback
+        log lines (``CONUS Mode 6`` vs ``PACUS`` etc.)."""
+        return "CONUS"
+    # ----------------------------------------------------------------------
 
     def resolve(self, time: dt.datetime) -> ResolvedSatellite:
         """Return the primary operational hardware at ``time``.
 
-        The actually-fetched satellite may differ during the goes19/goes16
-        overlap window (2018-08-01..2025-04-04) if the primary doesn't have
-        the file — that fallback is handled inside ``find_file`` and reflected
-        on the ``ResolvedFile`` it returns. ``resolve()`` itself reports the
-        ideal/primary hardware for the moment.
+        Default impl uses ``_buckets_for_time(t)[0]`` as the primary bucket;
+        subclasses can override if they need different reporting behavior.
         """
-        if GOES_BUCKET_OVERRIDE:
-            bucket = GOES_BUCKET_OVERRIDE
-        elif time >= GOES19_OPERATIONAL:
-            bucket = "noaa-goes19"
-        else:
-            bucket = "noaa-goes16"
+        bucket = self._buckets_for_time(time)[0]
         return ResolvedSatellite(
             name=goes_sat_label(bucket),
             bucket=bucket,
-            sub_sat_lon=GOES_EAST_SUB_SAT_LON,
+            sub_sat_lon=self.sub_sat_lon,
         )
 
     async def bucket_reachable(self) -> bool:
         """Probe the primary live bucket. Used by /health.
 
-        We don't probe historical fallbacks here because (a) goes16 is on the
-        same NOAA AWS Open Data CDN and effectively shares an availability
-        fate with goes19, and (b) /health green should mean "live renders
-        work" — historical query failures surface cleanly via /render's 502.
+        We don't probe historical fallbacks here because the goes16/17/18
+        archives are on the same NOAA AWS Open Data CDN and effectively
+        share an availability fate with the live primary, and /health
+        green should mean "live renders work" — historical query failures
+        surface cleanly via /render's 502.
         """
-        primary = GOES_BUCKET_OVERRIDE or self.primary_live_bucket
+        primary = self.primary_live_bucket
         try:
             fs = _get_fs()
             await _to_thread(fs.ls, f"{primary}/ABI-L2-CMIPF/")
@@ -492,14 +569,14 @@ class GOESEastSatellite(Satellite):
             )
         band = self.generic_to_band[generic_channel]
 
-        buckets = _pick_buckets_for_time_dt(time)
+        buckets = self._buckets_for_time(time)
         lon_w = bbox[2] - bbox[0]
         lat_h = bbox[3] - bbox[1]
 
         # Product preference: smallest sector that could plausibly cover
         # the bbox. CMIPM is only viable for ≤12°×12°; anything larger
         # starts at CMIPC, whose internal footprint check falls through to
-        # CMIPF when the bbox lies outside the CONUS scan footprint.
+        # CMIPF when the bbox lies outside the CONUS/PACUS scan footprint.
         if lon_w <= MESO_PER_AXIS_DEG_MAX and lat_h <= MESO_PER_AXIS_DEG_MAX:
             candidates = [self._pick_meso, self._pick_conus, self._pick_full_disk]
         else:
@@ -541,19 +618,19 @@ class GOESEastSatellite(Satellite):
         return None
 
     async def _pick_conus(self, bucket, bbox, channel, target, nearest_to_target):
-        # Validate that the requested bbox is fully inside the CONUS scan
+        # Validate that the requested bbox is fully inside the CMIPC scan
         # footprint for the selected satellite + date. Overlap-only checks are
-        # not safe — a Caribbean bbox extending east of the scan edge produces
-        # a black wedge in the rendered image (CMIPC sector has no data there).
-        footprint = _conus_footprint(target)
+        # not safe — a bbox extending past the scan edge produces a black
+        # wedge in the rendered image (CMIPC sector has no data there).
+        footprint = self._conus_sector_footprint(target)
         if not _bbox_inside(bbox, footprint):
             sat = goes_sat_label(bucket)
-            mode = "Mode 6" if target >= CMIPC_MODE6_START else "Mode 3"
+            label = self._conus_sector_label(target)
             log.info(
-                "bbox lon=%.1f..%.1f lat=%.1f..%.1f outside CONUS footprint "
-                "lon=%.1f..%.1f for %s %s — falling back to CMIPF",
+                "bbox lon=%.1f..%.1f lat=%.1f..%.1f outside %s footprint "
+                "lon=%.1f..%.1f for %s — falling back to CMIPF",
                 bbox[0], bbox[2], bbox[1], bbox[3],
-                footprint[0], footprint[2], sat, mode,
+                label, footprint[0], footprint[2], sat,
             )
             return None
         files = await _list_files_around(bucket, "CMIPC", channel, target)
@@ -578,17 +655,18 @@ class GOESEastSatellite(Satellite):
         return self._make_resolved(bucket, picked[0], "CMIPF", picked[1])
 
     def _make_resolved(self, bucket: str, s3_key: str, product: str, scan_start: dt.datetime) -> ResolvedFile:
-        # Both GOES-19 and GOES-16, in the time ranges we'd ever resolve them
-        # for this family, sit at the East slot (~-75.2°). GOES-16 only began
-        # drifting after handover, and we never query goes16 for post-handover
-        # times. So a single sub-sat-lon constant is correct here.
+        # All currently-resolvable East buckets sit near -75.2°W; all
+        # currently-resolvable West buckets sit near -137.2°W. (Old retired
+        # hardware drifts to other slots after handover, but we never query
+        # those time-ranges for that hardware.) So a single per-family
+        # sub-sat-lon constant is correct here.
         return ResolvedFile(
             bucket=bucket,
             s3_key=s3_key,
             product=product,
             scan_start=scan_start,
             sat_name=goes_sat_label(bucket),
-            sub_sat_lon=GOES_EAST_SUB_SAT_LON,
+            sub_sat_lon=self.sub_sat_lon,
         )
 
     def open(self, resolved: ResolvedFile) -> tuple[xr.Dataset, str]:
@@ -707,6 +785,119 @@ class GOESEastSatellite(Satellite):
         )
 
 
+class GOESEastSatellite(GOESBaseSatellite):
+    """GOES-East satellite (sub-sat -75.2°W).
+
+    Resolves to GOES-19 for time >= 2025-04-04; GOES-16 otherwise. The
+    goes19/goes16 fallback chain inside ``find_file`` (when
+    GOES16_PRIMARY_BEFORE <= time < GOES19_OPERATIONAL) handles the brief
+    overlap window where either satellite may have a given file first.
+    """
+
+    family = "GOES-East"
+    sub_sat_lon = GOES_EAST_SUB_SAT_LON
+    disk_bbox = GOES_DISK_BBOX
+    primary_live_bucket = PRIMARY_LIVE_BUCKET
+
+    def _buckets_for_time(self, t: dt.datetime) -> list[str]:
+        return _pick_buckets_for_time_dt(t)
+
+    def _conus_sector_footprint(self, t: dt.datetime) -> tuple[float, float, float, float]:
+        return _conus_footprint(t)
+
+    def _conus_sector_label(self, t: dt.datetime) -> str:
+        return "CONUS Mode 6" if t >= CMIPC_MODE6_START else "CONUS Mode 3"
+
+    def resolve(self, time: dt.datetime) -> ResolvedSatellite:
+        """East ``resolve()`` reports the *primary* operational hardware at
+        ``time``. The actually-fetched satellite may differ during the
+        goes19/goes16 overlap (2018-08-01..2025-04-04) if the primary
+        doesn't have the file — that fallback is handled inside
+        ``find_file`` and reflected on the ``ResolvedFile`` it returns.
+        ``resolve()`` itself reports the ideal/primary hardware for the
+        moment, so a probe like /health gets a deterministic answer.
+        """
+        if GOES_BUCKET_OVERRIDE:
+            bucket = GOES_BUCKET_OVERRIDE
+        elif time >= GOES19_OPERATIONAL:
+            bucket = "noaa-goes19"
+        else:
+            bucket = "noaa-goes16"
+        return ResolvedSatellite(
+            name=goes_sat_label(bucket),
+            bucket=bucket,
+            sub_sat_lon=GOES_EAST_SUB_SAT_LON,
+        )
+
+    async def bucket_reachable(self) -> bool:
+        # Honor GOES_BUCKET_OVERRIDE for the live probe — same behavior as
+        # before the GOESBaseSatellite refactor.
+        primary = GOES_BUCKET_OVERRIDE or self.primary_live_bucket
+        try:
+            fs = _get_fs()
+            await _to_thread(fs.ls, f"{primary}/ABI-L2-CMIPF/")
+            return True
+        except Exception as e:
+            log.warning("bucket unreachable: %s", e)
+            return False
+
+
+class GOESWestSatellite(GOESBaseSatellite):
+    """GOES-West satellite (sub-sat -137.2°W).
+
+    Resolves to GOES-18 for time >= 2023-01-04; GOES-17 for
+    2019-02-12 <= time < 2023-01-04. Pre-2019-02-12 raises
+    ``UnsupportedTimeError`` (GOES-17 wasn't operational GOES-West yet).
+
+    NOTE on GOES-17 archive: GOES-17 had a known ABI cooling system fault
+    that degraded several IR channels during local AM hours. Brightness
+    temperatures may show artifacts on bands 8-16 around local sunrise.
+    Users should be aware when interpreting historical 2019-2022 imagery.
+    Reference: https://www.goes-r.gov/users/abiCoolingFault.html
+    """
+
+    family = "GOES-West"
+    sub_sat_lon = GOES_WEST_SUB_SAT_LON
+    # disk_bbox is supplied for ABC compatibility but not used — can_see is
+    # overridden because the West disk crosses ±180° on the west edge.
+    disk_bbox = (-180.0, -GOES_WEST_DISK_LAT_LIMIT, 180.0, GOES_WEST_DISK_LAT_LIMIT)
+    primary_live_bucket = "noaa-goes18"
+
+    def can_see(self, bbox: list[float], time: dt.datetime) -> bool:
+        if bbox[1] <= -GOES_WEST_DISK_LAT_LIMIT or bbox[3] >= GOES_WEST_DISK_LAT_LIMIT:
+            return False
+        center_lon = antimeridian_safe_center_lon(bbox)
+        lon_offset = abs(((center_lon - self.sub_sat_lon + 180.0) % 360.0) - 180.0)
+        return lon_offset < GOES_WEST_DISK_HALF_LON
+
+    def _buckets_for_time(self, t: dt.datetime) -> list[str]:
+        # Raises UnsupportedTimeError if t < GOES17_OPERATIONAL.
+        return _pick_west_buckets_for_time_dt(t)
+
+    def _conus_sector_footprint(self, t: dt.datetime) -> tuple[float, float, float, float]:
+        # GOES-17/18 both ship Mode 6 from launch; PACUS footprint is constant.
+        return PACUS_FOOTPRINT
+
+    def _conus_sector_label(self, t: dt.datetime) -> str:
+        return "PACUS"
+
+    def resolve(self, time: dt.datetime) -> ResolvedSatellite:
+        if time >= GOES18_OPERATIONAL:
+            bucket = "noaa-goes18"
+        elif time >= GOES17_OPERATIONAL:
+            bucket = "noaa-goes17"
+        else:
+            raise UnsupportedTimeError(
+                f"GOES-West coverage starts 2019-02-12 (GOES-17 operational date); "
+                f"requested {time.isoformat()}"
+            )
+        return ResolvedSatellite(
+            name=goes_sat_label(bucket),
+            bucket=bucket,
+            sub_sat_lon=GOES_WEST_SUB_SAT_LON,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Himawari-Pacific implementation
 # ---------------------------------------------------------------------------
@@ -818,6 +1009,7 @@ class HimawariPacificSatellite(Satellite):
     # so we override can_see to use angular distance from sub-sat point.
     disk_bbox = (-180.0, -HIMAWARI_DISK_LAT_LIMIT, 180.0, HIMAWARI_DISK_LAT_LIMIT)
     primary_live_bucket = "noaa-himawari9"
+    sub_sat_lon = HIMAWARI_SUB_SAT_LON
 
     def can_see(self, bbox: list[float], time: dt.datetime) -> bool:
         if bbox[1] < -HIMAWARI_DISK_LAT_LIMIT or bbox[3] > HIMAWARI_DISK_LAT_LIMIT:
@@ -973,11 +1165,12 @@ class HimawariPacificSatellite(Satellite):
 # Singletons + picker
 # ---------------------------------------------------------------------------
 GOES_EAST = GOESEastSatellite()
+GOES_WEST = GOESWestSatellite()
 HIMAWARI_PACIFIC = HimawariPacificSatellite()
 
 # Order matters for ties in pick_satellite: candidates are filtered by can_see
 # then sorted by |sub_sat_lon - center_lon|.
-ALL_SATELLITES: list[Satellite] = [GOES_EAST, HIMAWARI_PACIFIC]
+ALL_SATELLITES: list[Satellite] = [GOES_EAST, GOES_WEST, HIMAWARI_PACIFIC]
 
 
 def pick_satellite(bbox: list[float], time: dt.datetime) -> Satellite:
@@ -993,15 +1186,24 @@ def pick_satellite(bbox: list[float], time: dt.datetime) -> Satellite:
     if not candidates:
         raise CoverageError(
             f"bbox center {center_lon:.1f}° not visible from any active satellite. "
-            f"GOES-East: -135° to -5°. Himawari-Pacific: +60°E to +220°E. "
+            f"GOES-East: -135° to -5°. GOES-West: +160° to -65° (wraps the antimeridian). "
+            f"Himawari-Pacific: +60°E to +220°E. "
             f"METEOSAT (Atlantic east / Africa / Europe) coming soon."
         )
-    resolved = [(s, s.resolve(time)) for s in candidates]
 
     def _angular_dist(sub_lon: float) -> float:
         return abs(((sub_lon - center_lon + 180.0) % 360.0) - 180.0)
 
-    return min(resolved, key=lambda pair: _angular_dist(pair[1].sub_sat_lon))[0]
+    # Sort by angular distance ASC and pick the best-fit. We deliberately do
+    # NOT silently fall back to a worse-angle satellite when the best fit
+    # raises UnsupportedTimeError (e.g. EPac bbox at a pre-2019 time, where
+    # GOES-East could technically see the bbox but at a 47°+ look angle that
+    # produces unusable limb imagery). Surfacing the time error is more
+    # honest than producing a low-quality fallback the user didn't ask for.
+    candidates.sort(key=lambda s: _angular_dist(s.sub_sat_lon))
+    best = candidates[0]
+    best.resolve(time)  # may raise UnsupportedTimeError — let it propagate
+    return best
 
 
 # ---------------------------------------------------------------------------

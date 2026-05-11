@@ -40,6 +40,7 @@ from satellites import (
     GOES_EAST,
     PRIMARY_LIVE_BUCKET,
     Satellite,
+    UnsupportedTimeError,
     bucket_reachable,
     goes_band_to_generic,
     parse_request_time,
@@ -331,7 +332,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     parsed_time, _ = parse_request_time(body.time)
     try:
         satellite: Satellite = pick_satellite(body.bbox, parsed_time)
-    except CoverageError as e:
+    except (CoverageError, UnsupportedTimeError) as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
     # Resolve which file we'll use; this gives us the snapped scan time which

@@ -24,7 +24,10 @@ from satellites import (  # noqa: E402
     CoverageError,
     GENERIC_CHANNELS,
     GOES_EAST,
+    GOES_WEST,
     HIMAWARI_PACIFIC,
+    PACUS_FOOTPRINT,
+    UnsupportedTimeError,
     _bbox_inside,
     _conus_footprint,
     antimeridian_safe_center_lon,
@@ -241,8 +244,9 @@ def test_pick_satellite_h9_handover_boundary():
 
 
 def test_pick_satellite_african_bbox_raises_meteosat_coverage_error():
-    """An African / European bbox (lon 0-30°E) is outside both GOES-East and Himawari coverage,
-    and must raise CoverageError that names METEOSAT coming soon.
+    """An African / European bbox (lon 0-30°E) is outside GOES-East, GOES-West,
+    and Himawari coverage, and must raise CoverageError that names both
+    GOES-West (newly added) and METEOSAT coming soon.
     """
     africa = [0.0, -10.0, 30.0, 20.0]
     when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
@@ -252,9 +256,168 @@ def test_pick_satellite_african_bbox_raises_meteosat_coverage_error():
         msg = str(e)
         assert "METEOSAT" in msg, f"CoverageError should mention METEOSAT: {msg!r}"
         assert "coming soon" in msg, f"CoverageError should mention coming soon: {msg!r}"
+        assert "GOES-West" in msg, f"CoverageError should mention GOES-West: {msg!r}"
         print(f"ok pick_satellite_african_bbox_raises_meteosat_coverage_error")
         return
     raise AssertionError("expected CoverageError for African bbox, got no exception")
+
+
+# ---------------------------------------------------------------------------
+# GOES-West picker tests
+# ---------------------------------------------------------------------------
+def test_pick_satellite_epac_2026_resolves_goes18():
+    """Eastern Pacific bbox (lon -130 to -115) at 2026 picks GOES_WEST → GOES-18."""
+    epac = [-130.0, 15.0, -115.0, 30.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(epac, when)
+    assert sat is GOES_WEST, f"EPac 2026 should pick GOES_WEST, got {sat.family}"
+    resolved = sat.resolve(when)
+    assert resolved.name == "GOES-18", resolved
+    assert resolved.bucket == "noaa-goes18", resolved
+    assert resolved.sub_sat_lon == -137.2, resolved
+    print("ok pick_satellite_epac_2026_resolves_goes18")
+
+
+def test_pick_satellite_epac_2020_resolves_goes17():
+    """Same EPac bbox at a 2020 timestamp picks GOES_WEST → GOES-17."""
+    epac = [-130.0, 15.0, -115.0, 30.0]
+    when = dt.datetime(2020, 8, 15, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(epac, when)
+    assert sat is GOES_WEST, f"EPac 2020 should pick GOES_WEST, got {sat.family}"
+    resolved = sat.resolve(when)
+    assert resolved.name == "GOES-17", resolved
+    assert resolved.bucket == "noaa-goes17", resolved
+    print("ok pick_satellite_epac_2020_resolves_goes17")
+
+
+def test_pick_satellite_epac_2018_raises_unsupported_time():
+    """Same EPac bbox at 2018 (before GOES-17 became operational GOES-West) must
+    raise UnsupportedTimeError — no GOES-West archive that far back, and no
+    other satellite can geometrically see this longitude.
+    """
+    epac = [-130.0, 15.0, -115.0, 30.0]
+    when = dt.datetime(2018, 10, 1, 12, 0, tzinfo=dt.timezone.utc)
+    try:
+        pick_satellite(epac, when)
+    except UnsupportedTimeError as e:
+        assert "GOES-West" in str(e), f"error should mention GOES-West: {e}"
+        assert "2019-02-12" in str(e), f"error should mention earliest date: {e}"
+        print("ok pick_satellite_epac_2018_raises_unsupported_time")
+        return
+    raise AssertionError("expected UnsupportedTimeError for EPac bbox at 2018")
+
+
+def test_pick_satellite_hawaii_2026_resolves_goes_west():
+    """Hawaii bbox (lon -160 to -154) at 2026 must pick GOES_WEST (sub-sat -137.2°)
+    over Himawari (sub-sat 140.7°) — Hawaii is closer to GOES-West.
+    """
+    hawaii = [-160.0, 18.0, -154.0, 23.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(hawaii, when)
+    assert sat is GOES_WEST, f"Hawaii 2026 should pick GOES_WEST, got {sat.family}"
+    print("ok pick_satellite_hawaii_2026_resolves_goes_west")
+
+
+def test_pick_satellite_eastern_epac_crossover_picks_goes_east():
+    """Eastern EPac bbox (lon -100 to -85) is inside both GOES-East and GOES-West
+    visible disks; tie-broken by angular distance, GOES-East (-75.2°) is closer
+    to center -92.5° than GOES-West (-137.2°).
+    """
+    eastern_epac = [-100.0, 10.0, -85.0, 25.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(eastern_epac, when)
+    assert sat is GOES_EAST, (
+        f"eastern EPac (center -92.5°) should pick GOES_EAST (-75.2°) over "
+        f"GOES_WEST (-137.2°), got {sat.family}"
+    )
+    print("ok pick_satellite_eastern_epac_crossover_picks_goes_east")
+
+
+def test_pick_satellite_atlantic_2026_regression_goes_east():
+    """Regression: Atlantic bbox (-85 to -60) must still route to GOES-East
+    after the GOES-West addition. Center -72.5° is way closer to East (-75.2°)
+    than to West (-137.2°), and West can't see this longitude anyway.
+    """
+    atlantic = [-85.0, 10.0, -60.0, 30.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(atlantic, when)
+    assert sat is GOES_EAST, f"Atlantic regression: expected GOES_EAST, got {sat.family}"
+    print("ok pick_satellite_atlantic_2026_regression_goes_east")
+
+
+def test_pick_satellite_japan_2026_regression_himawari():
+    """Regression: Japan bbox (130-145) must still route to HIMAWARI_PACIFIC
+    after the GOES-West addition (West can geometrically see Japan via the
+    antimeridian wrap, but Himawari at 140.7° is much closer than -137.2°).
+    """
+    japan = [130.0, 20.0, 145.0, 40.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    sat = pick_satellite(japan, when)
+    assert sat is HIMAWARI_PACIFIC, (
+        f"Japan regression: expected HIMAWARI_PACIFIC, got {sat.family}"
+    )
+    print("ok pick_satellite_japan_2026_regression_himawari")
+
+
+def test_goes_west_g18_handover_boundary():
+    """G-18 promoted 2023-01-04 00:00 UTC; ≥ that instant resolves to G-18,
+    < resolves to G-17."""
+    epac = [-130.0, 15.0, -115.0, 30.0]
+    just_before = dt.datetime(2023, 1, 3, 23, 59, tzinfo=dt.timezone.utc)
+    just_after = dt.datetime(2023, 1, 4, 0, 0, tzinfo=dt.timezone.utc)
+    assert pick_satellite(epac, just_before).resolve(just_before).name == "GOES-17"
+    assert pick_satellite(epac, just_after).resolve(just_after).name == "GOES-18"
+    print("ok goes_west_g18_handover_boundary")
+
+
+def test_goes_west_g17_operational_boundary():
+    """G-17 promoted 2019-02-12 00:00 UTC; the boundary itself resolves to
+    G-17, one second earlier raises UnsupportedTimeError.
+    """
+    epac = [-130.0, 15.0, -115.0, 30.0]
+    boundary = dt.datetime(2019, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
+    just_before = boundary - dt.timedelta(seconds=1)
+    assert pick_satellite(epac, boundary).resolve(boundary).name == "GOES-17"
+    try:
+        pick_satellite(epac, just_before)
+    except UnsupportedTimeError:
+        print("ok goes_west_g17_operational_boundary")
+        return
+    raise AssertionError("expected UnsupportedTimeError just before 2019-02-12")
+
+
+def test_goes_west_pacus_footprint_excludes_caribbean():
+    """PACUS sector (lon ~-152 to -77) must NOT accept a Caribbean bbox that
+    extends well east of -77°W — would otherwise produce a black-wedge render.
+    """
+    caribbean = [-78.0, 14.0, -60.0, 25.0]
+    assert not _bbox_inside(caribbean, PACUS_FOOTPRINT), (
+        "Caribbean bbox extending to -60W should be rejected by PACUS footprint"
+    )
+    # A bbox tightly inside PACUS (e.g., baja peninsula) should be accepted.
+    baja = [-115.0, 22.0, -110.0, 28.0]
+    assert _bbox_inside(baja, PACUS_FOOTPRINT), (
+        "Baja bbox should be inside PACUS footprint"
+    )
+    print("ok goes_west_pacus_footprint_excludes_caribbean")
+
+
+def test_goes_west_can_see_atlantic_false():
+    """GOES-West must NOT claim coverage of an Atlantic bbox (center way east
+    of its -137.2° sub-sat point) — picker would otherwise mis-route.
+    """
+    atlantic = [-60.0, 10.0, -30.0, 30.0]  # center -45°, 92° from sub-sat
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    assert GOES_WEST.can_see(atlantic, when) is False
+    print("ok goes_west_can_see_atlantic_false")
+
+
+def test_goes_west_can_see_hawaii_true():
+    """GOES-West sees Hawaii (~22° east of sub-sat point)."""
+    hawaii = [-160.0, 18.0, -154.0, 23.0]
+    when = dt.datetime(2026, 5, 7, 12, 0, tzinfo=dt.timezone.utc)
+    assert GOES_WEST.can_see(hawaii, when) is True
+    print("ok goes_west_can_see_hawaii_true")
 
 
 def test_himawari_can_see_caribbean_false():
@@ -388,6 +551,18 @@ def main():
     test_pick_satellite_hagibis_2019_resolves_himawari8()
     test_pick_satellite_h9_handover_boundary()
     test_pick_satellite_african_bbox_raises_meteosat_coverage_error()
+    test_pick_satellite_epac_2026_resolves_goes18()
+    test_pick_satellite_epac_2020_resolves_goes17()
+    test_pick_satellite_epac_2018_raises_unsupported_time()
+    test_pick_satellite_hawaii_2026_resolves_goes_west()
+    test_pick_satellite_eastern_epac_crossover_picks_goes_east()
+    test_pick_satellite_atlantic_2026_regression_goes_east()
+    test_pick_satellite_japan_2026_regression_himawari()
+    test_goes_west_g18_handover_boundary()
+    test_goes_west_g17_operational_boundary()
+    test_goes_west_pacus_footprint_excludes_caribbean()
+    test_goes_west_can_see_atlantic_false()
+    test_goes_west_can_see_hawaii_true()
     test_himawari_can_see_caribbean_false()
     test_himawari_can_see_antimeridian_crossing()
     test_himawari_generic_to_band()
