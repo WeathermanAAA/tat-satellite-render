@@ -23,10 +23,18 @@ Returns `image/png`. Headers:
 - `X-Product: CMIPF | CMIPC | CMIPM1 | CMIPM2`
 
 Constraints:
-- `bbox` size capped at 30°×30°, must overlap GOES-19 disk.
-- `channel`: 2 (visible), 8 (upper WV), or 13 (clean IR).
-- `enhancement`: `tat_neon`, `dvorak_bd`, or `grayscale`.
+- `bbox`: any size (auto-downsampled to a 16M-px budget); must be visible to an active satellite or you get a 422 naming the right one.
+- `channel`: a generic name (`clean_ir`, `ir_window`, `wv_upper`, `wv_lower`, `shortwave_ir`, `visible_red`), a legacy numeric band, or **`true_color`** (the multi-band RGB product).
+- `enhancement`: `tat_neon`, `dvorak_bd`, or `grayscale` (ignored for `true_color`).
 - `time`: ISO 8601 string or `"latest"`.
+
+### True color (`channel: "true_color"`)
+
+Cross-sensor geostationary RGB. The compositor resolves the red band first (which pins the product + scan time), pulls the other bands from that same scan, co-registers them onto a regular lat/lon grid, and builds the image in `truecolor.py`:
+
+- **Green:** ABI has no green band, so it's synthesized (Bah et al. 2018 fractional combination of red + veggie/NIR + blue); AHI uses its **native** green (band 2).
+- **Sun-zenith normalization** (÷cos SZA), **pyspectral Rayleigh** correction (deep-blue oceans, not milky; attenuated to avoid over-darkening), a true-color **tone curve**, and red-band **ratio sharpening** toward 0.5 km.
+- **Night:** GeoColor-lite — true color by day, fading to grayscale clean-IR across the terminator (looks good 24/7). Solar + geostationary-satellite geometry comes from `pyorbital`.
 
 ### `GET /health`
 
@@ -84,8 +92,9 @@ Healthcheck path is wired in `railway.json` → `/health`.
 | --- | --- |
 | `app.py` | FastAPI, CORS, slowapi rate limit, asyncio.Semaphore for concurrency, JSON logging |
 | `goes.py` | s3fs listing of `noaa-goes{16,19}`, time-based bucket picker, product selection (Meso → CONUS → Full Disk by bbox area), geos-projection bbox crop |
-| `render.py` | matplotlib + cartopy PlateCarree pipeline, dark theme, dashed gridlines, title/footer |
+| `render.py` | matplotlib + cartopy PlateCarree pipeline, dark theme, dashed gridlines, title/footer; RGB (`units="rgb"`) imshow branch for true color |
 | `colormaps.py` | `tat_neon`, `dvorak_bd`, `grayscale` |
+| `truecolor.py` | true-color recipe: synth/native green, sun-zenith normalization, pyspectral Rayleigh, tone curve, ratio sharpening, GeoColor-lite night blend |
 | `cache.py` | byte-budgeted LRU keyed by hash(bbox, snapped_time, channel, enhancement) |
 
 ### Selection logic

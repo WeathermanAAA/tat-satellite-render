@@ -156,6 +156,10 @@ def normalize_channel(raw) -> tuple[str, bool]:
     """
     if isinstance(raw, bool):  # bool is an int subclass — guard explicitly
         raise ValueError("channel must be a generic name (e.g. clean_ir) or a numeric band")
+    # true_color is a multi-band PRODUCT, not a single channel; it routes to
+    # the RGB compositor in /render rather than the single-band fetch path.
+    if raw == "true_color":
+        return "true_color", False
     if isinstance(raw, int):
         generic = goes_band_to_generic(raw)
         if generic is None:
@@ -319,12 +323,16 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # Validators already accepted it; here we resolve the pair and surface a
     # deprecation header on the response when numeric was used.
     generic_channel, channel_was_numeric = normalize_channel(body.channel)
+    is_true_color = generic_channel == "true_color"
 
     # Pixel-budget downsample is deterministic from bbox+channel so the
     # cache key (already keyed on bbox+channel) implicitly covers it. We
     # surface the factor on every response (HIT and MISS) so the frontend
-    # can show the "auto-downsampled Nx" badge.
-    downsample = compute_downsample_factor(body.bbox, generic_channel)
+    # can show the "auto-downsampled Nx" badge. True color is gated by its
+    # 0.5 km red band, so size it off visible_red.
+    downsample = compute_downsample_factor(
+        body.bbox, "visible_red" if is_true_color else generic_channel
+    )
 
     # Pick the satellite that can see this bbox at this time. CoverageError
     # surfaces as 422 with a message that names the right satellite for the
@@ -339,10 +347,13 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # is part of the cache key. For "latest" we don't snap to file precision
     # because that would produce a unique key every minute — instead we round
     # down to LATEST_CACHE_TTL buckets so concurrent "latest" renders share.
+    # True color resolves on its red band (pins product + scan time for all
+    # RGB bands); the composite fetch reuses that resolved file.
     nearest_to_target = not is_latest
+    resolve_channel = "visible_red" if is_true_color else generic_channel
     try:
         resolved = await satellite.find_file(
-            parsed_time, generic_channel, body.bbox, nearest_to_target
+            parsed_time, resolve_channel, body.bbox, nearest_to_target
         )
     except Exception as e:
         log.exception("resolve failed: %s", e)
@@ -355,7 +366,10 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         snapped = resolved.scan_start.isoformat()
 
     cache_key = _request_key(body, generic_channel, snapped, resolved.bucket)
-    native_band = satellite.generic_to_band[generic_channel]
+    native_band = (
+        satellite.truecolor_bands["red"] if is_true_color
+        else satellite.generic_to_band[generic_channel]
+    )
 
     def _response(content: bytes, cache_state: str, ms: int) -> Response:
         headers = {
@@ -389,7 +403,10 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             return _response(cached, "HIT", elapsed_ms)
 
         try:
-            data = await satellite.fetch(resolved, body.bbox, generic_channel)
+            if is_true_color:
+                data = await satellite.fetch_true_color(body.bbox, resolved)
+            else:
+                data = await satellite.fetch(resolved, body.bbox, generic_channel)
             png_bytes = await asyncio.get_event_loop().run_in_executor(
                 None,
                 render_png,

@@ -52,6 +52,14 @@ log = logging.getLogger("tat-satellite.satellites")
 # ---------------------------------------------------------------------------
 GENERIC_CHANNELS: dict[str, dict] = {
     "visible_red":   {"goes": 2,  "ahi": 3,  "wavelength": "0.64 µm",  "label": "Visible (red)",         "native_km": 0.5},
+    # Blue + veggie/NIR back the true-color recipe. They're real generic
+    # channels (selectable + downsampled like any other) but the dropdown
+    # only surfaces them via the `true_color` product, not as standalone
+    # grayscale options. ABI green is synthesized (no native band); AHI has a
+    # native green (band 2) handled inside its fetch_true_color, so green is
+    # deliberately NOT a generic channel (it can't map to a GOES band).
+    "visible_blue":  {"goes": 1,  "ahi": 1,  "wavelength": "0.47 µm",  "label": "Visible (blue)",        "native_km": 1.0},
+    "veggie":        {"goes": 3,  "ahi": 4,  "wavelength": "0.86 µm",  "label": "Veggie / NIR",          "native_km": 1.0},
     "shortwave_ir":  {"goes": 7,  "ahi": 7,  "wavelength": "3.9 µm",   "label": "Shortwave IR",          "native_km": 2.0},
     "wv_upper":      {"goes": 8,  "ahi": 8,  "wavelength": "6.2 µm",   "label": "Upper-tropospheric WV", "native_km": 2.0},
     "wv_lower":      {"goes": 10, "ahi": 10, "wavelength": "7.3 µm",   "label": "Lower-tropospheric WV", "native_km": 2.0},
@@ -112,7 +120,10 @@ class FetchResult:
     bucket: str             # source bucket — drives the title strip ("GOES-19" vs "GOES-16")
     sat_name: str
     sub_sat_lon: float
-    units: str              # "K" | "1"
+    units: str              # "K" | "1" | "rgb" (true-color composite: cmi is H×W×3, 0..1)
+    # True-color only: per-pixel cos(solar zenith), exposed so the render path
+    # can apply the day/night terminator (GeoColor-lite fade to IR at night).
+    cos_sza: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +231,18 @@ class Satellite(abc.ABC):
         generic_channel: str,
     ) -> FetchResult:
         return await _to_thread(self._fetch_sync, resolved, bbox, generic_channel)
+
+    async def fetch_true_color(
+        self, bbox: list[float], red_resolved: ResolvedFile
+    ) -> FetchResult:
+        """Fetch a multi-band RGB true-color composite, given the already-
+        resolved red-band file (which pins product + scan time so the RGB bands
+        are co-temporal). Implemented per family (ABI synthesizes green; AHI
+        uses its native green). Default raises so an as-yet-unsupported family
+        surfaces a clear message, not AttributeError."""
+        raise NotImplementedError(
+            f"true color is not yet available for {self.family}"
+        )
 
     def _fetch_sync(
         self,
@@ -480,6 +503,43 @@ def _xy_to_latlon(
     return lat, lon
 
 
+def _sample_geos(
+    data: np.ndarray,
+    x_src: np.ndarray,
+    y_src: np.ndarray,
+    x_q: np.ndarray,
+    y_q: np.ndarray,
+) -> np.ndarray:
+    """Bilinear-sample ``data`` (on its 1D geos grid x_src,y_src) at the query
+    scan-angles (x_q, y_q). Used to put every true-color band onto one regular
+    lat/lon target grid: the caller forward-projects the target lat/lon mesh to
+    each band's (x, y) and samples here, so all bands co-register exactly and
+    the result is a regular grid (clean to imshow, no curvilinear warp). ABI
+    ``y`` descends north→south, so flip to the ascending order
+    ``RegularGridInterpolator`` requires. Off-disk queries (NaN) -> NaN.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    ys = y_src[::-1]
+    d = data[::-1, :]
+    interp = RegularGridInterpolator(
+        (ys, x_src), d, bounds_error=False, fill_value=np.nan, method="linear"
+    )
+    out = interp(np.stack([y_q.ravel(), x_q.ravel()], axis=-1)).reshape(x_q.shape)
+    return out.astype(np.float32)
+
+
+def _truecolor_target_dims(lon_span: float, lat_span: float, max_px: int = 2400) -> tuple[int, int]:
+    """Pixel (W, H) for a true-color target grid at ~0.5 km red GSD, long axis
+    capped at ``max_px`` (matches the single-band MAX_PX_PER_AXIS so output
+    size and render time stay bounded)."""
+    deg_per_px = 0.5 / 111.0
+    nat_w = lon_span / deg_per_px
+    nat_h = lat_span / deg_per_px
+    scale = min(1.0, max_px / max(nat_w, nat_h, 1.0))
+    return max(16, int(round(nat_w * scale))), max(16, int(round(nat_h * scale)))
+
+
 class GOESBaseSatellite(Satellite):
     """Shared GOES (ABI) plumbing for GOES-East and GOES-West.
 
@@ -500,12 +560,18 @@ class GOESBaseSatellite(Satellite):
     sensor = "ABI"
     generic_to_band = {
         "visible_red": 2,
+        "visible_blue": 1,
+        "veggie": 3,
         "shortwave_ir": 7,
         "wv_upper": 8,
         "wv_lower": 10,
         "clean_ir": 13,
         "ir_window": 14,
     }
+    # Bands the true-color recipe pulls. ABI has no green -> synthesized from
+    # veggie; `green_band` is None to signal that to fetch_true_color.
+    truecolor_bands = {"red": 2, "blue": 1, "veggie": 3}
+    green_band = None
     sub_sat_lon: ClassVar[float]
 
     # --- per-family hooks --------------------------------------------------
@@ -669,6 +735,120 @@ class GOESBaseSatellite(Satellite):
             sub_sat_lon=self.sub_sat_lon,
         )
 
+    async def _find_band_at(
+        self, bucket: str, product: str, band: int, scan_start: dt.datetime
+    ) -> ResolvedFile:
+        """Locate band ``band``'s file for the SAME product + scan_start as an
+        already-resolved sibling band. All bands of one ABI scan share the
+        scan-start token, so the RGB bands are guaranteed co-temporal."""
+        files = await _to_thread(_list_hour, bucket, product, band, scan_start)
+        if not files:
+            # The scan can straddle an hour boundary for the previous-hour edge.
+            files = await _to_thread(_list_hour, bucket, product, band, scan_start - dt.timedelta(hours=1))
+        if not files:
+            raise RuntimeError(f"no band {band} file for {product} at {scan_start.isoformat()}")
+        with_t = [(f, _parse_scan_start(f)) for f in files]
+        exact = [f for f, t in with_t if t == scan_start]
+        chosen = exact[0] if exact else min(with_t, key=lambda p: abs((p[1] - scan_start).total_seconds()))[0]
+        return self._make_resolved(bucket, chosen, product, scan_start)
+
+    async def fetch_true_color(
+        self, bbox: list[float], red_resolved: ResolvedFile
+    ) -> FetchResult:
+        """Fetch the RGB true-color composite given the resolved red-band file.
+
+        Pulls the other true-color bands from that SAME product/scan so they're
+        co-temporal, crops each, resamples the 1 km bands onto the 0.5 km red
+        grid (shared geos x/y → exact co-registration), and hands off to
+        truecolor.assemble_truecolor. ABI green is synthesized inside.
+        """
+        band_files: dict[str, ResolvedFile] = {"red": red_resolved}
+        for role, band in self.truecolor_bands.items():
+            if role == "red":
+                continue
+            band_files[role] = await self._find_band_at(
+                red_resolved.bucket, red_resolved.product, band, red_resolved.scan_start
+            )
+        # Clean-IR (band 13) backs the GeoColor-lite night fade. Same product +
+        # scan so it co-registers with the visible bands.
+        band_files["ir"] = await self._find_band_at(
+            red_resolved.bucket, red_resolved.product,
+            self.generic_to_band["clean_ir"], red_resolved.scan_start,
+        )
+        return await _to_thread(self._compose_true_color_sync, band_files, bbox, red_resolved)
+
+    def _compose_true_color_sync(
+        self, band_files: dict[str, ResolvedFile], bbox: list[float], red_resolved: ResolvedFile
+    ) -> FetchResult:
+        import truecolor
+
+        crops: dict[str, tuple] = {}
+        proj = None
+        for role, rf in band_files.items():
+            ds, tmp_dir = self.open(rf)
+            try:
+                cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol = self._crop_to_bbox(ds, bbox)
+            finally:
+                ds.close()
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            crops[role] = (cmi, x_sub, y_sub)
+            proj = (lon_origin, H, r_eq, r_pol)
+
+        r_cmi, r_x, r_y = crops["red"]
+        lon_origin, H, r_eq, r_pol = proj
+        H_pix, W_pix = r_cmi.shape
+
+        # Regular lat/lon target grid over the bbox at the red pixel count.
+        # Image row order = north→south (row 0 = lat_max) for imshow origin
+        # "upper". Antimeridian (lon_max < lon_min) is unwrapped so the target
+        # longitudes stay monotonic, then re-wrapped to ±180 for projection.
+        lon_min, lat_min, lon_max, lat_max = bbox
+        lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
+        tgt_lons = ((np.linspace(lon_min, lon_max_uw, W_pix) + 180.0) % 360.0) - 180.0
+        tgt_lats = np.linspace(lat_max, lat_min, H_pix)
+        TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+        TX, TY = _latlon_to_xy(TLAT, TLON, lon_origin, H, r_eq, r_pol)
+
+        def grid(role: str):
+            c, xs, ys = crops[role]
+            return _sample_geos(c, xs, ys, TX, TY)
+
+        red = grid("red")
+        blue = grid("blue")
+        green = grid("green") if "green" in crops else None
+        veggie = grid("veggie") if "veggie" in crops else None
+        ir_bt = grid("ir") if "ir" in crops else None  # clean-IR (K) for night fade
+        lats, lons = TLAT.astype(np.float32), TLON.astype(np.float32)
+
+        platform_name = self._pyspectral_platform(red_resolved.bucket)
+        rgb, cos_sza = truecolor.assemble_truecolor(
+            red, green, blue, veggie, lats, lons,
+            when=red_resolved.scan_start,
+            sub_sat_lon=red_resolved.sub_sat_lon,
+            platform_name=platform_name,
+            sensor="abi",
+            ir_bt=ir_bt,
+        )
+        return FetchResult(
+            cmi=rgb,
+            lats=lats.astype(np.float32),
+            lons=lons.astype(np.float32),
+            channel=self.truecolor_bands["red"],
+            generic_channel="true_color",
+            scan_start=red_resolved.scan_start,
+            product=red_resolved.product,
+            bucket=red_resolved.bucket,
+            sat_name=red_resolved.sat_name,
+            sub_sat_lon=red_resolved.sub_sat_lon,
+            units="rgb",
+            cos_sza=cos_sza,
+        )
+
+    @staticmethod
+    def _pyspectral_platform(bucket: str) -> str:
+        """pyspectral platform name (e.g. 'GOES-19') from a bucket name."""
+        return goes_sat_label(bucket)
+
     def open(self, resolved: ResolvedFile) -> tuple[xr.Dataset, str]:
         """Download the NC file to /tmp, then open locally.
 
@@ -690,13 +870,17 @@ class GOESBaseSatellite(Satellite):
             raise
         return ds, tmp_dir
 
-    def project_to_latlon(
-        self,
-        ds: xr.Dataset,
-        bbox: list[float],
-        resolved: ResolvedFile,
-        generic_channel: str,
-    ) -> FetchResult:
+    def _crop_to_bbox(self, ds: xr.Dataset, bbox: list[float]):
+        """Geos-crop ``ds["CMI"]`` to ``bbox``.
+
+        Returns ``(cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol)``. Shared by
+        the single-band ``project_to_latlon`` and the multi-band
+        ``fetch_true_color`` paths. All ABI bands of one satellite share the
+        same geos projection, so the returned (x, y) scan-angle frame is a
+        *common coordinate system* across bands — co-registering them for an
+        RGB composite is just interpolation onto the red band's (x, y) grid,
+        with no reprojection.
+        """
         proj = ds["goes_imager_projection"]
         h = float(proj.attrs["perspective_point_height"])
         r_eq = float(proj.attrs["semi_major_axis"])
@@ -762,16 +946,29 @@ class GOESBaseSatellite(Satellite):
 
         sub = ds.isel(x=slice(ix0, ix1, x_stride), y=slice(iy_top, iy_bot, y_stride))
         cmi = sub["CMI"].load().values  # materialize the small window only
+        return (
+            cmi.astype(np.float32),
+            sub["x"].values,
+            sub["y"].values,
+            lon_origin, H, r_eq, r_pol,
+        )
+
+    def project_to_latlon(
+        self,
+        ds: xr.Dataset,
+        bbox: list[float],
+        resolved: ResolvedFile,
+        generic_channel: str,
+    ) -> FetchResult:
+        cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol = self._crop_to_bbox(ds, bbox)
 
         # Build lat/lon for this window via inverse projection
-        x_sub = sub["x"].values
-        y_sub = sub["y"].values
         X, Y = np.meshgrid(x_sub, y_sub)
         lats, lons = _xy_to_latlon(X, Y, lon_origin, H, r_eq, r_pol)
 
         units = ds["CMI"].attrs.get("units", "")
         return FetchResult(
-            cmi=cmi.astype(np.float32),
+            cmi=cmi,
             lats=lats.astype(np.float32),
             lons=lons.astype(np.float32),
             channel=self.generic_to_band[generic_channel],
@@ -999,12 +1196,19 @@ class HimawariPacificSatellite(Satellite):
     sensor = "AHI"
     generic_to_band = {
         "visible_red": 3,
+        "visible_blue": 1,
+        "veggie": 4,
         "shortwave_ir": 7,
         "wv_upper": 8,
         "wv_lower": 10,
         "clean_ir": 13,
         "ir_window": 14,
     }
+    # AHI has a native green (band 2, 0.51 µm), so true color uses it directly
+    # — no synthesis. Veggie (band 4) is fetched too for optional green
+    # correction but the v1 recipe uses native green as-is.
+    truecolor_bands = {"red": 3, "green": 2, "blue": 1, "veggie": 4}
+    green_band = 2
     # disk_bbox isn't usable here (the disk crosses ±180° on the east side),
     # so we override can_see to use angular distance from sub-sat point.
     disk_bbox = (-180.0, -HIMAWARI_DISK_LAT_LIMIT, 180.0, HIMAWARI_DISK_LAT_LIMIT)
@@ -1158,6 +1362,90 @@ class HimawariPacificSatellite(Satellite):
             sat_name=resolved.sat_name,
             sub_sat_lon=resolved.sub_sat_lon,
             units=disk.units,
+        )
+
+
+    async def fetch_true_color(
+        self, bbox: list[float], red_resolved: ResolvedFile
+    ) -> FetchResult:
+        """AHI true color: native green (band 2), no synthesis. ``red_resolved``
+        carries the snapped 10-min slot + bucket; all bands load from it."""
+        return await _to_thread(self._compose_true_color_sync, bbox, red_resolved)
+
+    def _compose_true_color_sync(
+        self, bbox: list[float], red_resolved: ResolvedFile
+    ) -> FetchResult:
+        from vendor.ahi_loader import load_band_sync
+        from scipy.interpolate import RegularGridInterpolator
+        import truecolor
+
+        fs = _get_fs()
+        # Load each true-color band's calibrated disk (segment-filtered to the
+        # bbox's line band so B03's 0.5 km segments don't blow memory).
+        disks: dict[str, object] = {}
+        for role, band in self.truecolor_bands.items():
+            disks[role] = load_band_sync(
+                fs, red_resolved.bucket, red_resolved.scan_start, band, bbox=tuple(bbox)
+            )
+        # Clean-IR (band 13) for the GeoColor-lite night fade.
+        disks["ir"] = load_band_sync(
+            fs, red_resolved.bucket, red_resolved.scan_start,
+            self.generic_to_band["clean_ir"], bbox=tuple(bbox),
+        )
+
+        # Regular lat/lon target grid (same scheme as GOES); antimeridian
+        # unwrap keeps target longitudes monotonic for the AHI disk (centered
+        # at 140.7°E, so W-Pac bboxes routinely cross ±180°).
+        lon_min, lat_min, lon_max, lat_max = bbox
+        lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
+        W_pix, H_pix = _truecolor_target_dims(lon_max_uw - lon_min, lat_max - lat_min)
+        tgt_lons = ((np.linspace(lon_min, lon_max_uw, W_pix) + 180.0) % 360.0) - 180.0
+        tgt_lats = np.linspace(lat_max, lat_min, H_pix)
+        TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+
+        def grid(role: str) -> np.ndarray:
+            d = disks[role]
+            # Forward-project target lat/lon -> this band's GLOBAL col/line, then
+            # shift line into the local (segment-banded) window before sampling.
+            col_g, line_g = _ahi_latlon_to_colline(
+                TLAT, TLON, d.sub_lon, d.cfac, d.lfac, d.coff, d.loff
+            )
+            line_local = line_g - d.line_offset
+            interp = RegularGridInterpolator(
+                (np.arange(d.n_lines), np.arange(d.n_columns)),
+                d.data, bounds_error=False, fill_value=np.nan, method="linear",
+            )
+            out = interp(np.stack([line_local.ravel(), col_g.ravel()], axis=-1))
+            return out.reshape(TLON.shape).astype(np.float32)
+
+        red = grid("red")
+        green = grid("green")
+        blue = grid("blue")
+        veggie = grid("veggie") if "veggie" in disks else None
+        ir_bt = grid("ir") if "ir" in disks else None  # clean-IR (K) for night fade
+        lats, lons = TLAT.astype(np.float32), TLON.astype(np.float32)
+
+        rgb, cos_sza = truecolor.assemble_truecolor(
+            red, green, blue, veggie, lats, lons,
+            when=red_resolved.scan_start,
+            sub_sat_lon=red_resolved.sub_sat_lon,
+            platform_name=red_resolved.sat_name,  # "Himawari-9"/"Himawari-8"
+            sensor="ahi",
+            ir_bt=ir_bt,
+        )
+        return FetchResult(
+            cmi=rgb,
+            lats=lats,
+            lons=lons,
+            channel=self.truecolor_bands["red"],
+            generic_channel="true_color",
+            scan_start=red_resolved.scan_start,
+            product=red_resolved.product,
+            bucket=red_resolved.bucket,
+            sat_name=red_resolved.sat_name,
+            sub_sat_lon=red_resolved.sub_sat_lon,
+            units="rgb",
+            cos_sza=cos_sza,
         )
 
 

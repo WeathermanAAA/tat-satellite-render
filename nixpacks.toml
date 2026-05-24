@@ -13,6 +13,10 @@ cmds = [
   "python -m venv /opt/venv",
   ". /opt/venv/bin/activate && pip install --no-cache-dir --upgrade pip",
   ". /opt/venv/bin/activate && pip install --no-cache-dir -r requirements.txt",
+  # Pre-warm pyspectral's Rayleigh LUTs + RSR at build time so the first live
+  # true-color render doesn't pay the (~tens of MB) download. Non-fatal: the
+  # recipe guards a missing LUT and just skips Rayleigh (hazier ocean).
+  ". /opt/venv/bin/activate && python -c \"from pyspectral.rayleigh import check_and_download; check_and_download()\" || true",
 ]
 
 [start]

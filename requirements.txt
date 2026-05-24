@@ -13,3 +13,13 @@ Pillow==11.0.0
 s3fs==2024.10.0
 aiobotocore==2.15.2
 python-dateutil==2.9.0
+# True-color recipe: scipy for band co-registration (RegularGridInterpolator),
+# pyorbital for sun + geostationary-satellite geometry, pyspectral for Rayleigh
+# (atmospheric) correction. pyspectral pulls RSR + Rayleigh LUTs on first use
+# (~tens of MB) — pre-warm them in the build (see README) so the first live
+# render isn't slow; if they're missing the recipe still renders (hazier).
+# Validated against scipy 1.17 / pyspectral 0.14 / pyorbital 1.12; the floors
+# below are the minimums known to expose the APIs used.
+scipy>=1.13
+pyspectral>=0.13
+pyorbital>=1.9
