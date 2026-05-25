@@ -73,12 +73,17 @@ def render_png(
     enhancement: str,
     downsample: int = 1,
 ) -> bytes:
-    enh = get_enhancement(enhancement)
+    # True-color composites carry an H×W×3 RGB array in ``cmi`` (units="rgb")
+    # and don't go through the scalar normalize/cmap path.
+    is_rgb = data.units == "rgb"
+    is_visible = data.units == "1"
+    enh = None if is_rgb else get_enhancement(enhancement)
 
     # Pixel-budget stride. App-layer (compute_downsample_factor) sets this
     # based on raw bbox×channel so output_pixels ≤ PIXEL_BUDGET. This
     # composes with the goes.py fetch-time stride: both layers cap output
-    # size, the more aggressive of the two wins.
+    # size, the more aggressive of the two wins. ``cmi[::d, ::d]`` strides the
+    # first two axes for both 2D (scalar) and 3D (RGB) arrays.
     cmi = data.cmi
     lats = data.lats
     lons = data.lons
@@ -94,33 +99,35 @@ def render_png(
         lats = lats[::downsample, ::downsample]
         lons = lons[::downsample, ::downsample]
 
-    # Normalize the CMI to 0..1 according to data kind + enhancement.
-    # We branch on units (not numeric channel) because the visible-red band
-    # is 2 on GOES and 3 on AHI — units="1" tags reflectance regardless.
-    is_visible = data.units == "1"
-    if is_visible:
-        # Visible: reflectance 0..1
-        norm = normalize_visible(cmi)
-        # Visible imagery is rendered grayscale regardless of enhancement;
-        # IR colormaps on reflectance data don't make physical sense.
-        cmap = plt.get_cmap("gray")
-    else:
-        # IR: brightness temperature in Kelvin (or convert from C if needed)
-        bt = cmi
-        if data.units in ("C", "celsius", "degC"):
-            bt = bt + 273.15
-        if enh["kind"] == "gray":
-            # grayscale on IR: invert (cold=white) for readable IR
-            t_warm, t_cold = 303.0, 183.0
-            x = (t_warm - bt) / (t_warm - t_cold)
-            norm = np.clip(x, 0.0, 1.0)
+    norm = None
+    cmap = None
+    if not is_rgb:
+        # Normalize the CMI to 0..1 according to data kind + enhancement.
+        # We branch on units (not numeric channel) because the visible-red band
+        # is 2 on GOES and 3 on AHI — units="1" tags reflectance regardless.
+        if is_visible:
+            # Visible: reflectance 0..1
+            norm = normalize_visible(cmi)
+            # Visible imagery is rendered grayscale regardless of enhancement;
+            # IR colormaps on reflectance data don't make physical sense.
             cmap = plt.get_cmap("gray")
         else:
-            norm = normalize_ir(bt, enh["range_k"])
-            cmap = enh["cmap"]
+            # IR: brightness temperature in Kelvin (or convert from C if needed)
+            bt = cmi
+            if data.units in ("C", "celsius", "degC"):
+                bt = bt + 273.15
+            if enh["kind"] == "gray":
+                # grayscale on IR: invert (cold=white) for readable IR
+                t_warm, t_cold = 303.0, 183.0
+                x = (t_warm - bt) / (t_warm - t_cold)
+                norm = np.clip(x, 0.0, 1.0)
+                cmap = plt.get_cmap("gray")
+            else:
+                norm = normalize_ir(bt, enh["range_k"])
+                cmap = enh["cmap"]
 
-    # Mask NaNs (off-disk + invalid pixels)
-    norm = np.ma.masked_invalid(norm)
+        # Mask NaNs (off-disk + invalid pixels)
+        norm = np.ma.masked_invalid(norm)
 
     lon_min, lat_min, lon_max, lat_max = bbox
     lon_span = lon_max - lon_min
@@ -146,18 +153,34 @@ def render_png(
     ax.set_facecolor(DARK_BG)
     ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
-    # Plot pcolormesh with the (lats, lons) arrays we computed via inverse proj
-    mesh = ax.pcolormesh(
-        lons,
-        lats,
-        norm,
-        cmap=cmap,
-        vmin=0.0,
-        vmax=1.0,
-        shading="auto",
-        transform=ccrs.PlateCarree(),
-        rasterized=True,
-    )
+    # Plot with the (lats, lons) arrays we computed via inverse projection.
+    if is_rgb:
+        # True-color RGB is resampled onto a REGULAR lat/lon grid (see
+        # _compose_true_color_sync), so imshow with a PlateCarree extent is
+        # exact — no curvilinear warp to honor, and it sidesteps cartopy's
+        # GeoQuadMesh.set_array(None) limitation for RGB pcolormesh. NaNs
+        # (off-disk) -> black. origin "upper" because row 0 = lat_max.
+        rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
+        ax.imshow(
+            rgb,
+            origin="upper",
+            extent=[lon_min, lon_max, lat_min, lat_max],
+            transform=ccrs.PlateCarree(),
+            interpolation="nearest",
+            zorder=1,
+        )
+    else:
+        mesh = ax.pcolormesh(
+            lons,
+            lats,
+            norm,
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            shading="auto",
+            transform=ccrs.PlateCarree(),
+            rasterized=True,
+        )
 
     # Coastlines + borders. Resolution scales with bbox; zorder explicitly
     # above pcolormesh (which defaults to ~1.5 in cartopy) so cyan coast
@@ -196,16 +219,21 @@ def render_png(
     # Sensor label: read off FetchResult so it works for both ABI (GOES) and
     # AHI (Himawari) without per-family branching here.
     sensor_label = "AHI" if data.bucket.startswith("noaa-himawari") else "ABI"
+    center_title = (
+        f"{data.sat_name} {sensor_label} True Color · {time_str} UTC"
+        if is_rgb
+        else f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC"
+    )
     title_ax.text(
         0.5, 0.5,
-        f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC",
+        center_title,
         ha="center", va="center",
         color=TEXT_COLOR, fontsize=14, fontweight="bold",
         transform=title_ax.transAxes,
     )
     title_ax.text(
         0.99, 0.5,
-        f"{data.product} · {enhancement}",
+        f"{data.product} · {'true color' if is_rgb else enhancement}",
         ha="right", va="center",
         color=ACCENT_COLOR, fontsize=9,
         transform=title_ax.transAxes,
