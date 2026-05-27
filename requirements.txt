@@ -23,3 +23,10 @@ python-dateutil==2.9.0
 scipy>=1.13
 pyspectral>=0.13
 pyorbital>=1.9
+# Dependency delta for the floater poller. Merge into tat-satellite-render's
+# existing requirements.txt (the /render service likely already has requests;
+# boto3 may already be present if it writes to R2). The poller itself needs
+# only these two — no Pillow/numpy (it passes /render's PNG bytes straight
+# through and does the solar-zenith math with the stdlib).
+boto3>=1.34
+requests>=2.31
