@@ -240,6 +240,21 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+class StormInfo(BaseModel):
+    """Optional storm context for the rendered title strip.
+
+    Supplied by the floater poller so the rendered PNG itself carries the
+    storm's identity + current intensity (a color-coded badge top-left).
+    All fields optional so legacy /satellite/ draw-a-box requests still
+    render the plain title.
+    """
+    name: str = Field(..., max_length=40)
+    basin: Optional[str] = Field(default=None, max_length=8)     # "WP", "AL", "EP"
+    nature: Optional[str] = Field(default=None, max_length=8)    # "TS", "TD", "HU", "EX", ...
+    wind_kt: Optional[float] = Field(default=None, ge=0, le=250)
+    pressure_mb: Optional[float] = Field(default=None, ge=850, le=1050)
+
+
 class RenderRequest(BaseModel):
     bbox: list[float] = Field(..., min_length=4, max_length=4)
     time: str = "latest"
@@ -248,6 +263,9 @@ class RenderRequest(BaseModel):
     # endpoint computes the (generic, was_numeric) pair via normalize_channel.
     channel: Union[int, str]
     enhancement: str = "tat_neon"
+    # Optional storm context. When supplied, render.py draws a color-coded
+    # intensity badge (name · category · wind · pressure) on the title strip.
+    storm: Optional[StormInfo] = None
 
     @field_validator("bbox")
     @classmethod
@@ -309,7 +327,20 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     # differently. Same scan_start in goes19 and goes16 still produces
     # different rendered output (different sat-label, possibly different
     # calibration), so they must cache separately.
-    raw = f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}|{bucket}"
+    #
+    # Storm metadata (name + intensity) is included so the cache invalidates
+    # when the storm's wind/pressure update at a new fix -- otherwise a
+    # cached frame from an earlier fix could be served with stale intensity
+    # burned into the title strip. None when no storm context is supplied
+    # (legacy draw-a-box requests share cache as before).
+    if body.storm is not None:
+        storm_part = (
+            f"|storm={body.storm.name},{body.storm.nature or ''},"
+            f"{body.storm.wind_kt or ''},{body.storm.pressure_mb or ''}"
+        )
+    else:
+        storm_part = ""
+    raw = f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}|{bucket}{storm_part}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -409,13 +440,15 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
             png_bytes = await asyncio.get_event_loop().run_in_executor(
                 None,
-                render_png,
-                data,
-                body.bbox,
-                native_band,
-                resolved.scan_start.strftime("%Y-%m-%d %H:%M"),
-                body.enhancement,
-                downsample,
+                lambda: render_png(
+                    data,
+                    body.bbox,
+                    native_band,
+                    resolved.scan_start.strftime("%Y-%m-%d %H:%M"),
+                    body.enhancement,
+                    downsample,
+                    storm=body.storm.model_dump() if body.storm is not None else None,
+                ),
             )
         except Exception as e:
             log.exception("render failed: %s", e)
