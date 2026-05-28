@@ -251,27 +251,27 @@ def _extrapolate(points: list[dict], now: dt.datetime) -> tuple[float, float]:
 def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
     """Return active storms across all basins.
 
-    Returns ``None`` if EVERY basin fetch failed (network glitch / origin
-    timeout) -- the caller treats this as "no fresh data" and preserves the
-    last-known-good top manifest instead of overwriting it with an empty
-    list, so a transient triple-a-tropics.com hiccup doesn't make the
-    floater widget self-hide on the live site. Returns ``[]`` only when
-    fetches succeeded but no basin reported any active storms (genuine
-    quiescence).
+    Returns ``None`` if ANY basin fetch failed -- a partial failure can
+    silently drop the storms that live in the failing basin (we'd return
+    an empty out from sibling-quiet basins), so the caller treats partial
+    failure the same as full failure and preserves the last-known-good
+    top manifest for one cycle (worst-case ~10 min stale). Returns ``[]``
+    only when EVERY basin fetched cleanly and none reported active storms
+    (genuine quiescence -- safe to clear the manifest).
     """
     now = utcnow()
     cutoff = now - dt.timedelta(hours=ACTIVE_WINDOW_HOURS)
     out: list[Storm] = []
-    any_ok = False
+    failed_basins: list[str] = []
     for basin in TRACKS_BASINS:
         url = f"{TRACKS_BASE}/{basin}_tracks_data.json"
         try:
             r = session.get(url, timeout=20)
             r.raise_for_status()
             data = r.json()
-            any_ok = True
         except Exception as e:  # noqa: BLE001 - never crash on a bad fetch
             log.warning("tracks fetch failed (%s): %s", basin, e)
+            failed_basins.append(basin)
             continue
         for s in data.get("storms", []):
             # Trust the hardened is_active baked into the JSON, but re-check
@@ -302,7 +302,13 @@ def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
                 intensity_kt=s.get("peak_wind_kt"),
                 last_fix=pts[-1].get("t", ""),
             ))
-    if not any_ok:
+    if failed_basins:
+        log.warning(
+            "tracks fetch failed for %d/%d basins (%s) -- returning None to "
+            "preserve last-known-good (avoids silently dropping storms that "
+            "live in the failing basin)",
+            len(failed_basins), len(TRACKS_BASINS), ",".join(failed_basins),
+        )
         return None
     return out
 
