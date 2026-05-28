@@ -12,7 +12,7 @@ Pipeline, per cycle:
      (https://triple-a-tropics.com/{wp,al,ep}_tracks_data.json), filtering on
      the hardened is_active flag (recency + tropical nature + valid wind).
   2. For each active storm x band, on the band's cadence, call /render with an
-     8 deg storm-centered bbox + time=latest.
+     12 deg storm-centered bbox + time=latest.
   3. sha256 the returned PNG; if it differs from the last uploaded frame for
      that (storm, band), upload it to R2 and append the per-storm manifest.
      X-Cache:HIT / a source-scan-time header (if present) are used only as a
@@ -86,7 +86,7 @@ TRACKS_BASE = _env("TRACKS_BASE", "https://triple-a-tropics.com").rstrip("/")
 TRACKS_BASINS = ("wp", "al", "ep")
 
 # Geometry + cadence
-BBOX_DEG = float(_env("BBOX_DEG", "8"))            # square floater width (deg)
+BBOX_DEG = float(_env("BBOX_DEG", "12"))           # square floater width (deg)
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))   # hot-band target
 TRACKS_REFRESH_S = float(_env("TRACKS_REFRESH_S", "600"))  # storms update every 6 h
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))  # min gap between /render calls
