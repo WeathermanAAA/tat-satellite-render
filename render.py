@@ -160,6 +160,39 @@ def render_png(
         # exact — no curvilinear warp to honor, and it sidesteps cartopy's
         # GeoQuadMesh.set_array(None) limitation for RGB pcolormesh. NaNs
         # (off-disk) -> black. origin "upper" because row 0 = lat_max.
+        # ---- DEGENERATE-RGB GUARD --------------------------------------
+        # Truecolor pulls 5 input bands (R/G/B/veggie/clean-IR) and a
+        # transient cache race on ANY of them can leave the composite
+        # mostly-NaN -- the nan_to_num below would then paint those
+        # regions pure black and the render would ship a 200 OK with a
+        # black PNG. Detect this and raise so /render returns 500: the
+        # poller's retry/skip path discards the frame instead of uploading
+        # it, and the next 10-min scan cycle (with the s3fs listings
+        # cache aged out) re-renders cleanly. Threshold: >50% NaN or
+        # mean-of-valid-channel-max <0.04 (~almost-pure-black even where
+        # not NaN) counts as degenerate.
+        finite_mask = np.isfinite(cmi).all(axis=-1)
+        nan_frac = float((~finite_mask).mean())
+        if finite_mask.any():
+            valid_max = float(
+                np.clip(cmi[finite_mask], 0.0, 1.0).max(axis=-1).mean()
+            )
+        else:
+            valid_max = 0.0
+        if nan_frac > 0.50 or valid_max < 0.04:
+            log.warning(
+                "truecolor RGB degenerate (nan=%.0f%%, mean valid max=%.3f) "
+                "-- bailing out so the poller doesn't ship a black frame",
+                nan_frac * 100.0, valid_max,
+            )
+            plt.close(fig)
+            raise RuntimeError(
+                f"truecolor render produced degenerate RGB "
+                f"(nan={nan_frac * 100:.0f}%, mean_valid_max={valid_max:.3f}) "
+                f"-- likely a cache race on one of the input band listings; "
+                f"the next scan cycle will re-render"
+            )
+        # ----------------------------------------------------------------
         rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
         ax.imshow(
             rgb,
