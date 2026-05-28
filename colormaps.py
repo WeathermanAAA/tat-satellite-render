@@ -17,10 +17,11 @@ temperature units, the colorbar ticks are physical °C with no manual remap.
 DEFAULT preset: rainbow_ir (the TAT signature look).
 
 Presets:
-  - rainbow_ir : TAT signature rainbow IR (TWC-family but personalized) —
-                 deep-blue clear/warm, cyan+teal accent at the cold-cloud edge,
-                 green -> yellow -> orange -> red -> maroon -> magenta cold
-                 sweep, white-hot overshoot core. The site default.
+  - rainbow_ir : TAT signature rainbow IR (TWC/TT-family but personalized) —
+                 GRAYSCALE warm half (landmasses/coastlines/clear air visible),
+                 cyan+teal accent at the cold-cloud edge, then green -> yellow
+                 -> orange -> red -> maroon -> magenta cold sweep, white-hot
+                 overshoot core. The site default.
   - dvorak_bd  : canonical Dvorak BD — stepped grayscale with the diagnostic
                  black (-63..-69) -> white (-69..-75) flip. Breakpoints per
                  Andrew's reference table (+9,-30,-41,-53,-63,-69,-75,-80,-85).
@@ -64,9 +65,11 @@ def _seg_cmap(name, anchors):
 # ---------------------------------------------------------------------------
 # rainbow_ir — TAT signature (TWC-family, personalized). DEFAULT.
 # ---------------------------------------------------------------------------
-# cold -> warm. Approved 2026-05-28: deep-blue clear (no white low-cloud band),
-# cyan/teal TAT accent at the cold-cloud edge, green/yellow/orange/red/maroon/
-# magenta cold sweep, white-hot overshoot core. Domain -95 .. +40 C.
+# cold -> warm. TT-family warm half: GRAYSCALE warmer than the cold-cloud edge
+# (so landmasses/coastlines/clear air show, not flooded with blue); cyan/teal
+# TAT accent at the cold-cloud edge; green/yellow/orange/red/maroon/magenta cold
+# sweep; white-hot overshoot core. Domain -95 .. +40 C. (Warm tail changed from
+# blue to gray 2026-05-28 per Andrew — copy TT so landmasses are visible.)
 _RAINBOW_IR_ANCHORS = [
     (-95.0, 1.00, 1.00, 1.00),  # white-hot overshoot core
     (-90.0, 0.88, 0.25, 0.98),  # magenta
@@ -81,12 +84,15 @@ _RAINBOW_IR_ANCHORS = [
     (-32.0, 0.72, 0.92, 0.20),  # yellow-green
     (-26.0, 0.18, 0.80, 0.22),  # green
     (-20.0, 0.08, 0.66, 0.48),  # teal-green (TAT)
-    (-14.0, 0.16, 0.72, 0.90),  # cyan accent (TAT)
-    (-7.0,  0.18, 0.52, 0.85),  # azure
-    (0.0,   0.12, 0.38, 0.74),  # medium blue
-    (12.0,  0.07, 0.26, 0.58),  # deeper blue
-    (25.0,  0.04, 0.16, 0.42),  # dark blue
-    (40.0,  0.02, 0.07, 0.22),  # very dark navy (warmest clear)
+    (-14.0, 0.16, 0.72, 0.90),  # cyan accent (TAT) — cold-cloud edge
+    # Warm half = GRAYSCALE (TT-style) so landmasses, coastlines, and clear
+    # air read through instead of being flooded with color. Cold = lighter,
+    # warmest land/sea = dark gray. Lets the cyan coastlines + terrain show.
+    (-9.0,  0.85, 0.93, 0.97),  # cyan -> near-white transition
+    (0.0,   0.80, 0.80, 0.80),  # light gray (low cloud)
+    (12.0,  0.58, 0.58, 0.58),  # medium gray
+    (25.0,  0.40, 0.40, 0.40),  # gray — clear ocean / land visible
+    (40.0,  0.18, 0.18, 0.18),  # dark gray (warmest land/sea)
 ]
 
 # ---------------------------------------------------------------------------
