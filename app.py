@@ -140,8 +140,12 @@ def compute_downsample_factor(bbox: list[float], channel) -> int:
 # ---------------------------------------------------------------------------
 # Channel normalization
 # ---------------------------------------------------------------------------
-# Accepted enhancements
-_ENHANCEMENTS = ("tat_neon", "dvorak_bd", "grayscale")
+# Accepted enhancements. rainbow_ir is the TAT default; wv_tat is the
+# water-vapor table; ir_gray is the standard grayscale ("grayscale" is kept
+# as a back-compat alias used by the floater poller + legacy share-links).
+_ENHANCEMENTS = (
+    "rainbow_ir", "dvorak_bd", "tat_neon", "wv_tat", "ir_gray", "grayscale",
+)
 
 
 def normalize_channel(raw) -> tuple[str, bool]:
@@ -262,7 +266,7 @@ class RenderRequest(BaseModel):
     # field validator only checks structural validity here; the /render
     # endpoint computes the (generic, was_numeric) pair via normalize_channel.
     channel: Union[int, str]
-    enhancement: str = "tat_neon"
+    enhancement: str = "rainbow_ir"
     # Optional storm context. When supplied, render.py draws a color-coded
     # intensity badge (name · category · wind · pressure) on the title strip.
     storm: Optional[StormInfo] = None
@@ -294,7 +298,9 @@ class RenderRequest(BaseModel):
     @classmethod
     def _v_enh(cls, v):
         if v not in _ENHANCEMENTS:
-            raise ValueError("enhancement must be tat_neon | dvorak_bd | grayscale")
+            raise ValueError(
+                "enhancement must be one of: " + " | ".join(_ENHANCEMENTS)
+            )
         return v
 
 
