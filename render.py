@@ -65,6 +65,43 @@ def _coast_resolution(span_deg: float) -> str:
     return "110m"
 
 
+# Saffir-Simpson + tropical-status colors for the title-strip storm badge.
+# Tuned to read clearly against the DARK_BG title strip (each is used as a
+# tinted/translucent bbox face for the text, not a fill).
+_SS_COLORS: dict[str, str] = {
+    "TD": "#5dd3ff",   # tropical depression — cyan
+    "TS": "#ffd24a",   # tropical storm — yellow
+    "C1": "#ff9a3a",   # cat 1 — orange
+    "C2": "#ff7a3a",   # cat 2 — red-orange
+    "C3": "#ef5350",   # cat 3 — red
+    "C4": "#ff5aa8",   # cat 4 — pink
+    "C5": "#c0a6ff",   # cat 5 — violet
+    "EX": "#9199a4",   # extratropical / post-tropical / remnant low — gray
+}
+
+
+def _ss_category(nature: Optional[str], wind_kt: Optional[float]) -> str:
+    """Map (nature, wind) -> short Saffir-Simpson-ish category label."""
+    n = (nature or "").upper()
+    # Non-tropical natures keep their own label (and the gray color).
+    if n in ("EX", "PT", "DB", "WV", "LO", "SD", "SS"):
+        return n or "EX"
+    w = wind_kt or 0.0
+    if w < 34:
+        return "TD"
+    if w < 64:
+        return "TS"
+    if w < 83:
+        return "C1"
+    if w < 96:
+        return "C2"
+    if w < 113:
+        return "C3"
+    if w < 137:
+        return "C4"
+    return "C5"
+
+
 def render_png(
     data: FetchResult,
     bbox: list[float],
@@ -72,6 +109,7 @@ def render_png(
     time_str: str,
     enhancement: str,
     downsample: int = 1,
+    storm: Optional[dict] = None,
 ) -> bytes:
     # True-color composites carry an H×W×3 RGB array in ``cmi`` (units="rgb")
     # and don't go through the scalar normalize/cmap path.
@@ -271,6 +309,35 @@ def render_png(
         color=ACCENT_COLOR, fontsize=9,
         transform=title_ax.transAxes,
     )
+
+    # Storm badge (left of title strip) — only when /render is called with
+    # storm context (poller path). Format:
+    #   JANGMI · TS · 35 kt · 998 mb
+    # Color-coded by Saffir-Simpson category as a tinted background pill.
+    if storm:
+        name = (storm.get("name") or "").upper()[:18]
+        wind_kt = storm.get("wind_kt")
+        pressure_mb = storm.get("pressure_mb")
+        nature = storm.get("nature")
+        cat = _ss_category(nature, wind_kt)
+        cat_color = _SS_COLORS.get(cat, _SS_COLORS["EX"])
+        parts = [name, cat]
+        if wind_kt is not None:
+            parts.append(f"{int(round(wind_kt))} kt")
+        if pressure_mb is not None:
+            parts.append(f"{int(round(pressure_mb))} mb")
+        badge_text = "  ·  ".join(p for p in parts if p)
+        title_ax.text(
+            0.01, 0.5,
+            badge_text,
+            ha="left", va="center",
+            color=TEXT_COLOR, fontsize=10, fontweight="bold",
+            transform=title_ax.transAxes,
+            bbox=dict(
+                facecolor=cat_color, alpha=0.22, edgecolor=cat_color,
+                linewidth=1.0, boxstyle="round,pad=0.35",
+            ),
+        )
 
     # Watermark: top-left of the map axes, mirroring the title strip's
     # right-aligned product label so the two corners balance visually.
