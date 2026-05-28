@@ -131,7 +131,7 @@ class Band:
 
 
 BANDS: tuple[Band, ...] = (
-    Band("ir",        "clean_ir",     "grayscale", "Clean IR",          hot=True,  daytime_only=False),
+    Band("ir",        "clean_ir",     "rainbow_ir", "Clean IR",         hot=True,  daytime_only=False),
     Band("irbd",      "clean_ir",     "dvorak_bd", "IR (Dvorak BD)",    hot=True,  daytime_only=False),
     Band("wv_up",     "wv_upper",     "tat_neon",  "Upper WV",          hot=False, daytime_only=False),
     Band("wv_low",    "wv_lower",     "tat_neon",  "Lower WV",          hot=False, daytime_only=False),
