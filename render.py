@@ -66,16 +66,17 @@ def _coast_resolution(span_deg: float) -> str:
 
 
 # Saffir-Simpson + tropical-status colors for the title-strip storm badge.
-# Tuned to read clearly against the DARK_BG title strip (each is used as a
-# tinted/translucent bbox face for the text, not a fill).
+# Per Andrew's spec (2026-05-28): TD neon blue, TS lime, C1 yellow, C2 amber,
+# C3 red, C4 pink, C5 magenta/purple. Tuned to read clearly against DARK_BG
+# (each is used as a tinted/translucent bbox face for the text, not a fill).
 _SS_COLORS: dict[str, str] = {
-    "TD": "#5dd3ff",   # tropical depression — cyan
-    "TS": "#ffd24a",   # tropical storm — yellow
-    "C1": "#ff9a3a",   # cat 1 — orange
-    "C2": "#ff7a3a",   # cat 2 — red-orange
-    "C3": "#ef5350",   # cat 3 — red
-    "C4": "#ff5aa8",   # cat 4 — pink
-    "C5": "#c0a6ff",   # cat 5 — violet
+    "TD": "#3b82f6",   # tropical depression — neon blue
+    "TS": "#84cc16",   # tropical storm — lime green
+    "C1": "#fde047",   # cat 1 — yellow
+    "C2": "#f59e0b",   # cat 2 — amber
+    "C3": "#dc2626",   # cat 3 — red
+    "C4": "#ec4899",   # cat 4 — pink
+    "C5": "#a855f7",   # cat 5 — magenta / purple
     "EX": "#9199a4",   # extratropical / post-tropical / remnant low — gray
 }
 
