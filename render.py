@@ -140,6 +140,7 @@ def render_png(
 
     norm = None
     cmap = None
+    bt_min = bt_max = None  # set on the IR/WV (Kelvin) branch -> bottom-left overlay
     if not is_rgb:
         # Normalize the CMI to 0..1 according to data kind + enhancement.
         # We branch on units (not numeric channel) because the visible-red band
@@ -155,6 +156,13 @@ def render_png(
             bt = cmi
             if data.units in ("C", "celsius", "degC"):
                 bt = bt + 273.15
+            # Capture brightness-temperature extremes over the rendered bbox
+            # (raw Kelvin, post-crop/downsample, pre-normalize) for the
+            # bottom-left min/max overlay. Guard the fully-off-disk case so
+            # np.nanmin/np.nanmax don't warn + return NaN on an all-NaN slice.
+            if np.isfinite(bt).any():
+                bt_min = float(np.nanmin(bt))
+                bt_max = float(np.nanmax(bt))
             if enh["kind"] == "gray":
                 # grayscale on IR: invert (cold=white) for readable IR
                 t_warm, t_cold = 303.0, 183.0
@@ -353,6 +361,22 @@ def render_png(
         bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=4),
         zorder=10,
     )
+
+    # Brightness-temperature min/max readout: bottom-left of the map, the
+    # diagonal mirror of the top-left watermark. IR/WV (Kelvin) renders only
+    # -- bt_min/bt_max stay None for visible + true-color, so this no-ops on
+    # those paths. Displayed in degrees Celsius (analyst-standard for
+    # cloud-top temps); bt_min/bt_max are raw Kelvin, so subtract 273.15.
+    if bt_min is not None and bt_max is not None:
+        ax.text(
+            0.01, 0.01,
+            f"min: {bt_min - 273.15:.0f}°C  ·  max: {bt_max - 273.15:.0f}°C",
+            ha="left", va="bottom",
+            color=ACCENT_COLOR, fontsize=9,
+            transform=ax.transAxes,
+            bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=4),
+            zorder=10,
+        )
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=110, facecolor=DARK_BG, edgecolor="none")
