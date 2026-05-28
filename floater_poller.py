@@ -228,8 +228,16 @@ class Storm:
     lat: float
     lon: float
     category: str
-    intensity_kt: float | None
-    last_fix: str          # ISO of latest fix
+    intensity_kt: float | None    # PEAK wind so far (kept for back-compat / sort)
+    last_fix: str                 # ISO of latest fix
+    # Current-fix snapshot used to color-code the title badge in /render.
+    # ``current_wind_kt`` / ``current_pressure_mb`` come from the LATEST fix
+    # point (peak fields would mislabel a weakening storm). ``nature``
+    # (TS/TD/HU/EX/...) lets the render side pick the right color family
+    # for non-tropical statuses.
+    current_wind_kt: Optional[float] = None
+    current_pressure_mb: Optional[float] = None
+    nature: Optional[str] = None
 
 
 def _extrapolate(points: list[dict], now: dt.datetime) -> tuple[float, float]:
@@ -294,9 +302,17 @@ def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
             # fixes arrive every ~6 h, so the bbox shifts only when an
             # actual fix lands rather than drifting continuously between
             # fixes (which created visible per-frame jitter in the loop).
-            lat = float(pts[-1].get("lat", 0.0))
-            lon = float(pts[-1].get("lon", 0.0))
+            last_pt = pts[-1]
+            lat = float(last_pt.get("lat", 0.0))
+            lon = float(last_pt.get("lon", 0.0))
             sid = s.get("sid") or ""
+            # Latest-fix wind/pressure/nature for the color-coded title badge.
+            # ``peak_wind_kt`` (storm-level) stays as ``intensity_kt`` for
+            # legacy callers, but the badge uses the CURRENT fix values so a
+            # weakening storm shows its current category, not its peak.
+            cur_wind = last_pt.get("wind_kt")
+            cur_pres = last_pt.get("pressure_mb")
+            nature = last_pt.get("nature")
             out.append(Storm(
                 sid=sid,
                 slug=storm_slug(sid, basin),
@@ -306,7 +322,10 @@ def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
                 lon=round(norm_lon(lon), 2),
                 category=s.get("current_category") or "TD",
                 intensity_kt=s.get("peak_wind_kt"),
-                last_fix=pts[-1].get("t", ""),
+                last_fix=last_pt.get("t", ""),
+                current_wind_kt=float(cur_wind) if cur_wind is not None else None,
+                current_pressure_mb=float(cur_pres) if cur_pres is not None else None,
+                nature=nature if isinstance(nature, str) else None,
             ))
     if failed_basins:
         log.warning(
@@ -401,8 +420,13 @@ class RenderSkip(Exception):
 
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
-                enhancement: str) -> tuple[bytes, dict]:
-    body = {"bbox": bbox, "time": "latest", "channel": channel, "enhancement": enhancement}
+                enhancement: str, storm: Optional[dict] = None) -> tuple[bytes, dict]:
+    body: dict = {"bbox": bbox, "time": "latest", "channel": channel, "enhancement": enhancement}
+    # When supplied, /render burns a color-coded intensity badge into the
+    # rendered PNG's title strip (left side). Only sent from the poller path;
+    # legacy draw-a-box /satellite/ UI omits it and gets the plain title.
+    if storm is not None:
+        body["storm"] = storm
     last_exc: Exception | None = None
     for attempt in range(RENDER_MAX_RETRIES):
         try:
@@ -593,9 +617,22 @@ class Poller:
         half = BBOX_DEG / 2.0
         bbox = [round(norm_lon(storm.lon - half), 3), round(storm.lat - half, 3),
                 round(norm_lon(storm.lon + half), 3), round(storm.lat + half, 3)]
+        # Storm metadata for the rendered title badge (color-coded intensity).
+        # Only the fields actually known get sent; missing pressure_mb is fine
+        # (the badge omits the section). Empty when the JSON doesn't carry
+        # a fix-level wind yet -- /render falls back to its plain title.
+        storm_ctx = {
+            "name": storm.name,
+            "basin": storm.basin,
+            "nature": storm.nature,
+            "wind_kt": storm.current_wind_kt,
+            "pressure_mb": storm.current_pressure_mb,
+        }
         self.limiter.acquire()
         try:
-            png, headers = call_render(self.session, bbox, band.channel, band.enhancement)
+            png, headers = call_render(
+                self.session, bbox, band.channel, band.enhancement, storm=storm_ctx,
+            )
         except RenderSkip as e:
             log.info("skip %s/%s: %s", storm.slug, band.key, e)
             self._consec_render_fail = 0
