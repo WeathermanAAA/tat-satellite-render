@@ -112,9 +112,13 @@ _DVORAK_BD_ANCHORS = [
     (-41.0, 0.76, 0.76, 0.76),
     (-41.0, 0.40, 0.40, 0.40),   # DG   dark gray    (-30..-41)
     (-30.0, 0.40, 0.40, 0.40),
-    (-30.0, 0.66, 0.66, 0.66),   # medium gray ramp  (+9..-30)
-    (9.0,   0.30, 0.30, 0.30),
-    (40.0,  0.10, 0.10, 0.10),   # warm sea/land dark gray
+    # Warm tail matched to the cyclonicwx BD scale (low-cloud "pop"): +9 is the
+    # lightest of the warm ramp, warm sea/land is dark gray, and it darkens
+    # gradually from +9 down to -30 (into the DG step). Non-monotonic on
+    # purpose so low/mid cloud reads as a brighter medium gray than the surface.
+    (-30.0, 0.50, 0.50, 0.50),   # medium gray, darkening toward -30
+    (9.0,   0.64, 0.64, 0.64),   # +9 — lightest warm gray (low-cloud pop)
+    (40.0,  0.16, 0.16, 0.16),   # warm sea/land — dark gray
 ]
 
 # ---------------------------------------------------------------------------
