@@ -53,7 +53,7 @@ import re
 import sys
 import threading
 import time
-from typing import Iterable
+from typing import Iterable, Optional
 
 import boto3
 import requests
@@ -248,16 +248,28 @@ def _extrapolate(points: list[dict], now: dt.datetime) -> tuple[float, float]:
     return lat + dlat * ahead_h, norm_lon(lon + dlon * ahead_h)
 
 
-def fetch_active_storms(session: requests.Session) -> list[Storm]:
+def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
+    """Return active storms across all basins.
+
+    Returns ``None`` if EVERY basin fetch failed (network glitch / origin
+    timeout) -- the caller treats this as "no fresh data" and preserves the
+    last-known-good top manifest instead of overwriting it with an empty
+    list, so a transient triple-a-tropics.com hiccup doesn't make the
+    floater widget self-hide on the live site. Returns ``[]`` only when
+    fetches succeeded but no basin reported any active storms (genuine
+    quiescence).
+    """
     now = utcnow()
     cutoff = now - dt.timedelta(hours=ACTIVE_WINDOW_HOURS)
     out: list[Storm] = []
+    any_ok = False
     for basin in TRACKS_BASINS:
         url = f"{TRACKS_BASE}/{basin}_tracks_data.json"
         try:
             r = session.get(url, timeout=20)
             r.raise_for_status()
             data = r.json()
+            any_ok = True
         except Exception as e:  # noqa: BLE001 - never crash on a bad fetch
             log.warning("tracks fetch failed (%s): %s", basin, e)
             continue
@@ -270,7 +282,14 @@ def fetch_active_storms(session: requests.Session) -> list[Storm]:
             lt = parse_iso(pts[-1].get("t", ""))
             if lt is None or lt < cutoff:
                 continue
-            lat, lon = _extrapolate(pts, now)
+            # Use the LATEST FIX position directly (no extrapolation). The
+            # bbox is computed from storm.lat/lon downstream, so this pins
+            # the floater crop to the most recent JTWC fix point -- new
+            # fixes arrive every ~6 h, so the bbox shifts only when an
+            # actual fix lands rather than drifting continuously between
+            # fixes (which created visible per-frame jitter in the loop).
+            lat = float(pts[-1].get("lat", 0.0))
+            lon = float(pts[-1].get("lon", 0.0))
             sid = s.get("sid") or ""
             out.append(Storm(
                 sid=sid,
@@ -283,6 +302,8 @@ def fetch_active_storms(session: requests.Session) -> list[Storm]:
                 intensity_kt=s.get("peak_wind_kt"),
                 last_fix=pts[-1].get("t", ""),
             ))
+    if not any_ok:
+        return None
     return out
 
 
@@ -463,6 +484,17 @@ class Poller:
 
     def refresh_storms(self) -> None:
         active = fetch_active_storms(self.session)
+        # ``None`` => every basin's tracks JSON fetch failed (transient
+        # origin/network hiccup). Don't touch the in-memory unit set OR the
+        # top R2 manifest in that case -- preserve last-known-good so the
+        # floater widget stays visible on the live site instead of self-
+        # hiding for the full TOP_REFRESH_MS window on the frontend.
+        if active is None:
+            log.warning(
+                "tracks fetch failed for ALL basins -- preserving last-known-good "
+                "manifest (no storm set / unit changes this cycle)"
+            )
+            return
         active_slugs = {s.slug for s in active}
         # New / updated storms.
         for s in active:
