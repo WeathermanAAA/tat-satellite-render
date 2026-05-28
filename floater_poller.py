@@ -135,7 +135,13 @@ BANDS: tuple[Band, ...] = (
     Band("irbd",      "clean_ir",     "dvorak_bd", "IR (Dvorak BD)",    hot=True,  daytime_only=False),
     Band("wv_up",     "wv_upper",     "tat_neon",  "Upper WV",          hot=False, daytime_only=False),
     Band("wv_low",    "wv_lower",     "tat_neon",  "Lower WV",          hot=False, daytime_only=False),
-    Band("truecolor", "true_color",   "tat_neon",  "Visible (true color)", hot=False, daytime_only=True),
+    # Truecolor now runs 24/7. The render-side GeoColor-lite night blend
+    # (truecolor.night_blend in tat-satellite-render) fades the true-color
+    # composite to grayscale clean-IR across the terminator, so the band
+    # shows photographic color by day and IR cloud structure at night --
+    # no more day-only dropout. Render-side guards catch any transient
+    # degenerate RGB so we don't ship a black frame mid-day.
+    Band("truecolor", "true_color",   "tat_neon",  "Visible (true color)", hot=False, daytime_only=False),
     Band("swir",      "shortwave_ir", "grayscale", "Shortwave IR",      hot=False, daytime_only=False),
 )
 BANDS_BY_KEY = {b.key: b for b in BANDS}
