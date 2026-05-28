@@ -2,7 +2,8 @@
 
 Takes a FetchResult (cropped CMI on the geos grid with companion lat/lon arrays),
 projects to PlateCarree, applies the requested enhancement, and produces a
-clean dark-themed PNG with title strip + footer credit.
+clean dark-themed PNG with title strip, a labeled right-side colorbar, and a
+footer credit.
 """
 
 from __future__ import annotations
@@ -19,12 +20,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from matplotlib.colors import Normalize
 
-from colormaps import (
-    get_enhancement,
-    normalize_ir,
-    normalize_visible,
-)
+from colormaps import get_enhancement, enhancement_norm, normalize_visible
 from satellites import FetchResult
 
 log = logging.getLogger("tat-satellite.render")
@@ -35,6 +33,7 @@ COAST_COLOR = "#7eb6c9"   # cyan — coastlines stand out against IR/visible
 BORDER_COLOR = "#e8eef5"  # near-white — political borders, slightly subordinate
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
+MUTED_COLOR = "#9199a4"
 
 
 def _gridline_step(span: float) -> float:
@@ -138,43 +137,43 @@ def render_png(
         lats = lats[::downsample, ::downsample]
         lons = lons[::downsample, ::downsample]
 
-    norm = None
-    cmap = None
-    bt_min = bt_max = None  # set on the IR/WV (Kelvin) branch -> bottom-left overlay
+    # ---- Build the scalar plot field (skipped for true-color RGB) ----------
+    # IR/WV  -> plot real brightness temperature in °C with the enhancement's
+    #           cmap + a fresh Normalize over its °C domain. The colorbar ticks
+    #           are then physical °C with no remap.
+    # visible -> sqrt-stretched reflectance (0..1) in grayscale; colorbar shows
+    #           reflectance %.
+    plot_field = None
+    plot_cmap = None
+    plot_cnorm = None
+    cbar_ticks = None
+    cbar_ticklabels = None
+    cbar_label = None
+    bt_min_c = bt_max_c = None  # IR/WV only -> bottom-left min/max overlay
     if not is_rgb:
-        # Normalize the CMI to 0..1 according to data kind + enhancement.
-        # We branch on units (not numeric channel) because the visible-red band
-        # is 2 on GOES and 3 on AHI — units="1" tags reflectance regardless.
         if is_visible:
-            # Visible: reflectance 0..1
-            norm = normalize_visible(cmi)
-            # Visible imagery is rendered grayscale regardless of enhancement;
-            # IR colormaps on reflectance data don't make physical sense.
-            cmap = plt.get_cmap("gray")
+            refl = normalize_visible(cmi)
+            plot_field = np.ma.masked_invalid(refl)
+            plot_cmap = plt.get_cmap("gray")
+            plot_cnorm = Normalize(vmin=0.0, vmax=1.0)
+            cbar_ticks = [0.0, 0.25, 0.5, 0.75, 1.0]
+            cbar_ticklabels = ["0", "25", "50", "75", "100"]
+            cbar_label = "Reflectance (%)"
         else:
-            # IR: brightness temperature in Kelvin (or convert from C if needed)
+            # IR/WV: brightness temperature. Source is Kelvin unless tagged C.
             bt = cmi
             if data.units in ("C", "celsius", "degC"):
                 bt = bt + 273.15
-            # Capture brightness-temperature extremes over the rendered bbox
-            # (raw Kelvin, post-crop/downsample, pre-normalize) for the
-            # bottom-left min/max overlay. Guard the fully-off-disk case so
-            # np.nanmin/np.nanmax don't warn + return NaN on an all-NaN slice.
-            if np.isfinite(bt).any():
-                bt_min = float(np.nanmin(bt))
-                bt_max = float(np.nanmax(bt))
-            if enh["kind"] == "gray":
-                # grayscale on IR: invert (cold=white) for readable IR
-                t_warm, t_cold = 303.0, 183.0
-                x = (t_warm - bt) / (t_warm - t_cold)
-                norm = np.clip(x, 0.0, 1.0)
-                cmap = plt.get_cmap("gray")
-            else:
-                norm = normalize_ir(bt, enh["range_k"])
-                cmap = enh["cmap"]
-
-        # Mask NaNs (off-disk + invalid pixels)
-        norm = np.ma.masked_invalid(norm)
+            bt_c = bt - 273.15
+            if np.isfinite(bt_c).any():
+                bt_min_c = float(np.nanmin(bt_c))
+                bt_max_c = float(np.nanmax(bt_c))
+            plot_field = np.ma.masked_invalid(bt_c)
+            plot_cmap = enh["cmap"]
+            plot_cnorm = enhancement_norm(enhancement)  # fresh, not shared
+            cbar_ticks = list(enh["ticks"])
+            cbar_ticklabels = [str(t) for t in enh["ticks"]]
+            cbar_label = enh.get("cbar_label", "Brightness Temperature (°C)")
 
     lon_min, lat_min, lon_max, lat_max = bbox
     lon_span = lon_max - lon_min
@@ -186,20 +185,23 @@ def render_png(
     fig_h = max(4.0, fig_w / max(aspect, 0.3))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
 
-    # Layout: title strip on top (~6%), main map fills the rest with a
-    # small bottom margin for gridline labels. Watermark moved into the
-    # map's top-left corner (see ax.text below) so we no longer reserve a
-    # bottom footer strip.
+    # Layout: title strip on top (~6%), main map fills the rest with a small
+    # bottom margin for gridline labels. A labeled vertical colorbar sits in a
+    # reserved right margin for every scalar (non-RGB) product; true color has
+    # no colorbar so the map uses the full width.
     title_h = 0.06
     bottom_pad = 0.04  # leaves room for x-axis gridline labels
     map_h = 1.0 - title_h - bottom_pad
+    show_cbar = not is_rgb
+    map_w = 0.84 if show_cbar else 0.92
 
     ax = fig.add_axes(
-        [0.04, bottom_pad, 0.92, map_h], projection=ccrs.PlateCarree()
+        [0.04, bottom_pad, map_w, map_h], projection=ccrs.PlateCarree()
     )
     ax.set_facecolor(DARK_BG)
     ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
+    mesh = None
     # Plot with the (lats, lons) arrays we computed via inverse projection.
     if is_rgb:
         # True-color RGB is resampled onto a REGULAR lat/lon grid (see
@@ -253,10 +255,9 @@ def render_png(
         mesh = ax.pcolormesh(
             lons,
             lats,
-            norm,
-            cmap=cmap,
-            vmin=0.0,
-            vmax=1.0,
+            plot_field,
+            cmap=plot_cmap,
+            norm=plot_cnorm,
             shading="auto",
             transform=ccrs.PlateCarree(),
             rasterized=True,
@@ -291,6 +292,17 @@ def render_png(
     gl.right_labels = False
     gl.xlabel_style = {"color": TEXT_COLOR, "size": 8}
     gl.ylabel_style = {"color": TEXT_COLOR, "size": 8}
+
+    # Right-side colorbar (every scalar product). Lives in the reserved right
+    # margin; physical °C ticks for IR/WV, reflectance % for visible.
+    if show_cbar and mesh is not None:
+        cbar_ax = fig.add_axes([0.905, bottom_pad + 0.04, 0.016, map_h - 0.08])
+        cbar = fig.colorbar(mesh, cax=cbar_ax)
+        cbar.set_ticks(cbar_ticks)
+        cbar.set_ticklabels(cbar_ticklabels)
+        cbar.ax.tick_params(colors=TEXT_COLOR, labelsize=8, length=3)
+        cbar.outline.set_edgecolor(GRID_COLOR)
+        cbar.set_label(cbar_label, color=MUTED_COLOR, fontsize=8)
 
     # Title strip
     title_ax = fig.add_axes([0, 1.0 - title_h, 1.0, title_h])
@@ -363,14 +375,13 @@ def render_png(
     )
 
     # Brightness-temperature min/max readout: bottom-left of the map, the
-    # diagonal mirror of the top-left watermark. IR/WV (Kelvin) renders only
-    # -- bt_min/bt_max stay None for visible + true-color, so this no-ops on
-    # those paths. Displayed in degrees Celsius (analyst-standard for
-    # cloud-top temps); bt_min/bt_max are raw Kelvin, so subtract 273.15.
-    if bt_min is not None and bt_max is not None:
+    # diagonal mirror of the top-left watermark. IR/WV only -- bt_min_c/
+    # bt_max_c stay None for visible + true-color, so this no-ops on those
+    # paths. Displayed in °C (analyst-standard for cloud-top temps).
+    if bt_min_c is not None and bt_max_c is not None:
         ax.text(
             0.01, 0.01,
-            f"min: {bt_min - 273.15:.0f}°C  ·  max: {bt_max - 273.15:.0f}°C",
+            f"min: {bt_min_c:.0f}°C  ·  max: {bt_max_c:.0f}°C",
             ha="left", va="bottom",
             color=ACCENT_COLOR, fontsize=9,
             transform=ax.transAxes,
