@@ -4,25 +4,27 @@ Operates on already-fetched, **co-registered** top-of-atmosphere reflectance
 bands (red / green / blue, each 0..1 on a common lat/lon grid) plus the
 observation time, and produces a display-ready RGB array.
 
-The make-or-break details (see module-level constants + functions):
+Recipe matches the documented CIMSS Natural True Color + CIRA GeoColor pipeline
+(see ABIQuickGuide_CIMSSRGB_v2 and QuickGuide_CIRA_Geocolor):
 
-  * GOES ABI has no green band -> synthesize one (Bah et al. 2018 / CIMSS
-    operational fractional combination, the same default satpy uses):
-        G = 0.45*Red + 0.45*Veggie(0.86um) + 0.10*Blue
-    Using raw veggie *as* green makes vegetation read orange; the mix fixes
-    it. Himawari AHI has a native green band and skips this.
-  * Solar-zenith normalization: both ABI CMI and our AHI albedo are raw TOA
-    reflectance (NOT sun-angle normalized), so we divide by cos(SZA) or the
-    disk darkens badly away from the subsolar point.
-  * Rayleigh / atmospheric correction (pyspectral) removes the blue molecular
-    scattering haze so oceans read deep blue, not milky. Guarded: if pyspectral
-    or its RSR data is unavailable the recipe still renders (just hazier).
-  * A tone curve (gamma-ish stretch) for natural brightness without blown tops.
+  * ORDER (CIRA GeoColor): sun-normalize -> **Rayleigh-correct the real bands
+    first** (blue 0.47, red 0.64, veggie 0.86) -> THEN synthesize green. Doing
+    Rayleigh before the green synthesis is what keeps clear-sky/ocean a clean
+    deep blue and the colors vibrant.
+  * ABI has no green band -> synthesize the CIMSS Natural True Color green:
+        G = 0.45*Red + 0.10*Veggie(0.86) + 0.45*Blue
+    The big 0.45 BLUE share is the fix for the "magenta ocean" failure: over
+    water veggie≈0, so a veggie-heavy green collapses and blue+red dominate ->
+    magenta. The CIMSS blue-heavy mix keeps green up over water (deep blue),
+    while the veggie term still lifts vegetation green over land. Himawari AHI
+    has a native 0.51 green band and skips synthesis entirely.
+  * Solar-zenith normalization: ABI CMI and our AHI albedo are raw TOA
+    reflectance (NOT sun-angle normalized) -> divide by cos(SZA).
+  * A CIRA/EUMETSAT tone curve (gamma-ish stretch) for natural brightness.
   * Red-band ratio sharpening lifts the 1 km green/blue toward the 0.5 km red.
-  * Day/night handled by the caller via the cos(SZA) field this module exposes.
+  * Day/night via the cos(SZA) field (GeoColor-lite: fade to clean-IR at night).
 
-Geometry (sun + geostationary satellite zenith/azimuth) comes from pyorbital,
-which has closed-form helpers for both — no TLEs needed for a fixed geo bird.
+Geometry (sun + geostationary satellite zenith/azimuth) comes from pyorbital.
 """
 
 from __future__ import annotations
@@ -35,18 +37,17 @@ import numpy as np
 
 log = logging.getLogger("tat-satellite.truecolor")
 
-# Synthetic-green fractions (Red, Veggie/NIR, Blue). Canonical Bah et al.
-# (2018) / satpy SimulatedGreen is (0.45, 0.45, 0.10); we nudge a little blue
-# in because veggie≈0 over open water drags synth-green below red there, which
-# (especially under Rayleigh removal) tints deep ocean magenta. The small blue
-# share lifts green over water to keep the ocean a neutral deep blue while
-# leaving land vegetation visibly green. Validated on GOES-19 over FL/Bahamas.
-GREEN_FRACTIONS = (0.40, 0.40, 0.20)
+# CIMSS Natural True Color synthetic-green fractions (Red, Veggie/NIR, Blue).
+# From ABIQuickGuide_CIMSSRGB_v2: G = 0.45*Red + 0.10*Veggie + 0.45*Blue.
+# (Previously 0.40/0.40/0.20 — the veggie-heavy / blue-light mix that turned
+# open ocean magenta because synth-green collapsed where veggie≈0.)
+GREEN_FRACTIONS = (0.45, 0.10, 0.45)
 
-# Rayleigh subtraction strength (0..1). Full removal (1.0) over-darkens open
-# ocean and exposes the synth-green imbalance as magenta; 0 leaves a milky blue
-# haze. 0.6 removes most of the haze for a deep-blue ocean without the magenta.
-RAYLEIGH_SCALE = 0.6
+# Rayleigh subtraction strength (0..1). CIRA GeoColor applies FULL Rayleigh
+# correction to maximize clear/cloud contrast and color vibrancy. With the
+# CIMSS blue-heavy green this no longer exposes a magenta imbalance, so we run
+# it at full strength.
+RAYLEIGH_SCALE = 1.0
 
 # Sun-correction floor: never divide by less than this cos(SZA), so the
 # terminator doesn't explode to white. ~84.3 deg SZA.
@@ -60,6 +61,7 @@ GEO_SAT_ALT_KM = 35786.0
 WL_RED = 0.64
 WL_GREEN = 0.51
 WL_BLUE = 0.47
+WL_VEGGIE = 0.86
 
 
 # ---------------------------------------------------------------------------
@@ -97,67 +99,55 @@ def sun_correct(refl: np.ndarray, cos_sza: np.ndarray) -> np.ndarray:
 
 
 def synth_green(red: np.ndarray, veggie: np.ndarray, blue: np.ndarray) -> np.ndarray:
-    """Synthesize the missing ABI green from red + veggie(NIR) + blue."""
+    """Synthesize the missing ABI green (CIMSS Natural True Color)."""
     fr, fv, fb = GREEN_FRACTIONS
     return fr * red + fv * veggie + fb * blue
 
 
-def rayleigh_correct(
-    rgb: np.ndarray,
-    sun_zenith: np.ndarray,
-    sat_zenith: np.ndarray,
-    sun_azimuth: np.ndarray,
-    sat_azimuth: np.ndarray,
-    platform_name: str,
-    sensor: str,
-    scale: float = 1.0,
-) -> np.ndarray:
-    """Subtract molecular (Rayleigh) scattering per band via pyspectral.
-
-    ``scale`` (0..1) attenuates the subtraction — see RAYLEIGH_SCALE.
-
-    Returns the RGB unchanged (with a warning) if pyspectral or its RSR data
-    for ``platform_name``/``sensor`` isn't available — the recipe degrades to
-    a hazier-but-valid image rather than failing the render.
-
-    pyspectral works in reflectance percent; we scale 0..1 <-> 0..100 around
-    the call. The red band is passed as the aerosol-scaling reference.
-    """
+def _make_rayleigh(platform_name: str, sensor: str):
+    """Build a pyspectral Rayleigh corrector, or None if unavailable."""
     try:
         from pyspectral.rayleigh import Rayleigh
     except Exception as e:  # pragma: no cover - import guard
         log.warning("pyspectral unavailable (%s); skipping Rayleigh correction", e)
-        return rgb
-
-    azidiff = np.abs(sun_azimuth - sat_azimuth)
-    azidiff = np.where(azidiff > 180.0, 360.0 - azidiff, azidiff)
-
+        return None
     try:
-        corrector = Rayleigh(platform_name, sensor)
+        return Rayleigh(platform_name, sensor)
     except Exception as e:
         log.warning("Rayleigh(%s,%s) init failed (%s); skipping", platform_name, sensor, e)
-        return rgb
+        return None
 
-    out = rgb.copy()
-    red_pct = np.clip(rgb[..., 0], 0.0, 1.0) * 100.0
-    for idx, wl in ((0, WL_RED), (1, WL_GREEN), (2, WL_BLUE)):
-        try:
-            corr_pct = corrector.get_reflectance(sun_zenith, sat_zenith, azidiff, wl, red_pct)
-        except Exception as e:
-            log.warning("Rayleigh get_reflectance failed for wl=%.2f (%s); skipping band", wl, e)
-            continue
-        out[..., idx] = np.clip(rgb[..., idx] - scale * corr_pct / 100.0, 0.0, 1.0)
-    return out
+
+def rayleigh_band(
+    band: np.ndarray,
+    wl: float,
+    sun_zenith: np.ndarray,
+    sat_zenith: np.ndarray,
+    azidiff: np.ndarray,
+    red_ref_pct: np.ndarray,
+    corrector,
+    scale: float = RAYLEIGH_SCALE,
+) -> np.ndarray:
+    """Subtract molecular (Rayleigh) scattering from a single band via pyspectral.
+
+    Done on the real measured bands BEFORE green synthesis (CIRA GeoColor order).
+    ``red_ref_pct`` (sun-corrected red, in reflectance percent) is the aerosol
+    scaling reference. Returns the band unchanged (with a warning) if the
+    corrector is missing or the call fails — degrade hazier, never fail.
+    pyspectral works in reflectance percent (0..100).
+    """
+    if corrector is None:
+        return band
+    try:
+        corr_pct = corrector.get_reflectance(sun_zenith, sat_zenith, azidiff, wl, red_ref_pct)
+    except Exception as e:
+        log.warning("Rayleigh get_reflectance failed for wl=%.2f (%s); skipping band", wl, e)
+        return band
+    return np.clip(band - scale * corr_pct / 100.0, 0.0, 1.0)
 
 
 def ratio_sharpen(rgb: np.ndarray, red_hires: np.ndarray) -> np.ndarray:
-    """Lift the (1 km) green/blue toward the 0.5 km red via the red ratio.
-
-    ``rgb`` and ``red_hires`` are on the same (red-resolution) grid; rgb[...,0]
-    is the upsampled-then-composited red, red_hires is the native red. Where
-    they differ, the ratio injects red's fine structure into G and B. Clamped
-    so a near-zero denominator can't blow up dark pixels.
-    """
+    """Lift the (1 km) green/blue toward the 0.5 km red via the red ratio."""
     base = rgb[..., 0]
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(base > 0.02, red_hires / base, 1.0)
@@ -170,9 +160,7 @@ def ratio_sharpen(rgb: np.ndarray, red_hires: np.ndarray) -> np.ndarray:
 
 
 # GeoColor-lite night: clean-IR grayscale range (cold = white) and the
-# terminator blend window in cos(SZA). cos(SZA)=0 is the horizon; we hold full
-# true color until the sun is ~8° up and fade to full IR a few degrees past
-# sunset so the day/night seam is a soft band, not a hard line.
+# terminator blend window in cos(SZA).
 IR_T_WARM = 303.0
 IR_T_COLD = 183.0
 COS_SZA_FULL_DAY = 0.14    # sun ≳ 8° up -> 100% true color
@@ -180,17 +168,13 @@ COS_SZA_FULL_NIGHT = -0.05  # sun ≳ 3° below -> 100% IR
 
 
 def _clean_ir_gray(bt_kelvin: np.ndarray) -> np.ndarray:
-    """Clean-IR brightness temperature -> grayscale 0..1 (cold cloud = white),
-    matching the render.py grayscale-IR ramp."""
+    """Clean-IR brightness temperature -> grayscale 0..1 (cold cloud = white)."""
     x = (IR_T_WARM - bt_kelvin) / (IR_T_WARM - IR_T_COLD)
     return np.clip(x, 0.0, 1.0)
 
 
 def night_blend(day_rgb: np.ndarray, ir_bt: np.ndarray, cos_sza: np.ndarray) -> np.ndarray:
-    """GeoColor-lite: fade true color (day) to grayscale clean-IR (night) across
-    the terminator, weighted by cos(SZA). Looks good 24/7 and reuses the IR we
-    already know how to read; full GeoColor (IR microphysics + city lights) is a
-    later upgrade."""
+    """GeoColor-lite: fade true color (day) to grayscale clean-IR (night)."""
     w_day = np.clip(
         (cos_sza - COS_SZA_FULL_NIGHT) / (COS_SZA_FULL_DAY - COS_SZA_FULL_NIGHT),
         0.0, 1.0,
@@ -201,14 +185,7 @@ def night_blend(day_rgb: np.ndarray, ir_bt: np.ndarray, cos_sza: np.ndarray) -> 
 
 
 def tone_curve(rgb: np.ndarray) -> np.ndarray:
-    """CIRA/Polar2Grid-style nonlinear stretch for natural true-color brightness.
-
-    Piecewise curve mapping input reflectance (post-sun-correction, 0..1) to
-    display 0..1: near-linear in the shadows with a gentle toe, rolling into a
-    sqrt-ish highlight compression so bright cloud tops don't clip to flat
-    white. This is the standard EUMETSAT/CIRA true-color enhancement, sampled
-    to control points and interpolated.
-    """
+    """CIRA/Polar2Grid-style nonlinear stretch for natural true-color brightness."""
     x = np.array([0.0, 0.0030, 0.0110, 0.0190, 0.0290, 0.0440, 0.0720, 0.1010,
                   0.1260, 0.1560, 0.1900, 0.2300, 0.2800, 0.3400, 0.4000,
                   0.4700, 0.5400, 0.6400, 0.7400, 0.8600, 1.0000], dtype=np.float64)
@@ -242,37 +219,47 @@ def assemble_truecolor(
 
     ``green`` is None for ABI (synthesized from veggie); supplied for AHI.
     ``ir_bt`` (clean-IR brightness temp, K, co-registered) enables the
-    GeoColor-lite night fade; omit it for a daytime-only (dark at night) image.
-    All inputs are co-registered TOA reflectance on the same (red-res) grid.
-    Returns (rgb, cos_sza).
+    GeoColor-lite night fade. All inputs are co-registered TOA reflectance on
+    the same (red-res) grid. Returns (rgb, cos_sza).
     """
     cos_sza, sun_zen, sun_az = solar_geometry(lats, lons, when)
     sat_zen, sat_az = satellite_geometry(lats, lons, sub_sat_lon, when)
 
-    # Native red kept aside for ratio sharpening after the band ops.
-    red_native = sun_correct(red, cos_sza)
+    # 1) Sun-angle normalize every measured band.
+    red_c = sun_correct(red, cos_sza)
     blue_c = sun_correct(blue, cos_sza)
-    if green is None:
-        if veggie is None:
-            raise ValueError("ABI true color needs a veggie band to synthesize green")
-        veggie_c = sun_correct(veggie, cos_sza)
-        green_c = synth_green(red_native, veggie_c, blue_c)
-    else:
-        green_c = sun_correct(green, cos_sza)
+    veggie_c = sun_correct(veggie, cos_sza) if veggie is not None else None
+    green_c = sun_correct(green, cos_sza) if green is not None else None
 
-    rgb = np.clip(np.dstack([red_native, green_c, blue_c]), 0.0, 1.0)
-
+    # 2) Rayleigh-correct the REAL bands first (CIRA GeoColor order), so the
+    #    synthesized green is built from already-corrected red/veggie/blue.
     if do_rayleigh:
-        rgb = rayleigh_correct(rgb, sun_zen, sat_zen, sun_az, sat_az,
-                               platform_name, sensor, scale=RAYLEIGH_SCALE)
+        azidiff = np.abs(sun_az - sat_az)
+        azidiff = np.where(azidiff > 180.0, 360.0 - azidiff, azidiff)
+        corrector = _make_rayleigh(platform_name, sensor)
+        red_ref_pct = np.clip(red_c, 0.0, 1.0) * 100.0
+        red_c = rayleigh_band(red_c, WL_RED, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+        blue_c = rayleigh_band(blue_c, WL_BLUE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+        if veggie_c is not None:
+            veggie_c = rayleigh_band(veggie_c, WL_VEGGIE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+        if green_c is not None:
+            green_c = rayleigh_band(green_c, WL_GREEN, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+
+    # 3) Synthesize green for ABI (CIMSS) from the corrected bands; AHI uses its
+    #    native (already-corrected) green.
+    if green_c is None:
+        if veggie_c is None:
+            raise ValueError("ABI true color needs a veggie band to synthesize green")
+        green_c = synth_green(red_c, veggie_c, blue_c)
+
+    rgb = np.clip(np.dstack([red_c, green_c, blue_c]), 0.0, 1.0)
 
     if do_ratio_sharpen:
-        rgb = ratio_sharpen(rgb, np.clip(red_native, 0.0, 1.0))
+        rgb = ratio_sharpen(rgb, np.clip(red_c, 0.0, 1.0))
 
     rgb = tone_curve(rgb)
 
-    # GeoColor-lite: fade to clean-IR at night. Done AFTER the tone curve so the
-    # day side is fully developed; the IR night layer has its own ramp.
+    # GeoColor-lite: fade to clean-IR at night (after the day side is developed).
     if ir_bt is not None:
         rgb = night_blend(rgb, ir_bt, cos_sza)
 
