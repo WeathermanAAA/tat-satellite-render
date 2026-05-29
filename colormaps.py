@@ -96,43 +96,43 @@ _RAINBOW_IR_ANCHORS = [
 ]
 
 # ---------------------------------------------------------------------------
-# dvorak_bd — official ADT BD-curve enhancement (stepped grayscale)
+# dvorak — BD grayscale LUT (exact)
 # ---------------------------------------------------------------------------
-# Our original breakpoints (+9,-30,-41,-53,-63,-69,-75,-80,-85 — these match
-# cyclonic) WITH the ADT v8.2.1 Table 1 category structure + gray shades mapped
-# onto them (Off-White cirrus, corrected Dark->Medium->Light order, named grays):
-#     > +9 C        No enhancement (low clouds)  -> plain-IR gray ramp
-#     +9 .. -30     Off White (cirrus outflow)
-#     -30 .. -41    Dark Gray
-#     -41 .. -53    Medium Gray
-#     -53 .. -63    Light Gray
-#     -63 .. -69    Black
-#     -69 .. -75    White                         <<< diagnostic B/W flip at -69
-#     -75 .. -80    Top Medium Gray
-#     -80 .. -85    Top Dark Gray
-#     < -85         extreme overshoot (a touch darker)
-# Flat bands w/ HARD edges (duplicate temps). Domain -95 .. +40 C.
+# Piecewise tb(Kelvin)->gray(0-255) BD enhancement, reproduced verbatim from a
+# reference implementation. Kelvin thresholds -> °C (tb-273.15),
+# gray bytes -> 0..1. Hard steps via duplicate temps; the two ramps are linear:
+#     tb<193 (< -80.15)      -> 85   (0.333)
+#     193-198 (-80.15..-75.15) -> 135 (0.529)
+#     198-204 (-75.15..-69.15) -> 255 (white)
+#     204-210 (-69.15..-63.15) -> 0   (black)   <<< B/W flip
+#     210-220 (-63.15..-53.15) -> 160 (0.627)
+#     220-232 (-53.15..-41.15) -> 110 (0.431)
+#     232-243 (-41.15..-30.15) -> 60  (0.235)
+#     243-282 (-30.15..+8.85)  -> ramp 202->109 (0.792->0.427)  cirrus
+#     282-303 (+8.85..+29.85)  -> ramp 255->0   (1.0->0.0)      low cloud/warm
+#                                  (note the hard jump up to white at +9)
+#     > 303                    -> 0
+# Domain -95 .. +40 C.
 _DVORAK_BD_ANCHORS = [
-    (-95.0, 0.22, 0.22, 0.22),   # extreme overshoot (< -85)
-    (-85.0, 0.22, 0.22, 0.22),
-    (-85.0, 0.30, 0.30, 0.30),   # Top Dark Gray   (-80..-85)
-    (-80.0, 0.30, 0.30, 0.30),
-    (-80.0, 0.54, 0.54, 0.54),   # Top Medium Gray (-75..-80)
-    (-75.0, 0.54, 0.54, 0.54),
-    (-75.0, 1.00, 1.00, 1.00),   # White           (-69..-75)
-    (-69.0, 1.00, 1.00, 1.00),
-    (-69.0, 0.00, 0.00, 0.00),   # Black           (-63..-69)  <<< flip
-    (-63.0, 0.00, 0.00, 0.00),
-    (-63.0, 0.78, 0.78, 0.78),   # Light Gray      (-53..-63)
-    (-53.0, 0.78, 0.78, 0.78),
-    (-53.0, 0.54, 0.54, 0.54),   # Medium Gray     (-41..-53)
-    (-41.0, 0.54, 0.54, 0.54),
-    (-41.0, 0.34, 0.34, 0.34),   # Dark Gray       (-30..-41)
-    (-30.0, 0.34, 0.34, 0.34),
-    (-30.0, 0.88, 0.88, 0.88),   # Off White       (-30..+9) cirrus outflow
-    (9.0,   0.88, 0.88, 0.88),
-    (9.0,   0.55, 0.55, 0.55),   # No enhancement  (>+9) low clouds — plain IR
-    (40.0,  0.20, 0.20, 0.20),   #                 warmer = darker
+    (-95.00, 0.33333, 0.33333, 0.33333),  # tb<193  -> 85
+    (-80.15, 0.33333, 0.33333, 0.33333),
+    (-80.15, 0.52941, 0.52941, 0.52941),  # 193-198 -> 135
+    (-75.15, 0.52941, 0.52941, 0.52941),
+    (-75.15, 1.00000, 1.00000, 1.00000),  # 198-204 -> 255 white
+    (-69.15, 1.00000, 1.00000, 1.00000),
+    (-69.15, 0.00000, 0.00000, 0.00000),  # 204-210 -> 0 black  <<< flip
+    (-63.15, 0.00000, 0.00000, 0.00000),
+    (-63.15, 0.62745, 0.62745, 0.62745),  # 210-220 -> 160
+    (-53.15, 0.62745, 0.62745, 0.62745),
+    (-53.15, 0.43137, 0.43137, 0.43137),  # 220-232 -> 110
+    (-41.15, 0.43137, 0.43137, 0.43137),
+    (-41.15, 0.23529, 0.23529, 0.23529),  # 232-243 -> 60
+    (-30.15, 0.23529, 0.23529, 0.23529),
+    (-30.15, 0.79216, 0.79216, 0.79216),  # 243-282 ramp 202->109 (cirrus)
+    (8.85,   0.42745, 0.42745, 0.42745),
+    (8.85,   1.00000, 1.00000, 1.00000),  # 282-303 ramp 255->0 (low cloud/warm)
+    (29.85,  0.00000, 0.00000, 0.00000),
+    (40.00,  0.00000, 0.00000, 0.00000),  # > 303 -> 0
 ]
 
 # ---------------------------------------------------------------------------
@@ -205,8 +205,8 @@ ENHANCEMENTS = {
         "vmin_c": -95.0, "vmax_c": 40.0, "ticks": _RAINBOW_TICKS,
         "domains": ("ir",), "kind": "ir", "cbar_label": _CBAR_LABEL_BT,
     },
-    "dvorak_bd": {
-        "label": "Dvorak BD", "cmap": DVORAK_BD_CMAP,
+    "dvorak": {
+        "label": "Dvorak", "cmap": DVORAK_BD_CMAP,
         "vmin_c": -95.0, "vmax_c": 40.0, "ticks": _BD_TICKS,
         "domains": ("ir",), "kind": "ir", "cbar_label": _CBAR_LABEL_BT,
     },
@@ -227,9 +227,11 @@ ENHANCEMENTS = {
     },
 }
 
-# Back-compat alias: the old name "grayscale" maps to ir_gray. The floater
-# poller and legacy share-links still use "grayscale".
+# Back-compat aliases (hidden from the UI): old names that legacy share-links
+# / older callers may still send. "grayscale"->ir_gray, "dvorak_bd"->dvorak.
 ENHANCEMENTS["grayscale"] = ENHANCEMENTS["ir_gray"]
+ENHANCEMENTS["dvorak_bd"] = ENHANCEMENTS["dvorak"]
+_ALIASES = ("grayscale", "dvorak_bd")
 
 # Default preset (used by app.py + frontend).
 DEFAULT_ENHANCEMENT = "rainbow_ir"
@@ -250,7 +252,7 @@ def enhancement_norm(name: str) -> Normalize:
 def list_enhancements_for_domain(domain: str):
     """UI helper: enhancement keys valid for a channel domain ('ir'|'wv')."""
     return [k for k, e in ENHANCEMENTS.items()
-            if k != "grayscale" and domain in e["domains"]]
+            if k not in _ALIASES and domain in e["domains"]]
 
 
 def normalize_visible(reflectance: np.ndarray) -> np.ndarray:
