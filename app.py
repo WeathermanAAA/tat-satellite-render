@@ -144,7 +144,8 @@ def compute_downsample_factor(bbox: list[float], channel) -> int:
 # water-vapor table; ir_gray is the standard grayscale ("grayscale" is kept
 # as a back-compat alias used by the floater poller + legacy share-links).
 _ENHANCEMENTS = (
-    "rainbow_ir", "dvorak_bd", "tat_neon", "wv_tat", "ir_gray", "grayscale",
+    "rainbow_ir", "dvorak", "tat_neon", "wv_tat", "ir_gray",
+    "grayscale", "dvorak_bd",   # hidden back-compat aliases
 )
 
 
