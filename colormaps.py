@@ -96,35 +96,43 @@ _RAINBOW_IR_ANCHORS = [
 ]
 
 # ---------------------------------------------------------------------------
-# dvorak_bd — canonical stepped grayscale
+# dvorak_bd — official ADT BD-curve enhancement (stepped grayscale)
 # ---------------------------------------------------------------------------
-# Breakpoints (°C): +9, -30, -41, -53, -63, -69, -75, -80, -85 (Andrew's table).
-# Ramps for the warm region (> -30); HARD steps for the diagnostic bands so the
-# black(-63..-69) -> white(-69..-75) flip is razor sharp. Domain -95 .. +40.
+# Our original breakpoints (+9,-30,-41,-53,-63,-69,-75,-80,-85 — these match
+# cyclonic) WITH the ADT v8.2.1 Table 1 category structure + gray shades mapped
+# onto them (Off-White cirrus, corrected Dark->Medium->Light order, named grays):
+#     > +9 C        No enhancement (low clouds)  -> plain-IR gray ramp
+#     +9 .. -30     Off White (cirrus outflow)
+#     -30 .. -41    Dark Gray
+#     -41 .. -53    Medium Gray
+#     -53 .. -63    Light Gray
+#     -63 .. -69    Black
+#     -69 .. -75    White                         <<< diagnostic B/W flip at -69
+#     -75 .. -80    Top Medium Gray
+#     -80 .. -85    Top Dark Gray
+#     < -85         extreme overshoot (a touch darker)
+# Flat bands w/ HARD edges (duplicate temps). Domain -95 .. +40 C.
 _DVORAK_BD_ANCHORS = [
-    (-95.0, 0.12, 0.12, 0.12),   # extreme cold wedge (< -85)
-    (-85.0, 0.12, 0.12, 0.12),
-    (-85.0, 0.34, 0.34, 0.34),   # CDG  darker gray (-80..-85)
-    (-80.0, 0.34, 0.34, 0.34),
-    (-80.0, 0.56, 0.56, 0.56),   # CMG  medium gray (-75..-80)
-    (-75.0, 0.56, 0.56, 0.56),
-    (-75.0, 1.00, 1.00, 1.00),   # W    white       (-69..-75)
+    (-95.0, 0.22, 0.22, 0.22),   # extreme overshoot (< -85)
+    (-85.0, 0.22, 0.22, 0.22),
+    (-85.0, 0.30, 0.30, 0.30),   # Top Dark Gray   (-80..-85)
+    (-80.0, 0.30, 0.30, 0.30),
+    (-80.0, 0.54, 0.54, 0.54),   # Top Medium Gray (-75..-80)
+    (-75.0, 0.54, 0.54, 0.54),
+    (-75.0, 1.00, 1.00, 1.00),   # White           (-69..-75)
     (-69.0, 1.00, 1.00, 1.00),
-    (-69.0, 0.00, 0.00, 0.00),   # B    black        (-63..-69)  <<< flip
+    (-69.0, 0.00, 0.00, 0.00),   # Black           (-63..-69)  <<< flip
     (-63.0, 0.00, 0.00, 0.00),
-    (-63.0, 0.46, 0.46, 0.46),   # MG   medium-dark  (-53..-63)
-    (-53.0, 0.46, 0.46, 0.46),
-    (-53.0, 0.76, 0.76, 0.76),   # LG   light gray   (-41..-53)
-    (-41.0, 0.76, 0.76, 0.76),
-    (-41.0, 0.40, 0.40, 0.40),   # DG   dark gray    (-30..-41)
-    (-30.0, 0.40, 0.40, 0.40),
-    # Warm tail matched to the cyclonicwx BD scale (low-cloud "pop"): +9 is the
-    # lightest of the warm ramp, warm sea/land is dark gray, and it darkens
-    # gradually from +9 down to -30 (into the DG step). Non-monotonic on
-    # purpose so low/mid cloud reads as a brighter medium gray than the surface.
-    (-30.0, 0.50, 0.50, 0.50),   # medium gray, darkening toward -30
-    (9.0,   0.64, 0.64, 0.64),   # +9 — lightest warm gray (low-cloud pop)
-    (40.0,  0.16, 0.16, 0.16),   # warm sea/land — dark gray
+    (-63.0, 0.78, 0.78, 0.78),   # Light Gray      (-53..-63)
+    (-53.0, 0.78, 0.78, 0.78),
+    (-53.0, 0.54, 0.54, 0.54),   # Medium Gray     (-41..-53)
+    (-41.0, 0.54, 0.54, 0.54),
+    (-41.0, 0.34, 0.34, 0.34),   # Dark Gray       (-30..-41)
+    (-30.0, 0.34, 0.34, 0.34),
+    (-30.0, 0.88, 0.88, 0.88),   # Off White       (-30..+9) cirrus outflow
+    (9.0,   0.88, 0.88, 0.88),
+    (9.0,   0.55, 0.55, 0.55),   # No enhancement  (>+9) low clouds — plain IR
+    (40.0,  0.20, 0.20, 0.20),   #                 warmer = darker
 ]
 
 # ---------------------------------------------------------------------------
