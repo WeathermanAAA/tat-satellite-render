@@ -165,6 +165,29 @@ def render_png(
             if data.units in ("C", "celsius", "degC"):
                 bt = bt + 273.15
             bt_c = bt - 273.15
+            # ---- DEGENERATE-FRAME GUARD (scalar IR/WV) --------------------
+            # A partial satellite-segment fetch (missing AHI/ABI tiles -- the
+            # same s3fs listings-cache race that bit truecolor) leaves most of
+            # the bbox NaN, so the frame renders as a mostly-empty "strip" and
+            # the poller would upload it -> glitchy loop. Mirror the truecolor
+            # guard: raise so /render returns 500 and the poller retries 3x
+            # then skips, and the next scan cycle (cache aged out) renders
+            # cleanly. Threshold 55% NaN: a storm floater fully inside the disk
+            # is ~0% NaN, a partial fetch is ~80%+, so this only trips on the
+            # broken frames (off-disk on-demand boxes are already 422'd by the
+            # satellite picker before reaching here).
+            nan_frac = float((~np.isfinite(bt_c)).mean())
+            if nan_frac > 0.55:
+                log.warning(
+                    "scalar IR/WV degenerate (nan=%.0f%%) -- bailing out so the "
+                    "poller doesn't ship a partial-fetch frame", nan_frac * 100.0,
+                )
+                raise RuntimeError(
+                    f"scalar render produced a mostly-NaN field "
+                    f"(nan={nan_frac * 100:.0f}%) -- likely a partial satellite "
+                    f"segment fetch; the next scan cycle will re-render"
+                )
+            # --------------------------------------------------------------
             if np.isfinite(bt_c).any():
                 bt_min_c = float(np.nanmin(bt_c))
                 bt_max_c = float(np.nanmax(bt_c))
