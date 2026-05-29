@@ -152,21 +152,44 @@ _TAT_NEON_ANCHORS = [
 ]
 
 # ---------------------------------------------------------------------------
-# wv_tat — dedicated water-vapor enhancement
+# wv_tat — "Water Vapor" (WV14 enhancement)
 # ---------------------------------------------------------------------------
-# Dry/sinking air (warm BT) = amber/brown; moist/rising (cold BT) = teal -> blue
-# -> white. Domain tuned for WV channels: -85 .. +20 C.
+# EXACT colors AND temperatures pixel-sampled from the WV14 legend/colorbar in
+# Andrew's reference (GOES-16 Ch09 WV). Legend spans 0..-90 °C: warm/dry
+# orange -> red -> maroon -> black(~-21) -> grays -> near-white(-39) ->
+# lavender -> blue(-60) -> teal(-69) -> green(-75) -> pale yellow(-90).
+# Both RGB (bytes/255) and °C are exact. Domain vmin_c=-90, vmax_c=0.
 _WV_TAT_ANCHORS = [
-    (-85.0, 1.00, 1.00, 1.00),  # coldest / highest moisture -> white
-    (-75.0, 0.72, 0.90, 1.00),  # pale blue
-    (-62.0, 0.20, 0.55, 0.92),  # blue
-    (-50.0, 0.10, 0.70, 0.78),  # teal
-    (-40.0, 0.20, 0.62, 0.45),  # green-teal
-    (-30.0, 0.45, 0.55, 0.40),  # transition
-    (-20.0, 0.70, 0.58, 0.30),  # tan
-    (-8.0,  0.85, 0.58, 0.20),  # amber
-    (6.0,   0.62, 0.36, 0.12),  # brown (dry)
-    (20.0,  0.34, 0.18, 0.06),  # dark brown (driest / warmest)
+    ( -90.0, 0.973, 0.973, 0.902),  # pale yellow-white (coldest)
+    ( -87.0, 0.945, 0.945, 0.792),
+    ( -84.0, 0.851, 0.902, 0.612),  # yellow-green
+    ( -81.0, 0.588, 0.902, 0.525),
+    ( -78.0, 0.424, 0.871, 0.529),  # green
+    ( -75.0, 0.290, 0.804, 0.596),
+    ( -72.0, 0.161, 0.741, 0.659),  # teal-green
+    ( -69.0, 0.071, 0.671, 0.694),  # teal
+    ( -66.0, 0.067, 0.565, 0.667),
+    ( -63.0, 0.063, 0.447, 0.631),  # blue
+    ( -60.0, 0.059, 0.337, 0.604),  # dark blue
+    ( -57.0, 0.220, 0.416, 0.686),
+    ( -54.0, 0.396, 0.506, 0.776),
+    ( -51.0, 0.565, 0.596, 0.867),  # periwinkle
+    ( -48.0, 0.706, 0.706, 0.922),
+    ( -45.0, 0.808, 0.808, 0.949),  # pale lavender
+    ( -42.0, 0.925, 0.925, 0.980),
+    ( -39.0, 0.965, 0.965, 0.965),  # near-white
+    ( -36.0, 0.820, 0.820, 0.820),  # light gray
+    ( -33.0, 0.678, 0.678, 0.678),
+    ( -30.0, 0.553, 0.553, 0.553),  # gray
+    ( -27.0, 0.408, 0.408, 0.408),
+    ( -24.0, 0.282, 0.282, 0.282),  # dark gray
+    ( -21.0, 0.137, 0.137, 0.137),  # near-black
+    ( -18.0, 0.231, 0.118, 0.125),  # dark maroon
+    ( -15.0, 0.435, 0.145, 0.169),  # maroon
+    ( -12.0, 0.620, 0.173, 0.204),
+    (  -9.0, 0.776, 0.259, 0.208),  # red
+    (  -6.0, 0.847, 0.439, 0.153),  # orange-red
+    (   0.0, 0.918, 0.624, 0.098),  # orange (warm/dry)
 ]
 
 # standard IR grayscale: cold = white, warm = black.
@@ -189,7 +212,7 @@ _RAINBOW_TICKS = [40, 30, 20, 10, 0, -10, -20, -30, -40, -50, -60, -70, -80, -90
 _IR_TICKS = [30, 20, 10, 0, -10, -20, -30, -40, -50, -60, -70, -80, -90]
 # Dvorak BD: label the exact diagnostic breakpoints + a couple of warm refs.
 _BD_TICKS = [30, 9, 0, -30, -41, -53, -63, -69, -75, -80, -85]
-_WV_TICKS = [20, 10, 0, -10, -20, -30, -40, -50, -60, -70, -80]
+_WV_TICKS = [0, -10, -20, -30, -40, -50, -60, -70, -80, -90]
 
 _CBAR_LABEL_BT = "Brightness Temperature (°C)"
 
@@ -217,7 +240,7 @@ ENHANCEMENTS = {
     },
     "wv_tat": {
         "label": "Water Vapor", "cmap": WV_TAT_CMAP,
-        "vmin_c": -85.0, "vmax_c": 20.0, "ticks": _WV_TICKS,
+        "vmin_c": -90.0, "vmax_c": 0.0, "ticks": _WV_TICKS,
         "domains": ("wv",), "kind": "ir", "cbar_label": _CBAR_LABEL_BT,
     },
     "ir_gray": {
