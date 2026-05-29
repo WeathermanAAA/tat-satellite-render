@@ -29,8 +29,8 @@ log = logging.getLogger("tat-satellite.render")
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
-COAST_COLOR = "#7eb6c9"   # cyan — coastlines stand out against IR/visible
-BORDER_COLOR = "#e8eef5"  # near-white — political borders, slightly subordinate
+COAST_COLOR = "#000000"   # deep bold black — landmass outlines (Andrew's pref)
+BORDER_COLOR = "#000000"  # black — political borders, to match the coastlines
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
@@ -269,11 +269,11 @@ def render_png(
     coast_scale = _coast_resolution(max(lon_span, lat_span))
     ax.add_feature(
         cfeature.COASTLINE.with_scale(coast_scale),
-        linewidth=0.6, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
+        linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
     )
     ax.add_feature(
         cfeature.BORDERS.with_scale(coast_scale),
-        linewidth=0.5, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
+        linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
     )
 
     # Dashed gridlines auto-spaced
