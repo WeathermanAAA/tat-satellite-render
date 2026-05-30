@@ -106,6 +106,14 @@ RENDER_MAX_RETRIES = int(_env("RENDER_MAX_RETRIES", "3"))
 CIRCUIT_TRIP_FAILS = int(_env("CIRCUIT_TRIP_FAILS", "8"))   # consecutive fails -> cool down
 CIRCUIT_COOLDOWN_S = float(_env("CIRCUIT_COOLDOWN_S", "60"))
 
+# Tracks-JSON fetch (Pages origin can be slow under load -- the read timeout
+# must tolerate a sluggish response or the basin a storm lives in silently
+# stops refreshing). Tuple timeout: fast connect, generous read. Retried with
+# exponential backoff so a single slow response is not treated as a failure.
+TRACKS_CONNECT_TIMEOUT_S = float(_env("TRACKS_CONNECT_TIMEOUT_S", "10"))
+TRACKS_READ_TIMEOUT_S = float(_env("TRACKS_READ_TIMEOUT_S", "45"))
+TRACKS_MAX_RETRIES = int(_env("TRACKS_MAX_RETRIES", "3"))   # retries AFTER the first attempt
+
 CACHE_FRAME = "public, max-age=31536000, immutable"
 CACHE_MANIFEST = "max-age=30"
 
@@ -262,31 +270,57 @@ def _extrapolate(points: list[dict], now: dt.datetime) -> tuple[float, float]:
     return lat + dlat * ahead_h, norm_lon(lon + dlon * ahead_h)
 
 
-def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
-    """Return active storms across all basins.
+def _fetch_tracks_json(session: requests.Session, url: str, basin: str) -> Optional[dict]:
+    """Fetch one basin's tracks JSON, surviving a slow origin.
 
-    Returns ``None`` if ANY basin fetch failed -- a partial failure can
-    silently drop the storms that live in the failing basin (we'd return
-    an empty out from sibling-quiet basins), so the caller treats partial
-    failure the same as full failure and preserves the last-known-good
-    top manifest for one cycle (worst-case ~10 min stale). Returns ``[]``
-    only when EVERY basin fetched cleanly and none reported active storms
-    (genuine quiescence -- safe to clear the manifest).
+    Uses a tuple (connect, read) timeout so a sluggish Pages response gets up
+    to TRACKS_READ_TIMEOUT_S to deliver, and retries TRACKS_MAX_RETRIES times
+    with 2s/4s/8s exponential backoff. Returns the parsed JSON, or ``None``
+    only after every attempt is exhausted. The shared ``session`` keeps a
+    keep-alive pool so the three basin fetches reuse one connection.
+    """
+    timeout = (TRACKS_CONNECT_TIMEOUT_S, TRACKS_READ_TIMEOUT_S)
+    total = TRACKS_MAX_RETRIES + 1
+    last_exc: Exception | None = None
+    for attempt in range(1, total + 1):
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001 - never crash on a bad fetch
+            last_exc = e
+            if attempt < total:
+                backoff = 2 ** attempt  # 2s, 4s, 8s
+                log.warning(
+                    "tracks fetch attempt %d/%d failed (%s): %s -- retrying in %.0fs",
+                    attempt, total, basin, e, backoff,
+                )
+                time.sleep(backoff)
+    log.warning("tracks fetch failed for %s after %d attempts: %s",
+                basin, total, last_exc)
+    return None
+
+
+def fetch_active_storms(session: requests.Session) -> dict[str, Optional[list[Storm]]]:
+    """Return active storms keyed by basin.
+
+    Each basin maps to its (possibly empty) active-storm list, or to ``None``
+    if that basin's tracks fetch failed after all retries. Returning per-basin
+    results lets the caller refresh the basins that succeeded and preserve only
+    the failing basin's last-known-good storms -- one slow basin no longer
+    freezes the whole top manifest. An empty list for a basin means it fetched
+    cleanly and reported no active storms (genuine quiescence).
     """
     now = utcnow()
     cutoff = now - dt.timedelta(hours=ACTIVE_WINDOW_HOURS)
-    out: list[Storm] = []
-    failed_basins: list[str] = []
+    results: dict[str, Optional[list[Storm]]] = {}
     for basin in TRACKS_BASINS:
         url = f"{TRACKS_BASE}/{basin}_tracks_data.json"
-        try:
-            r = session.get(url, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:  # noqa: BLE001 - never crash on a bad fetch
-            log.warning("tracks fetch failed (%s): %s", basin, e)
-            failed_basins.append(basin)
+        data = _fetch_tracks_json(session, url, basin)
+        if data is None:
+            results[basin] = None
             continue
+        storms: list[Storm] = []
         for s in data.get("storms", []):
             # Trust the hardened is_active baked into the JSON, but re-check
             # recency here so a stale JSON can't keep a storm "active" forever.
@@ -313,7 +347,7 @@ def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
             cur_wind = last_pt.get("wind_kt")
             cur_pres = last_pt.get("pressure_mb")
             nature = last_pt.get("nature")
-            out.append(Storm(
+            storms.append(Storm(
                 sid=sid,
                 slug=storm_slug(sid, basin),
                 name=s.get("name") or "UNNAMED",
@@ -327,15 +361,8 @@ def fetch_active_storms(session: requests.Session) -> Optional[list[Storm]]:
                 current_pressure_mb=float(cur_pres) if cur_pres is not None else None,
                 nature=nature if isinstance(nature, str) else None,
             ))
-    if failed_basins:
-        log.warning(
-            "tracks fetch failed for %d/%d basins (%s) -- returning None to "
-            "preserve last-known-good (avoids silently dropping storms that "
-            "live in the failing basin)",
-            len(failed_basins), len(TRACKS_BASINS), ",".join(failed_basins),
-        )
-        return None
-    return out
+        results[basin] = storms
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -519,22 +546,41 @@ class Poller:
     # ---- storm-set management ------------------------------------------
 
     def refresh_storms(self) -> None:
-        active = fetch_active_storms(self.session)
-        # ``None`` => every basin's tracks JSON fetch failed (transient
-        # origin/network hiccup). Don't touch the in-memory unit set OR the
-        # top R2 manifest in that case -- preserve last-known-good so the
-        # floater widget stays visible on the live site instead of self-
-        # hiding for the full TOP_REFRESH_MS window on the frontend.
-        if active is None:
+        per_basin = fetch_active_storms(self.session)
+        succeeded = [b for b, v in per_basin.items() if v is not None]
+        failed = [b for b, v in per_basin.items() if v is None]
+        # Only when EVERY basin failed do we preserve wholesale and skip the
+        # cycle -- the top manifest (generated_utc + intensity) keeps its
+        # last-known-good so the widget stays visible, and no unit churns.
+        if not succeeded:
             log.warning(
-                "tracks fetch failed for ALL basins -- preserving last-known-good "
-                "manifest (no storm set / unit changes this cycle)"
+                "tracks fetch failed for ALL basins (%s) -- preserving last-known-good "
+                "manifest (no storm set / unit changes this cycle)",
+                ",".join(failed),
             )
             return
-        active_slugs = {s.slug for s in active}
-        # New / updated storms.
+        if failed:
+            log.warning("tracks: refreshed %s; preserved last-known-good for %s",
+                        ",".join(succeeded), ",".join(failed))
+        else:
+            log.info("tracks: refreshed all basins (%s)", ",".join(succeeded))
+        # Per-basin merge: a refreshed basin replaces its storms outright;
+        # a failed basin keeps the storms it had last cycle (matched by the
+        # uppercase Storm.basin). At least one basin succeeded, so the top
+        # manifest IS rewritten below -- generated_utc advances every cycle
+        # and the surviving basins' intensities update immediately.
+        failed_upper = {b.upper() for b in failed}
+        new_storms: dict[str, Storm] = {
+            slug: s for slug, s in self.storms.items() if s.basin in failed_upper
+        }
+        for basin in succeeded:
+            for s in per_basin[basin] or []:
+                new_storms[s.slug] = s
+        self.storms = new_storms
+        active = list(new_storms.values())
+        active_slugs = set(new_storms)
+        # New / updated storms -> ensure a Unit per band; refresh metadata.
         for s in active:
-            self.storms[s.slug] = s
             for band in BANDS:
                 key = (s.slug, band.key)
                 if key not in self.units:
@@ -548,9 +594,6 @@ class Poller:
         for key in list(self.units):
             if key[0] not in active_slugs:
                 del self.units[key]
-        for slug in list(self.storms):
-            if slug not in active_slugs:
-                del self.storms[slug]
         self.write_top_manifest(active)
         log.info("active storms: %d (%s)", len(active),
                  ", ".join(f"{s.name}/{s.slug}" for s in active) or "none")
@@ -572,7 +615,16 @@ class Poller:
             "storms": [
                 {
                     "id": s.sid, "slug": s.slug, "name": s.name, "basin": s.basin,
-                    "category": s.category, "intensity_kt": s.intensity_kt,
+                    "category": s.category,
+                    # Pill intensity = the LATEST fix wind (pts[-1].wind_kt), so
+                    # a strengthening/weakening storm shows its current value,
+                    # not its season peak. Falls back to peak only when the JSON
+                    # carries no fix-level wind yet.
+                    "intensity_kt": (s.current_wind_kt
+                                     if s.current_wind_kt is not None
+                                     else s.intensity_kt),
+                    "peak_wind_kt": s.intensity_kt,
+                    "nature": s.nature,
                     "lat": s.lat, "lon": s.lon, "last_fix": s.last_fix,
                     "bands": [b.key for b in BANDS],
                     "manifest": f"{R2_PREFIX}/{s.slug}/manifest.json",
