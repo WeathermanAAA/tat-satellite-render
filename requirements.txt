@@ -13,6 +13,11 @@ Pillow==11.0.0
 s3fs==2024.10.0
 aiobotocore==2.15.2
 python-dateutil==2.9.0
+# Canonical shared color palettes — single source of truth in the main
+# Triple-A-Tropics Pages repo (palette/). Edit palettes there only; Railway
+# installs --no-cache-dir so @main refetches the latest on every deploy.
+# https://github.com/WeathermanAAA/Triple-A-Tropics/tree/main/palette
+tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@main#subdirectory=palette
 # True-color recipe: scipy for band co-registration (RegularGridInterpolator),
 # pyorbital for sun + geostationary-satellite geometry, pyspectral for Rayleigh
 # (atmospheric) correction. pyspectral pulls RSR + Rayleigh LUTs on first use
