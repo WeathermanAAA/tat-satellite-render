@@ -42,6 +42,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -79,6 +80,15 @@ HAFS_PRODUCTS = _env("HAFS_PRODUCTS")           # None -> generator default (all
 
 # Railway Pro: 8 vCPU for this service -> 8 render workers (2x the 4-core runner).
 HAFS_JOBS = int(_env("HAFS_JOBS", "8"))
+
+# INGEST runs at a LOWER width than render. Each ingest decodes a large
+# multi-field GRIB (the parent.atm / hafsb domains are the heaviest) -> the stage
+# is memory-bound, and 8 concurrent heavy decodes OOM'd the pool on this
+# memory-tighter host (BrokenProcessPool), dropping exactly the heavy
+# parent.atm/hafsb frames. 4-wide ingest fits in memory; render stays 8-wide
+# (CPU-bound, reads small cached fields). The generator's halving backoff is the
+# safety net if a cycle is heavy enough to still OOM at 4.
+HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "4"))
 
 # Concurrent R2 PNG uploads (Pass 1 only). The render is CPU-bound; the upload is
 # I/O/latency-bound (each put_object is a network round-trip), so a thread pool of
@@ -182,11 +192,12 @@ class RenderError(RuntimeError):
 
 def run_render_subprocess(cycle: str, out_dir: str, *,
                           jobs: int = HAFS_JOBS,
+                          ingest_jobs: int = HAFS_INGEST_JOBS,
                           models: str = HAFS_MODELS,
                           domains: str = HAFS_DOMAINS,
                           products: Optional[str] = HAFS_PRODUCTS,
                           timeout_s: int = RENDER_TIMEOUT_S,
-                          save_dir: str = CACHE_DIR) -> None:
+                          save_dir: str = CACHE_DIR) -> dict:
     """Render one cycle with the UNCHANGED hafs_render package (byte-identical to
     the cron) in a subprocess, killed if it exceeds ``timeout_s``.
 
@@ -198,12 +209,13 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
     non-zero exit (e.g. the generator's total-failure exit 1)."""
     cmd = [sys.executable, "-m", "hafs_render.generate_hafs_plots",
            "--cycle", cycle, "--out-dir", out_dir, "--jobs", str(jobs),
+           "--ingest-jobs", str(ingest_jobs),
            "--models", models, "--domains", domains, "--save-dir", save_dir]
     if products:
         cmd += ["--products", products]
     env = dict(os.environ, HERBIE_DATA=save_dir)
-    log.info("render start: cycle=%s jobs=%d -> %s (timeout %ds)",
-             cycle, jobs, out_dir, timeout_s)
+    log.info("render start: cycle=%s jobs=%d ingest_jobs=%d -> %s (timeout %ds)",
+             cycle, jobs, ingest_jobs, out_dir, timeout_s)
     t0 = time.time()
     # Capture combined stdout+stderr to a file (NOT a PIPE - a chatty render would
     # deadlock on a full pipe buffer). On failure the tail is embedded in the
@@ -231,7 +243,15 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
         # generator exits 1 on TOTAL failure (storms found, 0 rendered) so the
         # destructive prune never runs and the prior cycle stays live.
         raise RenderError(f"render exit {rc} (cycle {cycle})\n" + _tail(log_path))
-    log.info("render ok: cycle=%s in %.0fs", cycle, time.time() - t0)
+    secs = time.time() - t0
+    log.info("render ok: cycle=%s in %.0fs", cycle, secs)
+    # Parse the captured log into a per-pair coverage/health summary so the cycle
+    # SELF-REPORTS on success too (not just on failure): ingest/render ok-failed,
+    # the pairs that were skipped-incomplete, and the failed-ingest error types -
+    # which is how a partial-coverage cycle (e.g. dropped hafsb pairs) is visible.
+    summary = _parse_render_log(log_path)
+    summary["render_seconds"] = round(secs, 1)
+    return summary
 
 
 def _tail(path: str, nbytes: int = 6000) -> str:
@@ -246,6 +266,57 @@ def _tail(path: str, nbytes: int = 6000) -> str:
         return ("...\n" + data) if size > nbytes else data
     except Exception as e:  # noqa: BLE001
         return f"(could not read render log: {e})"
+
+
+def _parse_render_log(log_path: str) -> dict:
+    """Parse the render subprocess's stdout+stderr into a coverage/health summary.
+
+    Extracts the generator's own log lines: the plan, the ingest ok/failed count,
+    the render ok/failed count, every pair it SKIPPED (incomplete / no-data), and
+    the per-frame ingest failures WITH their error type - aggregated into
+    ``ingest_error_counts`` so the root cause is obvious (e.g.
+    ``{"BrokenProcessPool ...": 100}`` => OOM, vs a fetch/timeout error). Never
+    raises; returns whatever it could parse."""
+    summary: dict = {"planned": {}, "ingest": {}, "render": {},
+                     "skipped_pairs": [], "failed_ingest": [], "failed_render": []}
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            text = f.read()
+    except Exception as e:  # noqa: BLE001
+        summary["parse_error"] = str(e)
+        return summary
+    m = re.search(r"planned (\d+) ingest frame\(s\) \+ (\d+) render task\(s\) "
+                  r"across (\d+) storm", text)
+    if m:
+        summary["planned"] = {"ingest_frames": int(m[1]),
+                              "render_tasks": int(m[2]), "storms": int(m[3])}
+    m = re.search(r"ingested (\d+)/(\d+) frame\(s\) ok \((\d+) failed\)", text)
+    if m:
+        summary["ingest"] = {"ok": int(m[1]), "total": int(m[2]), "failed": int(m[3])}
+    m = re.search(r"rendered (\d+) ok, (\d+) failed", text)
+    if m:
+        summary["render"] = {"ok": int(m[1]), "failed": int(m[2])}
+    for mm in re.finditer(r"skip (\S+) (\S+) (\S+), "
+                          r"(incomplete \(max f\d+ < f\d+\)|no frames published[^\n]*)",
+                          text):
+        summary["skipped_pairs"].append(
+            {"model": mm[1], "storm": mm[2], "domain": mm[3], "reason": mm[4].strip()})
+    err_counts: dict = {}
+    for mm in re.finditer(r"ingest failed: (\S+) (\S+) (\S+) f(\d+) - (.+)", text):
+        if len(summary["failed_ingest"]) < 40:
+            summary["failed_ingest"].append(
+                {"model": mm[1], "storm": mm[2], "domain": mm[3],
+                 "fxx": int(mm[4]), "error": mm[5].strip()[:200]})
+        et = mm[5].strip().split(":")[0][:80]
+        err_counts[et] = err_counts.get(et, 0) + 1
+    for mm in re.finditer(r"render failed: (\S+) (\S+) (\S+) (\S+) f(\d+) - (.+)", text):
+        if len(summary["failed_render"]) < 40:
+            summary["failed_render"].append(
+                {"model": mm[1], "storm": mm[2], "domain": mm[3],
+                 "product": mm[4], "fxx": int(mm[5]), "error": mm[6].strip()[:200]})
+    if err_counts:
+        summary["ingest_error_counts"] = err_counts
+    return summary
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -308,19 +379,42 @@ def upload_cycle(r2: R2, out_dir: str, prefix: str) -> dict:
 
     # Pass 2: manifest - written ONLY after Pass 1's barrier, so it references
     # only frames that are all present on R2.
-    r2.put_json(f"{prefix}/manifest.json", json.loads(manifest_path.read_text()),
-                CC_MANIFEST)
+    manifest = json.loads(manifest_path.read_text())
+    r2.put_json(f"{prefix}/manifest.json", manifest, CC_MANIFEST)
 
-    # Pass 3: prune orphan *.png under the prefix (storms/frames no longer
-    # rendered), scoped to *.png so the manifest is never deleted, and AFTER the
-    # manifest is live so deleted frames are already unreferenced.
+    # Pass 3: prune - DUAL-WRITER SAFE. While the cron co-writes models/hafs, it
+    # renders frames for the SAME cycle including pairs this worker skipped (e.g.
+    # hafsb). The keys carry no cycle segment, so deleting every *.png not in THIS
+    # render would delete the cron's CURRENT-cycle frames -> live coverage
+    # flicker. So prune at the STORM level: keep every frame of a storm present in
+    # the current render (incl. the co-writer's pairs), delete only frames of
+    # storms no longer rendered at all (retired storms / old cycles). Off-season
+    # (storms=[]) -> current_storms empty -> all frames pruned (correct).
+    current_storms = {s.get("id") for s in manifest.get("storms", [])}
     existing = r2.list_keys(prefix + "/")
-    orphans = [k for k in existing if k.endswith(".png") and k not in fresh_png_keys]
+    orphans = []
+    for k in existing:
+        if not k.endswith(".png"):
+            continue
+        parts = k[len(prefix) + 1:].split("/")   # model/storm/domain/product/fNNN.png
+        storm = parts[1] if len(parts) >= 2 else None
+        if storm not in current_storms:          # a storm no longer rendered at all
+            orphans.append(k)
     if orphans:
         r2.delete(orphans)
-    log.info("uploaded %d frame(s) + manifest, pruned %d orphan(s) under %s",
-             len(pngs), len(orphans), prefix)
-    return {"frames": len(pngs), "pruned": len(orphans), "prefix": prefix}
+
+    # Per-pair coverage (model/storm/domain -> fxx count) for the cycle summary.
+    coverage = []
+    for s in manifest.get("storms", []):
+        for mdl, doms in s.get("frames", {}).items():
+            for dom, prods in doms.items():
+                nf = len(next(iter(prods.values()))) if prods else 0
+                coverage.append({"model": mdl, "storm": s.get("id"),
+                                 "domain": dom, "products": len(prods), "fxx": nf})
+    log.info("uploaded %d frame(s) + manifest, pruned %d retired-storm orphan(s) "
+             "under %s", len(pngs), len(orphans), prefix)
+    return {"frames": len(pngs), "pruned": len(orphans), "prefix": prefix,
+            "storms": sorted(s for s in current_storms if s), "coverage": coverage}
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +566,7 @@ def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, diagnose,
     # the destructive prune never runs and the prior shadow/live frames stay).
     with ProgressHeartbeat(r2, prefix, cycle, clock=clock):
         try:
-            render(cycle, out_dir)
+            summary = render(cycle, out_dir) or {}   # parsed coverage/health summary
         except RenderError as e:
             # The generator's process pool swallows per-frame tracebacks (logs
             # only the exception type). On failure, run ONE un-swallowed ingest to
@@ -487,7 +581,26 @@ def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, diagnose,
             except Exception:  # noqa: BLE001
                 pass
             raise
-        upload(r2, out_dir, prefix)
+        upcov = upload(r2, out_dir, prefix) or {}
+        # SUCCESS self-report: persist the coverage/health summary EVERY cycle
+        # (not just on failure) so partial coverage - dropped pairs, the
+        # ingest-error types - is visible on R2 without Railway-log access. Best
+        # effort: a summary-write failure never fails an otherwise-good publish.
+        try:
+            r2.put_json(f"{prefix}/render_summary.json", {
+                "cycle": cycle,
+                "generated_utc": pf.iso_z(clock()),
+                "frames": upcov.get("frames"),
+                "storms": upcov.get("storms"),
+                "pruned": upcov.get("pruned"),
+                "coverage": upcov.get("coverage"),
+                **{k: summary[k] for k in
+                   ("render_seconds", "planned", "ingest", "render",
+                    "skipped_pairs", "failed_ingest", "failed_render",
+                    "ingest_error_counts") if k in summary},
+            }, CC_HEALTH)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def diagnose_ingest(cycle: str) -> str:

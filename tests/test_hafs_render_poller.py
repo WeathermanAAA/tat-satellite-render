@@ -57,15 +57,25 @@ class FakeR2:
             self.store.pop(k, None)
 
 
-def _write_cycle_out(out_dir, cycle, products=("mslp_wind",), fxx=(0, 3)):
-    """Create a minimal rendered out-dir (manifest + dummy PNGs)."""
+def _write_cycle_out(out_dir, cycle, products=("mslp_wind",), fxx=(0, 3),
+                     storm="06w", model="hafsa", dom_slug="storm"):
+    """Create a minimal rendered out-dir (manifest + dummy PNGs) for one pair.
+
+    The manifest matches the generator's real schema: storms is a list of dicts
+    {"id", "name", "frames": {model: {dom_slug: {product: [fxx]}}}} - the
+    storm-level prune + per-pair coverage in upload_cycle parse exactly this."""
     out = Path(out_dir)
+    pair_frames = {}
     for p in products:
         for f in fxx:
-            png = out / "hafsa" / "06w" / "storm" / p / f"f{f:03d}.png"
+            png = out / model / storm / dom_slug / p / f"f{f:03d}.png"
             png.parent.mkdir(parents=True, exist_ok=True)
             png.write_bytes(b"\x89PNG\r\n" + cycle.encode() + p.encode() + bytes([f]))
-    (out / "manifest.json").write_text(json.dumps({"cycle": cycle, "storms": ["06w"]}))
+        pair_frames[p] = list(fxx)
+    (out / "manifest.json").write_text(json.dumps(
+        {"cycle": cycle,
+         "storms": [{"id": storm, "name": storm.upper(),
+                     "frames": {model: {dom_slug: pair_frames}}}]}))
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +241,147 @@ class TestUploadPrune(unittest.TestCase):
             out.mkdir()
             with self.assertRaises(hp.RenderError):
                 hp.upload_cycle(FakeR2(), str(out), "shadow/models/hafs")
+
+    def test_dual_writer_keeps_co_writer_current_storm_frames(self):
+        """DUAL-WRITER GUARDRAIL: during the cron+worker co-write window the worker
+        may skip a heavy pair (e.g. hafsb/parent) that the cron rendered for the
+        SAME current storm. The prune must KEEP those co-writer frames (storm is
+        live) and delete ONLY frames of storms no longer rendered at all."""
+        prefix = "models/hafs"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            # Worker renders only the light hafsa/storm pair for current storm 06w.
+            _write_cycle_out(out, "2026060206", products=("mslp_wind",), fxx=(0, 3),
+                             storm="06w", model="hafsa", dom_slug="storm")
+            r2 = FakeR2(preload={
+                # cron co-wrote a pair the worker SKIPPED, same current storm 06w:
+                f"{prefix}/hafsb/06w/parent/mslp_wind/f000.png": b"cron",
+                f"{prefix}/hafsb/06w/parent/mslp_wind/f126.png": b"cron",
+                # a storm no longer rendered at all (retired / prior cycle):
+                f"{prefix}/hafsa/55x/storm/mslp_wind/f000.png": b"retired",
+                f"{prefix}/manifest.json": b"{}",
+            })
+            summary = hp.upload_cycle(r2, str(out), prefix)
+
+        # the co-writer's CURRENT-storm frames are KEPT (storm 06w is live)
+        self.assertIn(f"{prefix}/hafsb/06w/parent/mslp_wind/f000.png", r2.store)
+        self.assertIn(f"{prefix}/hafsb/06w/parent/mslp_wind/f126.png", r2.store)
+        self.assertNotIn(f"{prefix}/hafsb/06w/parent/mslp_wind/f000.png", r2.deleted)
+        # only the RETIRED storm's frame was pruned
+        self.assertEqual(summary["pruned"], 1)
+        self.assertIn(f"{prefix}/hafsa/55x/storm/mslp_wind/f000.png", r2.deleted)
+        self.assertEqual(summary["storms"], ["06w"])
+        # per-pair coverage is reported for the worker's rendered pair
+        self.assertIn({"model": "hafsa", "storm": "06w", "domain": "storm",
+                       "products": 1, "fxx": 2}, summary["coverage"])
+
+    def test_offseason_prunes_all_when_no_storms(self):
+        """Off-season (manifest storms=[]) -> current_storms empty -> every *.png
+        under the prefix is a retired orphan and is pruned (R2 correctly cleared),
+        but the manifest itself is never deleted."""
+        prefix = "models/hafs"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            (out / "manifest.json").write_text(json.dumps({"cycle": None, "storms": []}))
+            r2 = FakeR2(preload={
+                f"{prefix}/hafsa/06w/storm/mslp_wind/f000.png": b"stale",
+                f"{prefix}/manifest.json": b"{}",
+            })
+            summary = hp.upload_cycle(r2, str(out), prefix)
+        self.assertEqual(summary["pruned"], 1)
+        self.assertIn(f"{prefix}/hafsa/06w/storm/mslp_wind/f000.png", r2.deleted)
+        self.assertIn(f"{prefix}/manifest.json", r2.store)   # manifest never pruned
+
+
+# --------------------------------------------------------------------------- #
+# Render-log parsing -> root-cause summary (drives render_summary.json)
+# --------------------------------------------------------------------------- #
+class TestParseRenderLog(unittest.TestCase):
+    SAMPLE = (
+        "INFO cycle 20260602 06Z - storms: ['06w', '90e']\n"
+        "INFO planned 1734 ingest frame(s) + 19074 render task(s) across 2 storm(s) - 8 worker(s)\n"
+        "INFO skip hafsb 90e parent.atm, incomplete (max f029 < f126)\n"
+        "INFO skip hafsb 90e storm.atm, no frames published this cycle\n"
+        "WARNING ingest failed: hafsa 90e parent.atm f030 - BrokenProcessPool (unrecoverable after retries)\n"
+        "WARNING ingest failed: hafsa 90e parent.atm f033 - BrokenProcessPool (unrecoverable after retries)\n"
+        "WARNING ingest failed: hafsa 06w parent.atm f120 - HTTPError: 503 Server Error: Service Unavailable\n"
+        "INFO ingested 1490/1734 frame(s) ok (244 failed) in 1801s\n"
+        "WARNING render failed: hafsa 90e storm.atm clean_ir f000 - ValueError: bad palette\n"
+        "INFO rendered 16380 ok, 0 failed in 210s\n"
+    )
+
+    def test_parses_counts_skips_and_error_aggregation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = os.path.join(tmp, "render.log")
+            with open(log_path, "w") as f:
+                f.write(self.SAMPLE)
+            s = hp._parse_render_log(log_path)
+
+        self.assertEqual(s["planned"], {"ingest_frames": 1734, "render_tasks": 19074,
+                                        "storms": 2})
+        self.assertEqual(s["ingest"], {"ok": 1490, "total": 1734, "failed": 244})
+        self.assertEqual(s["render"], {"ok": 16380, "failed": 0})
+        # both skipped hafsb/90e pairs captured with their reasons
+        reasons = {(p["model"], p["storm"], p["domain"]): p["reason"]
+                   for p in s["skipped_pairs"]}
+        self.assertEqual(reasons[("hafsb", "90e", "parent.atm")],
+                         "incomplete (max f029 < f126)")
+        self.assertEqual(reasons[("hafsb", "90e", "storm.atm")],
+                         "no frames published this cycle")
+        # OOM is made obvious: BrokenProcessPool aggregated to a count of 2
+        self.assertEqual(s["ingest_error_counts"]["BrokenProcessPool (unrecoverable after retries)"], 2)
+        self.assertEqual(s["ingest_error_counts"]["HTTPError"], 1)
+        self.assertEqual(len(s["failed_render"]), 1)
+        self.assertEqual(s["failed_render"][0]["product"], "clean_ir")
+
+    def test_empty_log_never_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = os.path.join(tmp, "render.log")
+            open(log_path, "w").close()
+            s = hp._parse_render_log(log_path)
+        self.assertEqual(s["skipped_pairs"], [])
+        self.assertEqual(s["planned"], {})
+
+
+# --------------------------------------------------------------------------- #
+# Success path writes render_summary.json (self-report on success, not just fail)
+# --------------------------------------------------------------------------- #
+class TestSuccessSummary(unittest.TestCase):
+    def test_render_summary_written_on_success(self):
+        prefix = "models/hafs"
+
+        def resolver():
+            return "2026060206"
+
+        def render(cycle, out_dir):
+            _write_cycle_out(out_dir, cycle)
+            # mimic run_render_subprocess's parsed-summary return value
+            return {"render_seconds": 1980.0, "planned": {"storms": 2},
+                    "ingest": {"ok": 1490, "total": 1734, "failed": 244},
+                    "skipped_pairs": [{"model": "hafsb", "storm": "90e",
+                                       "domain": "parent.atm",
+                                       "reason": "incomplete (max f029 < f126)"}],
+                    "ingest_error_counts": {"BrokenProcessPool (unrecoverable after retries)": 200}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = hp.build_engine(
+                r2, prefix=prefix, interval_s=1.0,
+                clock=FakeClock(), sleep=lambda s: None,
+                cycle_resolver=resolver, render_fn=render,
+                out_dir_factory=lambda c: str(Path(tmp) / c))
+            eng.run_forever(max_cycles=1)
+
+        self.assertIn(f"{prefix}/render_summary.json", r2.store)
+        snap = json.loads(r2.store[f"{prefix}/render_summary.json"])
+        self.assertEqual(snap["cycle"], "2026060206")
+        self.assertEqual(snap["storms"], ["06w"])           # from upload coverage
+        self.assertEqual(snap["ingest"]["failed"], 244)     # from render summary
+        self.assertEqual(snap["render_seconds"], 1980.0)
+        self.assertEqual(snap["ingest_error_counts"]
+                         ["BrokenProcessPool (unrecoverable after retries)"], 200)
+        self.assertTrue(snap["coverage"])                   # per-pair coverage present
 
 
 if __name__ == "__main__":
