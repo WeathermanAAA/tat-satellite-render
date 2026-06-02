@@ -199,6 +199,32 @@ class TestUploadPrune(unittest.TestCase):
         self.assertIn(f"{prefix}/hafsa/99x/storm/mslp_wind/f000.png", r2.deleted)
         self.assertIn(f"{prefix}/manifest.json", r2.store)
 
+    def test_upload_failure_is_atomic_no_manifest_no_prune(self):
+        """If any PNG put fails (Pass 1), raise BEFORE writing the manifest or
+        pruning - so the manifest never references an unpushed frame (no 404
+        window) and a stale prior manifest is left intact."""
+        prefix = "shadow/models/hafs"
+
+        class FlakyR2(FakeR2):
+            def put_bytes(self, key, data, content_type, cache):
+                if key.endswith("refl/f003.png"):   # one frame fails to upload
+                    return False
+                return super().put_bytes(key, data, content_type, cache)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            _write_cycle_out(out, "2026060206",
+                             products=("mslp_wind", "refl"), fxx=(0, 3))
+            r2 = FlakyR2(preload={
+                f"{prefix}/hafsa/99x/storm/mslp_wind/f000.png": b"orphan",
+                f"{prefix}/manifest.json": b'{"old":true}',
+            })
+            with self.assertRaises(hp.RenderError):
+                hp.upload_cycle(r2, str(out), prefix)
+        # manifest NOT overwritten (prior stays), nothing pruned (no 404 window)
+        self.assertEqual(r2.store[f"{prefix}/manifest.json"], b'{"old":true}')
+        self.assertEqual(r2.deleted, [])
+
     def test_upload_requires_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "empty"

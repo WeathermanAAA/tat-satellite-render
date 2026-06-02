@@ -37,6 +37,7 @@ retried next poll, instead of hanging the worker forever.
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
 import json
 import logging
@@ -78,6 +79,13 @@ HAFS_PRODUCTS = _env("HAFS_PRODUCTS")           # None -> generator default (all
 
 # Railway Pro: 8 vCPU for this service -> 8 render workers (2x the 4-core runner).
 HAFS_JOBS = int(_env("HAFS_JOBS", "8"))
+
+# Concurrent R2 PNG uploads (Pass 1 only). The render is CPU-bound; the upload is
+# I/O/latency-bound (each put_object is a network round-trip), so a thread pool of
+# ~16 cuts a 1738-frame upload from ~20 min (sequential) to ~1-2 min - matching
+# the cron's parallel `aws s3 sync`. Only Pass 1 is parallel; the manifest write
+# (Pass 2) and prune (Pass 3) stay strictly AFTER it (no 404 window).
+HAFS_UPLOAD_WORKERS = int(_env("HAFS_UPLOAD_WORKERS", "16"))
 
 # Watchdog: hard wall-clock cap on one cycle's render (mirrors the cron's
 # timeout-minutes: 120). A wedged render self-aborts; the cycle is retried.
@@ -269,15 +277,37 @@ def upload_cycle(r2: R2, out_dir: str, prefix: str) -> dict:
         raise RenderError(f"no manifest at {manifest_path} - nothing to publish")
 
     pngs = sorted(p for p in out.rglob("*.png"))
-    fresh_png_keys = set()
-    # Pass 1: frames, no delete.
-    for p in pngs:
+
+    # Pass 1: PNG frames, no delete - uploaded CONCURRENTLY (boto3 clients are
+    # thread-safe). This is a hard BARRIER: the ThreadPoolExecutor block exits
+    # only when every put has returned, so the manifest (Pass 2) is never written
+    # while a frame it references is still unpushed. All-or-nothing like the cron:
+    # if any frame fails (after botocore's own retries), raise so NO manifest and
+    # NO prune run - the cycle is held and retried, never published with 404s.
+    def _put(p):
         rel = p.relative_to(out).as_posix()
         key = f"{prefix}/{rel}"
-        fresh_png_keys.add(key)
-        r2.put_bytes(key, p.read_bytes(), "image/png", CC_FRAME)
+        try:
+            ok = r2.put_bytes(key, p.read_bytes(), "image/png", CC_FRAME)
+        except Exception:  # noqa: BLE001
+            ok = False
+        return key, ok
 
-    # Pass 2: manifest (references only frames uploaded in pass 1).
+    fresh_png_keys = set()
+    failures = 0
+    with cf.ThreadPoolExecutor(max_workers=HAFS_UPLOAD_WORKERS) as ex:
+        for key, ok in ex.map(_put, pngs):   # consuming all results = the barrier
+            if ok:
+                fresh_png_keys.add(key)
+            else:
+                failures += 1
+    if failures:
+        raise RenderError(
+            f"{failures}/{len(pngs)} frame uploads failed under {prefix} - "
+            "holding cycle (manifest NOT written, prune NOT run)")
+
+    # Pass 2: manifest - written ONLY after Pass 1's barrier, so it references
+    # only frames that are all present on R2.
     r2.put_json(f"{prefix}/manifest.json", json.loads(manifest_path.read_text()),
                 CC_MANIFEST)
 
