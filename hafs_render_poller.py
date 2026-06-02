@@ -197,21 +197,47 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
     log.info("render start: cycle=%s jobs=%d -> %s (timeout %ds)",
              cycle, jobs, out_dir, timeout_s)
     t0 = time.time()
+    # Capture combined stdout+stderr to a file (NOT a PIPE - a chatty render would
+    # deadlock on a full pipe buffer). On failure the tail is embedded in the
+    # RenderError so it reaches R2 (render_progress.json), making a remote failure
+    # self-diagnosing without Railway log access.
+    log_path = os.path.join(tempfile.gettempdir(), f"hafs_render_{cycle}.log")
+    logf = open(log_path, "wb")
     # start_new_session=True -> new process group; killpg on timeout takes the
     # whole render tree down (the spine has no process() timeout; this is it).
-    proc = subprocess.Popen(cmd, start_new_session=True)
+    proc = subprocess.Popen(cmd, start_new_session=True, env=env,
+                            stdout=logf, stderr=subprocess.STDOUT)
     try:
         rc = proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         log.error("render WATCHDOG fired after %ds - killing cycle %s",
                   timeout_s, cycle)
         _kill_tree(proc)
-        raise RenderError(f"render timeout after {timeout_s}s (cycle {cycle})")
+        logf.close()
+        raise RenderError(f"render timeout after {timeout_s}s (cycle {cycle})\n"
+                          + _tail(log_path))
+    finally:
+        if not logf.closed:
+            logf.close()
     if rc != 0:
         # generator exits 1 on TOTAL failure (storms found, 0 rendered) so the
         # destructive prune never runs and the prior cycle stays live.
-        raise RenderError(f"render exit {rc} (cycle {cycle})")
+        raise RenderError(f"render exit {rc} (cycle {cycle})\n" + _tail(log_path))
     log.info("render ok: cycle=%s in %.0fs", cycle, time.time() - t0)
+
+
+def _tail(path: str, nbytes: int = 6000) -> str:
+    """Last ``nbytes`` of a log file (the render subprocess's stdout+stderr) for
+    embedding in a RenderError so the real failure is observable on R2."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read().decode("utf-8", "replace")
+        return ("...\n" + data) if size > nbytes else data
+    except Exception as e:  # noqa: BLE001
+        return f"(could not read render log: {e})"
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -288,14 +314,19 @@ class ProgressHeartbeat:
         self._t: Optional[threading.Thread] = None
         self._t0 = time.time()
 
-    def _emit(self, status: str) -> None:
-        self.r2.put_json(self.key, {
+    def _emit(self, status: str, error: Optional[str] = None) -> None:
+        payload = {
             "status": status,
             "cycle": self.cycle,
             "started_utc": pf.iso_z(self._started_dt),
             "updated_utc": pf.iso_z(self.clock()),
             "elapsed_s": round(time.time() - self._t0, 1),
-        }, CC_HEALTH)
+        }
+        if error:
+            # The render subprocess's failure tail (embedded in RenderError) so a
+            # remote failure is fully diagnosable from R2, no Railway log needed.
+            payload["error"] = error[-6000:]
+        self.r2.put_json(self.key, payload, CC_HEALTH)
 
     def _loop(self) -> None:
         while not self._stop.wait(self.interval):
@@ -320,7 +351,8 @@ class ProgressHeartbeat:
         if self._t is not None:
             self._t.join(timeout=2)
         try:
-            self._emit("failed" if exc_type else "done")
+            err = f"{exc_type.__name__}: {exc}" if exc_type else None
+            self._emit("failed" if exc_type else "done", error=err)
         except Exception:  # noqa: BLE001
             pass
 
