@@ -282,8 +282,13 @@ def make_basin_source(basin: str, session: requests.Session,
         ctx.sink.write(f"feeds/{basin}_ace_data.json", ace_feed)
         ctx.sink.write(f"feeds/{basin}_tracks_data.json", tracks_feed)
 
+    # restamp=True: re-emit the feeds EVERY cycle so generated_utc ticks on the
+    # poll cadence (the "poller alive / last checked" stamp) and staleness_minutes
+    # stays continuously accurate. staleness is computed FROM latest_fix_valid_utc
+    # (the data anchor, which only moves on a new fix), so it grows honestly
+    # between advisories - re-stamping never resets it to ~0 / masks true data age.
     return pf.Source(name=basin, fetch=fetch, change_key=change_key,
-                     process=process, valid_time=valid_time)
+                     process=process, valid_time=valid_time, restamp=True)
 
 
 def build_engine(sink: pf.Sink, *, basins=BASINS,

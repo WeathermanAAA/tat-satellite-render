@@ -353,6 +353,14 @@ class Source:
     valid_time(data) -> optional; the data's own newest valid-time, used for
                       freshness stamping and data-lag visibility.
     policy         -> optional per-source FetchPolicy (else the engine default).
+    restamp        -> if True, ``process`` runs EVERY successful cycle, not only
+                      on a change_key change, so the output keeps a live "last
+                      built" stamp (generated_utc) that ticks each cycle while the
+                      data anchor (valid_time) is unchanged. ``last_change_utc``
+                      still advances ONLY on a real change_key change, so it stays
+                      an honest "data last changed" signal (and the result status
+                      stays UNCHANGED on a pure re-stamp). Default False keeps the
+                      cheap-when-nothing-new behavior (e.g. the floater poller).
     """
     name: str
     fetch: Callable[[], Any]
@@ -360,6 +368,7 @@ class Source:
     process: Callable[[ProcessContext], None]
     valid_time: Optional[Callable[[Any], Optional[dt.datetime]]] = None
     policy: Optional[FetchPolicy] = None
+    restamp: bool = False
 
 
 # Per-cycle outcome for one source.
@@ -574,15 +583,18 @@ class PollerEngine:
             h.last_error = "change_key: " + _format_err(e)
             return SourceResult(source.name, PROCESS_FAILED, error=h.last_error)
 
-        if h.last_change_utc is not None and sig == h.last_signature:
+        unchanged = (h.last_change_utc is not None and sig == h.last_signature)
+        if unchanged and not source.restamp:
             # Nothing new: cheap path. The successful fetch already refreshed
             # last_success_utc, so the source reads 'fresh' without doing work.
             h.consecutive_failures = 0
             h.last_error = None
             return SourceResult(source.name, UNCHANGED, signature=sig)
 
-        # 3. PROCESS (new data). On failure, do NOT advance the signature so the
-        #    same new data is retried next cycle.
+        # 3. PROCESS. New data -> the expensive recompute; OR a restamp source
+        #    re-running on UNCHANGED data so its output keeps a live built-at
+        #    stamp. On failure, do NOT advance the signature so the same data is
+        #    retried next cycle.
         ctx = ProcessContext(
             name=source.name,
             data=data,
@@ -604,9 +616,14 @@ class PollerEngine:
             return SourceResult(source.name, PROCESS_FAILED, error=h.last_error)
 
         h.last_signature = sig
-        h.last_change_utc = now
         h.consecutive_failures = 0
         h.last_error = None
+        if unchanged:
+            # Pure re-stamp: the data did NOT change, so keep last_change_utc an
+            # honest "data last changed" signal and report UNCHANGED even though a
+            # freshly-stamped output was re-emitted.
+            return SourceResult(source.name, UNCHANGED, signature=sig)
+        h.last_change_utc = now
         return SourceResult(source.name, CHANGED, signature=sig)
 
     # -- one cycle -------------------------------------------------------
