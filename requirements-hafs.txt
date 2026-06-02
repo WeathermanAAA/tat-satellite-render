@@ -1,0 +1,20 @@
+# HAFS render worker (hafs_render_poller.py, the 4th Railway service) - its OWN
+# build, separate from the shared satellite requirements.txt. The HAFS GRIB
+# time-decode asserts timedelta64[ns] in xarray, which FAILS on pandas 3.x under
+# the satellite's pinned xarray 2024.11.0; this build uses xarray 2026.4.0 +
+# herbie 2026.3.0 (the codespace-proven combo, render parity verified) WITHOUT
+# touching the satellite/web/floater/intensity build. Wired via
+# railway.hafs.json -> build.nixpacksConfigPath = nixpacks-hafs.toml, which
+# installs THIS file. Lean: only what the poller + the render subprocess need
+# (no fastapi / cartopy / pyspectral / ace-core / s3fs).
+xarray==2026.4.0
+herbie-data==2026.3.0
+boto3>=1.34
+requests>=2.31
+# Shared TAT palettes - imported by the hafs_render render path (the hafs-render
+# package does not declare it, since it is not on PyPI).
+tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@main#subdirectory=palette
+# The HAFS render pipeline, tag-pinned (the SAME code update-hafs.yml runs). It
+# pulls matplotlib==3.9.3 + numpy==2.1.3 + cfgrib + eccodes + netCDF4 (the GRIB
+# stack the satellite lacks); xarray/herbie are pinned above to the proven combo.
+hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.1.0#subdirectory=hafs_render
