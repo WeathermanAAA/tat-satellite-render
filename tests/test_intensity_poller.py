@@ -129,6 +129,28 @@ class TestRecompute(unittest.TestCase):
         self.assertEqual(af["latest_fix_valid_utc"], "2026-04-12T00:00:00Z")
         self.assertEqual(af["staleness_minutes"], 5)
 
+    def test_invests_never_enter_ace(self):
+        # an invest in an ACE frame contributes 0 ACE and never lands in storms_by_year
+        named = pd.DataFrame([_fix("TESTER", 100, h, 55.0) for h in (0, 6, 12, 18, 24, 30)])
+        inv = _fix("90W", 100, 0, 20.0, sid="JTWC_WP902026")
+        inv["storm_num"], inv["nature"] = 90, "DS"
+        with_inv = pd.concat([named, pd.DataFrame([inv])], ignore_index=True)
+        a0 = fr.recompute_ace_feed(self.ab, named, build_now=self.bn)
+        a1 = fr.recompute_ace_feed(self.ab, with_inv, build_now=self.bn)
+        self.assertEqual(a0["current"]["latest_value"], a1["current"]["latest_value"])  # invest adds 0
+        self.assertNotIn("90W", {s["name"] for s in a1["storms_by_year"].get(str(YEAR), [])})
+
+    def test_invest_appears_on_tracks(self):
+        # a RECENT invest (within the active window) shows on the tracks feed
+        now = dt.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        syn = now.replace(hour=(now.hour // 6) * 6)
+        inv = {"SID": "JTWC_WP902026", "NAME": "90W", "season": YEAR, "time": syn,
+               "lat": 12.0, "lon": 130.0, "wind_kt": 25.0, "pressure_mb": 1004.0,
+               "nature": "DS", "source": "live-knackwx", "storm_num": 90}
+        tf = fr.recompute_tracks_feed(self.tb, pd.DataFrame([inv]), build_now=now)
+        invs = [s["name"] for s in tf["storms"] if s.get("is_invest")]
+        self.assertEqual(invs, ["90W"])
+
 
 class TestEngineIsolation(unittest.TestCase):
     def _engine(self, sink, live_fetcher, clock):
