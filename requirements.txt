@@ -41,3 +41,14 @@ requests>=2.31
 # intentional ace_core bump (a new tag). Pulls pandas + numpy.
 ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.1.0#subdirectory=ace_core
 pandas>=2.0
+
+# HAFS render worker (hafs_render_poller.py, the 4th Railway service): the HAFS
+# render pipeline pinned as a git dependency so the worker runs the SAME code
+# update-hafs.yml runs (the ace-core pattern). It PINS matplotlib==3.9.3 +
+# numpy==2.1.3 (matching the pins above, so cron and worker rasterize
+# identically) and pulls the GRIB stack the satellite service lacks: herbie-data
+# + cfgrib + eccodes (the eccodes wheel bundles the binary, no apt). Tag-pinned
+# like ace-core so render output cannot shift without an intentional bump.
+# NOTE: the main-repo tag hafs-render-v0.1.0 (branch hafs-render-package) must be
+# pushed before THIS service deploys; until then point it at a branch ref.
+hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.1.0#subdirectory=hafs_render
