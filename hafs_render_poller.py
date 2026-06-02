@@ -381,13 +381,16 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                      render_fn: Optional[Callable[[str, str], None]] = None,
                      uploader: Optional[Callable[[R2, str, str], dict]] = None,
                      out_dir_factory: Optional[Callable[[str], str]] = None,
+                     diagnoser: Optional[Callable[[str], str]] = None,
                      clock: Callable[[], dt.datetime] = pf.utcnow) -> pf.Source:
     """Build the HAFS Source. ``cycle_resolver`` / ``render_fn`` / ``uploader`` /
-    ``out_dir_factory`` are injectable so the offline tests exercise the
-    change-gate, watchdog-abort, and prune WITHOUT a real render or R2."""
+    ``out_dir_factory`` / ``diagnoser`` are injectable so the offline tests
+    exercise the change-gate, watchdog-abort, and prune WITHOUT a real render,
+    R2, or network diagnostic."""
     resolve = cycle_resolver or resolve_latest_complete_cycle
     render = render_fn or run_render_subprocess
     upload = uploader or upload_cycle
+    diagnose = diagnoser or diagnose_ingest
 
     def fetch():
         # Cheap: an S3 listing to find the newest complete cycle. None off-season
@@ -419,24 +422,75 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             return
         if out_dir_factory is not None:
             out_dir = out_dir_factory(cycle)
-            _render_and_upload(r2, prefix, cycle, out_dir, render, upload, clock)
+            _render_and_upload(r2, prefix, cycle, out_dir, render, upload,
+                               diagnose, clock)
         else:
             with tempfile.TemporaryDirectory(prefix=f"hafs_{cycle}_") as td:
                 out_dir = str(Path(td) / "hafs")
-                _render_and_upload(r2, prefix, cycle, out_dir, render, upload, clock)
+                _render_and_upload(r2, prefix, cycle, out_dir, render, upload,
+                                   diagnose, clock)
 
     return pf.Source(name="hafs", fetch=fetch, change_key=change_key,
                      process=process, valid_time=valid_time)
 
 
-def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, clock) -> None:
+def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, diagnose,
+                       clock) -> None:
     # Progress heartbeat wraps the WHOLE render+upload so a hang at any stage is
     # observable. The render raises RenderError on timeout / total-failure -> the
     # spine holds the signature and retries next poll (NO upload on failure, so
     # the destructive prune never runs and the prior shadow/live frames stay).
     with ProgressHeartbeat(r2, prefix, cycle, clock=clock):
-        render(cycle, out_dir)
+        try:
+            render(cycle, out_dir)
+        except RenderError as e:
+            # The generator's process pool swallows per-frame tracebacks (logs
+            # only the exception type). On failure, run ONE un-swallowed ingest to
+            # capture the real traceback to R2 - a remote decode failure is then
+            # fully diagnosable without Railway log access.
+            diag = diagnose(cycle)
+            try:
+                r2.put_json(f"{prefix}/render_error.json", {
+                    "cycle": cycle, "utc": pf.iso_z(clock()),
+                    "error": str(e)[-4000:], "ingest_traceback": diag[-8000:],
+                }, CC_HEALTH)
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         upload(r2, out_dir, prefix)
+
+
+def diagnose_ingest(cycle: str) -> str:
+    """Run ONE hafs_render ingest in a subprocess WITHOUT the generator's
+    exception swallowing, so the real traceback (e.g. the cfgrib/eccodes
+    AssertionError location) is captured. Tries the simplest frame likely present
+    (hafsa 06w storm.atm f000); returns combined stdout+stderr."""
+    save_dir = os.path.join(tempfile.gettempdir(), "hafs_diag_cache")
+    code = (
+        "import datetime as dt, traceback\n"
+        "from pathlib import Path\n"
+        "from hafs_render import hafs_cache as fc\n"
+        "from hafs_render.generate_hafs_plots import list_storms\n"
+        "import requests\n"
+        f"date,hh={cycle[:8]!r},{cycle[8:]!r}\n"
+        "cy=dt.datetime.strptime(date+hh,'%Y%m%d%H')\n"
+        "try:\n"
+        "    storms=list_storms('hafsa',date,hh,session=requests.Session())\n"
+        "    print('storms',storms)\n"
+        "    st=storms[0] if storms else '06w'\n"
+        "    fc.ingest_frame('hafsa',st,'storm.atm',cy,0,Path(%r)/'diag.nc',%r,"
+        "want_refl=True,want_pwat=True,want_upper=True,sat_parms=(58,53),remove_grib=True)\n"
+        "    print('DIAG_INGEST_OK')\n"
+        "except Exception:\n"
+        "    traceback.print_exc()\n"
+    ) % (save_dir, save_dir)
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                           text=True, timeout=240,
+                           env=dict(os.environ, HERBIE_DATA=save_dir))
+        return (r.stdout + "\n" + r.stderr)[-8000:]
+    except Exception as e:  # noqa: BLE001
+        return f"(diagnose_ingest failed: {e})"
 
 
 # ---------------------------------------------------------------------------

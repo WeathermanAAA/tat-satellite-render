@@ -137,6 +137,7 @@ class TestWatchdogRetry(unittest.TestCase):
                 r2, prefix="shadow/models/hafs", interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=resolver, render_fn=render,
+                diagnoser=lambda c: "(test-diag, no network)",
                 out_dir_factory=lambda c: str(Path(tmp) / c))
             eng.run_forever(max_cycles=3)
         # A failed render does NOT advance the change signature, so the SAME
@@ -164,7 +165,8 @@ class TestWatchdogRetry(unittest.TestCase):
                 r2, prefix="shadow/models/hafs", interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=lambda: "2026060206", render_fn=render,
-                uploader=uploader, out_dir_factory=lambda c: str(Path(tmp) / c))
+                uploader=uploader, diagnoser=lambda c: "(test-diag, no network)",
+                out_dir_factory=lambda c: str(Path(tmp) / c))
             eng.run_forever(max_cycles=2)
         self.assertEqual(uploads, [])          # never uploaded
         self.assertEqual(r2.deleted, [])       # prior frames never pruned
