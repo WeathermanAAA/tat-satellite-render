@@ -466,31 +466,33 @@ def diagnose_ingest(cycle: str) -> str:
     AssertionError location) is captured. Tries the simplest frame likely present
     (hafsa 06w storm.atm f000); returns combined stdout+stderr."""
     save_dir = os.path.join(tempfile.gettempdir(), "hafs_diag_cache")
-    code = (
-        "import datetime as dt, traceback\n"
-        "from pathlib import Path\n"
-        "from hafs_render import hafs_cache as fc\n"
-        "from hafs_render.generate_hafs_plots import list_storms\n"
-        "import requests\n"
-        f"date,hh={cycle[:8]!r},{cycle[8:]!r}\n"
-        "cy=dt.datetime.strptime(date+hh,'%Y%m%d%H')\n"
-        "try:\n"
-        "    storms=list_storms('hafsa',date,hh,session=requests.Session())\n"
-        "    print('storms',storms)\n"
-        "    st=storms[0] if storms else '06w'\n"
-        "    fc.ingest_frame('hafsa',st,'storm.atm',cy,0,Path(%r)/'diag.nc',%r,"
-        "want_refl=True,want_pwat=True,want_upper=True,sat_parms=(58,53),remove_grib=True)\n"
-        "    print('DIAG_INGEST_OK')\n"
-        "except Exception:\n"
-        "    traceback.print_exc()\n"
-    ) % (save_dir, save_dir)
+    # Build the snippet with f-strings only (NO % operator - the embedded
+    # strptime '%Y%m%d%H' would break str.__mod__). Whole body guarded so a
+    # diagnostic bug can never mask or replace the real render failure.
     try:
+        date, hh = cycle[:8], cycle[8:]
+        code = "\n".join([
+            "import datetime as dt, traceback",
+            "from pathlib import Path",
+            "from hafs_render import hafs_cache as fc",
+            "from hafs_render.generate_hafs_plots import list_storms",
+            "import requests",
+            f"cy=dt.datetime.strptime({cycle!r},'%Y%m%d%H')",
+            "try:",
+            f"    storms=list_storms('hafsa',{date!r},{hh!r},session=requests.Session())",
+            "    print('storms',storms)",
+            "    st=storms[0] if storms else '06w'",
+            f"    fc.ingest_frame('hafsa',st,'storm.atm',cy,0,Path({save_dir!r})/'diag.nc',{save_dir!r},want_refl=True,want_pwat=True,want_upper=True,sat_parms=(58,53),remove_grib=True)",
+            "    print('DIAG_INGEST_OK')",
+            "except Exception:",
+            "    traceback.print_exc()",
+        ])
         r = subprocess.run([sys.executable, "-c", code], capture_output=True,
                            text=True, timeout=240,
                            env=dict(os.environ, HERBIE_DATA=save_dir))
         return (r.stdout + "\n" + r.stderr)[-8000:]
     except Exception as e:  # noqa: BLE001
-        return f"(diagnose_ingest failed: {e})"
+        return f"(diagnose_ingest failed: {type(e).__name__}: {e})"
 
 
 # ---------------------------------------------------------------------------
