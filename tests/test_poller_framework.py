@@ -253,6 +253,28 @@ class TestChangeDetection(unittest.TestCase):
         self.assertEqual(res.status, pf.UNCHANGED)
         self.assertEqual(eng.health_snapshot()["sources"]["s"]["state"], pf.FRESH)
 
+    def test_restamp_processes_every_cycle_but_last_change_honest(self):
+        """restamp=True: process runs EVERY successful cycle (re-stamp), but
+        last_change_utc advances ONLY on a real change_key change, and the result
+        status stays UNCHANGED on a pure re-stamp (the data did not change)."""
+        clock = FakeClock()
+        processed: list = []
+        src = pf.Source(
+            name="s",
+            fetch=lambda: {"v": 1},            # data never changes
+            change_key=lambda d: d["v"],
+            process=lambda ctx: processed.append(ctx.now),
+            restamp=True,
+        )
+        eng = pf.PollerEngine([src], clock=clock, sleep=lambda s: None)
+        statuses = []
+        for _ in range(3):
+            statuses.append(eng.poll_once()["s"].status)
+            clock.advance(60)
+        self.assertEqual(statuses, [pf.CHANGED, pf.UNCHANGED, pf.UNCHANGED])
+        self.assertEqual(len(processed), 3)            # process ran EVERY cycle (re-stamp)
+        self.assertEqual(eng.health("s").last_change_utc, processed[0])  # honest: first change only
+
 
 # ---------------------------------------------------------------------------
 # (a) Per-source isolation: a failing source never freezes the healthy ones

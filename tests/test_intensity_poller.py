@@ -151,6 +151,18 @@ class TestRecompute(unittest.TestCase):
         invs = [s["name"] for s in tf["storms"] if s.get("is_invest")]
         self.assertEqual(invs, ["90W"])
 
+    def test_restamp_staleness_is_true_data_age_not_reset(self):
+        # Re-stamping advances generated_utc, but staleness is (now - latest_fix),
+        # so it GROWS between fixes and is never reset to ~0 (the Fix 3 guardrail:
+        # never mask genuine data age). Base canon's newest fix is 2026-04-10T06:00Z.
+        a1 = fr.recompute_ace_feed(self.ab, pd.DataFrame(), build_now=dt.datetime(2026, 4, 10, 7, 0, 0))
+        a2 = fr.recompute_ace_feed(self.ab, pd.DataFrame(), build_now=dt.datetime(2026, 4, 10, 8, 0, 0))
+        self.assertEqual(a1["latest_fix_valid_utc"], "2026-04-10T06:00:00Z")     # data anchor
+        self.assertEqual(a1["latest_fix_valid_utc"], a2["latest_fix_valid_utc"])  # anchor unchanged
+        self.assertNotEqual(a1["generated_utc"], a2["generated_utc"])            # generated advances
+        self.assertEqual(a1["staleness_minutes"], 60)    # now - fix
+        self.assertEqual(a2["staleness_minutes"], 120)   # GROWS (not reset to ~0)
+
 
 class TestEngineIsolation(unittest.TestCase):
     def _engine(self, sink, live_fetcher, clock):
@@ -199,16 +211,26 @@ class TestEngineIsolation(unittest.TestCase):
         self.assertEqual(sig1, eng.health("wp").last_signature)  # signature preserved
         self.assertTrue(r2["al"].ok and r2["ep"].ok)
 
-    def test_change_gated_no_reprocess_when_unchanged(self):
+    def test_restamp_rewrites_every_cycle_but_status_unchanged(self):
+        # restamp=True: unchanged data across cycles -> status UNCHANGED, but the
+        # feed is re-emitted each cycle with a fresh generated_utc (advancing
+        # clock), while last_change_utc stays put (honest data-change signal).
         sink = pf.DictSink()
-        T = dt.datetime(2026, 4, 10, 6, 0, 0, tzinfo=dt.timezone.utc)
+        clk = {"t": dt.datetime(2026, 4, 10, 6, 0, 0, tzinfo=dt.timezone.utc)}
         live = pd.DataFrame([_fix("TESTER", 100, 0, 55.0)])
         eng = self._engine(sink, lambda cfg, y: live if cfg["short"] == "wp" else pd.DataFrame(),
-                           lambda: T)
+                           lambda: clk["t"])
         r1 = eng.poll_once()
+        gen1 = sink.store["feeds/wp_ace_data.json"]["generated_utc"]
+        lc1 = eng.health("wp").last_change_utc
+        clk["t"] = dt.datetime(2026, 4, 10, 6, 2, 0, tzinfo=dt.timezone.utc)  # +2 min
         r2 = eng.poll_once()
+        gen2 = sink.store["feeds/wp_ace_data.json"]["generated_utc"]
+        lc2 = eng.health("wp").last_change_utc
         self.assertEqual(r1["wp"].status, pf.CHANGED)
-        self.assertEqual(r2["wp"].status, pf.UNCHANGED)        # same fix -> skipped
+        self.assertEqual(r2["wp"].status, pf.UNCHANGED)   # data unchanged
+        self.assertNotEqual(gen1, gen2)                   # but re-stamped: generated_utc advanced
+        self.assertEqual(lc1, lc2)                        # last_change_utc honest (data did not change)
 
 
 if __name__ == "__main__":
