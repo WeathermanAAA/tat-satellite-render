@@ -81,8 +81,14 @@ R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY") or _env("AWS_SECRET_ACCESS_KEY")
 R2_PREFIX = _env("R2_PREFIX", "floaters").strip("/")
 
-# Where the hardened active-storm list lives (Pages origin, not R2).
-TRACKS_BASE = _env("TRACKS_BASE", "https://triple-a-tropics.com").rstrip("/")
+# Where the hardened active-storm list lives. Use the LIVE R2 feed (poller-
+# written, refreshed ~every 2 min) rather than the git-committed Pages origin
+# (cron-written, refreshed at best every 6 h - and GitHub drops those scheduled
+# runs under load). Reading the stale Pages feed pinned a storm's bbox to an old
+# fix so the storm drifted off-frame (Jangmi stuck at its 00Z position while it
+# had moved ~7 deg E by 18Z). The live feed carries the same
+# {basin}_tracks_data.json schema, so this is a source swap only.
+TRACKS_BASE = _env("TRACKS_BASE", "https://cdn.triple-a-tropics.com/feeds").rstrip("/")
 TRACKS_BASINS = ("wp", "al", "ep")
 
 # Invests (NHC ATCF best-track b-decks) -- an INDEPENDENT floater source.
@@ -98,6 +104,18 @@ INVEST_BTK_BASE = _env("INVEST_BTK_BASE", "https://ftp.nhc.noaa.gov/atcf/btk").r
 INVEST_INDEX_URL = INVEST_BTK_BASE + "/"
 # basin two-letter -> ATCF designation suffix (90 + "E" -> "90E").
 INVEST_BASIN_LETTER = {"al": "L", "ep": "E", "cp": "C"}
+
+# NHC CurrentStorms.json: the AUTHORITATIVE list of currently-NAMED NHC TCs
+# (AL/EP/CP). Re-read each cycle so a just-DESIGNATED system (an invest promoted
+# to a TD/TS, e.g. 90E -> One-E) is floated as the NAMED storm with its real
+# status, and its retired invest floater is dropped (never both at once).
+CURRENT_STORMS_URL = _env("CURRENT_STORMS_URL",
+                          "https://www.nhc.noaa.gov/CurrentStorms.json")
+NHC_BASIN_PREFIXES = {"al": "AL", "ep": "EP", "cp": "CP"}
+# An invest counts as DESIGNATED (-> dropped) when a named NHC storm sits in the
+# same basin within this many degrees of the invest's latest fix (it became that
+# TC). Generous enough to span a few 6-hourly fixes of drift between the two.
+INVEST_DESIGNATION_DEG = float(_env("INVEST_DESIGNATION_DEG", "5.0"))
 
 # Geometry + cadence
 BBOX_DEG = float(_env("BBOX_DEG", "12"))           # square floater width (deg)
@@ -552,6 +570,61 @@ def fetch_active_invests(session: requests.Session) -> Optional[list[Storm]]:
     return out
 
 
+def _deg_dist(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in degrees between two lat/lon points, with longitude wrap.
+    Good enough for the invest-designation co-location test (a few degrees)."""
+    dlon = ((lon1 - lon2 + 180.0) % 360.0) - 180.0
+    return math.hypot(lat1 - lat2, dlon)
+
+
+def fetch_current_named(session: requests.Session) -> Optional[dict[str, Storm]]:
+    """Named NHC TCs from NHC CurrentStorms.json (AL/EP/CP), keyed by slug.
+
+    The authoritative current-named list: a just-DESIGNATED system appears here
+    as its TD/TS the cycle it is named, before the derived {basin}_tracks_data
+    feed catches up. Used to (a) surface the named storm immediately and (b) drop
+    the retired invest it was promoted from. Returns None on fetch failure (the
+    caller preserves last-known-good); an empty dict when the fetch succeeds with
+    no active named NHC storm. Never raises.
+    """
+    data = _fetch_tracks_json(session, CURRENT_STORMS_URL, "nhc-current")
+    if data is None:
+        return None
+
+    def _pos_num(v):
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    out: dict[str, Storm] = {}
+    for s in (data.get("activeStorms") or []):
+        sid = (s.get("id") or "").strip()                  # "ep012026"
+        basin2 = sid[:2].lower()
+        if basin2 not in NHC_BASIN_PREFIXES:
+            continue
+        try:
+            lat = float(s.get("latitudeNumeric"))
+            lon = norm_lon(float(s.get("longitudeNumeric")))
+        except (TypeError, ValueError):
+            continue
+        cls = (s.get("classification") or "").strip().upper() or "TD"   # TD/TS/HU...
+        slug = storm_slug(sid.upper(), basin2)             # "ep01"
+        out[slug] = Storm(
+            sid=sid, slug=slug,
+            name=(s.get("name") or slug).strip().upper(),  # "ONE-E"
+            basin=NHC_BASIN_PREFIXES[basin2],
+            lat=round(lat, 2), lon=round(lon, 2),
+            category=cls, intensity_kt=_pos_num(s.get("intensity")),
+            last_fix=(s.get("lastUpdate") or ""),
+            current_wind_kt=_pos_num(s.get("intensity")),
+            current_pressure_mb=_pos_num(s.get("pressure")),
+            nature=cls,
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # R2 client
 # ---------------------------------------------------------------------------
@@ -728,6 +801,7 @@ class Poller:
         self.storms: dict[str, Storm] = {}     # slug -> storm (combined active set)
         self.named: dict[str, Storm] = {}      # slug -> named storm (last-known-good)
         self.invests: dict[str, Storm] = {}    # slug -> invest (last-known-good)
+        self.current_named: dict[str, Storm] = {}  # slug -> NHC named (last-known-good)
         self._last_tracks_refresh = 0.0
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
@@ -778,10 +852,46 @@ class Poller:
                 log.info("invests: %d active (%s)", len(invests),
                          ", ".join(f"{s.name}/{s.slug}" for s in invests))
 
-        # --- Combine both sources into the active floater set. Named and invest
-        # slugs never collide (invests are 90-99). Both flow through the same
-        # unit / render / manifest machinery from here.
-        combined: dict[str, Storm] = {**self.named, **self.invests}
+        # --- NHC CurrentStorms.json: AUTHORITATIVE current-named list (AL/EP/CP),
+        # re-read each cycle. It surfaces a just-DESIGNATED system as its named
+        # TD/TS immediately and tells us which invests were promoted, so a retired
+        # invest is REPLACED by its named successor (never shown alongside it).
+        # WP/JTWC is untouched (NHC-only source); a fetch failure preserves the
+        # last-known-good set and never crashes the cycle.
+        current = fetch_current_named(self.session)
+        if current is None:
+            log.warning("CurrentStorms fetch failed -- preserving last-known-good (%d)",
+                        len(self.current_named))
+        else:
+            self.current_named = current
+            if current:
+                log.info("CurrentStorms: %d named NHC TC(s) (%s)", len(current),
+                         ", ".join(f"{s.name}/{s.slug}" for s in current.values()))
+
+        # Named = tracks-feed named, with CurrentStorms overriding/adding the
+        # authoritative NHC TCs (One-E shows the cycle it is designated, with its
+        # real TD/TS status rather than waiting on the derived feed).
+        named_combined: dict[str, Storm] = {**self.named, **self.current_named}
+
+        # Designated-invest handoff: drop any invest co-located with a named NHC
+        # storm in the same basin (NHC promoted that invest into the TC). Keep
+        # every invest that is STILL an invest (no co-located named storm) - and
+        # the global track map's invest display is unaffected (separate source).
+        live_invests: dict[str, Storm] = {}
+        for slug, inv in self.invests.items():
+            succ = next((s for s in self.current_named.values()
+                         if s.basin == inv.basin
+                         and _deg_dist(s.lat, s.lon, inv.lat, inv.lon) <= INVEST_DESIGNATION_DEG),
+                        None)
+            if succ is not None:
+                log.info("invest %s/%s designated -> %s/%s; dropping the invest floater",
+                         inv.name, inv.slug, succ.name, succ.slug)
+            else:
+                live_invests[slug] = inv
+
+        # --- Combine into the active floater set. Named (tracks + CurrentStorms)
+        # plus the still-invests. Named and invest slugs never collide (90-99).
+        combined: dict[str, Storm] = {**named_combined, **live_invests}
         self.storms = combined
         active = list(combined.values())
         active_slugs = set(combined)
