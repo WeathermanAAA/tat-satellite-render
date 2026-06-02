@@ -233,5 +233,45 @@ class TestEngineIsolation(unittest.TestCase):
         self.assertEqual(lc1, lc2)                        # last_change_utc honest (data did not change)
 
 
+class TestMirrorFallthrough(unittest.TestCase):
+    """HARDENING: a single bad mirror raising a RAW fetch error (SSLError /
+    connection / timeout - not a TransientFetchError) must fall through to the
+    NEXT mirror in the chain, never crash the basin fetch and discard storms
+    already collected this pass. This is the bug that lost EP01 tonight (the
+    WP-only natyphoon mirror SSL-failed inside the AL/EP chain)."""
+
+    def test_raw_mirror_error_falls_through_and_keeps_storm(self):
+        import intensity_poller as ip
+        import requests
+
+        cfg = {"atcf_patterns": ["https://bad.example/b{nn}{year}.dat",
+                                 "https://good.example/b{nn}{year}.dat"]}
+        calls = []
+
+        def fake_get_text(session, url, policy):
+            calls.append(url)
+            if "bad.example" in url:               # raw SSL error, NOT Transient
+                raise requests.exceptions.SSLError("TLSV1_UNRECOGNIZED_NAME")
+            tail = url.rsplit("/", 1)[-1]           # "b012026.dat"
+            return "BEST track storm 01" if tail.startswith("b01") else None
+
+        sentinel = pd.DataFrame([{"storm": "01"}])
+        orig_get_text, orig_parse = ip._get_text, ip.ac.parse_bdeck
+        ip._get_text = fake_get_text
+        ip.ac.parse_bdeck = lambda text, year, basin_cfg: sentinel
+        try:
+            out = ip.fetch_live_bdecks(session=None, basin_cfg=cfg, year=2026,
+                                       max_storm_num=4)
+        finally:
+            ip._get_text, ip.ac.parse_bdeck = orig_get_text, orig_parse
+
+        # Did NOT crash on the bad mirror; the good mirror's storm survived.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out.iloc[0]["storm"], "01")
+        # The bad mirror was tried, then fell through to the good one.
+        self.assertTrue(any("bad.example" in u for u in calls))
+        self.assertTrue(any("good.example" in u for u in calls))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
