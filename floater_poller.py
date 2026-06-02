@@ -85,6 +85,20 @@ R2_PREFIX = _env("R2_PREFIX", "floaters").strip("/")
 TRACKS_BASE = _env("TRACKS_BASE", "https://triple-a-tropics.com").rstrip("/")
 TRACKS_BASINS = ("wp", "al", "ep")
 
+# Invests (NHC ATCF best-track b-decks) -- an INDEPENDENT floater source.
+# Invests are pre-classification disturbances (numbered 90-99) that NHC tracks
+# in best-track b-decks before they are named. This source is wholly separate
+# from the {basin}_tracks_data.json feeds: it never reads, writes, or affects
+# ACE / tracks / climatology data, and an invest must never enter season counts.
+# We list the public btk directory and parse each invest b-deck's latest fix.
+# NHC basins only (AL/EP/CP); WP/JTWC invests would need the JTWC proxy chain
+# and are out of scope here.
+INVESTS_ENABLED = (_env("INVESTS_ENABLED", "1") or "1").lower() not in ("0", "false", "no")
+INVEST_BTK_BASE = _env("INVEST_BTK_BASE", "https://ftp.nhc.noaa.gov/atcf/btk").rstrip("/")
+INVEST_INDEX_URL = INVEST_BTK_BASE + "/"
+# basin two-letter -> ATCF designation suffix (90 + "E" -> "90E").
+INVEST_BASIN_LETTER = {"al": "L", "ep": "E", "cp": "C"}
+
 # Geometry + cadence
 BBOX_DEG = float(_env("BBOX_DEG", "12"))           # square floater width (deg)
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))   # hot-band target
@@ -366,6 +380,179 @@ def fetch_active_storms(session: requests.Session) -> dict[str, Optional[list[St
 
 
 # ---------------------------------------------------------------------------
+# Invest discovery (NHC ATCF b-decks) -- an INDEPENDENT source
+# ---------------------------------------------------------------------------
+# Invests are floater-only: nothing here reads or writes the tracks / ACE /
+# climatology data, and an invest never enters season counts. The flow mirrors
+# the named-storm path (list -> parse latest fix -> Storm); the invest Storms
+# are then merged into the floater manifest alongside named storms.
+
+def _fetch_text(session: requests.Session, url: str, label: str) -> Optional[str]:
+    """GET a text resource, surviving a slow/transient origin.
+
+    Same hardening as the tracks fetch (tuple connect/read timeout + 2s/4s/8s
+    exponential-backoff retries). Returns the body text, or ``None`` once every
+    attempt is exhausted. Never raises -- a bad fetch is a None, not a crash.
+    """
+    timeout = (TRACKS_CONNECT_TIMEOUT_S, TRACKS_READ_TIMEOUT_S)
+    total = TRACKS_MAX_RETRIES + 1
+    last_exc: Exception | None = None
+    for attempt in range(1, total + 1):
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:  # noqa: BLE001 - never crash on a bad fetch
+            last_exc = e
+            if attempt < total:
+                time.sleep(2 ** attempt)  # 2s, 4s, 8s
+    log.warning("%s fetch failed after %d attempts: %s", label, total, last_exc)
+    return None
+
+
+def _bdeck_latlon(tok: str) -> Optional[float]:
+    """ATCF tenths-of-degree + hemisphere -> signed degrees.
+    '94N' -> 9.4, '1257W' -> -125.7. Returns None on a malformed token."""
+    tok = (tok or "").strip()
+    if len(tok) < 2:
+        return None
+    hemi = tok[-1].upper()
+    try:
+        val = int(tok[:-1]) / 10.0
+    except ValueError:
+        return None
+    if hemi in ("S", "W"):
+        return -val
+    if hemi in ("N", "E"):
+        return val
+    return None
+
+
+def _bdeck_time(tok: str) -> Optional[dt.datetime]:
+    """ATCF YYYYMMDDHH (UTC) -> aware datetime. None on a malformed token."""
+    tok = (tok or "").strip()
+    if len(tok) < 10:
+        return None
+    try:
+        return dt.datetime.strptime(tok[:10], "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_invest_bdeck(text: str, basin2: str, num: str, year: str,
+                        cutoff: dt.datetime) -> Optional[Storm]:
+    """Parse one invest b-deck into a Storm from its LATEST best-track fix.
+
+    Returns None if there is no usable fix, or if the latest fix is older than
+    ``cutoff`` (a dissipated/named invest whose b-deck lingers in the directory).
+    The peak wind across all fixes is kept as ``intensity_kt`` (sort / legacy)
+    while the badge uses the latest fix's wind/pressure. Never raises.
+    """
+    best: list[str] | None = None
+    best_t: dt.datetime | None = None
+    peak_wind: float | None = None
+    for line in text.splitlines():
+        f = [c.strip() for c in line.split(",")]
+        if len(f) < 11:
+            continue
+        t = _bdeck_time(f[2])
+        if t is None:
+            continue
+        try:
+            w = float(f[8]) if f[8] else None
+        except ValueError:
+            w = None
+        if w is not None and w > 0:
+            peak_wind = w if peak_wind is None else max(peak_wind, w)
+        if best_t is None or t > best_t:
+            best, best_t = f, t
+    if best is None or best_t is None or best_t < cutoff:
+        return None
+    lat = _bdeck_latlon(best[6])
+    lon = _bdeck_latlon(best[7])
+    if lat is None or lon is None:
+        return None
+    try:
+        vmax = float(best[8]) if best[8] else None
+    except ValueError:
+        vmax = None
+    if vmax is not None and vmax <= 0:
+        vmax = None
+    try:
+        mslp = float(best[9]) if best[9] else None
+    except ValueError:
+        mslp = None
+    if mslp is not None and not (850 <= mslp <= 1050):
+        mslp = None  # 0 / out-of-range placeholder -> omit from the badge
+    status = (best[10] or "DB").strip().upper() or "DB"
+    letter = INVEST_BASIN_LETTER.get(basin2, basin2.upper()[:1])
+    designation = f"{num}{letter}"            # "90E"
+    return Storm(
+        sid=f"{basin2.upper()}{num}{year}",   # "EP902026" (stable id)
+        slug=f"{basin2}{num}",                # "ep90" (never collides with named 01-49)
+        name=f"INVEST {designation}",         # "INVEST 90E"
+        basin=basin2.upper(),                 # "EP"
+        lat=round(lat, 2),
+        lon=round(norm_lon(lon), 2),
+        # The frontend shows ``category`` as plain text and defaults a falsy
+        # value to "TD"; "INVEST" keeps it honest (pre-classification, no
+        # Saffir-Simpson category).
+        category="INVEST",
+        intensity_kt=peak_wind,
+        last_fix=iso_z(best_t),
+        current_wind_kt=vmax,
+        current_pressure_mb=mslp,
+        # Real ATCF status (DB/LO/WV/...): render.py maps these to a neutral GRAY
+        # badge with no Saffir-Simpson category -- exactly the invest treatment.
+        nature=status,
+    )
+
+
+def fetch_active_invests(session: requests.Session) -> Optional[list[Storm]]:
+    """Active NHC invests (90-99) parsed from the ATCF best-track b-decks.
+
+    Lists the public btk directory, then fetches + parses each invest b-deck,
+    keeping those whose latest fix is within ACTIVE_WINDOW_HOURS. Returns:
+      * ``None`` only if the directory listing itself fails after all retries
+        (the caller then preserves the last-known-good invests);
+      * an empty list if invests are disabled, or the listing succeeded but no
+        invest is currently active;
+      * a list of invest Storms otherwise.
+    A single invest's fetch/parse failure is swallowed (that invest is skipped)
+    so one bad b-deck never sinks the rest. NEVER raises.
+    """
+    if not INVESTS_ENABLED:
+        return []
+    index = _fetch_text(session, INVEST_INDEX_URL, "invest-index")
+    if index is None:
+        return None
+    # Directory hrefs look like ``bep902026.dat`` -> (basin2, num, year). Each
+    # filename appears twice (href + link text); dedup keeps one per invest.
+    seen: set[tuple[str, str, str]] = set()
+    ids: list[tuple[str, str, str]] = []
+    for basin2, num, year in re.findall(r"b(al|ep|cp)(9\d)(20\d{2})\.dat", index, flags=re.I):
+        k = (basin2.lower(), num, year)
+        if k not in seen:
+            seen.add(k)
+            ids.append(k)
+    cutoff = utcnow() - dt.timedelta(hours=ACTIVE_WINDOW_HOURS)
+    out: list[Storm] = []
+    for basin2, num, year in ids:
+        url = f"{INVEST_BTK_BASE}/b{basin2}{num}{year}.dat"
+        text = _fetch_text(session, url, f"invest-{basin2}{num}")
+        if text is None:
+            continue
+        try:
+            s = _parse_invest_bdeck(text, basin2, num, year, cutoff)
+        except Exception as e:  # noqa: BLE001 - one bad deck never sinks the source
+            log.warning("invest parse failed for b%s%s%s: %s", basin2, num, year, e)
+            continue
+        if s is not None:
+            out.append(s)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # R2 client
 # ---------------------------------------------------------------------------
 
@@ -538,7 +725,9 @@ class Poller:
         self.session.headers["User-Agent"] = "tat-floater-poller/1.0"
         self.limiter = RateLimiter(RATE_MIN_SPACING_S)
         self.units: dict[tuple[str, str], Unit] = {}
-        self.storms: dict[str, Storm] = {}     # slug -> storm
+        self.storms: dict[str, Storm] = {}     # slug -> storm (combined active set)
+        self.named: dict[str, Storm] = {}      # slug -> named storm (last-known-good)
+        self.invests: dict[str, Storm] = {}    # slug -> invest (last-known-good)
         self._last_tracks_refresh = 0.0
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
@@ -546,39 +735,56 @@ class Poller:
     # ---- storm-set management ------------------------------------------
 
     def refresh_storms(self) -> None:
+        # --- Named storms: per-basin tracks feeds, last-known-good on failure.
+        # A refreshed basin replaces its storms outright; a failed basin keeps
+        # the storms it had last cycle (matched on the uppercase Storm.basin).
         per_basin = fetch_active_storms(self.session)
         succeeded = [b for b, v in per_basin.items() if v is not None]
         failed = [b for b, v in per_basin.items() if v is None]
-        # Only when EVERY basin failed do we preserve wholesale and skip the
-        # cycle -- the top manifest (generated_utc + intensity) keeps its
-        # last-known-good so the widget stays visible, and no unit churns.
-        if not succeeded:
+        if succeeded:
+            failed_upper = {b.upper() for b in failed}
+            named: dict[str, Storm] = {
+                slug: s for slug, s in self.named.items() if s.basin in failed_upper
+            }
+            for basin in succeeded:
+                for s in per_basin[basin] or []:
+                    named[s.slug] = s
+            self.named = named
+            if failed:
+                log.warning("tracks: refreshed %s; preserved last-known-good for %s",
+                            ",".join(succeeded), ",".join(failed))
+            else:
+                log.info("tracks: refreshed all basins (%s)", ",".join(succeeded))
+        else:
+            # Every basin failed -> keep the named set we already have. Invests
+            # below are an independent source and still refresh; the combined
+            # manifest is rewritten so generated_utc advances and the widget
+            # stays visible.
             log.warning(
                 "tracks fetch failed for ALL basins (%s) -- preserving last-known-good "
-                "manifest (no storm set / unit changes this cycle)",
-                ",".join(failed),
+                "named storms", ",".join(failed),
             )
-            return
-        if failed:
-            log.warning("tracks: refreshed %s; preserved last-known-good for %s",
-                        ",".join(succeeded), ",".join(failed))
+
+        # --- Invests: independent NHC b-deck source, isolated from the named
+        # feeds. A failed invest fetch preserves the last-known-good invests and
+        # never touches the named storms (and vice versa) -- per-source guarding.
+        invests = fetch_active_invests(self.session)
+        if invests is None:
+            log.warning("invests: fetch failed -- preserving last-known-good (%d)",
+                        len(self.invests))
         else:
-            log.info("tracks: refreshed all basins (%s)", ",".join(succeeded))
-        # Per-basin merge: a refreshed basin replaces its storms outright;
-        # a failed basin keeps the storms it had last cycle (matched by the
-        # uppercase Storm.basin). At least one basin succeeded, so the top
-        # manifest IS rewritten below -- generated_utc advances every cycle
-        # and the surviving basins' intensities update immediately.
-        failed_upper = {b.upper() for b in failed}
-        new_storms: dict[str, Storm] = {
-            slug: s for slug, s in self.storms.items() if s.basin in failed_upper
-        }
-        for basin in succeeded:
-            for s in per_basin[basin] or []:
-                new_storms[s.slug] = s
-        self.storms = new_storms
-        active = list(new_storms.values())
-        active_slugs = set(new_storms)
+            self.invests = {s.slug: s for s in invests}
+            if invests:
+                log.info("invests: %d active (%s)", len(invests),
+                         ", ".join(f"{s.name}/{s.slug}" for s in invests))
+
+        # --- Combine both sources into the active floater set. Named and invest
+        # slugs never collide (invests are 90-99). Both flow through the same
+        # unit / render / manifest machinery from here.
+        combined: dict[str, Storm] = {**self.named, **self.invests}
+        self.storms = combined
+        active = list(combined.values())
+        active_slugs = set(combined)
         # New / updated storms -> ensure a Unit per band; refresh metadata.
         for s in active:
             for band in BANDS:
