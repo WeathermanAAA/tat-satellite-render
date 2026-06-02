@@ -2,15 +2,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.4
 slowapi==0.1.9
-# Bumped 2024.11.0 -> 2026.4.0 on the HAFS-worker branch: the HAFS GRIB
-# time-decode path asserts `timedelta64[ns]` in xarray's coding/times.py, which
-# FAILS on pandas 3.x (non-ns resolution) under the old xarray; 2026.4.0 handles
-# it (the codespace-proven combo: xarray 2026.4.0 + herbie 2026.3.0 + pandas
-# 3.0, render parity 12/12). The old pin also backtracked herbie to 2024.8.0.
-# NOTE for Stage-3 cutover/merge: confirm the satellite GOES/Himawari reads still
-# work on xarray 2026.4.0 before this reaches main (or split the HAFS worker's
-# build), since main currently pins 2024.11.0 for the satellite service.
-xarray==2026.4.0
+xarray==2024.11.0
 netCDF4==1.7.2
 h5netcdf==1.4.1
 h5py==3.12.1
@@ -49,17 +41,3 @@ requests>=2.31
 # intentional ace_core bump (a new tag). Pulls pandas + numpy.
 ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.1.0#subdirectory=ace_core
 pandas>=2.0
-
-# HAFS render worker (hafs_render_poller.py, the 4th Railway service): the HAFS
-# render pipeline pinned as a git dependency so the worker runs the SAME code
-# update-hafs.yml runs (the ace-core pattern). It PINS matplotlib==3.9.3 +
-# numpy==2.1.3 (matching the pins above, so cron and worker rasterize
-# identically) and pulls the GRIB stack the satellite service lacks: herbie-data
-# + cfgrib + eccodes (the eccodes wheel bundles the binary, no apt). Tag-pinned
-# like ace-core so render output cannot shift without an intentional bump.
-# NOTE: the main-repo tag hafs-render-v0.1.0 (branch hafs-render-package) must be
-# pushed before THIS service deploys; until then point it at a branch ref.
-# herbie-data pinned to the codespace-proven version. The old xarray pin forced
-# pip to backtrack herbie to 2024.8.0; with xarray 2026.4.0 this stays current.
-herbie-data==2026.3.0
-hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.1.0#subdirectory=hafs_render

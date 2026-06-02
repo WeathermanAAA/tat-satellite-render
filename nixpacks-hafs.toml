@@ -1,0 +1,22 @@
+# nixpacks build for the HAFS render worker service ONLY (the 4th Railway
+# service). Selected by railway.hafs.json's build.nixpacksConfigPath, so it is
+# used ONLY by the HAFS service - the web / floater / intensity services keep
+# using the default nixpacks.toml + requirements.txt (xarray 2024.11.0). This is
+# the B-lite build split: the HAFS worker gets xarray 2026.4.0 + the GRIB stack
+# without changing the satellite build, so merging the worker to main is safe.
+#
+# cfgrib/eccodes/netCDF4 wheels bundle their native libs on manylinux, so a clean
+# pip install is enough; gcc/pkg-config are a safety net for any sdist.
+
+[phases.setup]
+nixPkgs = ["python311", "gcc", "pkg-config"]
+
+[phases.install]
+cmds = [
+  "python -m venv /opt/venv",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir --upgrade pip",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir -r requirements-hafs.txt",
+]
+
+[start]
+cmd = ". /opt/venv/bin/activate && python hafs_render_poller.py"
