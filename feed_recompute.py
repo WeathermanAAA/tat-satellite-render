@@ -17,7 +17,7 @@ compute_header_stats (tracks). Nothing is reimplemented here.
 The poller owns ONLY the fresh slice. The historical archive (curves, climo,
 past storms, ranking backbone) comes straight from the base; this never rebuilds
 it, never touches climo or /historical, and never alters ACE methodology
-(ace_core is pinned at ace-core-v0.1.0).
+(ace_core is pinned at ace-core-v0.2.0).
 """
 from __future__ import annotations
 
@@ -141,6 +141,55 @@ def recompute_ace_feed(ace_base: dict, live: Optional[pd.DataFrame],
         season_ace_current=season_ace_current,
         latest_fix_dt=latest_fix_dt,
         build_now=build_now)
+
+
+# The cron's global composition order (generate_tracks_plot.py BASINS["global"]
+# compose_from_basins). Feature order in the geojson follows storm order, which
+# follows this - keep aligned so poller output is byte-comparable to the cron's.
+GLOBAL_COMPOSE_ORDER = ("al", "ep", "wp")
+
+
+def build_global_geojson_feed(storms_by_basin: dict[str, list],
+                              build_now: Optional[dt.datetime] = None,
+                              compose_order=GLOBAL_COMPOSE_ORDER) -> dict:
+    """Per-basin storms (each list = a tracks feed's ``storms``) -> the global
+    FeatureCollection for /global_tracks.html, via the SHARED
+    ace_core.build_global_geojson - the identical assembly the cron's
+    ``--basin global`` mode runs, composed in the identical basin order with
+    ``basin`` stamped per storm (generate_tracks_plot.py:3022-3026). Pure: no
+    network, no I/O, inputs never mutated (storms are shallow-copied for the
+    basin stamp).
+
+    On top of the cron's bare FeatureCollection this adds the poller's
+    freshness stamps (``generated_utc`` / ``updated`` / ``latest_fix_valid_utc``
+    / ``staleness_minutes`` - the same fields the feeds carry) as top-level
+    foreign members, so the live "As of" can read the map's true freshness at
+    runtime. RFC 7946 permits foreign members; MapLibre only reads
+    ``features``. Invests ride along exactly as in the per-basin feeds:
+    DISPLAYED on the map (invest markers), never in ACE/counts (they were
+    excluded upstream by the ACE recompute)."""
+    build_now = build_now or pf.utcnow().replace(tzinfo=None)
+    storms: list[dict] = []
+    for sub in compose_order:
+        for s in storms_by_basin.get(sub) or []:
+            storms.append({**s, "basin": sub})   # copy-on-write basin stamp
+    fc = ac.build_global_geojson(storms)
+    # Freshest fix across all composed basins (per-storm field carries through
+    # from each sub-feed; ISO-Z strings compare lexicographically) - the same
+    # reduction the cron's global mode applies to its payload.
+    fix_times = [s.get("latest_fix_valid_utc") for s in storms
+                 if s.get("latest_fix_valid_utc")]
+    latest_fix_z = max(fix_times) if fix_times else None
+    return {
+        "type": fc["type"],
+        "generated_utc": ac.now_iso_z(build_now),
+        "updated": build_now.strftime("%Y-%m-%d %H:%M UTC"),
+        "latest_fix_valid_utc": latest_fix_z,
+        "staleness_minutes": ac.staleness_minutes(_parse_naive(latest_fix_z),
+                                                  build_now)
+        if latest_fix_z else None,
+        "features": fc["features"],
+    }
 
 
 def recompute_tracks_feed(tracks_base: dict, live: Optional[pd.DataFrame],

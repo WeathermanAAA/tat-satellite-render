@@ -25,7 +25,7 @@ the main-repo WRITE_LIVE_FEEDS flag and stays reversible.
 Anti-freeze (inherited from poller_framework): per-source isolation (one basin's
 b-deck fetch failing never freezes or stales the others; each keeps its own
 last-known-good), resilient_fetch (timeout + backoff retries), always-on health
-heartbeat. ace_core is pinned at ace-core-v0.1.0 - this never alters ACE
+heartbeat. ace_core is pinned at ace-core-v0.2.0 - this never alters ACE
 methodology, never rebuilds the archive, never touches climo or /historical.
 """
 from __future__ import annotations
@@ -74,6 +74,18 @@ INVESTS_ENABLED = (_env("POLLER_INVESTS", "1") or "1").lower() not in ("0", "fal
 CURRENT_STORMS_URL = _env("CURRENT_STORMS_URL",
                           "https://www.nhc.noaa.gov/CurrentStorms.json")
 LIVE_NAMES_ENABLED = (_env("POLLER_LIVE_NAMES", "1") or "1").lower() not in ("0", "false", "no")
+# Phase 3 (poller-primary storm-display): the poller assembles the SAME global
+# FeatureCollection the cron's --basin global mode builds (the shared
+# ace_core.build_global_geojson, pinned >= ace-core-v0.2.0) and writes it to
+# GLOBAL_GEOJSON_KEY after each basin's recompute - once EVERY configured basin
+# has reported since startup (cold-start guard: never publish a partial map).
+# SHADOW-FIRST cutover, mirroring the HAFS_R2_PREFIX pattern: the DEFAULT key
+# is the shadow one, so deploying this changes NOTHING live - the cron still
+# owns global_storms.geojson. Promote = set GLOBAL_GEOJSON_KEY=
+# global_storms.geojson (reversible; rollback = set back / unset). "off"
+# disables the writer entirely.
+GLOBAL_GEOJSON_KEY = (_env("GLOBAL_GEOJSON_KEY",
+                           "shadow/global_storms.geojson") or "").strip()
 # Same placeholder set the invest path guards with (and ace_core's
 # _PLACEHOLDER_NAMES, which is private to the pinned package).
 _NAME_PLACEHOLDERS = {"", "INVEST", "NAMELESS", "UNNAMED"}
@@ -355,6 +367,57 @@ def _combine(named: pd.DataFrame, invests: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+class GlobalGeojsonComposer:
+    """Holds each basin's latest tracks-feed storms and re-emits the composed
+    global geojson (feed_recompute.build_global_geojson_feed -> the shared
+    ace_core assembly) after every basin update - but only once ALL configured
+    basins have reported at least once since startup, so a cold start never
+    publishes a partial map. Per-source isolation: a basin that later fails
+    keeps its last-known-good storms on the map (matching the engine's
+    last-known-good feed semantics). Best-effort by construction: a geojson
+    compose/write failure is logged and NEVER fails the basin's feed publish -
+    the display layer must not flag a healthy data source unhealthy."""
+
+    def __init__(self, sink: pf.Sink, key: str, basins,
+                 clock: Callable[[], dt.datetime] = pf.utcnow):
+        self.sink = sink
+        self.key = (key or "").strip()
+        self.basins = tuple(basins)
+        self.clock = clock
+        self._storms: dict[str, list] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.key) and self.key.lower() != "off"
+
+    def update(self, basin: str, tracks_feed: dict,
+               now: Optional[dt.datetime] = None) -> bool:
+        """Record ``basin``'s latest storms; compose + write when every
+        configured basin has reported. Returns True iff written."""
+        # EVERYTHING inside the guard: no code path out of update() may raise,
+        # or the engine's process-level catch would flip a healthy basin's
+        # HEALTH over a display-layer blip. (The geojson is re-composed and
+        # re-written on each basin's update - up to 3 small PUTs per cycle.
+        # Each write is internally consistent (last-known-good per basin);
+        # writing only on the final basin would instead couple the map's
+        # freshness to that one basin's health, so the redundancy is the
+        # deliberate trade.)
+        try:
+            if not self.enabled:
+                return False
+            self._storms[basin] = list(tracks_feed.get("storms") or [])
+            if not all(b in self._storms for b in self.basins):
+                return False                   # cold start: partial coverage
+            now = now or self.clock()
+            payload = fr.build_global_geojson_feed(
+                self._storms, build_now=now.replace(tzinfo=None))
+            self.sink.write(self.key, payload)
+            return True
+        except Exception as e:  # noqa: BLE001 - display-layer best effort
+            log.warning("global geojson write failed (%s): %s", self.key, e)
+            return False
+
+
 # ---------------------------------------------------------------------------
 # Per-basin Source (fetch base+live -> change-gate on newest fix -> recompute)
 # ---------------------------------------------------------------------------
@@ -371,6 +434,7 @@ def make_basin_source(basin: str, session: requests.Session,
                       invest_fetcher: Optional[Callable[[dict, int], pd.DataFrame]] = None,
                       base_reader: Optional[Callable[[str, str], dict]] = None,
                       names_fetcher: Optional[Callable[[dict, int], dict]] = None,
+                      geojson: Optional[GlobalGeojsonComposer] = None,
                       clock: Callable[[], dt.datetime] = pf.utcnow) -> pf.Source:
     """Build the Source for one basin. ``live_fetcher`` / ``invest_fetcher`` /
     ``base_reader`` / ``names_fetcher`` are injectable for offline tests; the
@@ -433,6 +497,12 @@ def make_basin_source(basin: str, session: requests.Session,
                                                build_now=now_naive)
         ctx.sink.write(f"feeds/{basin}_ace_data.json", ace_feed)
         ctx.sink.write(f"feeds/{basin}_tracks_data.json", tracks_feed)
+        # Phase 3: feed the global-map composer AFTER the basin feeds are
+        # safely written. Best-effort inside (a geojson blip never fails or
+        # stales this basin's source); gated by GLOBAL_GEOJSON_KEY (default
+        # shadow - the cron still owns the live geojson until promotion).
+        if geojson is not None:
+            geojson.update(basin, tracks_feed, now=ctx.now)
 
     # restamp=True: re-emit the feeds EVERY cycle so generated_utc ticks on the
     # poll cadence (the "poller alive / last checked" stamp) and staleness_minutes
@@ -448,9 +518,14 @@ def build_engine(sink: pf.Sink, *, basins=BASINS,
                  interval_s: float = 60.0,
                  clock: Callable[[], dt.datetime] = pf.utcnow,
                  sleep: Callable[[float], None] = time.sleep,
+                 geojson_key: Optional[str] = None,
                  **source_kwargs) -> pf.PollerEngine:
     session = session or requests.Session()
-    sources = [make_basin_source(b, session, sink, clock=clock, **source_kwargs)
+    composer = GlobalGeojsonComposer(
+        sink, GLOBAL_GEOJSON_KEY if geojson_key is None else geojson_key,
+        basins, clock=clock)
+    sources = [make_basin_source(b, session, sink, clock=clock,
+                                 geojson=composer, **source_kwargs)
                for b in basins]
     return pf.PollerEngine(
         sources, name="intensity-poller", interval_s=interval_s,
@@ -498,9 +573,9 @@ def main() -> None:   # pragma: no cover - Railway worker entrypoint
     interval = float(_env("POLL_INTERVAL_S", "120"))
     eng = build_engine(sink, interval_s=interval)
     log.info("intensity poller starting | base=%s | basins=%s | interval=%gs | "
-             "invests=%s | live_names=%s",
+             "invests=%s | live_names=%s | geojson_key=%s",
              BASE_URL, ",".join(BASINS), interval, INVESTS_ENABLED,
-             LIVE_NAMES_ENABLED)
+             LIVE_NAMES_ENABLED, GLOBAL_GEOJSON_KEY or "off")
     eng.run_forever()
 
 
