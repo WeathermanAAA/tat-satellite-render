@@ -448,6 +448,151 @@ class TestLiveNames(unittest.TestCase):
         self.assertEqual(lc1, eng.health("ep").last_change_utc)  # honest signal
 
 
+class TestGlobalGeojson(unittest.TestCase):
+    """Phase 3 (poller-primary storm-display): the poller composes the global
+    FeatureCollection via the SHARED ace_core.build_global_geojson, shadow-key
+    gated. Composition must mirror the cron's --basin global mode exactly
+    (al,ep,wp order + basin stamp); ACE feeds must be untouched."""
+
+    @staticmethod
+    def _storm(name, basin_pts_lon, active=True, invest=False, n=3):
+        return {"sid": f"S{name}", "name": name, "atcf_id": f"X{name[:2]}",
+                "peak_wind_kt": 60.0, "is_active": active, "is_invest": invest,
+                "max_category": "TS", "current_category": "TS",
+                "latest_fix_valid_utc": "2026-04-11T00:00:00Z",
+                "points": [{"lon": basin_pts_lon + i, "lat": 10.0 + i,
+                            "wind_kt": 40.0 + i, "pressure_mb": 1000.0,
+                            "cls": "TS", "nature": "TS",
+                            "t": f"2026-04-10T{6*i:02d}:00:00Z"}
+                           for i in range(n)]}
+
+    def test_composer_mirrors_cron_composition_exactly(self):
+        # Same storms through (a) the pure composer and (b) a hand-rolled
+        # replica of the cron's global-mode loop -> identical features bytes.
+        by_basin = {"al": [self._storm("ALPHA", -60.0)],
+                    "ep": [self._storm("AMANDA", -120.0),
+                           self._storm("90E", -110.0, invest=True)],
+                    "wp": [self._storm("JANGMI", 140.0)]}
+        feed = fr.build_global_geojson_feed(
+            by_basin, build_now=dt.datetime(2026, 4, 11, 1, 0, 0))
+        # cron replica (generate_tracks_plot.py:3010-3026 + :3065)
+        storms = []
+        for sub in ("al", "ep", "wp"):
+            for s in by_basin[sub]:
+                storms.append({**s, "basin": sub})
+        cron_fc = ip.ac.build_global_geojson(storms)
+        self.assertEqual(json.dumps(feed["features"], separators=(",", ":")),
+                         json.dumps(cron_fc["features"], separators=(",", ":")))
+        # Freshness stamps present + correct shape
+        self.assertEqual(feed["type"], "FeatureCollection")
+        self.assertEqual(feed["generated_utc"], "2026-04-11T01:00:00Z")
+        self.assertEqual(feed["latest_fix_valid_utc"], "2026-04-11T00:00:00Z")
+        self.assertEqual(feed["staleness_minutes"], 60)
+        # Invest is on the map; inputs not mutated by the basin stamp
+        kinds = {(f["properties"]["kind"], f["properties"].get("marker_type"))
+                 for f in feed["features"]}
+        self.assertIn(("active_marker", "L"), kinds)        # active invest
+        self.assertNotIn("basin", by_basin["ep"][0])
+
+    def test_engine_writes_shadow_geojson_after_all_basins(self):
+        sink = pf.DictSink()
+        T = dt.datetime(2026, 4, 11, 0, 0, 0, tzinfo=dt.timezone.utc)
+        named = pd.DataFrame([{**_fix("ONE", 100, 6 * i, 45.0,
+                                      sid="NHC_EP012026"), "storm_num": 1}
+                              for i in range(3)])
+        base_reader = lambda b, k: (_synthetic_ace_base(b) if k == "ace"
+                                    else _synthetic_tracks_base(b))
+
+        def make(geojson_key, fail_basin=None):
+            def lf(cfg, y):
+                if cfg["short"] == fail_basin:
+                    raise pf.TransientFetchError("down")
+                return named
+            return ip.build_engine(
+                sink, basins=("wp", "al", "ep"), session=None,
+                base_reader=base_reader, live_fetcher=lf,
+                invest_fetcher=lambda cfg, y: pd.DataFrame(),
+                names_fetcher=lambda cfg, y: {},
+                geojson_key=geojson_key, clock=lambda: T, sleep=lambda _: None)
+
+        # All basins healthy -> shadow geojson written, feeds untouched by it
+        eng = make("shadow/global_storms.geojson")
+        eng.poll_once()
+        self.assertIn("shadow/global_storms.geojson", sink.store)
+        geo = sink.store["shadow/global_storms.geojson"]
+        self.assertEqual(geo["type"], "FeatureCollection")
+        self.assertTrue(any(f["properties"]["kind"] == "track"
+                            for f in geo["features"]))
+        self.assertIn("generated_utc", geo)
+        # ACE feed identical to a no-geojson engine run (display-only proof)
+        ace_with = json.dumps(sink.store["feeds/wp_ace_data.json"], sort_keys=True)
+        sink2 = pf.DictSink()
+        eng_off = ip.build_engine(
+            sink2, basins=("wp", "al", "ep"), session=None,
+            base_reader=base_reader, live_fetcher=lambda cfg, y: named,
+            invest_fetcher=lambda cfg, y: pd.DataFrame(),
+            names_fetcher=lambda cfg, y: {},
+            geojson_key="off", clock=lambda: T, sleep=lambda _: None)
+        eng_off.poll_once()
+        self.assertNotIn("shadow/global_storms.geojson", sink2.store)  # off = off
+        self.assertEqual(ace_with,
+                         json.dumps(sink2.store["feeds/wp_ace_data.json"],
+                                    sort_keys=True))
+
+    def test_cold_start_guard_no_partial_map(self):
+        # One basin failing on the first cycle -> NO geojson (partial map never
+        # published); once it recovers -> geojson appears with all basins.
+        sink = pf.DictSink()
+        T = dt.datetime(2026, 4, 11, 0, 0, 0, tzinfo=dt.timezone.utc)
+        state = {"fail": "wp"}
+        named = pd.DataFrame([{**_fix("ONE", 100, 0, 45.0, sid="NHC_EP012026"),
+                               "storm_num": 1}])
+
+        def lf(cfg, y):
+            if cfg["short"] == state["fail"]:
+                raise pf.TransientFetchError("down")
+            return named
+        eng = ip.build_engine(
+            sink, basins=("wp", "al", "ep"), session=None,
+            base_reader=lambda b, k: (_synthetic_ace_base(b) if k == "ace"
+                                      else _synthetic_tracks_base(b)),
+            live_fetcher=lf, invest_fetcher=lambda cfg, y: pd.DataFrame(),
+            names_fetcher=lambda cfg, y: {},
+            geojson_key="shadow/global_storms.geojson",
+            clock=lambda: T, sleep=lambda _: None)
+        eng.poll_once()
+        self.assertNotIn("shadow/global_storms.geojson", sink.store)
+        state["fail"] = None                       # basin recovers
+        eng.poll_once()
+        self.assertIn("shadow/global_storms.geojson", sink.store)
+
+    def test_geojson_write_failure_never_fails_the_basin(self):
+        # A sink that rejects ONLY the geojson key: feeds still publish, the
+        # source still reports ok (display layer is best-effort).
+        class PickySink(pf.DictSink):
+            def write(self, key, payload):
+                if key.endswith("global_storms.geojson"):
+                    raise RuntimeError("geojson blip")
+                super().write(key, payload)
+        sink = PickySink()
+        T = dt.datetime(2026, 4, 11, 0, 0, 0, tzinfo=dt.timezone.utc)
+        named = pd.DataFrame([{**_fix("ONE", 100, 0, 45.0, sid="NHC_EP012026"),
+                               "storm_num": 1}])
+        eng = ip.build_engine(
+            sink, basins=("ep",), session=None,
+            base_reader=lambda b, k: (_synthetic_ace_base(b) if k == "ace"
+                                      else _synthetic_tracks_base(b)),
+            live_fetcher=lambda cfg, y: named,
+            invest_fetcher=lambda cfg, y: pd.DataFrame(),
+            names_fetcher=lambda cfg, y: {},
+            geojson_key="shadow/global_storms.geojson",
+            clock=lambda: T, sleep=lambda _: None)
+        res = eng.poll_once()
+        self.assertTrue(res["ep"].ok)
+        self.assertIn("feeds/ep_tracks_data.json", sink.store)
+        self.assertNotIn("shadow/global_storms.geojson", sink.store)
+
+
 class TestMirrorFallthrough(unittest.TestCase):
     """HARDENING: a single bad mirror raising a RAW fetch error (SSLError /
     connection / timeout - not a TransientFetchError) must fall through to the
