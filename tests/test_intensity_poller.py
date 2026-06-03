@@ -233,6 +233,221 @@ class TestEngineIsolation(unittest.TestCase):
         self.assertEqual(lc1, lc2)                        # last_change_utc honest (data did not change)
 
 
+class TestLiveNames(unittest.TestCase):
+    """Phase 2 (storm-display): per-poll authoritative-name override from NHC
+    CurrentStorms.json. Display-only: ACE totals are byte-identical with and
+    without the override, and the ib-vs-live merge contest survives a rename."""
+
+    @staticmethod
+    def _named_one(n_fixes=6, wind=45.0):
+        """A live b-deck frame for storm 01 named 'ONE' (parse_bdeck schema)."""
+        rows = []
+        for i in range(n_fixes):
+            r = _fix("ONE", 100, 6 * i, wind, sid="NHC_EP012026")
+            r["storm_num"], r["source"] = 1, "live-atcf"
+            rows.append(r)
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _current_storms(name="Amanda", sid="ep012026"):
+        return {"activeStorms": [{"id": sid, "binNumber": "EP1", "name": name,
+                                  "classification": "TS", "intensity": "35"}]}
+
+    def _ep_cfg(self):
+        return {"short": "ep", "agency_name": "NHC", "invest_letter": "E",
+                "atcf_patterns": []}
+
+    # --- parser -----------------------------------------------------------
+    def test_parser_filters_basin_year_range_and_placeholders(self):
+        cfg = self._ep_cfg()
+        data = {"activeStorms": [
+            {"id": "ep012026", "name": "Amanda"},        # match -> {1: AMANDA}
+            {"id": "al022026", "name": "Barry"},         # other basin
+            {"id": "ep902026", "name": "Ninety"},        # invest-range num
+            {"id": "ep012025", "name": "Stale"},         # wrong year
+            {"id": "ep032026", "name": "  "},            # placeholder/blank
+            {"id": "epxx2026", "name": "Bad"},           # malformed id
+            "not-a-dict",
+        ]}
+        self.assertEqual(ip.parse_current_storm_names(data, cfg, YEAR),
+                         {1: "AMANDA"})
+        self.assertEqual(ip.parse_current_storm_names(None, cfg, YEAR), {})
+        self.assertEqual(ip.parse_current_storm_names({}, {"short": ""}, YEAR), {})
+
+    # --- apply: rename is display-only ------------------------------------
+    def test_rename_reaches_tracks_feed_and_ace_total_unchanged(self):
+        ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")
+        named = self._named_one()
+        bn = dt.datetime(2026, 4, 11, 0, 0, 0)
+
+        a0 = fr.recompute_ace_feed(ab, named, build_now=bn)
+        t0 = fr.recompute_tracks_feed(tb, named, build_now=bn)
+
+        named1, ab1, tb1 = ip.apply_live_names(named, {1: "AMANDA"}, ab, tb)
+        a1 = fr.recompute_ace_feed(ab1, named1, build_now=bn)
+        t1 = fr.recompute_tracks_feed(tb1, named1, build_now=bn)
+
+        # ACE math identical (headline + per-storm values).
+        self.assertEqual(a0["current"]["latest_value"], a1["current"]["latest_value"])
+        self.assertEqual(
+            sorted(round(s["ace_total"], 3) for s in a0["storms_by_year"][str(YEAR)]),
+            sorted(round(s["ace_total"], 3) for s in a1["storms_by_year"][str(YEAR)]))
+        # The display name flipped ONE -> AMANDA in BOTH feeds.
+        self.assertIn("AMANDA", {s["name"] for s in a1["storms_by_year"][str(YEAR)]})
+        self.assertNotIn("ONE", {s["name"] for s in a1["storms_by_year"][str(YEAR)]})
+        names1 = {s["name"] for s in t1["storms"]}
+        self.assertIn("AMANDA", names1)
+        self.assertNotIn("ONE", names1)
+        self.assertEqual(len(t0["storms"]), len(t1["storms"]))  # no card gained/lost
+        # Inputs were not mutated (copy-on-write).
+        self.assertEqual(named.iloc[0]["NAME"], "ONE")
+        self.assertEqual(t0["storms"] and tb["current_year_ibtracs"][0]["NAME"], "TESTER")
+
+    def test_rename_keeps_ib_vs_live_contest_no_double_count(self):
+        # The ONE hazard: the base already carries the storm under the OLD name
+        # (different SID). Renaming only the live side would un-contest the pair
+        # -> duplicate card + double-counted ACE. apply_live_names renames the
+        # base records in step, so the contest (and ACE) is identical.
+        ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")
+        ib_rows = [{**_fix("ONE", 100, 6 * i, 40.0, sid="2026152N10250")}
+                   for i in range(4)]                       # 4 obs: live (6) wins
+        ab = {**ab, "current_year_canon":
+              ab["current_year_canon"] + [{**r, "time": ip.ac.iso_z(r["time"])}
+                                          for r in ib_rows]}
+        tb = {**tb, "current_year_ibtracs":
+              tb["current_year_ibtracs"] + [{**r, "time": ip.ac.iso_z(r["time"])}
+                                            for r in ib_rows]}
+        named = self._named_one()
+        bn = dt.datetime(2026, 4, 11, 0, 0, 0)
+
+        a0 = fr.recompute_ace_feed(ab, named, build_now=bn)        # baseline: ONE everywhere
+        t0 = fr.recompute_tracks_feed(tb, named, build_now=bn)
+
+        named1, ab1, tb1 = ip.apply_live_names(named, {1: "AMANDA"}, ab, tb)
+        a1 = fr.recompute_ace_feed(ab1, named1, build_now=bn)
+        t1 = fr.recompute_tracks_feed(tb1, named1, build_now=bn)
+
+        self.assertEqual(a0["current"]["latest_value"], a1["current"]["latest_value"])
+        self.assertEqual(len(a0["storms_by_year"][str(YEAR)]),
+                         len(a1["storms_by_year"][str(YEAR)]))     # no extra ACE storm
+        self.assertEqual(len(t0["storms"]), len(t1["storms"]))     # no duplicate card
+        names1 = {s["name"] for s in t1["storms"]}
+        self.assertIn("AMANDA", names1)
+        self.assertNotIn("ONE", names1)                            # base rows renamed too
+
+    def test_noop_cases(self):
+        ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")
+        named = self._named_one()
+        # Same name -> no-op; unknown storm_num -> no-op; empty map -> no-op.
+        for live_names in ({1: "ONE"}, {7: "GHOST"}, {}):
+            n1, ab1, tb1 = ip.apply_live_names(named, live_names, ab, tb)
+            self.assertEqual(list(n1["NAME"].unique()), ["ONE"])
+            self.assertIs(ab1, ab)
+            self.assertIs(tb1, tb)
+        empty = pd.DataFrame()
+        n1, ab1, tb1 = ip.apply_live_names(empty, {1: "AMANDA"}, ab, tb)
+        self.assertTrue(n1.empty)
+
+    def test_parser_malformed_but_valid_json_shapes(self):
+        # Well-formed JSON of the WRONG shape must degrade to {} (review
+        # finding: these used to raise through the fetch and fail the basin).
+        cfg = self._ep_cfg()
+        for data in ({"activeStorms": True},            # truthy non-list
+                     {"activeStorms": 1},
+                     {"activeStorms": [{"id": 12345678, "name": "X"}]},   # numeric id
+                     {"activeStorms": [{"id": "ep012026", "name": 123}]},  # numeric name
+                     ["not", "a", "dict"], "html error page", 42):
+            self.assertEqual(ip.parse_current_storm_names(data, cfg, YEAR), {},
+                             f"shape {data!r} must yield no overrides")
+
+    def test_fetch_survives_malformed_payload_end_to_end(self):
+        # The exact prod trace: malformed CurrentStorms must NOT fail the basin
+        # fetch - the feed still publishes with the b-deck name standing.
+        orig = ip._get_text
+
+        def bad_payload(session, url, policy):
+            return '{"activeStorms": true}'
+        ip._get_text = bad_payload
+        try:
+            self.assertEqual(
+                ip.fetch_current_storm_names(None, self._ep_cfg(), YEAR), {})
+            sink = pf.DictSink()
+            named = self._named_one()
+            base_reader = lambda b, k: (_synthetic_ace_base(b) if k == "ace"
+                                        else _synthetic_tracks_base(b))
+            eng = ip.build_engine(
+                sink, basins=("ep",), session=None, base_reader=base_reader,
+                live_fetcher=lambda cfg, y: named,
+                invest_fetcher=lambda cfg, y: pd.DataFrame(),
+                clock=lambda: dt.datetime(2026, 4, 11, 0, 0, 0,
+                                          tzinfo=dt.timezone.utc),
+                sleep=lambda _: None)   # names_fetcher NOT injected: real path
+            res = eng.poll_once()
+            self.assertTrue(res["ep"].ok)                       # fetch survived
+            t = sink.store["feeds/ep_tracks_data.json"]
+            self.assertIn("ONE", {s["name"] for s in t["storms"]})  # b-deck stands
+        finally:
+            ip._get_text = orig
+
+    # --- fetch guards ------------------------------------------------------
+    def test_fetch_failure_returns_empty(self):
+        def boom(session, url, policy):
+            raise pf.TransientFetchError("nhc down")
+        orig = ip._get_text
+        ip._get_text = boom
+        try:
+            self.assertEqual(
+                ip.fetch_current_storm_names(None, self._ep_cfg(), YEAR), {})
+        finally:
+            ip._get_text = orig
+
+    def test_non_nhc_basin_never_fetches(self):
+        def fail_if_called(session, url, policy):
+            raise AssertionError("HTTP fetch attempted for a JTWC basin")
+        orig = ip._get_text
+        ip._get_text = fail_if_called
+        try:
+            self.assertEqual(
+                ip.fetch_current_storm_names(None, _cfg("wp"), YEAR), {})
+        finally:
+            ip._get_text = orig
+
+    # --- end-to-end: rename propagates on restamp, no new fix needed -------
+    def test_rename_propagates_on_restamp_without_new_fix(self):
+        sink = pf.DictSink()
+        clk = {"t": dt.datetime(2026, 4, 11, 0, 0, 0, tzinfo=dt.timezone.utc)}
+        names = {"m": {}}
+        named = self._named_one()
+        base_reader = lambda b, k: (_synthetic_ace_base(b) if k == "ace"
+                                    else _synthetic_tracks_base(b))
+        eng = ip.build_engine(
+            sink, basins=("ep",), session=None, base_reader=base_reader,
+            live_fetcher=lambda cfg, y: named,
+            invest_fetcher=lambda cfg, y: pd.DataFrame(),
+            names_fetcher=lambda cfg, y: names["m"],
+            clock=lambda: clk["t"], sleep=lambda _: None)
+
+        r1 = eng.poll_once()
+        t1 = sink.store["feeds/ep_tracks_data.json"]
+        self.assertEqual(r1["ep"].status, pf.CHANGED)
+        self.assertIn("ONE", {s["name"] for s in t1["storms"]})
+        ace1 = sink.store["feeds/ep_ace_data.json"]["current"]["latest_value"]
+        lc1 = eng.health("ep").last_change_utc
+
+        # NHC names the storm between polls; NO new fix lands.
+        names["m"] = {1: "AMANDA"}
+        clk["t"] = dt.datetime(2026, 4, 11, 0, 2, 0, tzinfo=dt.timezone.utc)
+        r2 = eng.poll_once()
+        t2 = sink.store["feeds/ep_tracks_data.json"]
+        names2 = {s["name"] for s in t2["storms"]}
+        self.assertEqual(r2["ep"].status, pf.UNCHANGED)   # no new fix: restamp path
+        self.assertIn("AMANDA", names2)                   # ...but the rename shipped
+        self.assertNotIn("ONE", names2)
+        ace2 = sink.store["feeds/ep_ace_data.json"]["current"]["latest_value"]
+        self.assertEqual(ace1, ace2)                      # ACE untouched
+        self.assertEqual(lc1, eng.health("ep").last_change_utc)  # honest signal
+
+
 class TestMirrorFallthrough(unittest.TestCase):
     """HARDENING: a single bad mirror raising a RAW fetch error (SSLError /
     connection / timeout - not a TransientFetchError) must fall through to the

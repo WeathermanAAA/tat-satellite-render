@@ -9,7 +9,10 @@ per NHC/JTWC basin (wp/al/ep). Each cycle a Source:
      the generators use (Cloudflare worker -> ftp.nhc / natyphoon mirror -> JTWC)
      parsed with the FROZEN ace_core.parse_bdeck, PLUS active invests 90-99 from
      the SAME knackwx source the cron uses. Named drives both feeds; invests go to
-     the TRACKS feed ONLY (they never enter ACE / season counts),
+     the TRACKS feed ONLY (they never enter ACE / season counts). Each named
+     storm's NAME/designation is re-derived per poll from NHC CurrentStorms.json
+     (the authoritative live list, which leads the b-deck name column by up to a
+     few advisory cycles) so ONE -> AMANDA reaches the banner at poll speed,
   3. recomputes the live feed (current curve + ytd@doy + rank + storms[] + header
      + freshness) via ace_core's shared assembly (feed_recompute), preserving the
      EXACT current feed shape, ONLY when a new fix actually lands (change-gated),
@@ -57,6 +60,23 @@ MAX_STORM_NUM = int(_env("MAX_STORM_NUM", "40"))   # named b-decks 01..40
 # the ACE recompute is given the named frame only.
 KNACKWX_ATCF_URL = _env("KNACKWX_ATCF_URL", "https://api.knackwx.com/atcf/v2")
 INVESTS_ENABLED = (_env("POLLER_INVESTS", "1") or "1").lower() not in ("0", "false", "no")
+# NHC CurrentStorms.json - the AUTHORITATIVE live name/designation list (AL/EP/
+# CP; JTWC basins have no entry). The b-deck name column (col 27, what
+# parse_bdeck reads) lags a rename by up to a few advisory cycles - observed
+# 2026-06-03: CurrentStorms said AMANDA at 15:00Z while bep012026.dat col 27
+# still said ONE - so each poll re-derives the display NAME from here, the same
+# authoritative source floater_poller.fetch_current_named reads. (Failure
+# semantics deliberately differ from the floater: we return {} and let the
+# b-deck name stand for the poll - stateless, worst case a brief name
+# flicker during an NHC outage - where the floater holds last-known-good.)
+# Display-only by construction: ACE math reads wind/time/nature, never NAME
+# (see apply_live_names for the one NAME-adjacent hazard and how it is closed).
+CURRENT_STORMS_URL = _env("CURRENT_STORMS_URL",
+                          "https://www.nhc.noaa.gov/CurrentStorms.json")
+LIVE_NAMES_ENABLED = (_env("POLLER_LIVE_NAMES", "1") or "1").lower() not in ("0", "false", "no")
+# Same placeholder set the invest path guards with (and ace_core's
+# _PLACEHOLDER_NAMES, which is private to the pinned package).
+_NAME_PLACEHOLDERS = {"", "INVEST", "NAMELESS", "UNNAMED"}
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
@@ -218,6 +238,117 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
     return pd.DataFrame(rows)
 
 
+def parse_current_storm_names(data, basin_cfg: dict, year: int,
+                              max_storm_num: int = MAX_STORM_NUM) -> dict[int, str]:
+    """CurrentStorms.json payload -> ``{storm_num: NAME}`` for THIS basin/year.
+    Pure (offline-testable). Only real names pass: placeholders, malformed ids,
+    other basins, other years, and invest-range numbers are skipped. Names are
+    upper-cased to the NAME-column convention ("Amanda" -> "AMANDA")."""
+    short = (basin_cfg.get("short") or "").strip().lower()
+    out: dict[int, str] = {}
+    if not isinstance(data, dict) or not short:
+        return out
+    storms = data.get("activeStorms")
+    if not isinstance(storms, list):       # truthy non-list (true/1/{}) included
+        return out
+    for s in storms:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id")                                  # "ep012026"
+        if not isinstance(sid, str):       # numeric/None id: skip, never .strip()
+            continue
+        sid = sid.strip().lower()
+        if len(sid) != 8 or sid[:2] != short:
+            continue
+        try:
+            num, yr = int(sid[2:4]), int(sid[4:8])
+        except ValueError:
+            continue
+        if yr != year or not (1 <= num <= max_storm_num):
+            continue
+        name = s.get("name")
+        if not isinstance(name, str):
+            continue
+        name = name.strip().upper()
+        if name in _NAME_PLACEHOLDERS:
+            continue
+        out[num] = name
+    return out
+
+
+def fetch_current_storm_names(session: requests.Session, basin_cfg: dict,
+                              year: int,
+                              policy: pf.FetchPolicy = FETCH_POLICY) -> dict[int, str]:
+    """``{storm_num: authoritative live NAME}`` from NHC CurrentStorms.json.
+    Empty for non-NHC basins (JTWC/WP has no CurrentStorms entry - their b-deck
+    name is already the live designation) and on ANY failure: a flaky NHC
+    endpoint must NEVER fail the basin fetch. This is a display-name nicety,
+    per-source-guarded exactly like invests."""
+    if not LIVE_NAMES_ENABLED:
+        return {}
+    if (basin_cfg.get("agency_name") or "").strip().upper() != "NHC":
+        return {}
+    try:
+        text = _get_text(session, CURRENT_STORMS_URL, policy)
+        data = json.loads(text) if text else None
+        # Parse INSIDE the guard: well-formed JSON of an unexpected shape must
+        # also degrade to {} - a CurrentStorms surprise can never fail the
+        # basin fetch (the b-deck name simply stands this poll).
+        return parse_current_storm_names(data, basin_cfg, year)
+    except Exception:  # noqa: BLE001 - any failure -> no override this poll
+        return {}
+
+
+def apply_live_names(named: pd.DataFrame, live_names: dict[int, str],
+                     ace_base: dict, tracks_base: dict):
+    """Override the b-deck NAME with NHC's authoritative current name, renaming
+    the bases' current-year records IN STEP (copy-on-write).
+
+    WHY both sides: ace_core dedups ib-vs-live per NAME (merge_named_sources)
+    but groups storms per SID, and IBTrACS SIDs never equal ATCF SIDs - so
+    renaming only the live frame while the base still carries the storm under
+    the OLD name would un-contest the pair and surface the same storm twice
+    (duplicate card + double-counted ACE). Applying the same old->new rename to
+    the base records keeps the contest intact in every window; with the bases
+    not yet carrying the storm (the common just-named case) this degenerates to
+    a pure rename of the live rows. Beyond the contest, NAME is display-only:
+    ACE math reads wind/time/nature and groups by SID.
+
+    Returns ``(named, ace_base, tracks_base)`` - new objects where changed, the
+    inputs never mutated (an injected base_reader may hand the same dict to
+    every poll)."""
+    if (not live_names or named is None or named.empty
+            or "storm_num" not in named.columns):
+        return named, ace_base, tracks_base
+    renames: dict[str, str] = {}        # normalized old NAME -> new NAME
+    out = named.copy()
+    for num, new in live_names.items():
+        mask = out["storm_num"] == num
+        if not mask.any():
+            continue
+        old = str(out.loc[mask, "NAME"].iloc[0] or "").strip().upper()
+        if old == new:
+            continue
+        out.loc[mask, "NAME"] = new
+        if old not in _NAME_PLACEHOLDERS:
+            renames[old] = new
+    if not renames:
+        return out, ace_base, tracks_base
+
+    def _patch(base: dict, key: str) -> dict:
+        recs, hit = [], False
+        for r in (base.get(key) or []):
+            old = str(r.get("NAME") or "").strip().upper()
+            if old in renames:
+                r = {**r, "NAME": renames[old]}
+                hit = True
+            recs.append(r)
+        return {**base, key: recs} if hit else base
+
+    return (out, _patch(ace_base, "current_year_canon"),
+            _patch(tracks_base, "current_year_ibtracs"))
+
+
 def _combine(named: pd.DataFrame, invests: pd.DataFrame) -> pd.DataFrame:
     """named + invests for the TRACKS frame (ace gets named only)."""
     frames = [f for f in (named, invests) if f is not None and not f.empty]
@@ -239,13 +370,17 @@ def make_basin_source(basin: str, session: requests.Session,
                       live_fetcher: Optional[Callable[[dict, int], pd.DataFrame]] = None,
                       invest_fetcher: Optional[Callable[[dict, int], pd.DataFrame]] = None,
                       base_reader: Optional[Callable[[str, str], dict]] = None,
+                      names_fetcher: Optional[Callable[[dict, int], dict]] = None,
                       clock: Callable[[], dt.datetime] = pf.utcnow) -> pf.Source:
     """Build the Source for one basin. ``live_fetcher`` / ``invest_fetcher`` /
-    ``base_reader`` are injectable for offline tests; the defaults hit the proxy
-    chain + knackwx + R2.
+    ``base_reader`` / ``names_fetcher`` are injectable for offline tests; the
+    defaults hit the proxy chain + knackwx + CurrentStorms.json + R2.
 
-    ``named`` = b-decks 01-40 -> drives BOTH feeds. ``invests`` = knackwx 90-99
-    -> the TRACKS feed only (invests never enter ACE)."""
+    ``named`` = b-decks 01-40 -> drives BOTH feeds, with each storm's NAME
+    re-derived per poll from NHC CurrentStorms.json (apply_live_names) so a
+    designation/rename (ONE -> AMANDA) reaches the banner at poll speed instead
+    of waiting for NHC to backfill the b-deck name column. ``invests`` = knackwx
+    90-99 -> the TRACKS feed only (invests never enter ACE)."""
     year = clock().year
 
     def _read_base(kind: str) -> dict:
@@ -265,6 +400,14 @@ def make_basin_source(basin: str, session: requests.Session,
         # empty and never drops the named cards.
         invests = (invest_fetcher(cfg, year) if invest_fetcher is not None
                    else fetch_live_invests(session, cfg, year))
+        # Authoritative live names (per-source-guarded: {} on any failure ->
+        # the b-deck name stands). Applied to named + bases IN STEP; with
+        # restamp=True the rename reaches the feeds next cycle even when no new
+        # fix landed (process re-runs every cycle on the fresh fetch).
+        live_names = (names_fetcher(cfg, year) if names_fetcher is not None
+                      else fetch_current_storm_names(session, cfg, year))
+        named, ace_base, tracks_base = apply_live_names(
+            named, live_names, ace_base, tracks_base)
         return {"ace_base": ace_base, "tracks_base": tracks_base,
                 "named": named, "invests": invests}
 
@@ -354,8 +497,10 @@ def main() -> None:   # pragma: no cover - Railway worker entrypoint
     sink = R2Sink()
     interval = float(_env("POLL_INTERVAL_S", "120"))
     eng = build_engine(sink, interval_s=interval)
-    log.info("intensity poller starting | base=%s | basins=%s | interval=%gs | invests=%s",
-             BASE_URL, ",".join(BASINS), interval, INVESTS_ENABLED)
+    log.info("intensity poller starting | base=%s | basins=%s | interval=%gs | "
+             "invests=%s | live_names=%s",
+             BASE_URL, ",".join(BASINS), interval, INVESTS_ENABLED,
+             LIVE_NAMES_ENABLED)
     eng.run_forever()
 
 
