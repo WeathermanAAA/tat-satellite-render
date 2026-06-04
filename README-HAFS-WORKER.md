@@ -10,8 +10,11 @@ pre-rendered** (no lazy, no frontend change).
 One `PollerEngine` + one HAFS `Source` on `poller_framework` (the **intensity
 poller** pattern, not the hand-rolled floater). Each poll:
 
-1. resolves the newest **complete** HAFS cycle (cheap S3 listing). `change_key`
-   is that cycle id, so the expensive render fires **only on a new cycle**.
+1. resolves the newest **complete** HAFS cycle (cheap S3 listing) plus which of
+   its `(model, storm, domain)` pairs are complete upstream (one exact-key list
+   per pair). `change_key` is the cycle id **+ that pair set**, so the
+   expensive render fires only on a new cycle **or** when the current cycle
+   gains a newly-complete pair (the **intra-cycle catch-up** trigger).
 2. on a new cycle, runs `python -m hafs_render.generate_hafs_plots --cycle ...`
    in a **subprocess** under a hard wall-clock **watchdog** (kills the render's
    whole process group on timeout). This is the *same code* the cron runs (the
@@ -20,7 +23,20 @@ poller** pattern, not the hand-rolled floater). Each poll:
 3. uploads frames + manifest to R2 in the cron's **3 passes** (PNGs no-delete →
    manifest → prune `--delete` scoped to `*.png`), via the floater `R2` client
    (`put_bytes`/`put_json`/`list`/batched `delete`).
-4. writes `{prefix}/render_progress.json` throughout (so a long/wedged render is
+4. **INTRA-CYCLE CATCH-UP**: while the rendered cycle is still the newest, a
+   pair that was absent or still uploading at render time (a late HAFS-B run, a
+   late storm - the generator logs it in `skipped_pairs`) is rendered as soon
+   as its terminal `f126` lands upstream: one *filtered*
+   `--models/--storm/--domains` subprocess per `(model, storm)` group (same
+   `HAFS_JOBS`/`HAFS_INGEST_JOBS`, so an incremental render can't OOM where a
+   full one fits), then an **additive** upload - the group's PNGs (all-or-
+   nothing barrier) + the manifest **merged** into the live one. Catch-up
+   **never prunes** and **never re-renders a completed pair**; a failing group
+   holds the spine signature (only the still-missing pairs retry next poll) and
+   is abandoned after `HAFS_CATCHUP_MAX_ATTEMPTS` (visible in
+   `render_summary.json` `skipped_pairs`; each success appends a `catchups`
+   audit entry). `HAFS_CATCHUP=false` restores pure cycle-id gating.
+5. writes `{prefix}/render_progress.json` throughout (so a long/wedged render is
    observable) and `{prefix}/poller_health.json` between cycles.
 
 Anti-freeze: the spine has no `process()` timeout, so the subprocess watchdog is

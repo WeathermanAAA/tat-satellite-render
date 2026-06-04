@@ -102,6 +102,7 @@ class TestChangeGate(unittest.TestCase):
             r2, prefix="shadow/models/hafs", interval_s=1.0,
             clock=FakeClock(), sleep=lambda s: None,
             cycle_resolver=resolver, render_fn=render,
+            complete_pairs_fn=lambda c: (),   # no upstream movement: pure cycle gate
             out_dir_factory=lambda c: str(Path(tmp) / c))
         return eng, r2
 
@@ -147,6 +148,7 @@ class TestWatchdogRetry(unittest.TestCase):
                 r2, prefix="shadow/models/hafs", interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=resolver, render_fn=render,
+                complete_pairs_fn=lambda c: (),
                 diagnoser=lambda c: "(test-diag, no network)",
                 out_dir_factory=lambda c: str(Path(tmp) / c))
             eng.run_forever(max_cycles=3)
@@ -175,6 +177,7 @@ class TestWatchdogRetry(unittest.TestCase):
                 r2, prefix="shadow/models/hafs", interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=lambda: "2026060206", render_fn=render,
+                complete_pairs_fn=lambda c: (),
                 uploader=uploader, diagnoser=lambda c: "(test-diag, no network)",
                 out_dir_factory=lambda c: str(Path(tmp) / c))
             eng.run_forever(max_cycles=2)
@@ -370,6 +373,7 @@ class TestSuccessSummary(unittest.TestCase):
                 r2, prefix=prefix, interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=resolver, render_fn=render,
+                complete_pairs_fn=lambda c: (),
                 out_dir_factory=lambda c: str(Path(tmp) / c))
             eng.run_forever(max_cycles=1)
 
@@ -382,6 +386,447 @@ class TestSuccessSummary(unittest.TestCase):
         self.assertEqual(snap["ingest_error_counts"]
                          ["BrokenProcessPool (unrecoverable after retries)"], 200)
         self.assertTrue(snap["coverage"])                   # per-pair coverage present
+
+
+# --------------------------------------------------------------------------- #
+# Intra-cycle catch-up: late pairs/storms render incrementally, additively
+# --------------------------------------------------------------------------- #
+def _write_out_multi(out_dir, cycle, spec):
+    """Rendered out-dir for arbitrary coverage. ``spec`` is
+    {storm: {model: {dom_slug: {product: [fxx]}}}} -> dummy PNGs + a manifest
+    in the generator's real schema (storms sorted by id)."""
+    out = Path(out_dir)
+    storms = []
+    for storm, models in spec.items():
+        frames = {}
+        for model, doms in models.items():
+            for dom_slug, prods in doms.items():
+                for prod, fxxs in prods.items():
+                    for f in fxxs:
+                        png = out / model / storm / dom_slug / prod / f"f{f:03d}.png"
+                        png.parent.mkdir(parents=True, exist_ok=True)
+                        png.write_bytes(b"\x89PNG" + cycle.encode() + model.encode()
+                                        + storm.encode() + prod.encode() + bytes([f]))
+                frames.setdefault(model, {})[dom_slug] = {
+                    p: list(v) for p, v in prods.items()}
+        storms.append({"id": storm, "name": storm.upper(), "frames": frames})
+    storms.sort(key=lambda s: s["id"])
+    (out / "manifest.json").write_text(json.dumps(
+        {"generated_at": "2026-06-04T12:00:00Z", "cycle": cycle,
+         "storms": storms}))
+
+
+class TestIntraCycleCatchup(unittest.TestCase):
+    PREFIX = "models/hafs"
+
+    def _engine(self, r2, tmp, resolver, pairs_fn, render, **kw):
+        return hp.build_engine(
+            r2, prefix=self.PREFIX, interval_s=1.0,
+            clock=FakeClock(), sleep=lambda s: None,
+            cycle_resolver=resolver, complete_pairs_fn=pairs_fn,
+            render_fn=render,
+            diagnoser=lambda c: "(test-diag, no network)",
+            out_dir_factory=lambda c: str(Path(tmp) / c.replace("/", "_")),
+            **kw)
+
+    def test_late_pair_triggers_incremental_catchup(self):
+        """The reported gap: hafsb/01e was at f123 when the cycle rendered ->
+        skipped. When its f126 lands upstream, the catch-up must render EXACTLY
+        the hafsb pairs, publish them additively (no deletes), merge the
+        manifest, and clear them from skipped_pairs."""
+        calls = []
+        polls = {"n": 0}
+        BASE = (("hafsa", "01e", "parent.atm"), ("hafsa", "01e", "storm.atm"))
+        LATE = tuple(sorted(BASE + (("hafsb", "01e", "parent.atm"),
+                                    ("hafsb", "01e", "storm.atm"))))
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append((cycle, kw))
+            if not kw:    # full render: only hafsa was complete at render time
+                _write_out_multi(out_dir, cycle, {"01e": {"hafsa": {
+                    "storm": {"mslp_wind": [0, 3]},
+                    "parent": {"mslp_wind": [0, 3]}}}})
+                return {"render_seconds": 100.0,
+                        "ingest": {"ok": 86, "total": 86, "failed": 0},
+                        "render": {"ok": 946, "failed": 0},
+                        "skipped_pairs": [
+                            {"model": "hafsb", "storm": "01e",
+                             "domain": "storm.atm",
+                             "reason": "incomplete (max f123 < f126)"},
+                            {"model": "hafsb", "storm": "01e",
+                             "domain": "parent.atm",
+                             "reason": "incomplete (max f123 < f126)"}]}
+            # catch-up render: exactly the late hafsb pairs
+            _write_out_multi(out_dir, cycle, {"01e": {"hafsb": {
+                "storm": {"mslp_wind": [0, 3]},
+                "parent": {"mslp_wind": [0, 3]}}}})
+            return {"render_seconds": 50.0,
+                    "ingest": {"ok": 86, "total": 86, "failed": 0},
+                    "render": {"ok": 946, "failed": 0}, "skipped_pairs": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render)
+            eng.run_forever(max_cycles=3)   # full, catch-up, unchanged
+
+        # one full render (no filters) + ONE catch-up with exact filters
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], ("2026060406", {}))
+        self.assertEqual(calls[1][0], "2026060406")
+        self.assertEqual(calls[1][1], {"models": "hafsb", "storm": "01e",
+                                       "domains": "parent.atm,storm.atm"})
+        # additive: both models' PNGs live under the prefix; NOTHING deleted
+        self.assertIn(f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f000.png", r2.store)
+        self.assertIn(f"{self.PREFIX}/hafsb/01e/parent/mslp_wind/f003.png", r2.store)
+        self.assertEqual(r2.deleted, [])
+        # merged manifest carries BOTH models for the storm
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        frames = man["storms"][0]["frames"]
+        self.assertEqual(sorted(frames), ["hafsa", "hafsb"])
+        self.assertEqual(frames["hafsb"]["parent"]["mslp_wind"], [0, 3])
+        self.assertEqual(man["cycle"], "2026060406")
+        # render_summary: totals accumulated, skipped cleared, catch-up audited
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        self.assertEqual(snap["frames"], 8)
+        self.assertEqual(snap["skipped_pairs"], [])
+        self.assertEqual(len(snap["catchups"]), 1)
+        self.assertEqual(sorted(snap["catchups"][0]["pairs"]),
+                         ["hafsb/01e/parent.atm", "hafsb/01e/storm.atm"])
+        self.assertEqual(snap["ingest"], {"ok": 172, "total": 172, "failed": 0})
+        self.assertEqual(snap["render"]["ok"], 1892)
+        # coverage gained the hafsb pairs without losing the hafsa ones
+        cov = {(c["model"], c["domain"]) for c in snap["coverage"]}
+        self.assertEqual(cov, {("hafsa", "storm"), ("hafsa", "parent"),
+                               ("hafsb", "storm"), ("hafsb", "parent")})
+
+    def test_catchup_noop_when_full_render_already_covered(self):
+        """Pairs that completed between fetch and the full render's own listing
+        are already in the manifest - the next signature change must NOT
+        re-render them (never re-render completed pairs)."""
+        calls = []
+        polls = {"n": 0}
+        BASE = (("hafsa", "01e", "storm.atm"),)
+        LATE = BASE + (("hafsb", "01e", "storm.atm"),)
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            # full render covered hafsb too (its own listing saw it complete)
+            _write_out_multi(out_dir, cycle, {"01e": {
+                "hafsa": {"storm": {"mslp_wind": [0]}},
+                "hafsb": {"storm": {"mslp_wind": [0]}}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render)
+            eng.run_forever(max_cycles=3)
+        self.assertEqual(calls, [{}])   # the full render only - no catch-up
+
+    def test_catchup_failure_holds_signature_and_retries(self):
+        """A failed catch-up group must hold the spine signature (retry next
+        poll) and leave the live manifest at its last good state."""
+        calls = []
+        polls = {"n": 0}
+        fail_once = {"left": 1}
+        BASE = (("hafsa", "01e", "storm.atm"),)
+        LATE = BASE + (("hafsb", "01e", "storm.atm"),)
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            if not kw:
+                _write_out_multi(out_dir, cycle,
+                                 {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            if fail_once["left"]:
+                fail_once["left"] -= 1
+                raise hp.RenderError("catch-up boom")
+            _write_out_multi(out_dir, cycle,
+                             {"01e": {"hafsb": {"storm": {"mslp_wind": [0]}}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render)
+            eng.poll_once()    # full render
+            eng.poll_once()    # catch-up attempt 1: fails
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(sorted(man["storms"][0]["frames"]), ["hafsa"])
+            self.assertEqual(r2.deleted, [])
+            eng.poll_once()    # catch-up attempt 2: succeeds
+            eng.poll_once()    # unchanged
+
+        self.assertEqual(calls, [
+            {},
+            {"models": "hafsb", "storm": "01e", "domains": "storm.atm"},
+            {"models": "hafsb", "storm": "01e", "domains": "storm.atm"}])
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        self.assertEqual(sorted(man["storms"][0]["frames"]), ["hafsa", "hafsb"])
+
+    def test_catchup_gives_up_after_max_attempts(self):
+        """A permanently-broken pair is abandoned after the cap (recorded in
+        skipped_pairs) so it can't burn a render attempt every poll forever."""
+        calls = []
+        polls = {"n": 0}
+        BASE = (("hafsa", "01e", "storm.atm"),)
+        LATE = BASE + (("hafsb", "01e", "storm.atm"),)
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            if not kw:
+                _write_out_multi(out_dir, cycle,
+                                 {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            raise hp.RenderError("permanently broken pair")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render,
+                               catchup_max_attempts=2)
+            eng.run_forever(max_cycles=6)
+
+        # 1 full + exactly 2 catch-up attempts, then abandoned: no more renders
+        self.assertEqual(len(calls), 3)
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        reasons = {(p["model"], p["storm"], p["domain"]): p["reason"]
+                   for p in snap["skipped_pairs"]}
+        self.assertIn("abandoned", reasons[("hafsb", "01e", "storm.atm")])
+
+    def test_late_storm_appears_via_catchup(self):
+        """A storm absent at render time (not just a pair) is picked up: it gets
+        its own (model, storm) group and lands in the merged manifest."""
+        calls = []
+        polls = {"n": 0}
+        BASE = (("hafsa", "06w", "storm.atm"),)
+        LATE = BASE + (("hafsa", "01e", "storm.atm"),)
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            if not kw:
+                _write_out_multi(out_dir, cycle,
+                                 {"06w": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            _write_out_multi(out_dir, cycle,
+                             {kw["storm"]: {kw["models"]:
+                                            {"storm": {"mslp_wind": [0]}}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render)
+            eng.run_forever(max_cycles=3)
+
+        self.assertEqual(calls, [{}, {"models": "hafsa", "storm": "01e",
+                                      "domains": "storm.atm"}])
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        self.assertEqual([s["id"] for s in man["storms"]], ["01e", "06w"])
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        self.assertEqual(snap["storms"], ["01e", "06w"])
+
+    def test_partial_catchup_progress_preserved(self):
+        """Two late groups; the second fails. The first group's publish must
+        survive, and the retry must re-render ONLY the failed group."""
+        calls = []
+        polls = {"n": 0}
+        fail = {"hafsb": 1}
+        BASE = (("hafsa", "01e", "storm.atm"),)
+        LATE = BASE + (("hafsa", "02e", "storm.atm"), ("hafsb", "01e", "storm.atm"))
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            if not kw:
+                _write_out_multi(out_dir, cycle,
+                                 {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            if kw["models"] == "hafsb" and fail["hafsb"]:
+                fail["hafsb"] -= 1
+                raise hp.RenderError("late hafsb flake")
+            _write_out_multi(out_dir, cycle,
+                             {kw["storm"]: {kw["models"]:
+                                            {"storm": {"mslp_wind": [0]}}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render)
+            eng.run_forever(max_cycles=4)   # full; cu(02e ok, hafsb fail); retry; idle
+
+        self.assertEqual(calls, [
+            {},
+            {"models": "hafsa", "storm": "02e", "domains": "storm.atm"},
+            {"models": "hafsb", "storm": "01e", "domains": "storm.atm"},
+            {"models": "hafsb", "storm": "01e", "domains": "storm.atm"}])
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        self.assertEqual([s["id"] for s in man["storms"]], ["01e", "02e"])
+        self.assertEqual(sorted(man["storms"][0]["frames"]), ["hafsa", "hafsb"])
+
+    def test_new_cycle_resets_catchup_ledger(self):
+        """A new cycle supersedes any pending catch-up: full render fires and
+        the attempts/given-up ledger starts fresh."""
+        calls = []
+        cycles = iter(["2026060406", "2026060406", "2026060412"])
+        last = {"c": None}
+
+        def resolver():
+            try:
+                last["c"] = next(cycles)
+            except StopIteration:
+                pass
+            return last["c"]
+
+        polls = {"n": 0}
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            if cycle == "2026060412":
+                return (("hafsa", "01e", "storm.atm"),)
+            return ((("hafsa", "01e", "storm.atm"),) if polls["n"] == 1 else
+                    (("hafsa", "01e", "storm.atm"), ("hafsb", "01e", "storm.atm")))
+
+        def render(cycle, out_dir, **kw):
+            calls.append((cycle, kw))
+            if kw:
+                raise hp.RenderError("late pair still failing")
+            _write_out_multi(out_dir, cycle,
+                             {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, resolver, pairs_fn, render)
+            eng.run_forever(max_cycles=3)   # full c1; cu fail; full c2
+
+        self.assertEqual(calls[0], ("2026060406", {}))
+        self.assertEqual(calls[1][1], {"models": "hafsb", "storm": "01e",
+                                       "domains": "storm.atm"})
+        self.assertEqual(calls[2], ("2026060412", {}))   # full render, no filter
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        self.assertEqual(man["cycle"], "2026060412")
+
+    def test_upload_catchup_atomic_and_never_prunes(self):
+        """upload_catchup: all-or-nothing PNG pass before the manifest write,
+        and NO pass-3 prune even with stale keys under the prefix."""
+        prefix = self.PREFIX
+        base = {"generated_at": "2026-06-04T12:00:00Z", "cycle": "2026060406",
+                "storms": [{"id": "01e", "name": "01E", "frames":
+                            {"hafsa": {"storm": {"mslp_wind": [0]}}}}]}
+
+        class FlakyR2(FakeR2):
+            def put_bytes(self, key, data, content_type, cache):
+                if key.endswith("f003.png"):
+                    return False
+                return super().put_bytes(key, data, content_type, cache)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            _write_out_multi(out, "2026060406",
+                             {"01e": {"hafsb": {"storm": {"mslp_wind": [0, 3]}}}})
+            r2 = FlakyR2(preload={f"{prefix}/manifest.json": b'{"old":true}',
+                                  f"{prefix}/hafsa/99x/storm/mslp_wind/f000.png":
+                                  b"stale"})
+            with self.assertRaises(hp.RenderError):
+                hp.upload_catchup(r2, str(out), prefix, base)
+            # manifest untouched, nothing deleted
+            self.assertEqual(r2.store[f"{prefix}/manifest.json"], b'{"old":true}')
+            self.assertEqual(r2.deleted, [])
+
+            # clean R2: success path merges + never deletes the stale key
+            r2 = FakeR2(preload={f"{prefix}/hafsa/99x/storm/mslp_wind/f000.png":
+                                 b"stale"})
+            res = hp.upload_catchup(r2, str(out), prefix, base)
+            self.assertEqual(res["frames"], 2)
+            self.assertEqual(res["pairs"], [("hafsb", "01e", "storm.atm")])
+            self.assertEqual(r2.deleted, [])
+            self.assertIn(f"{prefix}/hafsa/99x/storm/mslp_wind/f000.png", r2.store)
+            man = json.loads(r2.store[f"{prefix}/manifest.json"])
+            self.assertEqual(sorted(man["storms"][0]["frames"]),
+                             ["hafsa", "hafsb"])
+
+    def test_merge_manifest_and_pairs_helpers(self):
+        base = {"generated_at": "old", "cycle": None, "storms": []}
+        incr = {"generated_at": "new", "cycle": "2026060406",
+                "storms": [{"id": "01e", "name": "01E", "frames":
+                            {"hafsb": {"storm": {"mslp_wind": [3, 0]}}}}]}
+        merged = hp.merge_manifest(base, incr)
+        # an off-season/empty base is healed by the increment
+        self.assertEqual(merged["cycle"], "2026060406")
+        self.assertEqual(merged["generated_at"], "new")
+        self.assertEqual(merged["storms"][0]["frames"]["hafsb"]["storm"]
+                         ["mslp_wind"], [0, 3])
+        # fxx union at the product level, base entries preserved
+        base2 = {"cycle": "2026060406", "storms": [
+            {"id": "01e", "frames": {"hafsb": {"storm": {"mslp_wind": [0]}}}}]}
+        incr2 = {"cycle": "2026060406", "storms": [
+            {"id": "01e", "frames": {"hafsb": {"storm": {"mslp_wind": [3],
+                                                         "refl": [0]}}}}]}
+        m2 = hp.merge_manifest(base2, incr2)
+        self.assertEqual(m2["storms"][0]["frames"]["hafsb"]["storm"],
+                         {"mslp_wind": [0, 3], "refl": [0]})
+        # manifest_pairs maps slugs back to raw domains
+        self.assertEqual(hp.manifest_pairs(m2),
+                         {("hafsb", "01e", "storm.atm")})
+        # _group_missing groups by (model, storm) with sorted domains
+        groups = hp._group_missing({("hafsb", "01e", "storm.atm"),
+                                    ("hafsb", "01e", "parent.atm"),
+                                    ("hafsa", "02e", "storm.atm")})
+        self.assertEqual(groups, {("hafsa", "02e"): ["storm.atm"],
+                                  ("hafsb", "01e"): ["parent.atm", "storm.atm"]})
+
+    def test_list_complete_pairs_stubbed(self):
+        """Pure-logic check of the upstream completeness probe with a stubbed
+        hafs_render module (the real one pulls the GRIB stack)."""
+        import types
+        present = {
+            "hfsa/20260604/06/01e.2026060406.hfsa.storm.atm.f126.grb2",
+            "hfsa/20260604/06/01e.2026060406.hfsa.parent.atm.f126.grb2",
+            "hfsb/20260604/06/01e.2026060406.hfsb.storm.atm.f126.grb2",
+        }
+        stub = types.ModuleType("hafs_render.generate_hafs_plots")
+        stub.MODEL_TOKEN = {"hafsa": "hfsa", "hafsb": "hfsb"}
+        stub.TERMINAL_FXX = 126
+        stub._s3_list = (lambda prefix, delimiter=None, session=None:
+                         ([k for k in present if k == prefix], []))
+        stub.list_storms = lambda model, date, hh, session=None: ["01e"]
+        pkg = types.ModuleType("hafs_render")
+        pkg.generate_hafs_plots = stub
+        saved = {n: sys.modules.get(n)
+                 for n in ("hafs_render", "hafs_render.generate_hafs_plots")}
+        sys.modules["hafs_render"] = pkg
+        sys.modules["hafs_render.generate_hafs_plots"] = stub
+        try:
+            pairs = hp.list_complete_pairs("2026060406")
+        finally:
+            for n, m in saved.items():
+                if m is None:
+                    sys.modules.pop(n, None)
+                else:
+                    sys.modules[n] = m
+        self.assertEqual(pairs, (("hafsa", "01e", "parent.atm"),
+                                 ("hafsa", "01e", "storm.atm"),
+                                 ("hafsb", "01e", "storm.atm")))
 
 
 if __name__ == "__main__":

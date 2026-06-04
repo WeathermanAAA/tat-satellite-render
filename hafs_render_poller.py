@@ -16,9 +16,18 @@ On a NEW complete HAFS cycle the Source's process():
   3. writes a progress heartbeat throughout so a long (or wedged) render is
      OBSERVABLE, not silent.
 
-Change-gated: ``change_key`` is the newest COMPLETE cycle id, so the expensive
-render fires ONLY on a genuinely new cycle (the spine's cheap-when-nothing-new
-guarantee). The render is the same code the cron runs, imported as the pinned
+Change-gated: ``change_key`` is the newest COMPLETE cycle id PLUS the set of
+(model, storm, domain) pairs complete upstream, so the expensive render fires
+on a genuinely new cycle AND - the INTRA-CYCLE CATCH-UP - when a pair that was
+absent or still uploading at render time (a late HAFS-B run, a late storm)
+reaches its terminal frame while the cycle is still current. A brand-new cycle
+takes the full-render path exactly as before; a late pair takes an INCREMENTAL
+path that renders ONLY the newly-complete missing pairs (one filtered
+``--models/--storm/--domains`` subprocess per (model, storm) group, same
+HAFS_JOBS/HAFS_INGEST_JOBS), merges them ADDITIVELY into the live manifest +
+render_summary, and NEVER prunes. Completed pairs are never re-rendered; the
+picker gains a late Amanda/HAFS-B as soon as its data exists upstream, not a
+cycle later. The render is the same code the cron runs, imported as the pinned
 ``hafs-render`` git package - one source of truth.
 
 SHADOW MODE (Stage 2): ``HAFS_R2_PREFIX`` defaults to ``shadow/models/hafs`` so
@@ -89,6 +98,20 @@ HAFS_JOBS = int(_env("HAFS_JOBS", "8"))
 # (CPU-bound, reads small cached fields). The generator's halving backoff is the
 # safety net if a cycle is heavy enough to still OOM at 4.
 HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "4"))
+
+# INTRA-CYCLE CATCH-UP. While the rendered cycle is still the newest, each poll
+# re-checks upstream for (model, storm, domain) pairs that were skipped at
+# render time (absent or still uploading - "incomplete (max fNNN < f126)") and
+# renders the ones that have since reached their terminal frame, publishing
+# them additively. Default ON; set HAFS_CATCHUP=false to restore pure
+# cycle-id gating (instant rollback, no redeploy semantics change otherwise).
+HAFS_CATCHUP = (_env("HAFS_CATCHUP", "true") or "").strip().lower() not in (
+    "false", "0", "no")
+
+# A pair whose catch-up render keeps failing is abandoned after this many
+# attempts (visible in render_summary's skipped_pairs) so a permanently-broken
+# upstream pair can't burn a render attempt every poll until the next cycle.
+HAFS_CATCHUP_MAX_ATTEMPTS = int(_env("HAFS_CATCHUP_MAX_ATTEMPTS", "3"))
 
 # Concurrent R2 PNG uploads (Pass 1 only). The render is CPU-bound; the upload is
 # I/O/latency-bound (each put_object is a network round-trip), so a thread pool of
@@ -195,6 +218,7 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
                           ingest_jobs: int = HAFS_INGEST_JOBS,
                           models: str = HAFS_MODELS,
                           domains: str = HAFS_DOMAINS,
+                          storm: Optional[str] = None,
                           products: Optional[str] = HAFS_PRODUCTS,
                           timeout_s: int = RENDER_TIMEOUT_S,
                           save_dir: str = CACHE_DIR) -> dict:
@@ -206,16 +230,24 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
     cross-host raster noise). It is started in its OWN process group so the
     watchdog kills the whole render tree (the internal ProcessPoolExecutor
     workers too), never leaving orphans. Raises RenderError on timeout or a
-    non-zero exit (e.g. the generator's total-failure exit 1)."""
+    non-zero exit (e.g. the generator's total-failure exit 1).
+
+    ``storm`` (plus narrowed ``models``/``domains``) is the catch-up's scoping:
+    the generator's filters render exactly one (model, storm) group's late
+    pairs. Same jobs/ingest_jobs defaults as the full render, so an incremental
+    render can't OOM where the full one fits."""
     cmd = [sys.executable, "-m", "hafs_render.generate_hafs_plots",
            "--cycle", cycle, "--out-dir", out_dir, "--jobs", str(jobs),
            "--ingest-jobs", str(ingest_jobs),
            "--models", models, "--domains", domains, "--save-dir", save_dir]
+    if storm:
+        cmd += ["--storm", storm]
     if products:
         cmd += ["--products", products]
     env = dict(os.environ, HERBIE_DATA=save_dir)
-    log.info("render start: cycle=%s jobs=%d ingest_jobs=%d -> %s (timeout %ds)",
-             cycle, jobs, ingest_jobs, out_dir, timeout_s)
+    log.info("render start: cycle=%s%s jobs=%d ingest_jobs=%d -> %s (timeout %ds)",
+             cycle, f" storm={storm} models={models} domains={domains}"
+             if storm else "", jobs, ingest_jobs, out_dir, timeout_s)
     t0 = time.time()
     # Capture combined stdout+stderr to a file (NOT a PIPE - a chatty render would
     # deadlock on a full pipe buffer). On failure the tail is embedded in the
@@ -333,28 +365,28 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3-pass R2 upload (replicates the cron's aws s3 sync ordering exactly).
+# 3-pass R2 upload (replicates the cron's aws s3 sync ordering exactly), plus
+# the ADDITIVE catch-up upload (PNGs + merged manifest, no prune).
 # ---------------------------------------------------------------------------
-def upload_cycle(r2: R2, out_dir: str, prefix: str) -> dict:
-    """Upload a rendered out-dir to R2 under ``prefix`` in the cron's 3 passes:
-      1. PNG frames (no delete) - image/png, max-age=300.
-      2. manifest.json - application/json (now references only present frames).
-      3. prune: delete *.png under ``prefix`` NOT in this render (batched).
-    Returns a small summary dict. Mirrors update-hafs.yml's ordering so there is
-    no 404 window and an off-season empty manifest correctly clears the prefix."""
-    out = Path(out_dir)
-    manifest_path = out / "manifest.json"
-    if not manifest_path.exists():
-        raise RenderError(f"no manifest at {manifest_path} - nothing to publish")
+# domain slug (manifest / R2 path segment) -> raw S3 filename token. A static
+# mirror of hafs_render.generate_hafs_plots.DOMAINS - NOT imported here, since
+# that import pulls the whole GRIB/matplotlib stack and this map is needed by
+# the lightweight manifest bookkeeping the offline tests exercise.
+RAW_DOMAIN_BY_SLUG = {"storm": "storm.atm", "parent": "parent.atm"}
 
+
+def _upload_pngs(r2: R2, out: Path, prefix: str) -> set:
+    """Pass-1 concurrent PNG upload, shared by the full 3-pass upload and the
+    additive catch-up upload.
+
+    PNG frames are uploaded CONCURRENTLY (boto3 clients are thread-safe). This
+    is a hard BARRIER: the ThreadPoolExecutor block exits only when every put
+    has returned, so a manifest is never written while a frame it references is
+    still unpushed. All-or-nothing like the cron: if any frame fails (after
+    botocore's own retries), raise so NO manifest and NO prune run - the cycle
+    is held and retried, never published with 404s."""
     pngs = sorted(p for p in out.rglob("*.png"))
 
-    # Pass 1: PNG frames, no delete - uploaded CONCURRENTLY (boto3 clients are
-    # thread-safe). This is a hard BARRIER: the ThreadPoolExecutor block exits
-    # only when every put has returned, so the manifest (Pass 2) is never written
-    # while a frame it references is still unpushed. All-or-nothing like the cron:
-    # if any frame fails (after botocore's own retries), raise so NO manifest and
-    # NO prune run - the cycle is held and retried, never published with 404s.
     def _put(p):
         rel = p.relative_to(out).as_posix()
         key = f"{prefix}/{rel}"
@@ -376,6 +408,80 @@ def upload_cycle(r2: R2, out_dir: str, prefix: str) -> dict:
         raise RenderError(
             f"{failures}/{len(pngs)} frame uploads failed under {prefix} - "
             "holding cycle (manifest NOT written, prune NOT run)")
+    return fresh_png_keys
+
+
+def _manifest_coverage(manifest: dict) -> list:
+    """Per-pair coverage (model/storm/domain-slug -> product + fxx counts) of a
+    manifest, for the cycle's render_summary."""
+    coverage = []
+    for s in manifest.get("storms", []) or []:
+        for mdl, doms in (s.get("frames") or {}).items():
+            for dom, prods in (doms or {}).items():
+                nf = len(next(iter(prods.values()))) if prods else 0
+                coverage.append({"model": mdl, "storm": s.get("id"),
+                                 "domain": dom, "products": len(prods), "fxx": nf})
+    return coverage
+
+
+def manifest_pairs(manifest: dict) -> set:
+    """The (model, storm, RAW domain) pairs with at least one rendered frame in
+    a manifest - the worker's 'already rendered' ledger for the catch-up."""
+    pairs = set()
+    for s in manifest.get("storms", []) or []:
+        for mdl, doms in (s.get("frames") or {}).items():
+            for dom_slug, prods in (doms or {}).items():
+                if any((prods or {}).values()):
+                    pairs.add((mdl, s.get("id"),
+                               RAW_DOMAIN_BY_SLUG.get(dom_slug, dom_slug)))
+    return pairs
+
+
+def merge_manifest(base: dict, incr: dict) -> dict:
+    """ADDITIVE deep-merge of a catch-up render's manifest into the cycle's
+    published manifest: per-storm frames union at the product-fxx level, new
+    storms appended (storms stay sorted by id), generated_at/cycle refreshed
+    from the increment. Header arrays (models/domains/products/path_template)
+    stay the BASE's - the base is the full render (full scope); the increment
+    is a filtered run whose headers list only its filter."""
+    out = json.loads(json.dumps(base))   # deep copy; manifests are pure JSON
+    if incr.get("generated_at"):
+        out["generated_at"] = incr["generated_at"]
+    if incr.get("cycle"):
+        out["cycle"] = incr["cycle"]     # heals a prior empty/off-season base
+    out.setdefault("storms", [])
+    by_id = {s.get("id"): s for s in out["storms"]}
+    for s in incr.get("storms", []) or []:
+        cur = by_id.get(s.get("id"))
+        if cur is None:                  # a storm that appeared late upstream
+            cur = json.loads(json.dumps(s))
+            cur["frames"] = {}
+            out["storms"].append(cur)
+        tgt = cur.setdefault("frames", {})
+        for mdl, doms in (s.get("frames") or {}).items():
+            for dom_slug, prods in (doms or {}).items():
+                for prod, fxx in (prods or {}).items():
+                    have = (tgt.setdefault(mdl, {}).setdefault(dom_slug, {})
+                               .setdefault(prod, []))
+                    tgt[mdl][dom_slug][prod] = sorted(set(have) | set(fxx))
+    out["storms"].sort(key=lambda s: s.get("id") or "")
+    return out
+
+
+def upload_cycle(r2: R2, out_dir: str, prefix: str) -> dict:
+    """Upload a rendered out-dir to R2 under ``prefix`` in the cron's 3 passes:
+      1. PNG frames (no delete) - image/png, max-age=300.
+      2. manifest.json - application/json (now references only present frames).
+      3. prune: delete *.png under ``prefix`` NOT in this render (batched).
+    Returns a small summary dict. Mirrors update-hafs.yml's ordering so there is
+    no 404 window and an off-season empty manifest correctly clears the prefix."""
+    out = Path(out_dir)
+    manifest_path = out / "manifest.json"
+    if not manifest_path.exists():
+        raise RenderError(f"no manifest at {manifest_path} - nothing to publish")
+
+    # Pass 1: PNG frames, no delete (all-or-nothing barrier - see _upload_pngs).
+    fresh_png_keys = _upload_pngs(r2, out, prefix)
 
     # Pass 2: manifest - written ONLY after Pass 1's barrier, so it references
     # only frames that are all present on R2.
@@ -404,17 +510,45 @@ def upload_cycle(r2: R2, out_dir: str, prefix: str) -> dict:
         r2.delete(orphans)
 
     # Per-pair coverage (model/storm/domain -> fxx count) for the cycle summary.
-    coverage = []
-    for s in manifest.get("storms", []):
-        for mdl, doms in s.get("frames", {}).items():
-            for dom, prods in doms.items():
-                nf = len(next(iter(prods.values()))) if prods else 0
-                coverage.append({"model": mdl, "storm": s.get("id"),
-                                 "domain": dom, "products": len(prods), "fxx": nf})
+    coverage = _manifest_coverage(manifest)
     log.info("uploaded %d frame(s) + manifest, pruned %d retired-storm orphan(s) "
-             "under %s", len(pngs), len(orphans), prefix)
-    return {"frames": len(pngs), "pruned": len(orphans), "prefix": prefix,
+             "under %s", len(fresh_png_keys), len(orphans), prefix)
+    return {"frames": len(fresh_png_keys), "pruned": len(orphans), "prefix": prefix,
             "storms": sorted(s for s in current_storms if s), "coverage": coverage}
+
+
+def upload_catchup(r2: R2, out_dir: str, prefix: str, base_manifest: dict) -> dict:
+    """ADDITIVE upload for an intra-cycle catch-up render: the group's PNGs
+    (same all-or-nothing barrier as the full upload), then the increment's
+    manifest MERGED into ``base_manifest``. NEVER prunes - a catch-up only adds
+    late pairs to a cycle already live, so deletion has no business here (the
+    dual-writer-safe semantics are preserved by construction).
+
+    Returns ``{"frames", "storms", "coverage", "pairs", "merged_manifest"}``
+    where ``pairs`` is the increment's rendered (model, storm, raw-domain)
+    triples and ``merged_manifest`` is what now lives at the manifest key."""
+    out = Path(out_dir)
+    manifest_path = out / "manifest.json"
+    if not manifest_path.exists():
+        raise RenderError(f"no manifest at {manifest_path} - nothing to publish")
+    incr = json.loads(manifest_path.read_text())
+
+    # Pass 1: the late pairs' PNGs (barrier; raise -> no manifest write, the
+    # spine holds the signature and the group is retried next poll).
+    fresh = _upload_pngs(r2, out, prefix)
+
+    # Pass 2: the merged manifest - the picker gains the late pairs atomically,
+    # with every referenced frame already on R2.
+    merged = merge_manifest(base_manifest, incr)
+    r2.put_json(f"{prefix}/manifest.json", merged, CC_MANIFEST)
+
+    pairs = sorted(manifest_pairs(incr))
+    log.info("catch-up uploaded %d frame(s) for %s + merged manifest under %s",
+             len(fresh), " ".join("/".join(p) for p in pairs) or "(none)", prefix)
+    return {"frames": len(fresh),
+            "storms": sorted({s.get("id") for s in incr.get("storms", []) or []}),
+            "coverage": _manifest_coverage(incr), "pairs": pairs,
+            "merged_manifest": merged}
 
 
 # ---------------------------------------------------------------------------
@@ -497,34 +631,146 @@ def resolve_latest_complete_cycle(model: str = RESOLVE_MODEL) -> Optional[str]:
     return f"{date}{hh}"
 
 
+def list_complete_pairs(cycle: str, *, models: str = HAFS_MODELS,
+                        domains: str = HAFS_DOMAINS) -> tuple:
+    """Every (model, storm, raw_domain) pair whose run is COMPLETE upstream for
+    ``cycle`` - i.e. the pair's OWN terminal f126 GRIB exists, which is exactly
+    the generator's per-pair accept gate. Storm enumeration mirrors
+    build_cycle: the storm set comes from models[0]'s listing. One cheap
+    exact-key list call per pair (a handful per poll).
+
+    This is the catch-up's upstream eye: the pairs here that are NOT yet in the
+    published manifest are precisely the late arrivals worth a render."""
+    from hafs_render.generate_hafs_plots import (  # lazy - pulls the GRIB stack
+        MODEL_TOKEN, TERMINAL_FXX, _s3_list, list_storms)
+    import requests
+    sess = requests.Session()
+    date, hh = cycle[:8], cycle[8:]
+    model_list = [m.strip() for m in models.split(",") if m.strip()]
+    domain_list = [d.strip() for d in domains.split(",") if d.strip()]
+    pairs = []
+    for storm in list_storms(model_list[0], date, hh, session=sess):
+        for model in model_list:
+            tok = MODEL_TOKEN[model]
+            for domain in domain_list:
+                key = (f"{tok}/{date}/{hh}/{storm}.{date}{hh}.{tok}."
+                       f"{domain}.f{TERMINAL_FXX:03d}.grb2")
+                keys, _ = _s3_list(key, session=sess)
+                if key in keys:
+                    pairs.append((model, storm, domain))
+    return tuple(sorted(pairs))
+
+
+def _group_missing(missing) -> dict:
+    """Group missing (model, storm, raw_domain) pairs by (model, storm) so each
+    catch-up subprocess renders EXACTLY its pairs: the generator's
+    --models/--storm/--domains filters are a cross-product, so a per-(model,
+    storm) invocation carrying just that group's domains can never re-render a
+    completed pair."""
+    groups: dict = {}
+    for model, storm, domain in sorted(missing):
+        groups.setdefault((model, storm), []).append(domain)
+    return groups
+
+
+def _set_skip_reason(summary: dict, pair: tuple, reason: str) -> None:
+    """Update (or add) one pair's entry in render_summary's skipped_pairs."""
+    sp = summary.setdefault("skipped_pairs", [])
+    for e in sp:
+        if (e.get("model"), e.get("storm"), e.get("domain")) == pair:
+            e["reason"] = reason
+            return
+    sp.append({"model": pair[0], "storm": pair[1], "domain": pair[2],
+               "reason": reason})
+
+
+def _fold_catchup_summary(summary: dict, upcov: dict, new_pairs: list,
+                          clock: Callable[[], dt.datetime]) -> None:
+    """Fold one catch-up group's result into the cycle's render_summary payload
+    ADDITIVELY: bump the frame total, append/replace per-pair coverage, drop
+    the now-rendered pairs from skipped_pairs, accumulate the run counters, and
+    append a ``catchups`` audit entry so late arrivals are observable."""
+    summary["frames"] = (summary.get("frames") or 0) + (upcov.get("frames") or 0)
+    summary["storms"] = sorted(set(summary.get("storms") or [])
+                               | set(upcov.get("storms") or []))
+
+    def ckey(c):
+        return (c.get("model"), c.get("storm"), c.get("domain"))
+
+    new_cov = upcov.get("coverage") or []
+    new_keys = {ckey(c) for c in new_cov}
+    summary["coverage"] = ([c for c in (summary.get("coverage") or [])
+                            if ckey(c) not in new_keys] + new_cov)
+    rendered = set(new_pairs)
+    summary["skipped_pairs"] = [
+        e for e in (summary.get("skipped_pairs") or [])
+        if (e.get("model"), e.get("storm"), e.get("domain")) not in rendered]
+    for key in ("ingest", "render"):
+        inc = upcov.get(key) or {}
+        if inc:
+            tot = summary.setdefault(key, {})
+            for f in ("ok", "total", "failed"):
+                if f in inc:
+                    tot[f] = (tot.get(f) or 0) + (inc.get(f) or 0)
+    summary.setdefault("catchups", []).append({
+        "utc": pf.iso_z(clock()),
+        "pairs": ["/".join(p) for p in new_pairs],
+        "frames": upcov.get("frames"),
+        "render_seconds": upcov.get("render_seconds"),
+    })
+
+
 # ---------------------------------------------------------------------------
 # The HAFS Source (one Source; HMON later = a 2nd Source on the same engine).
 # ---------------------------------------------------------------------------
 def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                      cycle_resolver: Optional[Callable[[], Optional[str]]] = None,
-                     render_fn: Optional[Callable[[str, str], None]] = None,
+                     render_fn: Optional[Callable[..., dict]] = None,
                      uploader: Optional[Callable[[R2, str, str], dict]] = None,
+                     catchup_uploader: Optional[Callable[..., dict]] = None,
+                     complete_pairs_fn: Optional[Callable[[str], tuple]] = None,
+                     catchup_max_attempts: int = HAFS_CATCHUP_MAX_ATTEMPTS,
                      out_dir_factory: Optional[Callable[[str], str]] = None,
                      diagnoser: Optional[Callable[[str], str]] = None,
                      clock: Callable[[], dt.datetime] = pf.utcnow) -> pf.Source:
     """Build the HAFS Source. ``cycle_resolver`` / ``render_fn`` / ``uploader`` /
-    ``out_dir_factory`` / ``diagnoser`` are injectable so the offline tests
-    exercise the change-gate, watchdog-abort, and prune WITHOUT a real render,
-    R2, or network diagnostic."""
+    ``catchup_uploader`` / ``complete_pairs_fn`` / ``out_dir_factory`` /
+    ``diagnoser`` are injectable so the offline tests exercise the change-gate,
+    watchdog-abort, prune, and intra-cycle catch-up WITHOUT a real render, R2,
+    or network."""
     resolve = cycle_resolver or resolve_latest_complete_cycle
     render = render_fn or run_render_subprocess
     upload = uploader or upload_cycle
+    cu_upload = catchup_uploader or upload_catchup
     diagnose = diagnoser or diagnose_ingest
+    pairs_fn = complete_pairs_fn or (list_complete_pairs if HAFS_CATCHUP
+                                     else (lambda cycle: ()))
+
+    # The catch-up ledger for the CURRENT cycle (in-memory on purpose: a worker
+    # restart re-renders the current cycle in full anyway, which rebuilds it).
+    # ``rendered`` is derived from OUTPUT manifests (ground truth), so pairs the
+    # full render dropped (failed ingest, mid-upload skip) stay 'missing' and
+    # the catch-up loop heals them too, not just upstream late arrivals.
+    state = {"cycle": None, "manifest": None, "summary": None,
+             "rendered": set(), "attempts": {}, "given_up": set()}
 
     def fetch():
-        # Cheap: an S3 listing to find the newest complete cycle. None off-season
+        # Cheap: S3 listings to find the newest complete cycle + which of its
+        # (model, storm, domain) pairs are complete upstream. None off-season
         # is a legitimate 'nothing now' (no retry burns), not an error.
-        return {"cycle": resolve()}
+        cycle = resolve()
+        if not cycle:
+            return {"cycle": None, "complete_pairs": ()}
+        return {"cycle": cycle, "complete_pairs": tuple(pairs_fn(cycle))}
 
     def change_key(data):
-        # New data iff a brand-new COMPLETE cycle appeared. A still-latest cycle
-        # takes the spine's cheap path and is NOT re-rendered.
-        return data["cycle"]
+        # New data iff (a) a brand-new COMPLETE cycle appeared, or (b) the same
+        # cycle gained newly-complete upstream pairs - the intra-cycle catch-up
+        # trigger. A still-latest cycle with no upstream movement takes the
+        # spine's cheap path and is NOT re-rendered.
+        if not data["cycle"]:
+            return None
+        return (data["cycle"], data["complete_pairs"])
 
     def valid_time(data):
         c = data["cycle"]
@@ -544,22 +790,99 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             # worker simply renders nothing.)
             log.info("no complete cycle - nothing to render")
             return
+        if cycle != state["cycle"]:
+            _full_cycle(cycle)
+        else:
+            _catchup_cycle(cycle, set(ctx.data["complete_pairs"]))
+
+    def _full_cycle(cycle):
+        def run(out_dir):
+            manifest, summary = _render_and_upload(
+                r2, prefix, cycle, out_dir, render, upload, diagnose, clock)
+            state.update(cycle=cycle, manifest=manifest, summary=summary,
+                         rendered=manifest_pairs(manifest or {}),
+                         attempts={}, given_up=set())
         if out_dir_factory is not None:
-            out_dir = out_dir_factory(cycle)
-            _render_and_upload(r2, prefix, cycle, out_dir, render, upload,
-                               diagnose, clock)
+            run(out_dir_factory(cycle))
         else:
             with tempfile.TemporaryDirectory(prefix=f"hafs_{cycle}_") as td:
-                out_dir = str(Path(td) / "hafs")
-                _render_and_upload(r2, prefix, cycle, out_dir, render, upload,
-                                   diagnose, clock)
+                run(str(Path(td) / "hafs"))
+
+    def _catchup_cycle(cycle, complete):
+        # INTRA-CYCLE CATCH-UP: the cycle we already rendered gained newly
+        # complete upstream pairs (a late HAFS-B, a late storm). Render ONLY the
+        # missing ones, publish additively, never prune, never re-render a
+        # completed pair. A group failure raises -> the spine holds the
+        # signature and ONLY the still-missing pairs are retried next poll
+        # (earlier groups' progress is already in the ledger).
+        missing = complete - state["rendered"] - state["given_up"]
+        if not missing:
+            return    # upstream moved but nothing actionable; signature advances
+        if state["manifest"] is None:
+            # Unreachable while cycle == state["cycle"] implies a successful
+            # full render - but never catch-up onto an unknown base.
+            log.warning("catch-up skipped: no base manifest for cycle %s", cycle)
+            return
+        summary = state["summary"] or {}
+
+        def write_summary():
+            summary["generated_utc"] = pf.iso_z(clock())
+            state["summary"] = summary
+            try:
+                r2.put_json(f"{prefix}/render_summary.json", summary, CC_HEALTH)
+            except Exception:  # noqa: BLE001 - best-effort, like the full path
+                pass
+
+        for (model, storm), doms in sorted(_group_missing(missing).items()):
+            runnable = []
+            for d in doms:
+                p = (model, storm, d)
+                state["attempts"][p] = state["attempts"].get(p, 0) + 1
+                if state["attempts"][p] > catchup_max_attempts:
+                    state["given_up"].add(p)
+                    _set_skip_reason(summary, p, "catch-up abandoned after "
+                                     f"{catchup_max_attempts} failed attempts")
+                    log.warning("catch-up giving up on %s %s %s after %d attempts",
+                                model, storm, d, catchup_max_attempts)
+                else:
+                    runnable.append(d)
+            if not runnable:
+                write_summary()
+                continue
+            log.info("catch-up: late pair(s) complete upstream - rendering "
+                     "%s %s %s", model, storm, ",".join(runnable))
+            with ProgressHeartbeat(r2, prefix, f"{cycle} catchup {model}/{storm}",
+                                   clock=clock):
+                upcov = _run_catchup_group(cycle, model, storm, runnable)
+            new_pairs = [tuple(p) for p in upcov.get("pairs", [])]
+            state["rendered"] |= set(new_pairs)
+            state["manifest"] = upcov.get("merged_manifest") or state["manifest"]
+            _fold_catchup_summary(summary, upcov, new_pairs, clock)
+            write_summary()
+
+    def _run_catchup_group(cycle, model, storm, domains_g):
+        def run(out_dir):
+            rsum = render(cycle, out_dir, models=model,
+                          domains=",".join(domains_g), storm=storm) or {}
+            upcov = cu_upload(r2, out_dir, prefix, state["manifest"]) or {}
+            upcov.setdefault("render_seconds", rsum.get("render_seconds"))
+            upcov.setdefault("ingest", rsum.get("ingest"))
+            upcov.setdefault("render", rsum.get("render"))
+            return upcov
+        if out_dir_factory is not None:
+            return run(out_dir_factory(f"{cycle}-catchup-{model}-{storm}"))
+        with tempfile.TemporaryDirectory(prefix=f"hafs_cu_{cycle}_") as td:
+            return run(str(Path(td) / "hafs"))
 
     return pf.Source(name="hafs", fetch=fetch, change_key=change_key,
                      process=process, valid_time=valid_time)
 
 
 def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, diagnose,
-                       clock) -> None:
+                       clock) -> tuple:
+    """Full-cycle render + 3-pass upload. Returns ``(manifest, summary_payload)``
+    so the Source can seed its catch-up ledger (what rendered, what was skipped)
+    from the cycle's ground truth."""
     # Progress heartbeat wraps the WHOLE render+upload so a hang at any stage is
     # observable. The render raises RenderError on timeout / total-failure -> the
     # spine holds the signature and retries next poll (NO upload on failure, so
@@ -586,21 +909,27 @@ def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, diagnose,
         # (not just on failure) so partial coverage - dropped pairs, the
         # ingest-error types - is visible on R2 without Railway-log access. Best
         # effort: a summary-write failure never fails an otherwise-good publish.
+        payload = {
+            "cycle": cycle,
+            "generated_utc": pf.iso_z(clock()),
+            "frames": upcov.get("frames"),
+            "storms": upcov.get("storms"),
+            "pruned": upcov.get("pruned"),
+            "coverage": upcov.get("coverage"),
+            **{k: summary[k] for k in
+               ("render_seconds", "planned", "ingest", "render",
+                "skipped_pairs", "failed_ingest", "failed_render",
+                "ingest_error_counts") if k in summary},
+        }
         try:
-            r2.put_json(f"{prefix}/render_summary.json", {
-                "cycle": cycle,
-                "generated_utc": pf.iso_z(clock()),
-                "frames": upcov.get("frames"),
-                "storms": upcov.get("storms"),
-                "pruned": upcov.get("pruned"),
-                "coverage": upcov.get("coverage"),
-                **{k: summary[k] for k in
-                   ("render_seconds", "planned", "ingest", "render",
-                    "skipped_pairs", "failed_ingest", "failed_render",
-                    "ingest_error_counts") if k in summary},
-            }, CC_HEALTH)
+            r2.put_json(f"{prefix}/render_summary.json", payload, CC_HEALTH)
         except Exception:  # noqa: BLE001
             pass
+        try:
+            manifest = json.loads((Path(out_dir) / "manifest.json").read_text())
+        except Exception:  # noqa: BLE001 - a real upload already validated it
+            manifest = None
+        return manifest, payload
 
 
 def diagnose_ingest(cycle: str) -> str:
