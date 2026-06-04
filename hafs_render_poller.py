@@ -108,6 +108,27 @@ HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "4"))
 HAFS_CATCHUP = (_env("HAFS_CATCHUP", "true") or "").strip().lower() not in (
     "false", "0", "no")
 
+# PROGRESSIVE FRAME-LOAD: render forecast hours AS THEY POST upstream instead
+# of waiting for a pair's terminal f126 - the frame-granular generalization of
+# the pair-level catch-up (which stays in-tree as the rollback:
+# HAFS_PROGRESSIVE=false reverts to the classic complete-pair source above).
+# Frames publish ADDITIVELY per poll batch under CYCLE-SCOPED keys
+# ({prefix}/{cycle}/...) with a cycles[]-bearing manifest; the legacy manifest
+# fields keep describing the newest COMPLETE cycle with its prefix baked into
+# path_template, so an old frontend keeps working through deploy skew.
+HAFS_PROGRESSIVE = (_env("HAFS_PROGRESSIVE", "true") or "").strip().lower() not in (
+    "false", "0", "no")
+
+# The expected forecast grid (mirrors the generator's TERMINAL_FXX / step) -
+# drives frames_expected, completion detection, and the frontend's tick grid.
+FXX_END = int(_env("HAFS_FXX_END", "126"))
+FXX_STEP = int(_env("HAFS_FXX_STEP", "3"))
+
+# Flat (pre-cycle-scoped) legacy PNG keys are deleted by the completion prune
+# once they are older than this - long enough that no live browser session
+# still holds a manifest that references them.
+FLAT_KEY_TTL_S = int(_env("HAFS_FLAT_KEY_TTL_S", str(24 * 3600)))
+
 # A pair whose catch-up render keeps failing is abandoned after this many
 # attempts (visible in render_summary's skipped_pairs) so a permanently-broken
 # upstream pair can't burn a render attempt every poll until the next cycle.
@@ -174,6 +195,38 @@ class R2:
         body = json.dumps(obj, separators=(",", ":")).encode()
         return self.put_bytes(key, body, "application/json", cache)
 
+    def get_json(self, key: str) -> Optional[dict]:
+        """Fetch + parse a JSON object, or None on any failure (missing key,
+        bad JSON). Used to bootstrap the progressive ledger from the live
+        manifest after a worker restart."""
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=key)
+            return json.loads(resp["Body"].read())
+        except Exception as e:  # noqa: BLE001 - bootstrap is best-effort
+            log.info("R2 get %s: %s (cold start)", key, e)
+            return None
+
+    def list_objects(self, prefix: str) -> list:
+        """[(key, last_modified_datetime)] under ``prefix`` (paginated) - the
+        LastModified-aware variant list_keys lacks, for the age-gated flat-key
+        prune."""
+        out: list = []
+        token: Optional[str] = None
+        while True:
+            kw = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if token:
+                kw["ContinuationToken"] = token
+            resp = self.s3.list_objects_v2(**kw)
+            for obj in resp.get("Contents", []):
+                out.append((obj["Key"], obj.get("LastModified")))
+            if resp.get("IsTruncated"):
+                token = resp.get("NextContinuationToken")
+                if not token:
+                    break
+            else:
+                break
+        return out
+
     def list_keys(self, prefix: str) -> list[str]:
         """All object keys under ``prefix`` (paginated)."""
         keys: list[str] = []
@@ -219,6 +272,7 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
                           models: str = HAFS_MODELS,
                           domains: str = HAFS_DOMAINS,
                           storm: Optional[str] = None,
+                          only_fxx: Optional[str] = None,
                           products: Optional[str] = HAFS_PRODUCTS,
                           timeout_s: int = RENDER_TIMEOUT_S,
                           save_dir: str = CACHE_DIR) -> dict:
@@ -242,6 +296,10 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
            "--models", models, "--domains", domains, "--save-dir", save_dir]
     if storm:
         cmd += ["--storm", storm]
+    if only_fxx:
+        # Progressive subset (hafs-render >= 0.4.0): render exactly these
+        # hours, bypassing the per-pair terminal gate.
+        cmd += ["--only-fxx", only_fxx]
     if products:
         cmd += ["--products", products]
     env = dict(os.environ, HERBIE_DATA=save_dir)
@@ -437,6 +495,20 @@ def manifest_pairs(manifest: dict) -> set:
     return pairs
 
 
+def manifest_frames(manifest: dict) -> set:
+    """The (model, storm, RAW domain, fxx) FRAMES with a rendered PNG in a
+    manifest (union across products) - the progressive ledger's granularity."""
+    frames = set()
+    for s in manifest.get("storms", []) or []:
+        for mdl, doms in (s.get("frames") or {}).items():
+            for dom_slug, prods in (doms or {}).items():
+                raw = RAW_DOMAIN_BY_SLUG.get(dom_slug, dom_slug)
+                for fxx_list in (prods or {}).values():
+                    for f in fxx_list or []:
+                        frames.add((mdl, s.get("id"), raw, int(f)))
+    return frames
+
+
 def merge_manifest(base: dict, incr: dict) -> dict:
     """ADDITIVE deep-merge of a catch-up render's manifest into the cycle's
     published manifest: per-storm frames union at the product-fxx level, new
@@ -551,6 +623,100 @@ def upload_catchup(r2: R2, out_dir: str, prefix: str, base_manifest: dict) -> di
             "merged_manifest": merged}
 
 
+def upload_progressive_batch(r2: R2, out_dir: str, prefix: str,
+                             cycle: str) -> dict:
+    """ADDITIVE upload of one progressive batch under the CYCLE-SCOPED prefix
+    ``{prefix}/{cycle}/...``. PNGs only (same all-or-nothing barrier); the
+    manifest is composed + written by the caller AFTER this returns, so a
+    listed frame's PNG is always already on R2. NEVER prunes.
+
+    Returns ``{"frames", "incr", "new_frames", "coverage", "storms"}`` where
+    ``incr`` is the subprocess's manifest and ``new_frames`` its
+    (model, storm, raw_domain, fxx) set."""
+    out = Path(out_dir)
+    manifest_path = out / "manifest.json"
+    if not manifest_path.exists():
+        raise RenderError(f"no manifest at {manifest_path} - nothing to publish")
+    incr = json.loads(manifest_path.read_text())
+    fresh = _upload_pngs(r2, out, f"{prefix}/{cycle}")
+    new_frames = manifest_frames(incr)
+    log.info("progressive batch uploaded %d PNG(s) (%d model frame(s)) under "
+             "%s/%s", len(fresh), len(new_frames), prefix, cycle)
+    return {"frames": len(fresh), "incr": incr, "new_frames": new_frames,
+            "coverage": _manifest_coverage(incr),
+            "storms": sorted({s.get("id") for s in incr.get("storms", []) or []})}
+
+
+def _manifest_headers() -> dict:
+    """The canonical products/models/domains header arrays, derived from the
+    SAME registry the generator's _manifest_skeleton uses (the worker pins the
+    hafs-render package, so there is one source of header truth), scoped by
+    the worker's HAFS_MODELS / HAFS_DOMAINS / HAFS_PRODUCTS env exactly like
+    the render subprocess. Lazy + cached: pulls the GRIB stack."""
+    global _HDR_CACHE
+    if _HDR_CACHE is not None:
+        return _HDR_CACHE
+    from hafs_render.generate_hafs_plots import (  # lazy
+        DEFAULT_PRODUCTS, DOMAINS, MODEL_LABEL, PRODUCTS)
+    models = [m.strip() for m in HAFS_MODELS.split(",") if m.strip()]
+    domains = [d.strip() for d in HAFS_DOMAINS.split(",") if d.strip()]
+    products = ([p.strip() for p in HAFS_PRODUCTS.split(",") if p.strip()]
+                if HAFS_PRODUCTS else list(DEFAULT_PRODUCTS))
+    _HDR_CACHE = {
+        "product": PRODUCTS[products[0]],
+        "products": [PRODUCTS[p] for p in products],
+        "models": [{"slug": m, "label": MODEL_LABEL[m]} for m in models],
+        "domains": [{"slug": DOMAINS[d][0], "label": DOMAINS[d][1], "raw": d}
+                    for d in domains],
+        "n_products": len(products),
+    }
+    return _HDR_CACHE
+
+
+_HDR_CACHE: Optional[dict] = None
+
+
+def compose_manifest_v2(entries: list, headers: dict, *,
+                        now_iso: str, fxx_step: Optional[int] = None,
+                        fxx_end: Optional[int] = None,
+                        fxx_pad: int = 3) -> dict:
+    """The published manifest: NEW cycles[]-bearing fields for the progressive
+    frontend + LEGACY single-cycle fields for an old frontend (zero-blink
+    deploy skew). ``entries`` is newest-first cycle entries (at most 2).
+
+    Legacy fields always describe the newest COMPLETE cycle - its prefix is
+    BAKED INTO path_template as a literal, so old JS (which substitutes only
+    {model}/{storm}/{domain}/{product}/{fxx}) resolves into the cycle-scoped
+    keys unchanged. With no complete cycle yet, legacy falls back to the
+    newest entry that has frames (a fresh deploy mid-build-out)."""
+    fxx_step = FXX_STEP if fxx_step is None else fxx_step
+    fxx_end = FXX_END if fxx_end is None else fxx_end
+    legacy = next((e for e in entries if not e.get("in_progress")), None)
+    if legacy is None:
+        legacy = next((e for e in entries if e.get("storms")), None)
+    out = {
+        "generated_at": now_iso,
+        "product": headers["product"],
+        "products": headers["products"],
+        "models": headers["models"],
+        "domains": headers["domains"],
+        "fxx_step": fxx_step,
+        "fxx_pad": fxx_pad,
+        "fxx_end": fxx_end,
+        "path_template_cycles":
+            "{cycle}/{model}/{storm}/{domain}/{product}/f{fxx}.png",
+        "cycles": entries,
+        # legacy single-cycle view (old frontend):
+        "cycle": legacy["cycle"] if legacy else None,
+        "storms": legacy["storms"] if legacy else [],
+        "path_template": (
+            f"{legacy['cycle']}/{{model}}/{{storm}}/{{domain}}/{{product}}/f{{fxx}}.png"
+            if legacy else
+            "{model}/{storm}/{domain}/{product}/f{fxx}.png"),
+    }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Progress heartbeat - written THROUGHOUT a long render so it is observable.
 # ---------------------------------------------------------------------------
@@ -659,6 +825,100 @@ def list_complete_pairs(cycle: str, *, models: str = HAFS_MODELS,
                 if key in keys:
                     pairs.append((model, storm, domain))
     return tuple(sorted(pairs))
+
+
+def resolve_active_cycle(models: str = HAFS_MODELS) -> Optional[str]:
+    """The newest cycle id with ANY upstream presence across the configured
+    models - a cycle dir exists as soon as its first artifact (storm_info,
+    ~1.3 h before f000) posts, which is the pre-announce beacon. Progressive
+    mode switches to a new cycle here instead of waiting for completeness."""
+    from hafs_render.generate_hafs_plots import list_dates, list_hours  # lazy
+    import requests
+    sess = requests.Session()
+    best: Optional[str] = None
+    for model in [m.strip() for m in models.split(",") if m.strip()]:
+        try:
+            dates = list_dates(model, session=sess)
+        except Exception as e:  # noqa: BLE001 - one model's listing failing
+            log.warning("resolve_active_cycle: %s listing failed: %s", model, e)
+            continue
+        for date in reversed(dates[-4:]):
+            hours = list_hours(model, date, session=sess)
+            if hours:
+                cand = f"{date}{hours[-1]}"
+                if best is None or cand > best:
+                    best = cand
+                break
+    return best
+
+
+_FXX_GRB_RE = re.compile(r"\.f(\d{3})\.grb2$")
+_FXX_IDX_RE = re.compile(r"\.f(\d{3})\.grb2\.idx$")
+
+
+def _needs_sat() -> bool:
+    """True when the effective product set includes a simulated-satellite
+    product (the default set does), so a frame is only 'posted' once its .sat
+    sibling is up too - the union ingest hard-requires it."""
+    if not HAFS_PRODUCTS:
+        return True
+    prods = {p.strip() for p in HAFS_PRODUCTS.split(",")}
+    return bool(prods & {"clean_ir", "water_vapor"})
+
+
+def list_posted_frames(cycle: str, *, models: str = HAFS_MODELS,
+                       domains: str = HAFS_DOMAINS) -> tuple:
+    """Every (model, storm, raw_domain, fxx) RENDERABLE upstream for ``cycle``:
+    the .atm grb2+idx exist AND (when sim-sat products are in scope) the
+    sibling .sat grb2+idx for the same fxx exist - both verified empirically
+    to post essentially together, but a frame must never plan before its
+    inputs are complete (the union ingest hard-raises on a missing .sat).
+
+    One listing per (model, storm, family): 2 models x S storms x 4 families
+    ~ 8-16 cheap list calls per poll. Storms come from each model's OWN
+    listing (a model's pair exists iff that model has files)."""
+    from hafs_render.generate_hafs_plots import (  # lazy
+        MODEL_TOKEN, _s3_list, list_storms)
+    import requests
+    sess = requests.Session()
+    date, hh = cycle[:8], cycle[8:]
+    model_list = [m.strip() for m in models.split(",") if m.strip()]
+    domain_list = [d.strip() for d in domains.split(",") if d.strip()]
+    need_sat = _needs_sat()
+    frames = []
+    for model in model_list:
+        tok = MODEL_TOKEN[model]
+        try:
+            storms = list_storms(model, date, hh, session=sess)
+        except Exception as e:  # noqa: BLE001
+            log.warning("list_posted_frames: %s storm listing failed: %s",
+                        model, e)
+            continue
+        for storm in storms:
+            fam_ready: dict = {}
+            fams = set()
+            for domain in domain_list:
+                fams.add(domain)                       # e.g. storm.atm
+                if need_sat:
+                    fams.add(domain.split(".")[0] + ".sat")
+            for fam in sorted(fams):
+                prefix = (f"{tok}/{date}/{hh}/{storm}.{date}{hh}.{tok}"
+                          f".{fam}.f")
+                keys, _ = _s3_list(prefix, session=sess)
+                grb = {int(m.group(1)) for k in keys
+                       if (m := _FXX_GRB_RE.search(k))}
+                idx = {int(m.group(1)) for k in keys
+                       if (m := _FXX_IDX_RE.search(k))}
+                fam_ready[fam] = grb & idx
+            for domain in domain_list:
+                ready = fam_ready.get(domain, set())
+                if need_sat:
+                    ready = ready & fam_ready.get(
+                        domain.split(".")[0] + ".sat", set())
+                for fxx in sorted(ready):
+                    if fxx % FXX_STEP == 0 and fxx <= FXX_END:
+                        frames.append((model, storm, domain, fxx))
+    return tuple(sorted(frames))
 
 
 def _group_missing(missing) -> dict:
@@ -908,6 +1168,338 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                      process=process, valid_time=valid_time)
 
 
+# ---------------------------------------------------------------------------
+# The PROGRESSIVE HAFS Source (HAFS_PROGRESSIVE=true): frame-granular - render
+# forecast hours AS THEY POST, publish additively per poll batch under
+# cycle-scoped keys, complete + prune when every posted pair reaches f126.
+# The pair-level source above stays in-tree as the rollback.
+# ---------------------------------------------------------------------------
+def _fold_batch_summary(summary: dict, upres: dict, batch_label: str,
+                        clock: Callable[[], dt.datetime]) -> None:
+    """Fold one progressive batch into the cycle's render_summary payload:
+    cumulative counters + a capped frame_batches audit trail."""
+    summary["frames"] = (summary.get("frames") or 0) + (upres.get("frames") or 0)
+    summary["storms"] = sorted(set(summary.get("storms") or [])
+                               | set(upres.get("storms") or []))
+    for key in ("ingest", "render"):
+        inc = upres.get(key) or {}
+        if inc:
+            tot = summary.setdefault(key, {})
+            for f in ("ok", "total", "failed"):
+                if f in inc:
+                    tot[f] = (tot.get(f) or 0) + (inc.get(f) or 0)
+    if upres.get("render_seconds"):
+        summary["render_seconds"] = round(
+            (summary.get("render_seconds") or 0) + upres["render_seconds"], 1)
+    batches = summary.setdefault("frame_batches", [])
+    nf = sorted(upres.get("new_frames") or ())
+    span = (f"f{nf[0][3]:03d}-f{nf[-1][3]:03d}" if nf else "(none)")
+    batches.append({"utc": pf.iso_z(clock()), "batch": batch_label,
+                    "model_frames": len(nf), "fxx_span": span,
+                    "frames": upres.get("frames"),
+                    "render_seconds": upres.get("render_seconds")})
+    del batches[:-60]   # cap the audit trail
+
+
+def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
+                            cycle_resolver: Optional[Callable[[], Optional[str]]] = None,
+                            posted_frames_fn: Optional[Callable[[str], tuple]] = None,
+                            render_fn: Optional[Callable[..., dict]] = None,
+                            batch_uploader: Optional[Callable[..., dict]] = None,
+                            headers_fn: Optional[Callable[[], dict]] = None,
+                            catchup_max_attempts: int = HAFS_CATCHUP_MAX_ATTEMPTS,
+                            out_dir_factory: Optional[Callable[[str], str]] = None,
+                            clock: Callable[[], dt.datetime] = pf.utcnow) -> pf.Source:
+    """Build the frame-granular progressive Source. All collaborators are
+    injectable so the offline tests exercise the ledger, batching, completion,
+    prune, bootstrap, and zero-blink manifest WITHOUT a render, R2, or
+    network."""
+    resolve = cycle_resolver or resolve_active_cycle
+    posted_fn = posted_frames_fn or list_posted_frames
+    render = render_fn or run_render_subprocess
+    upload_batch = batch_uploader or upload_progressive_batch
+    headers = headers_fn or _manifest_headers
+
+    # The frame ledger for the ACTIVE cycle + the retained previous-complete
+    # entry (the frontend's flip-back target). In-memory, but bootstrapped
+    # from the live manifest on restart so a deploy neither re-renders the
+    # whole active cycle nor loses the flip-back entry.
+    state = {"cycle": None, "entry": None, "prev_entry": None, "summary": None,
+             "rendered": set(), "attempts": {}, "given_up": set(),
+             "complete": False, "bootstrapped": False}
+
+    def _grid_n() -> int:
+        return FXX_END // FXX_STEP + 1
+
+    def _entries() -> list:
+        out = []
+        if state["entry"] is not None:
+            out.append(state["entry"])
+        if (state["prev_entry"] is not None
+                and (not out or state["prev_entry"]["cycle"] != out[0]["cycle"])):
+            out.append(state["prev_entry"])
+        return out
+
+    def _publish_manifest() -> None:
+        man = compose_manifest_v2(_entries(), headers(),
+                                  now_iso=pf.iso_z(clock()))
+        r2.put_json(f"{prefix}/manifest.json", man, CC_MANIFEST)
+
+    def _write_summary() -> None:
+        s = state["summary"]
+        if s is None:
+            return
+        s["generated_utc"] = pf.iso_z(clock())
+        s["frames_done"] = len(state["rendered"])
+        s["complete"] = state["complete"]
+        try:
+            r2.put_json(f"{prefix}/render_summary.json", s, CC_HEALTH)
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+
+    def _bootstrap() -> None:
+        """Recover the ledger + flip-back entry from the live manifest once
+        per process lifetime. Best-effort: any failure = cold start."""
+        state["bootstrapped"] = True
+        man = r2.get_json(f"{prefix}/manifest.json")
+        if not man or not man.get("cycles"):
+            return
+        entries = man["cycles"]
+        newest = entries[0]
+        prev = next((e for e in entries[1:] if not e.get("in_progress")), None)
+        state["prev_entry"] = prev
+        if newest.get("in_progress"):
+            state.update(cycle=newest["cycle"], entry=newest,
+                         complete=False,
+                         rendered=manifest_frames(newest))
+            state["summary"] = {"cycle": newest["cycle"], "progressive": True,
+                                "bootstrapped": True}
+        else:
+            # Newest is complete: treat it as prev so a same-cycle re-resolve
+            # is a no-op and the next NEW cycle archives it correctly.
+            state["prev_entry"] = newest
+        log.info("bootstrapped from live manifest: active=%s (%d frames), "
+                 "prev=%s", state["cycle"],
+                 len(state["rendered"]),
+                 state["prev_entry"] and state["prev_entry"]["cycle"])
+
+    def fetch():
+        if not state["bootstrapped"]:
+            try:
+                _bootstrap()
+            except Exception as e:  # noqa: BLE001 - never block polling
+                log.warning("bootstrap failed (cold start): %s", e)
+                state["bootstrapped"] = True
+        cycle = resolve()
+        if not cycle:
+            return {"cycle": None, "posted": ()}
+        return {"cycle": cycle, "posted": tuple(posted_fn(cycle))}
+
+    def change_key(data):
+        # Fires on a NEW cycle dir (pre-announce beacon) and on every newly
+        # posted upstream frame - the progressive trigger. Quiet upstream =
+        # the spine's cheap path.
+        if not data["cycle"]:
+            return None
+        return (data["cycle"], data["posted"])
+
+    def valid_time(data):
+        c = data["cycle"]
+        if not c:
+            return None
+        try:
+            return dt.datetime.strptime(c, "%Y%m%d%H")
+        except ValueError:
+            return None
+
+    def process(ctx: pf.ProcessContext):
+        cycle = ctx.data["cycle"]
+        posted = set(ctx.data["posted"])
+        if not cycle:
+            log.info("no active cycle - nothing to render")
+            return
+        if cycle != state["cycle"]:
+            _begin_cycle(cycle)
+        _render_delta(cycle, posted)
+        _update_completion(posted)
+
+    def _begin_cycle(cycle):
+        if state["entry"] is not None and state["complete"]:
+            # Archive the completed cycle as the flip-back target. A
+            # superseded INCOMPLETE cycle is dropped (its prefix is pruned at
+            # the next completion); the older complete entry stays.
+            state["prev_entry"] = state["entry"]
+        state.update(cycle=cycle, complete=False, rendered=set(),
+                     attempts={}, given_up=set())
+        state["entry"] = {"cycle": cycle, "in_progress": True,
+                          "frames_done": 0, "frames_expected": None,
+                          "started_utc": pf.iso_z(clock()), "storms": []}
+        state["summary"] = {"cycle": cycle, "progressive": True}
+        log.info("new active cycle %s - pre-announcing", cycle)
+        _publish_manifest()
+        _write_summary()
+
+    def _render_delta(cycle, posted):
+        missing = posted - state["rendered"] - state["given_up"]
+        if not missing:
+            return
+        groups: dict = {}
+        for (m, s, d, f) in sorted(missing):
+            groups.setdefault((m, s), {}).setdefault(d, set()).add(f)
+        # One subprocess per (model, storm, IDENTICAL-fxx-set of domains): the
+        # generator's --domains x --only-fxx is a cross-product, so domains
+        # with ASYMMETRIC missing sets must not share an invocation or the
+        # overlap would re-render already-completed frames. Domains post near
+        # lock-step upstream, so the common case stays one invocation.
+        for (model, storm), doms in sorted(groups.items()):
+            runnable_by_set: dict = {}
+            for d, fxxs in sorted(doms.items()):
+                keep = set()
+                for f in sorted(fxxs):
+                    key = (model, storm, d, f)
+                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+                    if state["attempts"][key] > catchup_max_attempts:
+                        state["given_up"].add(key)
+                        _set_skip_reason(
+                            state["summary"], (model, storm, d),
+                            f"frame f{f:03d} abandoned after "
+                            f"{catchup_max_attempts} failed attempts")
+                        log.warning("progressive giving up on %s %s %s f%03d",
+                                    model, storm, d, f)
+                    else:
+                        keep.add(f)
+                if keep:
+                    runnable_by_set.setdefault(
+                        tuple(sorted(keep)), []).append(d)
+            if not runnable_by_set:
+                _write_summary()
+                continue
+            for fxx_set, set_doms in sorted(runnable_by_set.items()):
+                runnable = [(model, storm, d, f) for d in set_doms
+                            for f in fxx_set]
+                log.info("progressive batch: %s %s %s fxx=%s",
+                         model, storm, ",".join(set_doms),
+                         ",".join(str(f) for f in fxx_set))
+                with ProgressHeartbeat(r2, prefix,
+                                       f"{cycle} progressive {model}/{storm}",
+                                       clock=clock):
+                    upres = _run_batch(cycle, model, storm, set_doms,
+                                       set(fxx_set))
+                state["rendered"] |= set(upres.get("new_frames") or ())
+                _merge_entry(upres.get("incr") or {})
+                _refresh_counts(posted)
+                _fold_batch_summary(state["summary"], upres,
+                                    f"{model}/{storm}", clock)
+                # Manifest AFTER the PNG barrier (inside _run_batch) - a
+                # listed frame's PNG is already on R2.
+                _publish_manifest()
+                _write_summary()
+                # GATE-REOPEN GUARD (frame level): the subprocess exits 0 as
+                # long as anything rendered; a planned frame that produced
+                # nothing must hold the signature so it retries (bounded by
+                # the attempts cap).
+                dropped = [k for k in runnable if k not in state["rendered"]]
+                if dropped:
+                    raise RenderError(
+                        "progressive batch exited 0 but produced no frames "
+                        f"for {dropped[:6]}{'...' if len(dropped) > 6 else ''}"
+                        " - holding signature for retry")
+
+    def _run_batch(cycle, model, storm, doms, fxxs):
+        only = ",".join(str(f) for f in sorted(fxxs))
+        def run(out_dir):
+            rsum = render(cycle, out_dir, models=model,
+                          domains=",".join(doms), storm=storm,
+                          only_fxx=only) or {}
+            upres = upload_batch(r2, out_dir, prefix, cycle) or {}
+            upres.setdefault("render_seconds", rsum.get("render_seconds"))
+            upres.setdefault("ingest", rsum.get("ingest"))
+            upres.setdefault("render", rsum.get("render"))
+            return upres
+        if out_dir_factory is not None:
+            return run(out_dir_factory(f"{cycle}-prog-{model}-{storm}"))
+        with tempfile.TemporaryDirectory(prefix=f"hafs_pg_{cycle}_") as td:
+            return run(str(Path(td) / "hafs"))
+
+    def _merge_entry(incr):
+        entry = state["entry"]
+        merged = merge_manifest({"cycle": entry["cycle"],
+                                 "storms": entry["storms"]}, incr)
+        entry["storms"] = merged["storms"]
+        state["summary"]["coverage"] = _manifest_coverage(
+            {"storms": entry["storms"]})
+
+    def _refresh_counts(posted):
+        entry = state["entry"]
+        if entry is None:
+            return
+        pairs = {(m, s, d) for (m, s, d, f) in (posted | state["rendered"])}
+        entry["frames_done"] = len(state["rendered"])
+        entry["frames_expected"] = (len(pairs) * _grid_n()) if pairs else None
+
+    def _update_completion(posted):
+        entry = state["entry"]
+        if entry is None:
+            return
+        _refresh_counts(posted)
+        missing_left = posted - state["rendered"] - state["given_up"]
+        posted_pairs = {(m, s, d) for (m, s, d, f) in posted}
+        have_terminal = bool(posted_pairs) and all(
+            (m, s, d, FXX_END) in state["rendered"]
+            for (m, s, d) in posted_pairs)
+        complete = have_terminal and not missing_left
+        if complete and not state["complete"]:
+            state["complete"] = True
+            entry["in_progress"] = False
+            log.info("cycle %s COMPLETE (%d model frames) - publishing + prune",
+                     entry["cycle"], len(state["rendered"]))
+            _publish_manifest()      # legacy fields flip to this cycle
+            _write_summary()
+            try:
+                _prune_retired()
+            except Exception as e:  # noqa: BLE001 - prune must never wedge
+                log.warning("completion prune failed (retrying next "
+                            "completion): %s", e)
+        elif not complete and state["complete"]:
+            # A late pair re-opened the cycle (e.g. hafsb posting after we
+            # completed) - honest flip back; renders resume next polls.
+            state["complete"] = False
+            entry["in_progress"] = True
+            _publish_manifest()
+            _write_summary()
+
+    def _prune_retired():
+        """Completion prune: delete cycle prefixes not in the kept entries +
+        flat (pre-cycle-scoped) legacy PNGs older than FLAT_KEY_TTL_S. The
+        manifest key itself and health/summary JSONs are never touched."""
+        keep = {e["cycle"] for e in _entries()}
+        now = clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=dt.timezone.utc)
+        doomed = []
+        for key, lm in r2.list_objects(prefix + "/"):
+            if not key.endswith(".png"):
+                continue
+            rel = key[len(prefix) + 1:]
+            m = re.match(r"^(\d{10})/", rel)
+            if m:
+                if m.group(1) not in keep:
+                    doomed.append(key)
+            else:
+                # flat legacy key: age-gated so a long-lived browser session
+                # holding a pre-transition manifest doesn't 404 mid-scrub
+                if lm is not None and lm.tzinfo is None:
+                    lm = lm.replace(tzinfo=dt.timezone.utc)
+                if lm is not None and (now - lm).total_seconds() > FLAT_KEY_TTL_S:
+                    doomed.append(key)
+        if doomed:
+            log.info("completion prune: deleting %d retired PNG(s)", len(doomed))
+            r2.delete(doomed)
+
+    return pf.Source(name="hafs", fetch=fetch, change_key=change_key,
+                     process=process, valid_time=valid_time)
+
+
 def _render_and_upload(r2, prefix, cycle, out_dir, render, upload, diagnose,
                        clock) -> tuple:
     """Full-cycle render + 3-pass upload. Returns ``(manifest, summary_payload)``
@@ -1015,11 +1607,18 @@ class _HealthSink(pf.Sink):
 
 def build_engine(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                  interval_s: float = POLL_INTERVAL_S,
+                 progressive: Optional[bool] = None,
                  clock: Callable[[], dt.datetime] = pf.utcnow,
                  sleep: Callable[[float], None] = time.sleep,
                  **source_kwargs) -> pf.PollerEngine:
+    """``progressive`` selects the frame-granular source (default: the
+    HAFS_PROGRESSIVE env flag); False = the classic complete-pair source -
+    the in-tree rollback path."""
+    if progressive is None:
+        progressive = HAFS_PROGRESSIVE
     health = _HealthSink(r2, prefix)
-    source = make_hafs_source(r2, prefix=prefix, clock=clock, **source_kwargs)
+    maker = make_progressive_source if progressive else make_hafs_source
+    source = maker(r2, prefix=prefix, clock=clock, **source_kwargs)
     return pf.PollerEngine(
         [source], name="hafs-render-poller", interval_s=interval_s,
         stale_after_s=STALE_AFTER_S, sink=health,
@@ -1043,9 +1642,10 @@ def main() -> None:  # pragma: no cover - Railway worker entrypoint
     r2 = R2()
     eng = build_engine(r2)
     log.info("hafs render poller starting | prefix=%s | jobs=%d | interval=%gs "
-             "| watchdog=%ds | stale_after=%gs",
+             "| watchdog=%ds | stale_after=%gs | mode=%s",
              HAFS_R2_PREFIX, HAFS_JOBS, POLL_INTERVAL_S, RENDER_TIMEOUT_S,
-             STALE_AFTER_S)
+             STALE_AFTER_S,
+             "progressive" if HAFS_PROGRESSIVE else "complete-pair")
     eng.run_forever()
 
 

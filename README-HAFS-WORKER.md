@@ -48,6 +48,24 @@ Anti-freeze: the spine has no `process()` timeout, so the subprocess watchdog is
 what guarantees a wedged cycle self-aborts and retries; `STALE_AFTER_S` is set
 above the watchdog so the health watcher never false-alarms mid-render.
 
+## Progressive frame-load (HAFS_PROGRESSIVE, default ON)
+
+The frame-granular generalization of the catch-up: `change_key = (cycle,
+posted-frame set)` where a frame is "posted" once its `.atm` AND `.sat`
+grb2+idx exist upstream. Each poll renders only the NEW frames (one filtered
+`--models/--storm/--domains/--only-fxx` subprocess per (model, storm,
+identical-fxx-set) group - exact, never re-renders), uploads them under
+CYCLE-SCOPED keys (`{prefix}/{cycle}/...`, immutable), then publishes a
+cycles[]-bearing manifest whose LEGACY fields keep describing the newest
+COMPLETE cycle with its prefix baked into `path_template` (an old frontend
+keeps working through deploy skew). A new cycle dir (storm_info, ~1.3 h before
+f000) pre-announces with an empty in-progress entry. Completion = every posted
+pair rendered through f126 -> legacy fields flip, the completion prune deletes
+retired cycle prefixes + aged-out flat legacy keys. Frame-level attempts cap +
+gate-reopen guard as in the pair path; the ledger bootstraps from the live
+manifest on restart (no full re-render after a deploy).
+`HAFS_PROGRESSIVE=false` = the classic complete-pair source, untouched.
+
 ## Deploy (Stage 2 = SHADOW)
 
 Prereq (main repo, one-time): the `hafs_render` package must be importable as the

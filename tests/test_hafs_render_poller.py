@@ -35,21 +35,38 @@ class FakeClock:
 
 
 class FakeR2:
-    """Records puts/deletes; list_keys reflects current state. No network."""
-    def __init__(self, preload=None):
+    """Records puts/deletes; list_keys reflects current state. No network.
+    ``mtimes`` backs the LastModified-aware list_objects (flat-key prune)."""
+    def __init__(self, preload=None, mtimes=None):
         self.store = dict(preload or {})       # key -> bytes
+        self.mtimes = dict(mtimes or {})       # key -> tz-aware datetime
         self.deleted = []
 
     def put_bytes(self, key, data, content_type, cache):
         self.store[key] = data
+        self.mtimes.setdefault(
+            key, dt.datetime(2026, 6, 4, 12, 0, tzinfo=dt.timezone.utc))
         return True
 
     def put_json(self, key, obj, cache):
         self.store[key] = json.dumps(obj).encode()
         return True
 
+    def get_json(self, key):
+        if key not in self.store:
+            return None
+        try:
+            return json.loads(self.store[key])
+        except Exception:  # noqa: BLE001
+            return None
+
     def list_keys(self, prefix):
         return [k for k in self.store if k.startswith(prefix)]
+
+    def list_objects(self, prefix):
+        return [(k, self.mtimes.get(
+                    k, dt.datetime(2026, 6, 4, 12, 0, tzinfo=dt.timezone.utc)))
+                for k in self.store if k.startswith(prefix)]
 
     def delete(self, keys):
         for k in keys:
@@ -99,7 +116,7 @@ class TestChangeGate(unittest.TestCase):
 
         r2 = FakeR2()
         eng = hp.build_engine(
-            r2, prefix="shadow/models/hafs", interval_s=1.0,
+            r2, progressive=False, prefix="shadow/models/hafs", interval_s=1.0,
             clock=FakeClock(), sleep=lambda s: None,
             cycle_resolver=resolver, render_fn=render,
             complete_pairs_fn=lambda c: (),   # no upstream movement: pure cycle gate
@@ -145,7 +162,7 @@ class TestWatchdogRetry(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             r2 = FakeR2()
             eng = hp.build_engine(
-                r2, prefix="shadow/models/hafs", interval_s=1.0,
+                r2, progressive=False, prefix="shadow/models/hafs", interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=resolver, render_fn=render,
                 complete_pairs_fn=lambda c: (),
@@ -174,7 +191,7 @@ class TestWatchdogRetry(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             r2 = FakeR2(preload={"shadow/models/hafs/hafsa/06w/storm/mslp_wind/f000.png": b"old"})
             eng = hp.build_engine(
-                r2, prefix="shadow/models/hafs", interval_s=1.0,
+                r2, progressive=False, prefix="shadow/models/hafs", interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=lambda: "2026060206", render_fn=render,
                 complete_pairs_fn=lambda c: (),
@@ -370,7 +387,7 @@ class TestSuccessSummary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             r2 = FakeR2()
             eng = hp.build_engine(
-                r2, prefix=prefix, interval_s=1.0,
+                r2, progressive=False, prefix=prefix, interval_s=1.0,
                 clock=FakeClock(), sleep=lambda s: None,
                 cycle_resolver=resolver, render_fn=render,
                 complete_pairs_fn=lambda c: (),
@@ -421,7 +438,7 @@ class TestIntraCycleCatchup(unittest.TestCase):
 
     def _engine(self, r2, tmp, resolver, pairs_fn, render, **kw):
         return hp.build_engine(
-            r2, prefix=self.PREFIX, interval_s=1.0,
+            r2, progressive=False, prefix=self.PREFIX, interval_s=1.0,
             clock=FakeClock(), sleep=lambda s: None,
             cycle_resolver=resolver, complete_pairs_fn=pairs_fn,
             render_fn=render,
@@ -926,6 +943,378 @@ class TestIntraCycleCatchup(unittest.TestCase):
         self.assertEqual(pairs, (("hafsa", "01e", "parent.atm"),
                                  ("hafsa", "01e", "storm.atm"),
                                  ("hafsb", "01e", "storm.atm")))
+
+
+# --------------------------------------------------------------------------- #
+# PROGRESSIVE frame-load: render fhrs as they post, cycle-scoped keys,
+# manifest v2 (cycles[] + zero-blink legacy), completion + prune, bootstrap
+# --------------------------------------------------------------------------- #
+FAKE_HEADERS = {
+    "product": {"slug": "mslp_wind", "label": "W", "short": "Wind"},
+    "products": [{"slug": "mslp_wind", "label": "W", "short": "Wind"}],
+    "models": [{"slug": "hafsa", "label": "HAFS-A"},
+               {"slug": "hafsb", "label": "HAFS-B"}],
+    "domains": [{"slug": "storm", "label": "S", "raw": "storm.atm"},
+                {"slug": "parent", "label": "P", "raw": "parent.atm"}],
+    "n_products": 1,
+}
+
+
+class TestProgressive(unittest.TestCase):
+    """Frame-granular progressive source, with a tiny grid (FXX_END=6) so a
+    full cycle is f000/f003/f006 per pair."""
+    PREFIX = "models/hafs"
+
+    def setUp(self):
+        self._saved = (hp.FXX_END, hp.FXX_STEP)
+        hp.FXX_END, hp.FXX_STEP = 6, 3
+
+    def tearDown(self):
+        hp.FXX_END, hp.FXX_STEP = self._saved
+
+    def _engine(self, r2, tmp, resolver, posted_fn, render, **kw):
+        return hp.build_engine(
+            r2, progressive=True, prefix=self.PREFIX, interval_s=1.0,
+            clock=FakeClock(), sleep=lambda s: None,
+            cycle_resolver=resolver, posted_frames_fn=posted_fn,
+            render_fn=render, headers_fn=lambda: FAKE_HEADERS,
+            out_dir_factory=lambda c: str(Path(tmp) / c.replace("/", "_")),
+            **kw)
+
+    @staticmethod
+    def _prog_render(plan):
+        """A fake render honoring the progressive filters: writes exactly the
+        frames asked for (models x storm x domains x only_fxx), recording each
+        call's kwargs into ``plan`` (a list)."""
+        def render(cycle, out_dir, **kw):
+            plan.append(dict(kw))
+            fxxs = [int(x) for x in kw["only_fxx"].split(",")]
+            doms = kw["domains"].split(",")
+            slug = {"storm.atm": "storm", "parent.atm": "parent"}
+            spec = {kw["storm"]: {kw["models"]: {
+                slug[d]: {"mslp_wind": list(fxxs)} for d in doms}}}
+            _write_out_multi(out_dir, cycle, spec)
+            return {"render_seconds": 5.0,
+                    "ingest": {"ok": len(fxxs) * len(doms),
+                               "total": len(fxxs) * len(doms), "failed": 0},
+                    "render": {"ok": len(fxxs) * len(doms), "failed": 0}}
+        return render
+
+    def test_pre_announce_then_progressive_build_to_completion(self):
+        calls = []
+        polls = {"n": 0}
+        F = lambda *fr: tuple(sorted(fr))
+        seq = [
+            (),                                                    # storm_info only
+            F(("hafsa", "01e", "storm.atm", 0)),                   # f000 posts
+            F(("hafsa", "01e", "storm.atm", 0),
+              ("hafsa", "01e", "storm.atm", 3),
+              ("hafsa", "01e", "parent.atm", 0)),                  # more posts
+            F(("hafsa", "01e", "storm.atm", 0),
+              ("hafsa", "01e", "storm.atm", 3),
+              ("hafsa", "01e", "storm.atm", 6),
+              ("hafsa", "01e", "parent.atm", 0),
+              ("hafsa", "01e", "parent.atm", 3),
+              ("hafsa", "01e", "parent.atm", 6)),                  # terminal
+        ]
+
+        def posted_fn(cycle):
+            i = min(polls["n"], len(seq) - 1)
+            polls["n"] += 1
+            return seq[i]
+
+        # previous complete cycle lives in the live manifest (bootstrap source)
+        prev_man = {
+            "cycles": [{"cycle": "2026060412", "in_progress": False,
+                        "frames_done": 6, "frames_expected": 6,
+                        "storms": [{"id": "01e", "name": "01E", "frames":
+                                    {"hafsa": {"storm": {"mslp_wind": [0, 3, 6]}}}}]}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(prev_man).encode()})
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               self._prog_render(calls))
+
+            eng.poll_once()    # pre-announce (no frames posted yet)
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["cycle"], "2026060418")
+            self.assertTrue(man["cycles"][0]["in_progress"])
+            self.assertEqual(man["cycles"][0]["storms"], [])
+            # legacy fields still serve the PREVIOUS complete cycle (zero-blink)
+            self.assertEqual(man["cycle"], "2026060412")
+            self.assertTrue(man["path_template"].startswith("2026060412/"))
+            self.assertNotIn("{cycle}", man["path_template"])
+            self.assertEqual(calls, [])
+
+            eng.poll_once()    # f000 lands -> first batch
+            self.assertEqual(calls[-1], {"models": "hafsa", "storm": "01e",
+                                         "domains": "storm.atm",
+                                         "only_fxx": "0"})
+            self.assertIn(f"{self.PREFIX}/2026060418/hafsa/01e/storm/"
+                          "mslp_wind/f000.png", r2.store)
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["storms"][0]["frames"]["hafsa"]
+                             ["storm"]["mslp_wind"], [0])
+            self.assertEqual(man["cycles"][0]["frames_done"], 1)
+            self.assertEqual(man["cycle"], "2026060412")   # legacy unchanged
+
+            eng.poll_once()    # delta: TWO exact batches (asymmetric sets)
+            self.assertEqual(calls[-2], {"models": "hafsa", "storm": "01e",
+                                         "domains": "parent.atm",
+                                         "only_fxx": "0"})
+            self.assertEqual(calls[-1], {"models": "hafsa", "storm": "01e",
+                                         "domains": "storm.atm",
+                                         "only_fxx": "3"})
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["frames_done"], 3)
+            self.assertTrue(man["cycles"][0]["in_progress"])
+
+            eng.poll_once()    # terminal frames -> COMPLETE
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertFalse(man["cycles"][0]["in_progress"])
+            self.assertEqual(man["cycles"][0]["frames_done"], 6)
+            # legacy fields FLIP to the newly-completed cycle
+            self.assertEqual(man["cycle"], "2026060418")
+            self.assertTrue(man["path_template"].startswith("2026060418/"))
+            # flip-back target retained
+            self.assertEqual([c["cycle"] for c in man["cycles"]],
+                             ["2026060418", "2026060412"])
+            # no frame ever re-rendered
+            asked = [f for c in calls for f in c["only_fxx"].split(",")]
+            self.assertEqual(len(asked), 6)
+
+            eng.poll_once()    # quiet
+            self.assertEqual(len(calls), 5)
+        # summary audit
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        self.assertTrue(snap["progressive"])
+        self.assertTrue(snap["complete"])
+        self.assertEqual(snap["frames_done"], 6)
+        self.assertEqual(len(snap["frame_batches"]), 5)
+
+    def test_exit0_frame_drop_held_then_abandoned(self):
+        calls = []
+
+        def posted_fn(cycle):
+            return (("hafsa", "01e", "storm.atm", 0),)
+
+        def render(cycle, out_dir, **kw):
+            calls.append(dict(kw))
+            # exits 0 but writes a manifest with NO frames for the asked fxx
+            _write_out_multi(out_dir, cycle, {"01e": {"hafsa": {}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               render, catchup_max_attempts=2)
+            r1 = eng.poll_once()["hafs"]
+            self.assertEqual(r1.status, pf.PROCESS_FAILED)   # held
+            r2_ = eng.poll_once()["hafs"]
+            self.assertEqual(r2_.status, pf.PROCESS_FAILED)  # retry, held
+            r3 = eng.poll_once()["hafs"]                     # cap -> abandoned
+            self.assertEqual(r3.status, pf.CHANGED)
+            r4 = eng.poll_once()["hafs"]
+            self.assertEqual(r4.status, pf.UNCHANGED)
+        self.assertEqual(len(calls), 2)
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        reasons = [e["reason"] for e in snap["skipped_pairs"]]
+        self.assertTrue(any("abandoned" in r for r in reasons))
+
+    def test_render_failure_keeps_prior_batches(self):
+        calls = []
+        polls = {"n": 0}
+        fail = {"left": 1}
+
+        def posted_fn(cycle):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return (("hafsa", "01e", "storm.atm", 0),)
+            return (("hafsa", "01e", "storm.atm", 0),
+                    ("hafsa", "01e", "storm.atm", 3))
+
+        good = self._prog_render(calls)
+
+        def render(cycle, out_dir, **kw):
+            if kw["only_fxx"] == "3" and fail["left"]:
+                fail["left"] -= 1
+                calls.append(dict(kw))
+                raise hp.RenderError("boom")
+            return good(cycle, out_dir, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn, render)
+            eng.poll_once()                                  # f000 ok
+            r = eng.poll_once()["hafs"]                      # f003 fails
+            self.assertEqual(r.status, pf.PROCESS_FAILED)
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["storms"][0]["frames"]["hafsa"]
+                             ["storm"]["mslp_wind"], [0])    # f000 survived
+            eng.poll_once()                                  # f003 retried ok
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["storms"][0]["frames"]["hafsa"]
+                             ["storm"]["mslp_wind"], [0, 3])
+        self.assertEqual([c["only_fxx"] for c in calls], ["0", "3", "3"])
+
+    def test_new_cycle_supersedes_partial_keeps_older_complete(self):
+        calls = []
+        cyc = {"v": "2026060418"}
+        posted = {"2026060418": (("hafsa", "01e", "storm.atm", 0),),
+                  "2026060500": (("hafsa", "01e", "storm.atm", 0),)}
+
+        def posted_fn(cycle):
+            return posted[cycle]
+
+        prev_man = {"cycles": [
+            {"cycle": "2026060412", "in_progress": False, "frames_done": 6,
+             "frames_expected": 6, "storms": [
+                 {"id": "01e", "name": "01E", "frames":
+                  {"hafsa": {"storm": {"mslp_wind": [0, 3, 6]}}}}]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(prev_man).encode()})
+            eng = self._engine(r2, tmp, lambda: cyc["v"], posted_fn,
+                               self._prog_render(calls))
+            eng.poll_once()            # 18z partial (f000 only, never completes)
+            cyc["v"] = "2026060500"
+            eng.poll_once()            # 00z supersedes
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            # the PARTIAL 18z is dropped from cycles[]; the older COMPLETE 12z
+            # stays as the flip-back target
+            self.assertEqual([c["cycle"] for c in man["cycles"]],
+                             ["2026060500", "2026060412"])
+            self.assertEqual(man["cycle"], "2026060412")     # legacy intact
+
+    def test_bootstrap_recovers_ledger_no_rerender(self):
+        calls = []
+        live = {"cycles": [
+            {"cycle": "2026060418", "in_progress": True, "frames_done": 2,
+             "frames_expected": 3, "started_utc": "x", "storms": [
+                 {"id": "01e", "name": "01E", "frames":
+                  {"hafsa": {"storm": {"mslp_wind": [0, 3]}}}}]},
+            {"cycle": "2026060412", "in_progress": False, "frames_done": 6,
+             "frames_expected": 6, "storms": [
+                 {"id": "01e", "name": "01E", "frames":
+                  {"hafsa": {"storm": {"mslp_wind": [0, 3, 6]}}}}]}]}
+
+        def posted_fn(cycle):
+            return (("hafsa", "01e", "storm.atm", 0),
+                    ("hafsa", "01e", "storm.atm", 3),
+                    ("hafsa", "01e", "storm.atm", 6))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(live).encode()})
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               self._prog_render(calls))
+            eng.poll_once()
+        # only the MISSING f006 rendered after restart; f000/f003 recovered
+        self.assertEqual([c["only_fxx"] for c in calls], ["6"])
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        self.assertFalse(man["cycles"][0]["in_progress"])    # completed too
+        self.assertEqual([c["cycle"] for c in man["cycles"]],
+                         ["2026060418", "2026060412"])
+
+    def test_completion_prune_cycle_prefixes_and_aged_flat_keys(self):
+        calls = []
+        old_dt = dt.datetime(2026, 5, 25, 0, 0, tzinfo=dt.timezone.utc)
+        fresh_dt = dt.datetime(2026, 6, 4, 11, 0, tzinfo=dt.timezone.utc)
+
+        def posted_fn(cycle):
+            return (("hafsa", "01e", "storm.atm", 0),
+                    ("hafsa", "01e", "storm.atm", 3),
+                    ("hafsa", "01e", "storm.atm", 6))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                # retired cycle prefix (not in keep set)
+                f"{self.PREFIX}/2026060400/hafsa/01e/storm/mslp_wind/f000.png": b"x",
+                # flat legacy keys: one ancient, one fresh
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f000.png": b"x",
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f003.png": b"x",
+            }, mtimes={
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f000.png": old_dt,
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f003.png": fresh_dt,
+            })
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               self._prog_render(calls))
+            eng.poll_once()    # renders all + completes + prunes
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertFalse(man["cycles"][0]["in_progress"])
+        # retired cycle prefix pruned; ancient flat key pruned; fresh flat kept
+        self.assertIn(f"{self.PREFIX}/2026060400/hafsa/01e/storm/mslp_wind/f000.png",
+                      r2.deleted)
+        self.assertIn(f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f000.png",
+                      r2.deleted)
+        self.assertIn(f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f003.png",
+                      r2.store)
+        # the active cycle's own frames survive
+        self.assertIn(f"{self.PREFIX}/2026060418/hafsa/01e/storm/mslp_wind/f000.png",
+                      r2.store)
+
+    def test_compose_manifest_v2_zero_blink(self):
+        entries = [
+            {"cycle": "2026060418", "in_progress": True, "frames_done": 1,
+             "frames_expected": 3, "storms": [{"id": "01e", "frames": {}}]},
+            {"cycle": "2026060412", "in_progress": False, "frames_done": 6,
+             "frames_expected": 6, "storms": [{"id": "01e", "frames": {}}]},
+        ]
+        man = hp.compose_manifest_v2(entries, FAKE_HEADERS, now_iso="now")
+        self.assertEqual(man["cycle"], "2026060412")
+        self.assertEqual(man["path_template"],
+                         "2026060412/{model}/{storm}/{domain}/{product}/f{fxx}.png")
+        self.assertEqual(man["path_template_cycles"],
+                         "{cycle}/{model}/{storm}/{domain}/{product}/f{fxx}.png")
+        self.assertEqual(man["fxx_end"], 6)    # patched grid
+        # no complete cycle at all -> legacy falls to newest WITH frames
+        man2 = hp.compose_manifest_v2([entries[0]], FAKE_HEADERS, now_iso="n")
+        self.assertEqual(man2["cycle"], "2026060418")
+        # nothing at all -> legacy template keeps the un-prefixed token form
+        man3 = hp.compose_manifest_v2([], FAKE_HEADERS, now_iso="n")
+        self.assertIsNone(man3["cycle"])
+        self.assertEqual(man3["path_template"],
+                         "{model}/{storm}/{domain}/{product}/f{fxx}.png")
+
+    def test_list_posted_frames_gates_on_sat_and_idx(self):
+        import types
+        present = {
+            # f000: atm grb2+idx AND sat grb2+idx -> ready
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.atm.f000.grb2",
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.atm.f000.grb2.idx",
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.sat.f000.grb2",
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.sat.f000.grb2.idx",
+            # f003: atm complete but sat MISSING -> not ready
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.atm.f003.grb2",
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.atm.f003.grb2.idx",
+            # f006: atm grb2 present but idx MISSING -> not ready
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.atm.f006.grb2",
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.sat.f006.grb2",
+            "hfsa/20260604/18/01e.2026060418.hfsa.storm.sat.f006.grb2.idx",
+        }
+        stub = types.ModuleType("hafs_render.generate_hafs_plots")
+        stub.MODEL_TOKEN = {"hafsa": "hfsa", "hafsb": "hfsb"}
+        stub._s3_list = (lambda prefix, delimiter=None, session=None:
+                         ([k for k in present if k.startswith(prefix)], []))
+        stub.list_storms = lambda model, date, hh, session=None: (
+            ["01e"] if model == "hafsa" else [])
+        pkg = types.ModuleType("hafs_render")
+        pkg.generate_hafs_plots = stub
+        saved = {n: sys.modules.get(n)
+                 for n in ("hafs_render", "hafs_render.generate_hafs_plots")}
+        sys.modules["hafs_render"] = pkg
+        sys.modules["hafs_render.generate_hafs_plots"] = stub
+        try:
+            frames = hp.list_posted_frames("2026060418",
+                                           domains="storm.atm")
+        finally:
+            for n, m in saved.items():
+                if m is None:
+                    sys.modules.pop(n, None)
+                else:
+                    sys.modules[n] = m
+        self.assertEqual(frames, (("hafsa", "01e", "storm.atm", 0),))
 
 
 if __name__ == "__main__":
