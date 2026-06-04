@@ -1346,6 +1346,7 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
         groups: dict = {}
         for (m, s, d, f) in sorted(missing):
             groups.setdefault((m, s), {}).setdefault(d, set()).add(f)
+        group_errors = []
         # One subprocess per (model, storm, IDENTICAL-fxx-set of domains): the
         # generator's --domains x --only-fxx is a cross-product, so domains
         # with ASYMMETRIC missing sets must not share an invocation or the
@@ -1374,17 +1375,28 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             if not runnable_by_set:
                 _write_summary()
                 continue
+            # EVERY subgroup executes EVERY poll (errors collected, raised
+            # at the end): the attempts counter above was bumped for the whole
+            # group, so an early subgroup's failure must not strand the later
+            # subgroups - otherwise their frames burn attempts without ever
+            # running and get falsely abandoned (review-confirmed critical).
+            errors = []
             for fxx_set, set_doms in sorted(runnable_by_set.items()):
                 runnable = [(model, storm, d, f) for d in set_doms
                             for f in fxx_set]
                 log.info("progressive batch: %s %s %s fxx=%s",
                          model, storm, ",".join(set_doms),
                          ",".join(str(f) for f in fxx_set))
-                with ProgressHeartbeat(r2, prefix,
-                                       f"{cycle} progressive {model}/{storm}",
-                                       clock=clock):
-                    upres = _run_batch(cycle, model, storm, set_doms,
-                                       set(fxx_set))
+                try:
+                    with ProgressHeartbeat(
+                            r2, prefix,
+                            f"{cycle} progressive {model}/{storm}",
+                            clock=clock):
+                        upres = _run_batch(cycle, model, storm, set_doms,
+                                           set(fxx_set))
+                except RenderError as e:
+                    errors.append(str(e))
+                    continue
                 state["rendered"] |= set(upres.get("new_frames") or ())
                 _merge_entry(upres.get("incr") or {})
                 _refresh_counts(posted)
@@ -1400,10 +1412,16 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                 # the attempts cap).
                 dropped = [k for k in runnable if k not in state["rendered"]]
                 if dropped:
-                    raise RenderError(
-                        "progressive batch exited 0 but produced no frames "
-                        f"for {dropped[:6]}{'...' if len(dropped) > 6 else ''}"
-                        " - holding signature for retry")
+                    errors.append(
+                        "batch exited 0 but produced no frames for "
+                        f"{dropped[:6]}{'...' if len(dropped) > 6 else ''}")
+            if errors:
+                group_errors.append(
+                    f"{model}/{storm}: " + "; ".join(errors)[:600])
+        if group_errors:
+            raise RenderError(
+                f"{len(group_errors)} progressive group failure(s) - holding "
+                "signature for retry: " + " | ".join(group_errors)[:1500])
 
     def _run_batch(cycle, model, storm, doms, fxxs):
         only = ",".join(str(f) for f in sorted(fxxs))
@@ -1444,10 +1462,16 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
         _refresh_counts(posted)
         missing_left = posted - state["rendered"] - state["given_up"]
         posted_pairs = {(m, s, d) for (m, s, d, f) in posted}
+        # A pair's terminal counts as RESOLVED when rendered OR abandoned
+        # after the attempts cap - completion-with-gaps is honest (the gaps
+        # stay greyed in the UI and audited in the summary), while requiring
+        # a render would wedge the cycle in_progress forever on one
+        # persistently-broken frame (review-confirmed).
+        resolved = state["rendered"] | state["given_up"]
         have_terminal = bool(posted_pairs) and all(
-            (m, s, d, FXX_END) in state["rendered"]
-            for (m, s, d) in posted_pairs)
-        complete = have_terminal and not missing_left
+            (m, s, d, FXX_END) in resolved for (m, s, d) in posted_pairs)
+        complete = (have_terminal and not missing_left
+                    and bool(state["rendered"]))
         if complete and not state["complete"]:
             state["complete"] = True
             entry["in_progress"] = False
