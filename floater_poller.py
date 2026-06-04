@@ -91,19 +91,33 @@ R2_PREFIX = _env("R2_PREFIX", "floaters").strip("/")
 TRACKS_BASE = _env("TRACKS_BASE", "https://cdn.triple-a-tropics.com/feeds").rstrip("/")
 TRACKS_BASINS = ("wp", "al", "ep")
 
-# Invests (NHC ATCF best-track b-decks) -- an INDEPENDENT floater source.
-# Invests are pre-classification disturbances (numbered 90-99) that NHC tracks
-# in best-track b-decks before they are named. This source is wholly separate
-# from the {basin}_tracks_data.json feeds: it never reads, writes, or affects
+# Invests (numbered 90-99, pre-classification disturbances) -- INDEPENDENT
+# floater sources, one per basin family. Wholly separate from the
+# {basin}_tracks_data.json feeds: nothing here reads, writes, or affects
 # ACE / tracks / climatology data, and an invest must never enter season counts.
-# We list the public btk directory and parse each invest b-deck's latest fix.
-# NHC basins only (AL/EP/CP); WP/JTWC invests would need the JTWC proxy chain
-# and are out of scope here.
+#
+#   * NHC basins (AL/EP/CP): list the public btk directory and parse each
+#     invest b-deck's latest fix (the path that discovered 90E).
+#   * WP/JTWC: the knackwx ATCF API -- the SAME source the site's tracks
+#     pipeline (cron + intensity poller) uses for its invest cards, so the
+#     floater discovers a new WP invest as fast as the rest of the site. The
+#     JTWC b-deck mirrors (proxy/natyphoon) are NOT usable here: invest
+#     numbers recycle within a season and the mirrors keep serving the
+#     RETIRED deck (observed 2026-06-04: bwp912026.dat on both mirrors ended
+#     at the April 91W's 04-30 fix while the June 91W was live at 19.1N
+#     118.8E), so a mirror fetch would float a month-old ghost. knackwx
+#     carries the CURRENT fix (atcf_id, analysis_time, position, winds,
+#     cyclone_nature) plus ``transitioned_from`` on named entries -- an
+#     EXPLICIT invest->named handoff signal ("01E" said it came from "90E").
 INVESTS_ENABLED = (_env("INVESTS_ENABLED", "1") or "1").lower() not in ("0", "false", "no")
 INVEST_BTK_BASE = _env("INVEST_BTK_BASE", "https://ftp.nhc.noaa.gov/atcf/btk").rstrip("/")
 INVEST_INDEX_URL = INVEST_BTK_BASE + "/"
 # basin two-letter -> ATCF designation suffix (90 + "E" -> "90E").
 INVEST_BASIN_LETTER = {"al": "L", "ep": "E", "cp": "C"}
+# WP invests (knackwx). WP_INVESTS_ENABLED is the per-source kill switch;
+# INVESTS_ENABLED still gates all invest sources globally.
+KNACKWX_ATCF_URL = _env("KNACKWX_ATCF_URL", "https://api.knackwx.com/atcf/v2")
+WP_INVESTS_ENABLED = (_env("WP_INVESTS_ENABLED", "1") or "1").lower() not in ("0", "false", "no")
 
 # NHC CurrentStorms.json: the AUTHORITATIVE list of currently-NAMED NHC TCs
 # (AL/EP/CP). Re-read each cycle so a just-DESIGNATED system (an invest promoted
@@ -372,6 +386,12 @@ def fetch_active_storms(session: requests.Session) -> dict[str, Optional[list[St
             lat = float(last_pt.get("lat", 0.0))
             lon = float(last_pt.get("lon", 0.0))
             sid = s.get("sid") or ""
+            # Invest-range entries (90-99) ride the dedicated invest sources
+            # (NHC b-decks / knackwx) with INVEST labeling -- never the named
+            # path, even if the feed ever marks one active. Belt-and-suspenders:
+            # today the feed carries invests with is_active=false.
+            if re.search(r"[A-Z]{2}9\d\d{4}$", sid):
+                continue
             # Latest-fix wind/pressure/nature for the color-coded title badge.
             # ``peak_wind_kt`` (storm-level) stays as ``intensity_kt`` for
             # legacy callers, but the badge uses the CURRENT fix values so a
@@ -568,6 +588,133 @@ def fetch_active_invests(session: requests.Session) -> Optional[list[Storm]]:
         if s is not None:
             out.append(s)
     return out
+
+
+# ---------------------------------------------------------------------------
+# WP invest discovery (knackwx ATCF API) -- an INDEPENDENT source
+# ---------------------------------------------------------------------------
+# Mirrors the NHC invest path's contract exactly (None = fetch failure -> the
+# caller preserves last-known-good; [] = genuine quiescence; one bad entry is
+# skipped, never sinks the source) so the per-source isolation guarantees stay
+# uniform across basins.
+
+# ATCF statuses render.py's _ss_category gives the neutral GRAY (no
+# Saffir-Simpson) badge. knackwx's cyclone_nature is an independent analysis
+# classification that CAN read TD/TS/TY on a system still numbered 90-99 (a
+# developing pre-designation disturbance -- the sibling intensity_poller parser
+# even falls back to TS for an invest with wind); the invest convention is NO
+# Saffir-Simpson pill, so anything outside the neutral set is coerced to DB.
+# (The NHC b-deck path needs no coercion: ATCF decks structurally tag 90-99
+# systems DB/LO/WV.)
+INVEST_NEUTRAL_NATURES = frozenset({"DB", "LO", "WV", "SD", "SS", "EX", "PT"})
+
+
+def _parse_knackwx_invest(it: dict, cutoff: dt.datetime) -> Optional[Storm]:
+    """One knackwx ATCF entry -> a WP invest Storm, or None.
+
+    None when the entry is not a WP invest (atcf_id not 9xW), is missing or
+    garbling a required field, or its latest fix is older than ``cutoff`` (a
+    dissipated invest knackwx hasn't dropped yet -- the freshness lifecycle,
+    same ACTIVE_WINDOW_HOURS the NHC invest path applies). Labeling follows
+    the established invest convention: name "INVEST 91W", category "INVEST"
+    (frontend plain-text pill, no Saffir-Simpson category), nature = the ATCF
+    status coerced into INVEST_NEUTRAL_NATURES (render.py gives those the
+    neutral GRAY badge -- never a Saffir-Simpson pill on an invest).
+    """
+    m = re.fullmatch(r"(9\d)W", (str(it.get("atcf_id") or "")).strip().upper())
+    if m is None:
+        return None
+    num = m.group(1)
+    t = parse_iso(str(it.get("analysis_time") or ""))
+    if t is None or t < cutoff:
+        return None
+    try:
+        lat = float(it.get("latitude"))
+        lon = float(it.get("longitude"))
+    except (TypeError, ValueError):
+        return None
+
+    def _pos(v) -> Optional[float]:
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    vmax = _pos(it.get("winds"))
+    mslp = _pos(it.get("pressure"))
+    if mslp is not None and not (850 <= mslp <= 1050):
+        mslp = None  # 0 / out-of-range placeholder -> omit from the badge
+    status = (str(it.get("cyclone_nature") or "")).strip().upper() or "DB"
+    if status not in INVEST_NEUTRAL_NATURES:
+        status = "DB"  # never a Saffir-Simpson-colored pill on an invest
+    yid = (str(it.get("long_atcf_id") or "")).strip().lower()
+    year = yid[-4:] if re.fullmatch(r"wp9\d20\d\d", yid) else str(t.year)
+    return Storm(
+        sid=f"WP{num}{year}",                 # "WP912026" (stable id)
+        slug=f"wp{num}",                      # "wp91" (never collides with named 01-49)
+        name=f"INVEST {num}W",                # "INVEST 91W"
+        basin="WP",
+        lat=round(lat, 2),
+        lon=round(norm_lon(lon), 2),
+        category="INVEST",
+        intensity_kt=vmax,                    # knackwx carries the latest fix only
+        last_fix=iso_z(t),
+        current_wind_kt=vmax,
+        current_pressure_mb=mslp,
+        nature=status,
+    )
+
+
+def fetch_wp_invests(session: requests.Session) -> Optional[tuple[list[Storm], set[str]]]:
+    """Active WP invests (90-99) + the retired-designation set, from knackwx.
+
+    Returns ``None`` when the API is unreachable or unparseable after all
+    retries (the caller preserves last-known-good), else ``(invests, retired)``:
+      * ``invests`` -- WP invest Storms with a fix within ACTIVE_WINDOW_HOURS
+        (empty = invests disabled, or genuine quiescence);
+      * ``retired`` -- invest designations that NAMED entries (numbers 01-49,
+        ANY basin) report in ``transitioned_from`` ("90E" on 01E): the explicit
+        invest->named handoff signal, consumed by refresh_storms to drop a
+        just-designated invest's floater the cycle the link appears.
+    A single malformed entry is skipped (logged), never sinks the source.
+    NEVER raises.
+    """
+    if not (INVESTS_ENABLED and WP_INVESTS_ENABLED):
+        return [], set()
+    text = _fetch_text(session, KNACKWX_ATCF_URL, "knackwx-atcf")
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        log.warning("knackwx: malformed JSON (%s) -- treating as fetch failure", e)
+        return None
+    if not isinstance(data, list):
+        log.warning("knackwx: unexpected payload type %s -- treating as fetch failure",
+                    type(data).__name__)
+        return None
+    cutoff = utcnow() - dt.timedelta(hours=ACTIVE_WINDOW_HOURS)
+    invests: list[Storm] = []
+    retired: set[str] = set()
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        try:
+            aid = (str(it.get("atcf_id") or "")).strip().upper()
+            tf = (str(it.get("transitioned_from") or "")).strip().upper()
+            m = re.fullmatch(r"(\d\d)[A-Z]", aid)
+            if m is not None and 1 <= int(m.group(1)) <= 49:
+                if tf:
+                    retired.add(tf)           # named entry born from an invest
+                continue
+            s = _parse_knackwx_invest(it, cutoff)
+        except Exception as e:  # noqa: BLE001 - one bad entry never sinks the source
+            log.warning("knackwx: bad entry skipped (%s): %s", it.get("atcf_id"), e)
+            continue
+        if s is not None:
+            invests.append(s)
+    return invests, retired
 
 
 def _deg_dist(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -800,7 +947,12 @@ class Poller:
         self.units: dict[tuple[str, str], Unit] = {}
         self.storms: dict[str, Storm] = {}     # slug -> storm (combined active set)
         self.named: dict[str, Storm] = {}      # slug -> named storm (last-known-good)
-        self.invests: dict[str, Storm] = {}    # slug -> invest (last-known-good)
+        self.invests: dict[str, Storm] = {}    # slug -> NHC invest (last-known-good)
+        self.wp_invests: dict[str, Storm] = {}  # slug -> WP/knackwx invest (last-known-good)
+        # designation -> when we FIRST saw its transitioned_from link (LKG).
+        # The timestamp makes the explicit handoff recycle-safe; see
+        # refresh_storms.
+        self.retired_invests: dict[str, dt.datetime] = {}
         self.current_named: dict[str, Storm] = {}  # slug -> NHC named (last-known-good)
         self._last_tracks_refresh = 0.0
         self._consec_render_fail = 0
@@ -839,7 +991,7 @@ class Poller:
                 "named storms", ",".join(failed),
             )
 
-        # --- Invests: independent NHC b-deck source, isolated from the named
+        # --- NHC invests: independent NHC b-deck source, isolated from the named
         # feeds. A failed invest fetch preserves the last-known-good invests and
         # never touches the named storms (and vice versa) -- per-source guarding.
         invests = fetch_active_invests(self.session)
@@ -851,6 +1003,35 @@ class Poller:
             if invests:
                 log.info("invests: %d active (%s)", len(invests),
                          ", ".join(f"{s.name}/{s.slug}" for s in invests))
+
+        # --- WP invests: knackwx ATCF API, the same source the site's tracks
+        # pipeline uses for its invest cards -- per-source isolated exactly like
+        # the NHC invests above. A knackwx failure preserves the last-known-good
+        # WP invests AND the last-known retired-designation set, and never
+        # touches the named storms or the NHC invests. Slugs (wp90-99) never
+        # collide with NHC invests (al/ep/cp 90-99) or named storms (01-49).
+        wp = fetch_wp_invests(self.session)
+        if wp is None:
+            log.warning("wp-invests: fetch failed -- preserving last-known-good (%d)",
+                        len(self.wp_invests))
+        else:
+            wp_invests, retired = wp
+            # Stamp each designation with when we FIRST saw its
+            # transitioned_from link. The explicit handoff below only retires
+            # an invest whose latest fix predates that moment, which makes it
+            # recycle-safe: transitioned_from persists on a named entry for its
+            # whole life (AMANDA carries "90E" weeks after designation), but a
+            # RECYCLED 90E gets fixes NEWER than the first-seen stamp and
+            # floats, while the old promoted invest's deck stopped at
+            # designation and stays retired. A designation drops out of the
+            # dict when no named entry reports it anymore.
+            now = utcnow()
+            self.retired_invests = {d: self.retired_invests.get(d, now)
+                                    for d in retired}
+            self.wp_invests = {s.slug: s for s in wp_invests}
+            if wp_invests:
+                log.info("wp-invests: %d active (%s)", len(wp_invests),
+                         ", ".join(f"{s.name}/{s.slug}" for s in wp_invests))
 
         # --- NHC CurrentStorms.json: AUTHORITATIVE current-named list (AL/EP/CP),
         # re-read each cycle. It surfaces a just-DESIGNATED system as its named
@@ -873,13 +1054,28 @@ class Poller:
         # real TD/TS status rather than waiting on the derived feed).
         named_combined: dict[str, Storm] = {**self.named, **self.current_named}
 
-        # Designated-invest handoff: drop any invest co-located with a named NHC
-        # storm in the same basin (NHC promoted that invest into the TC). Keep
-        # every invest that is STILL an invest (no co-located named storm) - and
+        # Designated-invest handoff (the 90E -> One-E pattern), two signals,
+        # uniform across basins. Keep every invest that is STILL an invest --
         # the global track map's invest display is unaffected (separate source).
+        #   1. EXPLICIT: knackwx named entries carry transitioned_from ("01E"
+        #      came from "90E") -- drop that invest the cycle the link appears.
+        #   2. CO-LOCATION: drop any invest within INVEST_DESIGNATION_DEG of a
+        #      same-basin NAMED storm (tracks feeds + CurrentStorms -- the feeds
+        #      cover WP/JTWC designations, which have no CurrentStorms entry).
         live_invests: dict[str, Storm] = {}
-        for slug, inv in self.invests.items():
-            succ = next((s for s in self.current_named.values()
+        for slug, inv in {**self.invests, **self.wp_invests}.items():
+            desig = inv.name.split()[-1].upper()       # "INVEST 91W" -> "91W"
+            retired_at = self.retired_invests.get(desig)
+            if retired_at is not None:
+                # Only fixes from BEFORE we first saw the transitioned_from
+                # link belong to the promoted (retired) invest; a newer fix
+                # means the number was RECYCLED for a new system -- float it.
+                fix_t = parse_iso(inv.last_fix)
+                if fix_t is None or fix_t <= retired_at:
+                    log.info("invest %s/%s designated (knackwx transitioned_from); "
+                             "dropping the invest floater", inv.name, inv.slug)
+                    continue
+            succ = next((s for s in named_combined.values()
                          if s.basin == inv.basin
                          and _deg_dist(s.lat, s.lon, inv.lat, inv.lon) <= INVEST_DESIGNATION_DEG),
                         None)
