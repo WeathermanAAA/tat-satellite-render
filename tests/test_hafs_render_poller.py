@@ -795,6 +795,105 @@ class TestIntraCycleCatchup(unittest.TestCase):
         self.assertEqual(groups, {("hafsa", "02e"): ["storm.atm"],
                                   ("hafsb", "01e"): ["parent.atm", "storm.atm"]})
 
+    def test_catchup_exit0_drop_retries_then_abandons(self):
+        """REVIEW FINDING (confirmed): a catch-up group whose subprocess exits 0
+        while one of its pairs produced ZERO frames (whole-run exit gate, not
+        per-pair) must NOT advance the signature - the dropped pair retries
+        next poll and a persistent failure becomes an audited give-up."""
+        calls = []
+        polls = {"n": 0}
+        BASE = (("hafsa", "01e", "storm.atm"),)
+        LATE = BASE + (("hafsb", "01e", "parent.atm"),
+                       ("hafsb", "01e", "storm.atm"))
+
+        def pairs_fn(cycle):
+            polls["n"] += 1
+            return BASE if polls["n"] == 1 else LATE
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            if not kw:
+                _write_out_multi(out_dir, cycle,
+                                 {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            if kw["domains"] == "parent.atm,storm.atm":
+                # exit-0 PARTIAL: storm.atm rendered, parent.atm dropped (OOM)
+                _write_out_multi(out_dir, cycle,
+                                 {"01e": {"hafsb": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            # single-pair retry: the real generator exits 1 (n_ok==0) -> raises
+            raise hp.RenderError("render exit 1 (all frames failed)")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406", pairs_fn, render,
+                               catchup_max_attempts=2)
+            res1 = eng.poll_once()["hafs"]            # full render: ok
+            self.assertEqual(res1.status, pf.CHANGED)
+            res2 = eng.poll_once()["hafs"]            # partial group: published
+            self.assertEqual(res2.status, pf.PROCESS_FAILED)   # ...but HELD
+            # the successful domain IS live despite the held signature
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(sorted(man["storms"][0]["frames"]["hafsb"]),
+                             ["storm"])
+            res3 = eng.poll_once()["hafs"]            # retry parent alone: fails
+            self.assertEqual(res3.status, pf.PROCESS_FAILED)
+            res4 = eng.poll_once()["hafs"]            # cap hit: audited give-up
+            self.assertEqual(res4.status, pf.CHANGED)
+            res5 = eng.poll_once()["hafs"]            # quiet
+            self.assertEqual(res5.status, pf.UNCHANGED)
+
+        self.assertEqual(calls, [
+            {},
+            {"models": "hafsb", "storm": "01e",
+             "domains": "parent.atm,storm.atm"},
+            {"models": "hafsb", "storm": "01e", "domains": "parent.atm"}])
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        reasons = {(p["model"], p["storm"], p["domain"]): p["reason"]
+                   for p in snap["skipped_pairs"]}
+        self.assertIn("abandoned",
+                      reasons[("hafsb", "01e", "parent.atm")])
+        self.assertNotIn(("hafsb", "01e", "storm.atm"), reasons)
+        self.assertEqual(snap["catchups"][0]["pairs"], ["hafsb/01e/storm.atm"])
+
+    def test_full_render_drop_self_heals_via_catchup(self):
+        """REVIEW FINDING (confirmed): a pair complete upstream BEFORE the fetch
+        but dropped by the full render (exit 0 - another pair kept n_ok>0) has
+        no upstream change to reopen the gate. The gate-reopen guard must hold
+        the signature so the next poll catch-up renders it."""
+        calls = []
+        PAIRS = (("hafsa", "01e", "storm.atm"), ("hafsb", "01e", "storm.atm"))
+
+        def render(cycle, out_dir, **kw):
+            calls.append(kw)
+            if not kw:
+                # full render DROPPED hafsb (OOM analog) but exited 0
+                _write_out_multi(out_dir, cycle,
+                                 {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+                return {}
+            _write_out_multi(out_dir, cycle,
+                             {"01e": {"hafsb": {"storm": {"mslp_wind": [0]}}}})
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060406",
+                               lambda c: PAIRS, render)
+            res1 = eng.poll_once()["hafs"]   # publishes hafsa, HOLDS signature
+            self.assertEqual(res1.status, pf.PROCESS_FAILED)
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(sorted(man["storms"][0]["frames"]), ["hafsa"])
+            res2 = eng.poll_once()["hafs"]   # catch-up heals the dropped pair
+            self.assertEqual(res2.status, pf.CHANGED)
+            res3 = eng.poll_once()["hafs"]
+            self.assertEqual(res3.status, pf.UNCHANGED)
+
+        self.assertEqual(calls, [{}, {"models": "hafsb", "storm": "01e",
+                                      "domains": "storm.atm"}])
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        self.assertEqual(sorted(man["storms"][0]["frames"]),
+                         ["hafsa", "hafsb"])
+
     def test_list_complete_pairs_stubbed(self):
         """Pure-logic check of the upstream completeness probe with a stubbed
         hafs_render module (the real one pulls the GRIB stack)."""

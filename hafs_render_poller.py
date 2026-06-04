@@ -792,6 +792,19 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             return
         if cycle != state["cycle"]:
             _full_cycle(cycle)
+            # GATE-REOPEN GUARD: a pair complete upstream BEFORE this fetch but
+            # dropped by the full render (OOM stragglers, a listing flake - the
+            # generator exits 0 as long as ANY frame rendered) leaves no
+            # upstream change to flip the signature, so without this it would
+            # be stranded until the next cycle. Raise AFTER publishing: the
+            # spine holds the signature and the next poll routes the leftovers
+            # through the catch-up path (bounded by the attempts cap).
+            leftover = set(ctx.data["complete_pairs"]) - state["rendered"]
+            if leftover:
+                raise RenderError(
+                    "cycle published but %d upstream-complete pair(s) produced "
+                    "no frames: %s - holding signature so catch-up retries"
+                    % (len(leftover), sorted(leftover)))
         else:
             _catchup_cycle(cycle, set(ctx.data["complete_pairs"]))
 
@@ -859,6 +872,23 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             state["manifest"] = upcov.get("merged_manifest") or state["manifest"]
             _fold_catchup_summary(summary, upcov, new_pairs, clock)
             write_summary()
+            # GATE-REOPEN GUARD (same as the full path): the subprocess can
+            # exit 0 with one of its pairs producing zero frames (the exit-1
+            # gate is whole-run n_ok==0, not per-pair). Upstream won't change
+            # for an already-complete pair, so returning normally here would
+            # advance the signature and strand it. Raise AFTER publishing the
+            # pairs that did land - the spine holds the signature, the next
+            # poll retries ONLY the dropped pair(s), and the attempts cap
+            # (already incremented above) bounds a persistent failure into an
+            # audited give-up.
+            dropped = [(model, storm, d) for d in runnable
+                       if (model, storm, d) not in state["rendered"]]
+            if dropped:
+                raise RenderError(
+                    "catch-up subprocess exited 0 but produced no frames for "
+                    f"{dropped} - holding signature for retry "
+                    f"(attempt {max(state['attempts'][p] for p in dropped)}"
+                    f"/{catchup_max_attempts})")
 
     def _run_catchup_group(cycle, model, storm, domains_g):
         def run(out_dir):

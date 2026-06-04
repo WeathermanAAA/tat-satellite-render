@@ -32,8 +32,13 @@ poller** pattern, not the hand-rolled floater). Each poll:
    full one fits), then an **additive** upload - the group's PNGs (all-or-
    nothing barrier) + the manifest **merged** into the live one. Catch-up
    **never prunes** and **never re-renders a completed pair**; a failing group
-   holds the spine signature (only the still-missing pairs retry next poll) and
-   is abandoned after `HAFS_CATCHUP_MAX_ATTEMPTS` (visible in
+   holds the spine signature (only the still-missing pairs retry next poll) -
+   including the **exit-0 drop** case (the generator's exit-1 gate is whole-run
+   `n_ok==0`, not per-pair, so a group/cycle can exit 0 while one pair produced
+   zero frames; a gate-reopen guard raises after publishing what landed, since
+   an already-complete pair gives upstream no change to flip the signature) -
+   and a persistently-failing pair is abandoned after
+   `HAFS_CATCHUP_MAX_ATTEMPTS` (visible in
    `render_summary.json` `skipped_pairs`; each success appends a `catchups`
    audit entry). `HAFS_CATCHUP=false` restores pure cycle-id gating.
 5. writes `{prefix}/render_progress.json` throughout (so a long/wedged render is
