@@ -1254,6 +1254,142 @@ class TestProgressive(unittest.TestCase):
         self.assertIn(f"{self.PREFIX}/2026060418/hafsa/01e/storm/mslp_wind/f000.png",
                       r2.store)
 
+    def test_v1_manifest_bootstrap_migrates_flat_keys(self):
+        """DEPLOY-TRANSITION: bootstrapping from the live v1 manifest must
+        server-side-copy its complete cycle's flat frames under the
+        cycle-scoped prefix and carry it as the prev/legacy entry - old
+        frontends keep a working complete cycle through the first v2 publish."""
+        calls = []
+        v1 = {"generated_at": "x", "cycle": "2026060412", "fxx_pad": 3,
+              "path_template": "{model}/{storm}/{domain}/{product}/f{fxx}.png",
+              "storms": [{"id": "01e", "name": "01E", "frames":
+                          {"hafsa": {"storm": {"mslp_wind": [0, 3, 6]}}}}]}
+
+        class CopyR2(FakeR2):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.copies = []
+
+            def copy(self, src, dst):
+                self.copies.append((src, dst))
+                if src in self.store:
+                    self.store[dst] = self.store[src]
+                    return True
+                return False
+
+        def posted_fn(cycle):
+            return (("hafsa", "01e", "storm.atm", 0),)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = CopyR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(v1).encode(),
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f000.png": b"a",
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f003.png": b"b",
+                f"{self.PREFIX}/hafsa/01e/storm/mslp_wind/f006.png": b"c",
+            })
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               self._prog_render(calls))
+            eng.poll_once()
+        # flat frames copied under the cycle prefix
+        self.assertEqual(len(r2.copies), 3)
+        self.assertIn(f"{self.PREFIX}/2026060412/hafsa/01e/storm/mslp_wind/"
+                      "f000.png", r2.store)
+        man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        # 12z carried as the complete prev entry; legacy fields keep serving it
+        self.assertEqual([c["cycle"] for c in man["cycles"]],
+                         ["2026060418", "2026060412"])
+        self.assertEqual(man["cycle"], "2026060412")
+        self.assertTrue(man["path_template"].startswith("2026060412/"))
+        self.assertFalse(man["cycles"][1]["in_progress"])
+
+    def test_subgroup_failure_does_not_strand_siblings(self):
+        """REVIEW FINDING (critical, confirmed): an early subgroup's failure
+        must not strand later subgroups - every subgroup executes every poll,
+        and no frame is abandoned without real attempts."""
+        calls = []
+
+        def posted_fn(cycle):
+            # storm.atm{0} will fail forever; parent.atm{0,3} healthy ->
+            # asymmetric sets -> two subgroups; storm's (0,) sorts first
+            return (("hafsa", "01e", "parent.atm", 0),
+                    ("hafsa", "01e", "parent.atm", 3),
+                    ("hafsa", "01e", "storm.atm", 0))
+
+        good = self._prog_render(calls)
+
+        def render(cycle, out_dir, **kw):
+            if kw["domains"] == "storm.atm":
+                calls.append(dict(kw))
+                raise hp.RenderError("storm.atm permanently broken")
+            return good(cycle, out_dir, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               render, catchup_max_attempts=2)
+            r1 = eng.poll_once()["hafs"]
+            # the failing subgroup held the signature, BUT the healthy
+            # parent.atm subgroup rendered + published in the SAME poll
+            self.assertEqual(r1.status, pf.PROCESS_FAILED)
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["storms"][0]["frames"]["hafsa"]
+                             ["parent"]["mslp_wind"], [0, 3])
+            eng.poll_once()     # storm.atm attempt 2: fails
+            r3 = eng.poll_once()["hafs"]   # cap -> abandoned; clean
+            self.assertEqual(r3.status, pf.CHANGED)
+        # parent never re-rendered; storm tried exactly twice (real attempts)
+        storm_calls = [c for c in calls if c.get("domains") == "storm.atm"]
+        parent_calls = [c for c in calls if c.get("domains") == "parent.atm"]
+        self.assertEqual(len(storm_calls), 2)
+        self.assertEqual(len(parent_calls), 1)
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        reasons = [e["reason"] for e in snap["skipped_pairs"]]
+        self.assertTrue(any("abandoned" in r for r in reasons))
+        # parent frames were NEVER falsely abandoned
+        self.assertFalse(any("parent" in e["domain"]
+                             for e in snap["skipped_pairs"]))
+
+    def test_terminal_giveup_completes_with_gaps(self):
+        """REVIEW FINDING (major, confirmed): an abandoned TERMINAL frame must
+        not wedge the cycle in_progress forever - completion-with-gaps."""
+        calls = []
+
+        def posted_fn(cycle):
+            return (("hafsa", "01e", "storm.atm", 0),
+                    ("hafsa", "01e", "storm.atm", 3),
+                    ("hafsa", "01e", "storm.atm", 6))
+
+        good = self._prog_render(calls)
+
+        def render(cycle, out_dir, **kw):
+            if "6" in kw["only_fxx"].split(","):
+                # the batch renders everything EXCEPT the terminal frame
+                calls.append(dict(kw))
+                kept = [f for f in kw["only_fxx"].split(",") if f != "6"]
+                if not kept:
+                    _write_out_multi(out_dir, cycle, {"01e": {"hafsa": {}}})
+                    return {}
+                kw2 = dict(kw, only_fxx=",".join(kept))
+                return good(cycle, out_dir, **kw2)
+            return good(cycle, out_dir, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                               render, catchup_max_attempts=2)
+            for _ in range(5):
+                eng.poll_once()
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+        # f006 abandoned after the cap -> the cycle COMPLETES with the gap
+        self.assertFalse(man["cycles"][0]["in_progress"])
+        self.assertEqual(man["cycles"][0]["storms"][0]["frames"]["hafsa"]
+                         ["storm"]["mslp_wind"], [0, 3])
+        self.assertEqual(man["cycle"], "2026060418")     # legacy promoted
+        snap = json.loads(r2.store[f"{self.PREFIX}/render_summary.json"])
+        self.assertTrue(snap["complete"])
+        self.assertTrue(any("abandoned" in e["reason"]
+                            for e in snap["skipped_pairs"]))
+
     def test_compose_manifest_v2_zero_blink(self):
         entries = [
             {"cycle": "2026060418", "in_progress": True, "frames_done": 1,

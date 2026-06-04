@@ -195,6 +195,19 @@ class R2:
         body = json.dumps(obj, separators=(",", ":")).encode()
         return self.put_bytes(key, body, "application/json", cache)
 
+    def copy(self, src_key: str, dst_key: str) -> bool:
+        """Server-side object copy (no download) - the one-time v1->v2 key
+        migration uses it to move the newest complete cycle's frames under
+        their cycle-scoped prefix."""
+        try:
+            self.s3.copy_object(Bucket=self.bucket, Key=dst_key,
+                                CopySource={"Bucket": self.bucket,
+                                            "Key": src_key})
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("R2 copy %s -> %s failed: %s", src_key, dst_key, e)
+            return False
+
     def get_json(self, key: str) -> Optional[dict]:
         """Fetch + parse a JSON object, or None on any failure (missing key,
         bad JSON). Used to bootstrap the progressive ledger from the live
@@ -1262,7 +1275,28 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
         per process lifetime. Best-effort: any failure = cold start."""
         state["bootstrapped"] = True
         man = r2.get_json(f"{prefix}/manifest.json")
-        if not man or not man.get("cycles"):
+        if not man:
+            return
+        if not man.get("cycles"):
+            # LIVE v1 manifest (the pre-progressive worker's): its complete
+            # cycle's frames live at FLAT keys. Migrate ONCE - server-side
+            # copy each listed frame under the cycle-scoped prefix, then
+            # carry the cycle as the prev (flip-back/legacy) entry. Without
+            # this, the first v2 publish would either show old frontends an
+            # empty manifest or bake a path prefix whose keys don't exist.
+            cyc = man.get("cycle")
+            storms = man.get("storms") or []
+            if cyc and storms:
+                pad = int(man.get("fxx_pad") or 3)
+                n = _migrate_flat_cycle(cyc, storms, pad)
+                state["prev_entry"] = {
+                    "cycle": cyc, "in_progress": False,
+                    "frames_done": len(manifest_frames(man)),
+                    "frames_expected": len(manifest_frames(man)),
+                    "storms": storms,
+                }
+                log.info("v1 manifest bootstrap: migrated %d frame(s) of "
+                         "cycle %s to cycle-scoped keys", n, cyc)
             return
         entries = man["cycles"]
         newest = entries[0]
@@ -1282,6 +1316,28 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                  "prev=%s", state["cycle"],
                  len(state["rendered"]),
                  state["prev_entry"] and state["prev_entry"]["cycle"])
+
+    def _migrate_flat_cycle(cyc, storms, pad) -> int:
+        """Server-side copy of every frame a v1 manifest lists from its FLAT
+        key to the cycle-scoped key. All-or-nothing is NOT required: a copy
+        failure just leaves that frame missing under the new prefix (the
+        frontend's availability grid greys it); copies are idempotent."""
+        tasks = []
+        for s in storms:
+            sid = s.get("id")
+            for mdl, doms in (s.get("frames") or {}).items():
+                for dom_slug, prods in (doms or {}).items():
+                    for prod, fxx_list in (prods or {}).items():
+                        for f in fxx_list or []:
+                            rel = (f"{mdl}/{sid}/{dom_slug}/{prod}/"
+                                   f"f{int(f):0{pad}d}.png")
+                            tasks.append((f"{prefix}/{rel}",
+                                          f"{prefix}/{cyc}/{rel}"))
+        done = 0
+        with cf.ThreadPoolExecutor(max_workers=HAFS_UPLOAD_WORKERS) as ex:
+            for ok in ex.map(lambda p_: r2.copy(p_[0], p_[1]), tasks):
+                done += 1 if ok else 0
+        return done
 
     def fetch():
         if not state["bootstrapped"]:
