@@ -17,4 +17,4 @@ tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@main#su
 # The HAFS render pipeline, tag-pinned (the SAME code update-hafs.yml runs). It
 # pulls matplotlib==3.9.3 + numpy==2.1.3 + cfgrib + eccodes + netCDF4 (the GRIB
 # stack the satellite lacks); xarray/herbie are pinned above to the proven combo.
-hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.2.0#subdirectory=hafs_render
+hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.3.0#subdirectory=hafs_render
