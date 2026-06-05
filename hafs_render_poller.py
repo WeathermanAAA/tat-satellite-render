@@ -1374,6 +1374,19 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             r2.put_json(f"{prefix}/render_summary.json", s, CC_HEALTH)
         except Exception:  # noqa: BLE001 - best-effort
             pass
+        # ALSO under a cycle-scoped key: the flat key above is reset when the
+        # next cycle goes active, which would erase the previous cycle's
+        # frame_batches/mem audit ~6h after the fact. The cycle-scoped copy
+        # makes per-cycle telemetry durable (read 18z/00z/06z side-by-side
+        # the next morning for the VPS-sizing summary). The completion prune
+        # never touches it (it deletes .png keys only), so these accumulate -
+        # 4/day at ~1-2 KB each, negligible.
+        cyc = s.get("cycle")
+        if cyc:
+            try:
+                r2.put_json(f"{prefix}/{cyc}/render_summary.json", s, CC_HEALTH)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
 
     def _bootstrap() -> None:
         """Recover the ledger + flip-back entry from the live manifest once
@@ -1414,9 +1427,23 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             state["summary"] = {"cycle": newest["cycle"], "progressive": True,
                                 "bootstrapped": True}
         else:
-            # Newest is complete: treat it as prev so a same-cycle re-resolve
-            # is a no-op and the next NEW cycle archives it correctly.
-            state["prev_entry"] = newest
+            # Newest is complete: adopt it as the CURRENT cycle state, not
+            # just the flip-back target. Upstream keeps resolving this same
+            # cycle until the next one posts, and process() compares against
+            # state["cycle"] - leaving it None here made an IDLE-WINDOW
+            # restart _begin_cycle() the already-finished cycle: the live
+            # manifest was replaced by an empty pre-announce (the complete
+            # cycle DELISTED from /models/) and the whole cycle re-rendered
+            # from a cold ledger (observed on the 2026-06-05 18:43Z deploy,
+            # 12Z complete + 18z not yet posting). With the entry + rendered
+            # ledger adopted, the same-cycle re-resolve is the no-op this
+            # branch always intended, and the next REAL cycle archives this
+            # one via _begin_cycle's complete-entry branch exactly as if the
+            # process had never restarted.
+            state.update(cycle=newest["cycle"], entry=newest, complete=True,
+                         rendered=manifest_frames(newest))
+            state["summary"] = {"cycle": newest["cycle"], "progressive": True,
+                                "bootstrapped": True}
         log.info("bootstrapped from live manifest: active=%s (%d frames), "
                  "prev=%s", state["cycle"],
                  len(state["rendered"]),

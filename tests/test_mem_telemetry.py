@@ -152,6 +152,114 @@ class TestFoldMem(unittest.TestCase):
         self.assertEqual(summary["mem_peak"]["tree_rss_mb"], 7000.0)
 
 
+class TestCycleScopedSummary(unittest.TestCase):
+
+    def test_summary_also_written_under_cycle_key_with_mem(self):
+        # The flat render_summary.json is reset when the next cycle goes
+        # active; the cycle-scoped copy is what makes the mem audit durable
+        # enough to read 18z/00z/06z side-by-side the next morning. One
+        # progressive poll must write BOTH, carrying the render's mem block.
+        import json
+        from test_hafs_render_poller import (FAKE_HEADERS, FakeClock, FakeR2,
+                                             _write_out_multi)
+        PREFIX = "models/hafs"
+
+        def posted_fn(cycle):
+            return (("hafsa", "01e", "storm.atm", 0),)
+
+        def render(cycle, out_dir, **kw):
+            _write_out_multi(out_dir, cycle,
+                             {"01e": {"hafsa": {"storm": {"mslp_wind": [0]}}}})
+            return {"render_seconds": 5.0,
+                    "mem": {"peak_tree_rss_mb": 1234.5,
+                            "peak_proc_rss_mb": 800.0,
+                            "peak_procs": 3, "samples": 4}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = hrp.build_engine(
+                r2, progressive=True, prefix=PREFIX, interval_s=1.0,
+                clock=FakeClock(), sleep=lambda s: None,
+                cycle_resolver=lambda: "2026060418",
+                posted_frames_fn=posted_fn, render_fn=render,
+                headers_fn=lambda: FAKE_HEADERS,
+                out_dir_factory=lambda c: str(Path(tmp) / c.replace("/", "_")))
+            eng.poll_once()
+            eng.poll_once()
+
+        flat = json.loads(r2.store[f"{PREFIX}/render_summary.json"])
+        scoped = json.loads(r2.store[f"{PREFIX}/2026060418/render_summary.json"])
+        self.assertEqual(flat["cycle"], "2026060418")
+        self.assertEqual(scoped["cycle"], "2026060418")
+        b = scoped["frame_batches"][-1]
+        self.assertEqual(b["tree_rss_mb"], 1234.5)
+        self.assertEqual(scoped["mem_peak"]["tree_rss_mb"], 1234.5)
+        self.assertEqual(scoped["mem_peak"]["procs"], 3)
+
+
+class TestIdleWindowRestart(unittest.TestCase):
+
+    def test_bootstrap_adopts_complete_cycle_no_rerender(self):
+        # THE 2026-06-05 18:43Z incident: a restart while the active upstream
+        # cycle is COMPLETE (idle window between cycles) must be a true no-op.
+        # Before the fix, bootstrap parked the complete cycle as prev only,
+        # process() saw state.cycle=None != resolved cycle, _begin_cycle wiped
+        # the ledger -> empty pre-announce manifest (complete cycle DELISTED
+        # live) + full spurious re-render. Pin: no render call, manifest still
+        # lists the complete cycle with its frames + legacy fields.
+        import json
+        from test_hafs_render_poller import FAKE_HEADERS, FakeClock, FakeR2
+        PREFIX = "models/hafs"
+        CYC = "2026060512"
+        # NOTE the terminal f126: completion requires the FXX_END frame, and
+        # an adopted complete cycle must stay complete (no re-open flip).
+        frames = {"hafsa": {"storm": {"mslp_wind": [0, 3, 126]}}}
+        live_man = {
+            "generated_at": "2026-06-05T18:00:00Z",
+            "cycles": [{"cycle": CYC, "in_progress": False,
+                        "frames_done": 3, "frames_expected": 3,
+                        "storms": [{"id": "01e", "name": "01E",
+                                    "frames": frames}]}],
+            "cycle": CYC,
+            "storms": [{"id": "01e", "name": "01E", "frames": frames}],
+            "path_template": CYC + "/{model}/{storm}/{domain}/{product}/f{fxx}.png",
+        }
+        renders = []
+
+        def render(cycle, out_dir, **kw):
+            renders.append(cycle)
+            raise AssertionError("must not render on idle-window restart")
+
+        def posted_fn(cycle):
+            # upstream still serves the complete cycle's full frame set
+            return (("hafsa", "01e", "storm.atm", 0),
+                    ("hafsa", "01e", "storm.atm", 3),
+                    ("hafsa", "01e", "storm.atm", 126))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{PREFIX}/manifest.json": json.dumps(live_man)})
+            eng = hrp.build_engine(
+                r2, progressive=True, prefix=PREFIX, interval_s=1.0,
+                clock=FakeClock(), sleep=lambda s: None,
+                cycle_resolver=lambda: CYC,
+                posted_frames_fn=posted_fn, render_fn=render,
+                headers_fn=lambda: FAKE_HEADERS,
+                out_dir_factory=lambda c: str(Path(tmp) / c.replace("/", "_")))
+            eng.poll_once()
+            eng.poll_once()
+
+        self.assertEqual(renders, [])
+        man = json.loads(r2.store[f"{PREFIX}/manifest.json"])
+        self.assertEqual(man["cycles"][0]["cycle"], CYC)
+        self.assertFalse(man["cycles"][0]["in_progress"])
+        self.assertEqual(man["cycles"][0]["storms"][0]["frames"]
+                         ["hafsa"]["storm"]["mslp_wind"], [0, 3, 126])
+        # legacy (zero-blink) fields still serve the complete cycle
+        self.assertEqual(man["cycle"], CYC)
+        self.assertTrue(man["path_template"].startswith(CYC + "/"))
+
+
 class TestParentHeartbeatMem(unittest.TestCase):
 
     def test_process_mem_mb_reads_self(self):
