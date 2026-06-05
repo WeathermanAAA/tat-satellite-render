@@ -488,10 +488,12 @@ class TestGlobalGeojson(unittest.TestCase):
         self.assertEqual(feed["generated_utc"], "2026-04-11T01:00:00Z")
         self.assertEqual(feed["latest_fix_valid_utc"], "2026-04-11T00:00:00Z")
         self.assertEqual(feed["staleness_minutes"], 60)
-        # Invest is on the map; inputs not mutated by the basin stamp
+        # Invest is on the map; inputs not mutated by the basin stamp.
+        # ace-core-v0.4.0: EVERY invest is invest_x (the red NHC X) -
+        # active state no longer splits the icon ('L' retired).
         kinds = {(f["properties"]["kind"], f["properties"].get("marker_type"))
                  for f in feed["features"]}
-        self.assertIn(("active_marker", "L"), kinds)        # active invest
+        self.assertIn(("active_marker", "invest_x"), kinds)  # active invest
         self.assertNotIn("basin", by_basin["ep"][0])
 
     def test_engine_writes_shadow_geojson_after_all_basins(self):

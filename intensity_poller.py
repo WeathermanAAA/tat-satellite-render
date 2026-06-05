@@ -25,10 +25,11 @@ the main-repo WRITE_LIVE_FEEDS flag and stays reversible.
 Anti-freeze (inherited from poller_framework): per-source isolation (one basin's
 b-deck fetch failing never freezes or stales the others; each keeps its own
 last-known-good), resilient_fetch (timeout + backoff retries), always-on health
-heartbeat. ace_core is pinned at ace-core-v0.3.0 (invest guard by
-construction: ATCF 90-99 can never accrue ACE or count as named) - this never
-alters ACE methodology, never rebuilds the archive, never touches climo or
-/historical.
+heartbeat. ace_core is pinned at ace-core-v0.4.0 (invest guard by
+construction: ATCF 90-99 can never accrue ACE or count as named; unified
+invest marker: every invest is invest_x regardless of active state) - this
+never alters ACE methodology, never rebuilds the archive, never touches
+climo or /historical.
 """
 from __future__ import annotations
 
