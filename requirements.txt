@@ -39,5 +39,8 @@ requests>=2.31
 # Intensity poller (Piece 3): the FROZEN single-source ACE + shared feed
 # assembly. Pinned by tag so the poller's ACE numbers cannot shift without an
 # intentional ace_core bump (a new tag). Pulls pandas + numpy.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.2.0#subdirectory=ace_core
+# v0.3.0: invest guard by construction (storm_is_invest) - an ATCF 90-99
+# system can never accrue ACE or count as named, no matter its wind/nature.
+# Numbers byte-identical to v0.2.0 on all current data (A/B-proven upstream).
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.3.0#subdirectory=ace_core
 pandas>=2.0
