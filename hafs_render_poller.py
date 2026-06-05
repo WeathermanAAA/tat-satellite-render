@@ -151,6 +151,15 @@ POLL_INTERVAL_S = float(_env("POLL_INTERVAL_S", "120"))
 STALE_AFTER_S = float(_env("STALE_AFTER_S", str(RENDER_TIMEOUT_S + 30 * 60)))
 PROGRESS_HEARTBEAT_S = float(_env("PROGRESS_HEARTBEAT_S", "30"))
 
+# Memory-telemetry sample cadence: while a render subprocess runs, the parent
+# samples the whole render tree's RSS (every process in the child's process
+# group, via /proc) at this interval and records the peak. The Railway bill is
+# RAM-minutes, ~76% of it in these render windows - this is the instrument
+# that says where the GB-minutes go (and sizes the VPS: peak tree RSS during a
+# heavy cycle is the "does it fit in 24GB" number). Pure observation: ~10
+# /proc reads every 2s, no effect on render behavior.
+MEM_SAMPLE_S = float(_env("MEM_SAMPLE_S", "2.0"))
+
 # Which model the cycle is resolved from (the cron uses models[0] = hafsa).
 RESOLVE_MODEL = _env("HAFS_RESOLVE_MODEL", "hafsa")
 
@@ -279,6 +288,44 @@ class RenderError(RuntimeError):
     """Render subprocess failed or was killed - hold the signature, retry."""
 
 
+def _proc_tree_rss_mb(pgid: int) -> tuple:
+    """One memory sample of the render tree: (total_rss_mb, largest_proc_mb,
+    nprocs) summed over every live process whose process GROUP is ``pgid``
+    (run_render_subprocess starts the child with start_new_session=True, so
+    the generator AND all its ProcessPoolExecutor workers share the child's
+    pgid - the same property the watchdog's killpg relies on). Reads
+    /proc/<pid>/stat directly (field 5 = pgrp, field 24 = rss pages); a pid
+    vanishing mid-walk is skipped, never raised. Returns zeros on non-Linux."""
+    page_mb = 4096 / (1024.0 * 1024.0)
+    try:
+        page_mb = os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+    except (ValueError, OSError, AttributeError):
+        pass
+    total = 0.0
+    largest = 0.0
+    n = 0
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return 0.0, 0.0, 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                stat = f.read().decode("ascii", "replace")
+            # comm (field 2) may contain spaces/parens: split after the LAST
+            # ')' so the numeric fields index stably from there.
+            rest = stat[stat.rindex(")") + 2:].split()
+            if int(rest[2]) != pgid:          # pgrp = overall field 5
+                continue
+            rss_mb = int(rest[21]) * page_mb  # rss = overall field 24 (pages)
+            total += rss_mb
+            largest = max(largest, rss_mb)
+            n += 1
+        except (OSError, ValueError, IndexError):
+            continue
+    return total, largest, n
+
+
 def run_render_subprocess(cycle: str, out_dir: str, *,
                           jobs: int = HAFS_JOBS,
                           ingest_jobs: int = HAFS_INGEST_JOBS,
@@ -330,8 +377,27 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
     # whole render tree down (the spine has no process() timeout; this is it).
     proc = subprocess.Popen(cmd, start_new_session=True, env=env,
                             stdout=logf, stderr=subprocess.STDOUT)
+    # Memory telemetry: while waiting on the child, sample the whole render
+    # tree's RSS (the child + its pool workers, by process group) and keep the
+    # peak. Same hard wall-clock watchdog as before - the deadline is checked
+    # against t0, so sampling never extends the timeout. Pure observation.
+    mem = {"peak_tree_rss_mb": 0.0, "peak_proc_rss_mb": 0.0,
+           "peak_procs": 0, "samples": 0}
     try:
-        rc = proc.wait(timeout=timeout_s)
+        while True:
+            try:
+                rc = proc.wait(timeout=max(0.1, MEM_SAMPLE_S))
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() - t0 >= timeout_s:
+                    raise
+                tot, big, n = _proc_tree_rss_mb(proc.pid)
+                mem["samples"] += 1
+                if tot > mem["peak_tree_rss_mb"]:
+                    mem["peak_tree_rss_mb"] = round(tot, 1)
+                    mem["peak_procs"] = n
+                if big > mem["peak_proc_rss_mb"]:
+                    mem["peak_proc_rss_mb"] = round(big, 1)
     except subprocess.TimeoutExpired:
         log.error("render WATCHDOG fired after %ds - killing cycle %s",
                   timeout_s, cycle)
@@ -347,13 +413,17 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
         # destructive prune never runs and the prior cycle stays live.
         raise RenderError(f"render exit {rc} (cycle {cycle})\n" + _tail(log_path))
     secs = time.time() - t0
-    log.info("render ok: cycle=%s in %.0fs", cycle, secs)
+    log.info("render ok: cycle=%s in %.0fs - mem peak %.0f MB across %d proc(s), "
+             "largest %.0f MB (%d samples)",
+             cycle, secs, mem["peak_tree_rss_mb"], mem["peak_procs"],
+             mem["peak_proc_rss_mb"], mem["samples"])
     # Parse the captured log into a per-pair coverage/health summary so the cycle
     # SELF-REPORTS on success too (not just on failure): ingest/render ok-failed,
     # the pairs that were skipped-incomplete, and the failed-ingest error types -
     # which is how a partial-coverage cycle (e.g. dropped hafsb pairs) is visible.
     summary = _parse_render_log(log_path)
     summary["render_seconds"] = round(secs, 1)
+    summary["mem"] = mem
     return summary
 
 
@@ -957,6 +1027,25 @@ def _set_skip_reason(summary: dict, pair: tuple, reason: str) -> None:
                "reason": reason})
 
 
+def _fold_mem_peak(summary: dict, mem: Optional[dict], label: str,
+                   clock: Callable[[], dt.datetime]) -> None:
+    """Track the cycle-level memory high-water mark across batches: the single
+    worst render-tree peak seen this cycle, with which batch owned it. THIS is
+    the VPS-sizing number ("does the worker fit in N GB") - per-batch detail
+    stays in the frame_batches/catchups audit entries."""
+    if not mem or not mem.get("peak_tree_rss_mb"):
+        return
+    cur = summary.get("mem_peak") or {}
+    if mem["peak_tree_rss_mb"] > (cur.get("tree_rss_mb") or 0):
+        summary["mem_peak"] = {
+            "tree_rss_mb": mem.get("peak_tree_rss_mb"),
+            "procs": mem.get("peak_procs"),
+            "largest_proc_rss_mb": mem.get("peak_proc_rss_mb"),
+            "batch": label,
+            "utc": pf.iso_z(clock()),
+        }
+
+
 def _fold_catchup_summary(summary: dict, upcov: dict, new_pairs: list,
                           clock: Callable[[], dt.datetime]) -> None:
     """Fold one catch-up group's result into the cycle's render_summary payload
@@ -985,12 +1074,19 @@ def _fold_catchup_summary(summary: dict, upcov: dict, new_pairs: list,
             for f in ("ok", "total", "failed"):
                 if f in inc:
                     tot[f] = (tot.get(f) or 0) + (inc.get(f) or 0)
+    mem = upcov.get("mem") or {}
     summary.setdefault("catchups", []).append({
         "utc": pf.iso_z(clock()),
         "pairs": ["/".join(p) for p in new_pairs],
         "frames": upcov.get("frames"),
         "render_seconds": upcov.get("render_seconds"),
+        "tree_rss_mb": mem.get("peak_tree_rss_mb"),
+        "largest_proc_rss_mb": mem.get("peak_proc_rss_mb"),
+        "procs": mem.get("peak_procs"),
     })
+    _fold_mem_peak(summary, mem,
+                   "catchup " + ",".join("/".join(p) for p in new_pairs[:3]),
+                   clock)
 
 
 # ---------------------------------------------------------------------------
@@ -1171,6 +1267,7 @@ def make_hafs_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             upcov.setdefault("render_seconds", rsum.get("render_seconds"))
             upcov.setdefault("ingest", rsum.get("ingest"))
             upcov.setdefault("render", rsum.get("render"))
+            upcov.setdefault("mem", rsum.get("mem"))
             return upcov
         if out_dir_factory is not None:
             return run(out_dir_factory(f"{cycle}-catchup-{model}-{storm}"))
@@ -1207,11 +1304,19 @@ def _fold_batch_summary(summary: dict, upres: dict, batch_label: str,
     batches = summary.setdefault("frame_batches", [])
     nf = sorted(upres.get("new_frames") or ())
     span = (f"f{nf[0][3]:03d}-f{nf[-1][3]:03d}" if nf else "(none)")
+    mem = upres.get("mem") or {}
     batches.append({"utc": pf.iso_z(clock()), "batch": batch_label,
                     "model_frames": len(nf), "fxx_span": span,
                     "frames": upres.get("frames"),
-                    "render_seconds": upres.get("render_seconds")})
+                    "render_seconds": upres.get("render_seconds"),
+                    # Render-tree memory peak for THIS batch's subprocess
+                    # (parent samples the child's process group; see
+                    # _proc_tree_rss_mb). Sums to the Railway RAM-minutes.
+                    "tree_rss_mb": mem.get("peak_tree_rss_mb"),
+                    "largest_proc_rss_mb": mem.get("peak_proc_rss_mb"),
+                    "procs": mem.get("peak_procs")})
     del batches[:-60]   # cap the audit trail
+    _fold_mem_peak(summary, mem, batch_label, clock)
 
 
 def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
@@ -1489,6 +1594,7 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             upres.setdefault("render_seconds", rsum.get("render_seconds"))
             upres.setdefault("ingest", rsum.get("ingest"))
             upres.setdefault("render", rsum.get("render"))
+            upres.setdefault("mem", rsum.get("mem"))
             return upres
         if out_dir_factory is not None:
             return run(out_dir_factory(f"{cycle}-prog-{model}-{storm}"))
