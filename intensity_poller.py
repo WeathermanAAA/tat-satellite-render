@@ -522,6 +522,7 @@ def build_engine(sink: pf.Sink, *, basins=BASINS,
                  clock: Callable[[], dt.datetime] = pf.utcnow,
                  sleep: Callable[[float], None] = time.sleep,
                  geojson_key: Optional[str] = None,
+                 cyclolab: Optional[bool] = None,
                  **source_kwargs) -> pf.PollerEngine:
     session = session or requests.Session()
     composer = GlobalGeojsonComposer(
@@ -530,6 +531,14 @@ def build_engine(sink: pf.Sink, *, basins=BASINS,
     sources = [make_basin_source(b, session, sink, clock=clock,
                                  geojson=composer, **source_kwargs)
                for b in basins]
+    # CycloLab advisories+cone Source (CYCLOLAB_DESIGN.md §9) rides the
+    # same engine - per-source isolation means an NHC outage can never
+    # stale the feeds, and vice versa. Kill-switch: CYCLOLAB_ADVISORIES.
+    if cyclolab is None:
+        from cyclolab_advisories import CYCLOLAB_ENABLED as cyclolab
+    if cyclolab:
+        from cyclolab_advisories import make_advisories_source
+        sources.append(make_advisories_source(session, sink, clock=clock))
     return pf.PollerEngine(
         sources, name="intensity-poller", interval_s=interval_s,
         stale_after_s=float(_env("STALE_AFTER_S", "1800")),
