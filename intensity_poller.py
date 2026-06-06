@@ -563,6 +563,16 @@ class R2Sink(pf.Sink):
                            ContentType="application/json",
                            CacheControl="public, max-age=30")
 
+    def write_html(self, key: str, html: str,
+                   cache: str = "public, max-age=30") -> None:
+        """CycloLab page writer (CYCLOLAB_DESIGN.md §3.1): per-storm HTML
+        PUT with text/html so the cyclolab-router Worker serves it as a
+        real document. Same raise-on-failure semantics as write()."""
+        self.s3.put_object(Bucket=self.bucket, Key=key,
+                           Body=html.encode("utf-8"),
+                           ContentType="text/html; charset=utf-8",
+                           CacheControl=cache)
+
 
 def main() -> None:   # pragma: no cover - Railway worker entrypoint
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
