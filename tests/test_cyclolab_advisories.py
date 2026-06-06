@@ -30,10 +30,22 @@ def _clock():
     return dt.datetime(2026, 6, 6, 1, 0, 0)
 
 
-def make_engine(sink, *, current_text=CURRENT, kmz=None):
+TCP_SHTML = (FIX / "tcp_amanda_current.shtml").read_text()
+
+
+def make_engine(sink, *, current_text=CURRENT, kmz=None, tcp_text=TCP_SHTML,
+                tcd_text="<pre>TCD DISCUSSION BODY</pre>", text_raises=None):
     kmz = kmz or {"CONE": CONE, "TRACK": TRACK}
 
     def fetch_text(url):
+        # URL-routed: the CurrentStorms index, then the two text products
+        # (None -> product missing; text_raises matches by substring).
+        if text_raises and text_raises in url:
+            raise RuntimeError("boom " + url)
+        if "TCP" in url:
+            return tcp_text
+        if "TCD" in url:
+            return tcd_text
         return current_text
 
     def fetch_bytes(url):
@@ -76,6 +88,42 @@ class TestAdvisoriesSource(unittest.TestCase):
                          "2026-06-06T01:00:00Z")
         # JSON-serializable end to end
         json.dumps(p)
+
+    def test_text_panels_ship_stripped_products(self):
+        # §7.4: the payload carries the PLAIN product text for both
+        # panels (the browser cannot fetch nhc.gov cross-origin).
+        sink = pf.DictSink()
+        make_engine(sink).poll_once()
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        if isinstance(p, str):
+            p = json.loads(p)
+        self.assertIn("BULLETIN", p["text"]["tcp"])
+        self.assertNotIn("<pre", p["text"]["tcp"])
+        self.assertNotIn("<html", p["text"]["tcp"].lower())
+        self.assertEqual(p["text"]["tcd"], "TCD DISCUSSION BODY")
+        self.assertTrue(p["text"]["tcp_url"])  # urls still ride along
+
+    def test_tcd_failure_never_blocks_tcp_cone_or_countdown(self):
+        sink = pf.DictSink()
+        make_engine(sink, text_raises="TCD").poll_once()
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        if isinstance(p, str):
+            p = json.loads(p)
+        self.assertIn("tcp", p["text"])         # TCP still shipped
+        self.assertNotIn("tcd", p["text"])      # TCD honestly absent
+        self.assertGreaterEqual(len(p["cone"]), 1000)
+        self.assertIn("next_advisory_utc", p)   # countdown still parsed
+
+    def test_tcp_failure_blocks_neither_cone_nor_tcd(self):
+        sink = pf.DictSink()
+        make_engine(sink, text_raises="TCP").poll_once()
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        if isinstance(p, str):
+            p = json.loads(p)
+        self.assertNotIn("tcp", p["text"])
+        self.assertEqual(p["text"]["tcd"], "TCD DISCUSSION BODY")
+        self.assertGreaterEqual(len(p["cone"]), 1000)
+        self.assertNotIn("next_advisory_utc", p)  # countdown source gone
 
     def test_adv_gate_no_rewrite_on_same_advisory(self):
         sink = pf.DictSink()

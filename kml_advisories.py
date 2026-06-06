@@ -542,6 +542,13 @@ def _resolve_footer_time(hh: int, mm: int, ampm: str, tz: str,
     return cand.astimezone(timezone.utc)
 
 
+def product_text(text: str) -> str:
+    """Public face of the product extractor: the plain advisory text from
+    a .shtml wrapper page or a bare product (see _strip_html). Used to
+    ship TCP/TCD panels in the advisory JSON (§7.4)."""
+    return _strip_html(text)
+
+
 def parse_next_advisory(tcp_text: str, issued_utc: str) -> dict:
     """Parse a Public Advisory (TCP) footer into the next-advisory countdown.
 

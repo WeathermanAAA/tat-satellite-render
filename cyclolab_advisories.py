@@ -38,6 +38,7 @@ import requests
 
 import poller_framework as pf
 from kml_advisories import (AdvisoryParseError, build_advisory_json,
+                            product_text,
                             parse_next_advisory)
 from storm_ids import InvestSidError, parse_sid
 
@@ -163,13 +164,33 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                         f"(cone={bool(cone_b)}, track={bool(track_b)})")
                 payload = build_advisory_json(sid, cone_b, track_b,
                                               text_urls=e["text"])
+                # §7.4 ADVISORY TEXT PANELS: ship the parsed product
+                # text (TCP + TCD) alongside the URLs - the browser
+                # cannot fetch nhc.gov cross-origin. Best-effort PER
+                # PRODUCT: missing text never blocks the cone, the
+                # countdown, or the other product.
+                tcp_txt = None
+                try:
+                    tcp_url = (e["text"] or {}).get("tcp_url")
+                    tcp_txt = get_text(tcp_url) if tcp_url else None
+                    if tcp_txt:
+                        payload["text"]["tcp"] = product_text(tcp_txt)
+                except Exception as tx:  # noqa: BLE001
+                    log.warning("%s adv %d: TCP text skipped: %s",
+                                sid, adv, tx)
+                try:
+                    tcd_url = (e["text"] or {}).get("tcd_url")
+                    tcd_txt = get_text(tcd_url) if tcd_url else None
+                    if tcd_txt:
+                        payload["text"]["tcd"] = product_text(tcd_txt)
+                except Exception as tx:  # noqa: BLE001
+                    log.warning("%s adv %d: TCD text skipped: %s",
+                                sid, adv, tx)
                 # NEXT-ADVISORY countdown source (the advisory's OWN
                 # stated time - never wall-clock cadence). Best-effort:
                 # a TCP fetch/parse failure leaves the fields absent and
                 # the shell simply shows no countdown this cycle.
                 try:
-                    tcp_url = (e["text"] or {}).get("tcp_url")
-                    tcp_txt = get_text(tcp_url) if tcp_url else None
                     if tcp_txt:
                         nxt = parse_next_advisory(tcp_txt,
                                                   payload["issued_utc"])
