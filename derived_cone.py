@@ -95,6 +95,17 @@ def _dest_point(lat: float, lon: float, bearing_deg: float,
     return (lon2, math.degrees(phi2))
 
 
+def _gc_dist_nm(lat1: float, lon1: float,
+                lat2: float, lon2: float) -> float:
+    """Great-circle distance (n mi) - haversine on the R_NM sphere."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = (math.sin(dp / 2.0) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2)
+    return 2.0 * R_NM * math.asin(min(1.0, math.sqrt(a)))
+
+
 def _initial_bearing(lat1: float, lon1: float,
                      lat2: float, lon2: float) -> float:
     """Initial great-circle bearing (deg, 0..360) from point 1 to point 2."""
@@ -174,10 +185,14 @@ def derive_cone(points: list[dict],
     ``radii_nm_by_tau`` maps integer tau -> radius n mi (the blob's
     ``nm_values`` with int keys). Returns a CLOSED ``[[lon,lat],...]`` ring.
 
-    Algorithm: the CORRIDOR WALK documented in the module docstring -
-    left rail forward, terminal-circle half arc, right rail back, start
-    half arc. Single point -> full circle. Deterministic (fixed sampling,
-    no RNG, no hull tie-breaking)."""
+    Algorithm: the TANGENT-CHAIN swept envelope - external tangent
+    segments between consecutive tau circles, bridged by arcs on each
+    circle between its incoming/outgoing contact bearings, with the far
+    end capped by the last circle's outer arc and the start by the
+    first circle's back arc. This is the geometrically exact boundary
+    of the swept discs (C1-smooth, monotonically widening for growing
+    radii); the previous corridor-walk chords bent at every tau and
+    read as scallops. Single point -> full circle. Deterministic."""
     if not points:
         raise ValueError("derive_cone: empty points list")
 
@@ -191,45 +206,150 @@ def derive_cone(points: list[dict],
         (lat, lon), r = coords[0], radii[0]
         return _circle_ring(lat, lon, r)
 
+    # DOMINATION FILTER: a slow-moving storm's growing radii can engulf
+    # earlier circles entirely (d + r_i <= r_j); engulfed circles have
+    # no external tangent and corrupt the chain. The swept envelope of
+    # the family equals the envelope of the non-dominated subset, so
+    # drop any circle fully inside another (order preserved).
+    keep = []
+    for i in range(len(coords)):
+        dominated = False
+        for j in range(len(coords)):
+            if i == j:
+                continue
+            d_ij = _gc_dist_nm(coords[i][0], coords[i][1],
+                               coords[j][0], coords[j][1])
+            if d_ij + radii[i] <= radii[j] + 0.1:
+                dominated = True
+                break
+        if not dominated:
+            keep.append(i)
+    coords = [coords[i] for i in keep]
+    radii = [radii[i] for i in keep]
+    if len(coords) == 1:
+        (lat, lon), r = coords[0], radii[0]
+        return _circle_ring(lat, lon, r)
+
     n = len(coords)
-    # Per-point local course (deg). Interior = circular mean of in/out
-    # segment bearings; ends = the single adjacent segment bearing.
-    seg = [_initial_bearing(coords[i][0], coords[i][1],
-                            coords[i + 1][0], coords[i + 1][1])
-           for i in range(n - 1)]
-    course = []
-    for i in range(n):
-        if i == 0:
-            course.append(seg[0])
-        elif i == n - 1:
-            course.append(seg[-1])
+
+    # ---- LOCAL PLANAR FRAME (S4-AD1 #9) -------------------------------
+    # The tangent-chain construction is exact, simple 2D geometry, so we
+    # run it in a local equirectangular plane (n mi units; lon scaled by
+    # cos of the mid latitude) and map back. Over basin-scale cones the
+    # planar error is ~1-2% - immaterial for an uncertainty band - and
+    # in exchange every contact, crossing and arc is EXACT:
+    #   * outward contact normal between consecutive circles leans BACK
+    #     by gamma = asin((r_j - r_i)/d) (it touches BOTH circles at the
+    #     same normal);
+    #   * where consecutive tangent lines CROSS (radius growth, or a
+    #     bend into this side), the envelope vertex is their
+    #     intersection - an arc there would backtrack;
+    #   * where the turn opens OUTWARD, the junction circle's arc
+    #     bridges the contacts;
+    #   * far end capped by the last circle's outer arc (sweep
+    #     180 + 2*gamma: the widening cone bulges past the half
+    #     circle), start capped by the first circle's back arc.
+    lat0 = sum(c[0] for c in coords) / n
+    lon0 = coords[0][1]
+    coslat = max(0.2, math.cos(math.radians(lat0)))
+
+    def to_xy(lat: float, lon: float) -> tuple[float, float]:
+        dl = (lon - lon0 + 540.0) % 360.0 - 180.0   # antimeridian-safe
+        return (dl * 60.0 * coslat, (lat - lat0) * 60.0)
+
+    def to_ll(x: float, y: float) -> list[float]:
+        return [lon0 + x / (60.0 * coslat), lat0 + y / 60.0]
+
+    P = [to_xy(la, lo) for la, lo in coords]
+    R = radii
+
+    def ang(v):
+        return math.atan2(v[1], v[0])
+
+    def arc_pts(c, r, a0, a1, cw):
+        # sample the arc from angle a0 to a1 in the given direction,
+        # endpoints EXCLUDED (contacts/junctions are emitted explicitly)
+        if cw:
+            while a1 > a0:
+                a1 -= 2.0 * math.pi
+            sweep = a0 - a1
         else:
-            course.append(_mean_bearing(seg[i - 1], seg[i]))
+            while a1 < a0:
+                a1 += 2.0 * math.pi
+            sweep = a1 - a0
+        steps = max(1, int(sweep / math.radians(5.0)))
+        out = []
+        for k in range(1, steps):
+            a = a0 - sweep * k / steps if cw else a0 + sweep * k / steps
+            out.append((c[0] + r * math.cos(a), c[1] + r * math.sin(a)))
+        return out
 
-    ring: list[list[float]] = []
+    def side_chain(sign: float):
+        # sign = +1 left of track, -1 right. Returns the planar vertex
+        # chain from circle 0's contact to circle n-1's contact.
+        normals = []
+        for i in range(n - 1):
+            vx, vy = P[i + 1][0] - P[i][0], P[i + 1][1] - P[i][1]
+            d = max(math.hypot(vx, vy), 1e-9)
+            ux, uy = vx / d, vy / d
+            s = max(-0.99985, min(0.99985, (R[i + 1] - R[i]) / d))
+            g = math.asin(s)
+            # outward perpendicular for this side, leaned BACK by gamma
+            px, py = -uy * sign, ux * sign
+            cg, sg = math.cos(g), math.sin(g)
+            normals.append((px * cg - ux * sg, py * cg - uy * sg))
+        chain = [(P[0][0] + R[0] * normals[0][0],
+                  P[0][1] + R[0] * normals[0][1])]
+        for i in range(1, n - 1):
+            n_in, n_out = normals[i - 1], normals[i]
+            cin = (P[i][0] + R[i] * n_in[0], P[i][1] + R[i] * n_in[1])
+            cout = (P[i][0] + R[i] * n_out[0], P[i][1] + R[i] * n_out[1])
+            cross = n_in[0] * n_out[1] - n_in[1] * n_out[0]
+            # outward bridge direction: left side bridges around the
+            # circle when the normal rotates CW (cross < 0); right side
+            # when CCW. Otherwise the tangent lines cross - emit their
+            # intersection as the (single) envelope vertex.
+            bridges = (cross < 0) if sign > 0 else (cross > 0)
+            if abs(cross) < 1e-6:
+                chain.append(cout)
+            elif bridges:
+                chain.append(cin)
+                chain += arc_pts(P[i], R[i], ang(n_in), ang(n_out),
+                                 cw=(sign > 0))
+                chain.append(cout)
+            else:
+                # tangent directions (along travel) for both lines
+                t_in = (-n_in[1] * sign, n_in[0] * sign)
+                t_out = (-n_out[1] * sign, n_out[0] * sign)
+                den = t_in[0] * (-t_out[1]) - t_in[1] * (-t_out[0])
+                if abs(den) < 1e-9:
+                    chain.append(cout)
+                else:
+                    bx, by = cout[0] - cin[0], cout[1] - cin[1]
+                    t = (bx * (-t_out[1]) - by * (-t_out[0])) / den
+                    chain.append((cin[0] + t_in[0] * t,
+                                  cin[1] + t_in[1] * t))
+        chain.append((P[-1][0] + R[-1] * normals[-1][0],
+                      P[-1][1] + R[-1] * normals[-1][1]))
+        return chain, normals
 
-    # 1. LEFT rail forward (course - 90).
-    for i in range(n):
-        lat, lon = coords[i]
-        ring.append(list(_dest_point(lat, lon, course[i] - 90.0, radii[i])))
+    left, lnorm = side_chain(+1.0)
+    right, rnorm = side_chain(-1.0)
 
-    # 2. Terminal cap: outer semicircle from left bearing to right bearing,
-    #    sweeping the FAR side (around the forward course).
-    lat, lon = coords[-1]
-    left_b, right_b = course[-1] - 90.0, course[-1] + 90.0
-    # Outer half goes left -> course -> right (clockwise through course).
-    ring += _arc(lat, lon, radii[-1], left_b, right_b)[1:-1]
+    ring_xy = list(left)
+    # The ring as a whole travels CLOCKWISE (left flank forward keeps
+    # the corridor on the traveler's right), so BOTH caps sweep cw:
+    # terminal from the left contact around the FAR side to the right
+    # contact, start from the right contact around the BACK side to
+    # the left one. (The first cut swept these ccw - across the NEAR
+    # side - and drove the boundary ~90 nm through the terminal
+    # circle. Probe-caught.)
+    ring_xy += arc_pts(P[-1], R[-1], ang(lnorm[-1]), ang(rnorm[-1]),
+                       cw=True)
+    ring_xy += list(reversed(right))
+    ring_xy += arc_pts(P[0], R[0], ang(rnorm[0]), ang(lnorm[0]), cw=True)
 
-    # 3. RIGHT rail backward (course + 90).
-    for i in range(n - 1, -1, -1):
-        lat, lon = coords[i]
-        ring.append(list(_dest_point(lat, lon, course[i] + 90.0, radii[i])))
-
-    # 4. Start cap: outer semicircle from right bearing back to left bearing,
-    #    sweeping the BACK side (around the reverse course).
-    lat, lon = coords[0]
-    left_b, right_b = course[0] - 90.0, course[0] + 90.0
-    ring += _arc(lat, lon, radii[0], right_b, left_b)[1:-1]
+    ring = [to_ll(x, y) for x, y in ring_xy]
 
     # Close the ring.
     if ring[0] != ring[-1]:
@@ -275,6 +395,6 @@ def build_derived_advisory_json(sid: str, forecast_points: list[dict],
             "radii_source_doc": radii_blob.get("source_doc"),
             "radii_source_md5": radii_blob.get("source_md5"),
             "min_radius_nm_floor": MIN_RADIUS_NM,
-            "construction": "corridor-walk-swept-envelope",
+            "construction": "tangent-chain-swept-envelope",
         },
     }
