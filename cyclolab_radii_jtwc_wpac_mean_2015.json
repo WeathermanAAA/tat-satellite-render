@@ -1,0 +1,24 @@
+{
+  "method_version": "jtwc-wpac-mean-2015",
+  "source_doc": "ESCAP/WMO Typhoon Committee, Verification of Tropical Cyclone Operational Forecast (2015 season), Table 3, JTWC-sub row",
+  "source_md5": "a5eafd0f4ce55ac4e2c7f4420bfe43f6",
+  "km_values": {
+    "24": 72.1,
+    "48": 112.7,
+    "72": 169.7,
+    "96": 238.1,
+    "120": 334.1
+  },
+  "nm_values": {
+    "12": 24,
+    "24": 39,
+    "36": 50,
+    "48": 61,
+    "72": 92,
+    "96": 129,
+    "120": 180
+  },
+  "conversion_nm_per_km": 0.539957,
+  "interpolated_taus": [12, 36],
+  "notes": "mean great-circle errors vs RSMC-Tokyo best track; 12h/36h linearly interpolated (JTWC verifies 24h cadence); radii applied 1:1 (NOT NHC 2/3 percentile scaling)"
+}
