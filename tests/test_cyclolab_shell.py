@@ -666,6 +666,18 @@ class TestStage3Mounts(unittest.TestCase):
 
 
 
+class TestOgImageTag(unittest.TestCase):
+    def test_og_image_emitted_only_with_url(self):
+        storm = load_storm()
+        with_url = cyclolab_shell.render_page(
+            storm, feed_url=FEED_URL,
+            og_image_url="https://cdn.x/og/NHC_EP082026.png")
+        self.assertIn('<meta property="og:image" content="https://cdn.x/'
+                      'og/NHC_EP082026.png">', with_url)
+        without = cyclolab_shell.render_page(storm, feed_url=FEED_URL)
+        self.assertNotIn("og:image", without)
+
+
 @unittest.skipIf(NODE is None, "node not on PATH")
 class TestStage4Advisories(unittest.TestCase):
     """Stage 4: THE CONE reveal + the intensity cone + advisory text

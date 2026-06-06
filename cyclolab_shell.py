@@ -168,7 +168,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <meta property="og:title" content="__OG_TITLE__">
 <meta property="og:description" content="__OG_DESC__">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://triple-a-tropics.com__PAGE_PATH__">
+<meta property="og:url" content="https://triple-a-tropics.com__PAGE_PATH__">__OG_IMAGE__
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
   __FONT_CSS__
@@ -1914,7 +1914,8 @@ def _odo_static(text) -> str:
 
 
 def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
-                ended: bool = False, loader: str = "b") -> str:
+                ended: bool = False, loader: str = "b",
+                og_image_url: str | None = None) -> str:
     """Render one storm's shell. ``loader`` selects the loading screen:
     "b" (eye opens - THE CHOSEN loader, AD R3 default) or the other
     prototypes "a"/"c"/"d"; "" = plain wipe."""
@@ -1962,6 +1963,9 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SID__", _esc(storm["sid"]))
             .replace("__FEED_URL__", _esc(feed_url))
             .replace("__HAFS_ID__", _esc(ids.hafs_id))
+            .replace("__OG_IMAGE__",
+                     ('\n<meta property="og:image" content="' +
+                      _esc(og_image_url) + '">') if og_image_url else "")
             .replace("__INTENSITY_ERR__",
                      json.dumps(basin_entry(ids.basin),
                                 separators=(",", ":")))

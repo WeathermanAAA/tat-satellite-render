@@ -125,6 +125,26 @@ class TestAdvisoriesSource(unittest.TestCase):
         self.assertGreaterEqual(len(p["cone"]), 1000)
         self.assertNotIn("next_advisory_utc", p)  # countdown source gone
 
+    def test_og_card_written_when_sink_supports_png(self):
+        class PngSink(pf.DictSink):
+            def __init__(self):
+                super().__init__()
+                self.pngs = {}
+            def write_png(self, key, data, cache=None):
+                self.pngs[key] = data
+        sink = PngSink()
+        make_engine(sink).poll_once()
+        key = "shadow/cyclolab/og/NHC_EP012026.png"
+        self.assertIn(key, sink.pngs)
+        self.assertEqual(sink.pngs[key][:4], b"\x89PNG")
+        self.assertGreater(len(sink.pngs[key]), 10000)
+
+    def test_og_card_skipped_gracefully_without_binary_sink(self):
+        sink = pf.DictSink()           # no write_png
+        make_engine(sink).poll_once()
+        self.assertIn("shadow/cyclolab/adv/NHC_EP012026.json", sink.store)
+        self.assertFalse([k for k in sink.store if k.endswith(".png")])
+
     def test_adv_gate_no_rewrite_on_same_advisory(self):
         sink = pf.DictSink()
         writes = []

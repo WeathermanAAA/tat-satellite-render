@@ -21,6 +21,7 @@ strings - the two suites together are the cross-repo contract.
 """
 from __future__ import annotations
 
+from cyclolab_intensity import basin_entry
 from storm_ids import StormIds, parse_sid
 
 LIVE_PREFIX = "cyclolab"          # what the deployed Worker reads
@@ -100,6 +101,17 @@ class CycloLabPageWriter:
             return f"/cyclolab/adv/{sid}.json"
         return f"{self.cdn_base}/{adv_key(sid, prefix=self.prefix)}"
 
+    def _og_url(self, sid: str) -> str | None:
+        """The intensity OG card URL - only when the storm's basin has a
+        published-error registry entry (the honesty guard: no statistics,
+        no card, no og:image tag)."""
+        try:
+            if basin_entry(parse_sid(sid).basin) is None:
+                return None
+        except Exception:  # noqa: BLE001 - unparseable sid -> no card
+            return None
+        return f"{self.cdn_base}/{self.prefix}/og/{sid}.png"
+
     def update(self, basin: str, tracks_feed: dict, now=None) -> None:
         """Feed one basin's freshly-written tracks feed through the
         lifecycle. NEVER raises (best-effort contract)."""
@@ -126,7 +138,8 @@ class CycloLabPageWriter:
             fix = storm.get("latest_fix_valid_utc")
             if st is None or st["ended"] or st["cat"] != cat or st["fix"] != fix:
                 html = render_page(storm, feed_url=feed_url,
-                                   adv_url=self._adv_url(sid))
+                                   adv_url=self._adv_url(sid),
+                                   og_image_url=self._og_url(sid))
                 self.sink.write_html(page_key(sid, prefix=self.prefix), html)
                 _log.info("cyclolab page %s: %s (%s, fix %s)",
                           "BIRTH" if st is None else "refresh", sid, cat, fix)

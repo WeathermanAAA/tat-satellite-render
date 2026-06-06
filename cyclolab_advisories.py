@@ -37,6 +37,8 @@ from typing import Callable, Optional
 import requests
 
 import poller_framework as pf
+from cyclolab_intensity import basin_entry
+from cyclolab_og import render_intensity_card
 from kml_advisories import (AdvisoryParseError, build_advisory_json,
                             product_text,
                             parse_next_advisory)
@@ -104,6 +106,7 @@ def _storm_entries(current_storms: dict) -> list[dict]:
             continue
         out.append({
             "sid": sid, "ids": ids, "adv": adv,
+            "name": str(s.get("name") or nhc_id),
             "cone_url": cone["kmzFile"], "track_url": track["kmzFile"],
             "text": {
                 "tcp_url": (s.get("publicAdvisory") or {}).get("url"),
@@ -210,6 +213,20 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                 payload["provenance"]["parsed_utc"] = _iso_z(clock())
                 payload["provenance"]["source_index"] = current_storms_url
                 sink.write(f"{prefix}/adv/{sid}.json", payload)
+                # §8.6 second placement: the server-rendered intensity
+                # OG/share card, refreshed per advisory. Best-effort and
+                # honesty-guarded: no registry entry (or a sink without
+                # binary writes, e.g. tests) -> no card, never a
+                # borrowed envelope; failure never blocks the advisory.
+                try:
+                    entry = basin_entry(e["ids"].basin)
+                    if entry and hasattr(sink, "write_png"):
+                        png = render_intensity_card(
+                            payload, entry, storm_name=e["name"])
+                        sink.write_png(f"{prefix}/og/{sid}.png", png)
+                except Exception as og:  # noqa: BLE001
+                    log.warning("%s adv %d: OG card skipped: %s",
+                                sid, adv, og)
                 ledger[sid] = {"adv": adv, "issued": payload["issued_utc"]}
                 log.info("cyclolab adv cached: %s adv %d (%d cone vtx, "
                          "%d points)", sid, adv, len(payload["cone"]),

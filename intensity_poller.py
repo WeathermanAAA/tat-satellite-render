@@ -597,6 +597,13 @@ class R2Sink(pf.Sink):
                            ContentType="text/html; charset=utf-8",
                            CacheControl=cache)
 
+    def write_png(self, key: str, data: bytes,
+                  cache: str = "public, max-age=300") -> None:
+        """Binary PNG PUT (the CycloLab intensity OG card). Same
+        raise-on-failure semantics as write()."""
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=data,
+                           ContentType="image/png", CacheControl=cache)
+
 
 def main() -> None:   # pragma: no cover - Railway worker entrypoint
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
