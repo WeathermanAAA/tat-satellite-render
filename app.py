@@ -31,6 +31,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from cache import RenderCache
+from poller_framework import process_mem_mb
 from render import render_png
 from satellites import (
     ALL_SATELLITES,
@@ -325,6 +326,11 @@ async def health():
         ],
         "cache_entries": len(cache),
         "cache_bytes": cache.size_bytes,
+        # Parent residency (MB), same shape as the pollers' heartbeat
+        # "process" block (pf.process_mem_mb is stdlib-/proc-only). The
+        # VPS-sizing audit had no measured number for the web service -
+        # Railway bills RAM-minutes, so every service self-reports.
+        "process": process_mem_mb(),
     }
 
 

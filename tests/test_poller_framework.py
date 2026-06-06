@@ -547,5 +547,24 @@ class TestRunForever(unittest.TestCase):
         self.assertEqual(hb[-1]["sources"]["s"]["state"], pf.FAILING)
 
 
+class TestParentHeartbeatMem(unittest.TestCase):
+    """process_mem_mb + the heartbeat's process block (ported from the
+    worker branch so EVERY pf-based poller reports parent residency -
+    the VPS-sizing telemetry needs per-service RSS, and the Railway
+    bill is RAM-minutes)."""
+
+    def test_process_mem_mb_reads_self(self):
+        m = pf.process_mem_mb()
+        self.assertGreater(m.get("rss_mb", 0), 1.0)
+        self.assertGreaterEqual(m.get("peak_rss_mb", 0), m.get("rss_mb", 0))
+
+    def test_health_snapshot_carries_process_mem(self):
+        eng = pf.PollerEngine(name="t", sources=[], sink=pf.DictSink(),
+                              interval_s=1, stale_after_s=10)
+        snap = eng.health_snapshot()
+        self.assertIn("process", snap)
+        self.assertGreater(snap["process"].get("rss_mb", 0), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

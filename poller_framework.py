@@ -101,6 +101,26 @@ def iso_z(t: Optional[dt.datetime]) -> Optional[str]:
     return _as_utc(t).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def process_mem_mb() -> dict:
+    """This process's current and peak resident set (MB) from
+    /proc/self/status - the parent-side half of the memory telemetry (the
+    Railway bill is RAM-minutes, so the heartbeat exposes whether the POLLER
+    itself holds anything resident between polls, vs the render subprocesses
+    owning the plateau). Empty dict on non-Linux / unreadable /proc - the
+    heartbeat shape simply omits it, nothing fails."""
+    out: dict = {}
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as f:
+            for ln in f:
+                if ln.startswith("VmRSS:"):
+                    out["rss_mb"] = round(int(ln.split()[1]) / 1024.0, 1)
+                elif ln.startswith("VmHWM:"):
+                    out["peak_rss_mb"] = round(int(ln.split()[1]) / 1024.0, 1)
+    except (OSError, ValueError, IndexError):
+        return {}
+    return out
+
+
 def parse_iso(s: Optional[str]) -> Optional[dt.datetime]:
     """Parse an ISO8601 timestamp (trailing Z accepted) into tz-aware UTC, or
     None if it is empty / unparseable. Never raises."""
@@ -676,6 +696,11 @@ class PollerEngine:
             "fail_threshold": self.fail_threshold,
             "healthy": healthy,
             "worst_state": worst,
+            # Parent-process residency, sampled every heartbeat: rss_mb should
+            # sit near boot size between renders; peak_rss_mb is the parent's
+            # own high-water mark since start (render memory lives in the
+            # subprocess tree, NOT here - see hafs_render_poller's mem audit).
+            "process": process_mem_mb(),
             "sources": sources,
         }
 
