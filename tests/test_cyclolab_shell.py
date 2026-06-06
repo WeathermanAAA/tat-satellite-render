@@ -726,7 +726,11 @@ class TestStage4Advisories(unittest.TestCase):
     def test_cone_reveal_structure_and_stagger(self):
         recs = self._run([{"op": "openSec", "name": "advisories"}])
         a = recs[-1]["state"]["stage3"]["adv"]
-        self.assertTrue(a["coneHasRevealer"], "expanding clip circle")
+        # jsdom has no WAAPI -> the final frame branch must engage and
+        # the clip must be the FULL circle (cone visible).
+        self.assertEqual(a["coneReveal"], "final")
+        self.assertIn("circle(", a["coneClipPath"])
+        self.assertNotIn("circle(0px", a["coneClipPath"])
         self.assertTrue(a["coneHasPlacard"], "current-intensity placard")
         self.assertEqual(a["coneIcons"], 4)       # one per forecast point
         self.assertGreaterEqual(a["coneSpinners"], 4)
@@ -818,7 +822,8 @@ class TestStage4Advisories(unittest.TestCase):
             {"op": "openSec", "name": "overview"},
             {"op": "openSec", "name": "advisories"}])
         self.assertEqual(recs[-1]["state"]["stage3"]["adv"]["coneIcons"], 4)
-        self.assertTrue(recs[-1]["state"]["stage3"]["adv"]["coneHasRevealer"])
+        self.assertEqual(
+            recs[-1]["state"]["stage3"]["adv"]["coneReveal"], "final")
 
 
 if __name__ == "__main__":

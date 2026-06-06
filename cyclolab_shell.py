@@ -492,9 +492,6 @@ HTML_TEMPLATE = r"""<!doctype html>
   .ac-placard { transform-box: fill-box; transform-origin: center;
     animation: ac-pop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 1 both;
     animation-delay: 1s; }
-  .ac-conegrp circle.ac-revealer { animation: ac-grow 2s ease-out 1 both;
-    animation-delay: 1.4s; }
-  @keyframes ac-grow { from { r: 0; } to { r: var(--ac-rmax, 1200px); } }
   .ac-icon { transform-box: fill-box; transform-origin: center;
     animation: ac-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) 1 both; }
   @keyframes ac-pop { from { transform: scale(0); opacity: 0; }
@@ -512,9 +509,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       monospace; color: #dfe6ee; white-space: pre-wrap;
     max-height: 480px; overflow: auto; }
   @media (prefers-reduced-motion: reduce) {
-    .ac-zoom, .ac-placard, .ac-conegrp circle.ac-revealer, .ac-icon {
-      animation: none !important; }
-    .ac-conegrp circle.ac-revealer { r: var(--ac-rmax, 1200px); }
+    .ac-zoom, .ac-placard, .ac-icon { animation: none !important; }
     .ac-spin { animation: none !important; }
   }
 
@@ -1417,13 +1412,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<g class="ac-zoom" style="transform-origin:' +
       cx.toFixed(0) + "px " + cy.toFixed(0) + 'px">');
     parts.push('<defs><filter id="ac-soft" x="-20%" y="-20%" width="140%" ' +
-      'height="140%"><feGaussianBlur stdDeviation="5"/></filter>' +
-      '<clipPath id="ac-clip"><circle class="ac-revealer" cx="' +
-      cx.toFixed(1) + '" cy="' + cy.toFixed(1) + '" r="0" style="--ac-rmax:' +
-      rmax + 'px"/></clipPath></defs>');
+      'height="140%"><feGaussianBlur stdDeviation="5"/></filter></defs>');
     // the cone (brand blue/white, never category-colored), revealed
-    // outward from the present position by the expanding clip circle
-    parts.push('<g class="ac-conegrp" clip-path="url(#ac-clip)">' +
+    // outward from the present position by an expanding clip circle.
+    // The clip animates via WAAPI on the group's clip-path basic shape
+    // (a CSS r keyframe inside <clipPath> does not animate and left the
+    // cone invisible - render-verified the hard way).
+    parts.push('<g class="ac-conegrp" data-cx="' + cx.toFixed(1) +
+      '" data-cy="' + cy.toFixed(1) + '" data-rmax="' + rmax + '">' +
       '<path d="' + dC + '" fill="none" stroke="#8cc8ff" stroke-width="9" ' +
       'stroke-opacity="0.35" filter="url(#ac-soft)"/>' +
       '<path d="' + dC + '" fill="rgba(255,255,255,0.12)" ' +
@@ -1475,6 +1471,21 @@ HTML_TEMPLATE = r"""<!doctype html>
       Math.round(cur.intensity_kt || 0) + "kt</text></g></g>");
     parts.push("</g>");
     svg.innerHTML = parts.join("");
+    var grp = svg.querySelector(".ac-conegrp");
+    var at = " at " + grp.getAttribute("data-cx") + "px " +
+             grp.getAttribute("data-cy") + "px";
+    var full = "circle(" + grp.getAttribute("data-rmax") + "px" + at + ")";
+    if (!reduced && grp.animate) {
+      grp.style.clipPath = "circle(0px" + at + ")";
+      grp.animate([{ clipPath: "circle(0px" + at + ")" },
+                   { clipPath: full }],
+                  { duration: 2000, delay: 1400, easing: "ease-out",
+                    fill: "forwards" });
+      grp.setAttribute("data-reveal", "animated");
+    } else {
+      grp.style.clipPath = full;        // reduced motion / no WAAPI:
+      grp.setAttribute("data-reveal", "final");   // final frame instantly
+    }
     var official = advFull.method === "official-cone";
     note.textContent = official
       ? "Official NHC forecast cone \u00b7 advisory " + advFull.advisory +

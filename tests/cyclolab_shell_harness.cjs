@@ -254,8 +254,12 @@ const scheduledDelays = [];
       coneIconDelays: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll(".ac-icon"),
         (g) => (g.getAttribute("style") || "")).slice(0, 3) : [],
-      coneHasRevealer: !!(coneSvg &&
-        coneSvg.querySelector("circle.ac-revealer")),
+      coneReveal: coneSvg && coneSvg.querySelector(".ac-conegrp")
+        ? coneSvg.querySelector(".ac-conegrp").getAttribute("data-reveal")
+        : null,
+      coneClipPath: coneSvg && coneSvg.querySelector(".ac-conegrp")
+        ? (coneSvg.querySelector(".ac-conegrp").style.clipPath || "")
+        : "",
       coneHasPlacard: !!(coneSvg && coneSvg.querySelector(".ac-placard")),
       coneSpinners: coneSvg
         ? coneSvg.querySelectorAll(".ac-spin").length : 0,
