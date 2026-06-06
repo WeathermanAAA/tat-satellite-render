@@ -9,11 +9,28 @@
       "window": "2020-2024",
       "source_doc": "NHC 'Official NHC 5-Year Average Forecast Errors (2020-2024)', OFCL_5-yr_averages.pdf, ATL intensity row; cross-validated byte-identical vs Verification_2025.pdf Table 3",
       "source_md5": "b48e4759ea3153f74314467d0da72567",
-      "mae_kt": {"12": 5.1, "24": 7.3, "36": 8.6, "48": 10.0,
-                 "60": 10.5, "72": 10.9, "96": 12.4, "120": 13.6},
-      "bias_kt": {"12": 0.5, "24": 0.5, "36": 0.3, "48": 0.3,
-                  "60": 0.3, "72": 0.5, "96": 0.1, "120": -1.6},
-      "asymmetric_supported": true
+      "mae_kt": {
+        "12": 5.1,
+        "24": 7.3,
+        "36": 8.6,
+        "48": 10.0,
+        "60": 10.5,
+        "72": 10.9,
+        "96": 12.4,
+        "120": 13.6
+      },
+      "bias_kt": {
+        "12": 0.5,
+        "24": 0.5,
+        "36": 0.3,
+        "48": 0.3,
+        "60": 0.3,
+        "72": 0.5,
+        "96": 0.1,
+        "120": -1.6
+      },
+      "asymmetric_supported": true,
+      "error_type": "MAE"
     },
     "EP": {
       "method_version": "nhc-ofcl-5yr-2020-2024",
@@ -21,11 +38,28 @@
       "window": "2020-2024",
       "source_doc": "NHC 'Official NHC 5-Year Average Forecast Errors (2020-2024)', OFCL_5-yr_averages.pdf, EPAC intensity row; cross-validated vs Verification_2025.pdf Table 7",
       "source_md5": "b48e4759ea3153f74314467d0da72567",
-      "mae_kt": {"12": 5.7, "24": 8.9, "36": 10.8, "48": 12.9,
-                 "60": 14.4, "72": 15.5, "96": 17.0, "120": 18.6},
-      "bias_kt": {"12": 0.6, "24": 0.6, "36": 0.4, "48": 0.0,
-                  "60": -0.2, "72": -0.3, "96": -1.8, "120": -5.6},
-      "asymmetric_supported": true
+      "mae_kt": {
+        "12": 5.7,
+        "24": 8.9,
+        "36": 10.8,
+        "48": 12.9,
+        "60": 14.4,
+        "72": 15.5,
+        "96": 17.0,
+        "120": 18.6
+      },
+      "bias_kt": {
+        "12": 0.6,
+        "24": 0.6,
+        "36": 0.4,
+        "48": 0.0,
+        "60": -0.2,
+        "72": -0.3,
+        "96": -1.8,
+        "120": -5.6
+      },
+      "asymmetric_supported": true,
+      "error_type": "MAE"
     },
     "CP": {
       "method_version": "cphc-5yr-2015-2019",
@@ -33,11 +67,19 @@
       "window": "2015-2019",
       "source_doc": "CPHC 5-year running verification (2011-2019 report), '5 year running average - CPHC intensity error in knots', 2015-2019 row; no 60 h column, no bias row published",
       "source_md5": "fbec6c21dde52412833c722bedfabf33",
-      "mae_kt": {"12": 5.9, "24": 9.0, "36": 11.3, "48": 12.6,
-                 "72": 14.5, "96": 16.5, "120": 17.4},
+      "mae_kt": {
+        "12": 5.9,
+        "24": 9.0,
+        "36": 11.3,
+        "48": 12.6,
+        "72": 14.5,
+        "96": 16.5,
+        "120": 17.4
+      },
       "bias_kt": null,
       "asymmetric_supported": false,
-      "staleness_note": "CPHC's most recent published 5-year verification window (2015-2019) - older than the NHC AL/EP window; NHC annual reports carry no CP intensity verification. Disclosed inline, never silently borrowed from EP."
+      "staleness_note": "CPHC's most recent published 5-year verification window (2015-2019) - older than the NHC AL/EP window; NHC annual reports carry no CP intensity verification. Disclosed inline, never silently borrowed from EP.",
+      "error_type": "MAE"
     },
     "WP": {
       "method_version": "jtwc-wpac-atcr2020-5yr",
@@ -45,11 +87,19 @@
       "window": "2016-2020",
       "source_doc": "JTWC Annual Tropical Cyclone Report 2020, Table 6-4 (p.104), '5Yr Avg' 2016-2020 row - native 1-min kt, native 12 h AND 36 h columns; the 36 h value 12.9 was verified at 400 dpi after a sourcing transposition to 13.9 was caught by the adversarial pass",
       "source_md5": "2ab9a2225bffc1791320fa8aafab6711",
-      "mae_kt": {"12": 7.7, "24": 10.7, "36": 12.9, "48": 15.0,
-                 "72": 17.7, "96": 18.9, "120": 20.3},
+      "mae_kt": {
+        "12": 7.7,
+        "24": 10.7,
+        "36": 12.9,
+        "48": 15.0,
+        "72": 17.7,
+        "96": 18.9,
+        "120": 20.3
+      },
       "bias_kt": null,
       "asymmetric_supported": false,
-      "vintage_note": "The TRACK cone pins jtwc-wpac-mean-2015 (Typhoon Committee); this intensity cone pins ATCR 2020 (native kt incl. 12/36 h). The 2015 report's intensity table is m/s 2-min winds without 12/36 h - incomparable. Different verification vintages, disclosed rather than forced consistent."
+      "vintage_note": "The TRACK cone pins jtwc-wpac-mean-2015 (Typhoon Committee); this intensity cone pins ATCR 2020 (native kt incl. 12/36 h). The 2015 report's intensity table is m/s 2-min winds without 12/36 h - incomparable. Different verification vintages, disclosed rather than forced consistent.",
+      "error_type": "MAE"
     }
   }
 }

@@ -1528,9 +1528,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (p.intensity_kt == null) return;
       var tau = +(p.tau_h || 0);
       var m = maeAt(INTENSITY_ERR, tau);
-      rows.push({ tau: tau, center: +p.intensity_kt,
-                  upper: Math.min(200, p.intensity_kt + m),
-                  lower: Math.max(0, p.intensity_kt - m), mae: m });
+      var kt = +p.intensity_kt;   // coerce BEFORE arithmetic - a string
+      rows.push({ tau: tau, center: kt,        // kt would concatenate
+                  upper: Math.min(200, kt + m),
+                  lower: Math.max(0, kt - m), mae: m });
     });
     return rows;
   }
