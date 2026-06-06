@@ -12,7 +12,11 @@ user SEES:
   * true baselines: digit ink bottoms == unit ink bottoms == label ink
     bottoms (digits + the uppercase/no-descender units used here bottom
     out exactly at the baseline);
-  * glyph category label: actually painted in the category accent.
+  * glyph category label: actually painted in the category accent;
+  * no neighbor ghosts: the strip row BELOW the settled digit must not
+    peek through the clip slack (symmetric +-0.18em slack let the next
+    digit's cap-top ghost under the vitals values - the band just
+    below every rolling cell must be pure background).
 
 Skips cleanly when playwright/chromium or Pillow are unavailable (CI
 without browsers); run locally before any visual sign-off.
@@ -105,6 +109,13 @@ class TestRenderedCard(unittest.TestCase):
                        mslpUnit: g('#vrow-mslp .unit'),
                        glyph: g('.banner .glyph') };
             }""")
+            cls.cols = pg.evaluate("""() =>
+              [...document.querySelectorAll('.odo .col')].map(c => {
+                const r = c.getBoundingClientRect();
+                return {box: [r.left, r.top, r.right, r.bottom],
+                        em: parseFloat(getComputedStyle(c).fontSize),
+                        odo: (c.closest('.odo') || {}).id || '?'};
+              })""")
             b.close()
         cls.im = Image.open(shot)
 
@@ -160,6 +171,31 @@ class TestRenderedCard(unittest.TestCase):
         self.assertGreater(hits, 5,
                            "no category-accent ink found on the glyph "
                            "label - is it still white?")
+
+    def test_no_neighbor_ghost_below_rolling_cells(self):
+        # the band just below a settled rolling cell must be pure panel
+        # background: with symmetric clip slack the NEXT strip row's
+        # cap-top ghosted through (e.g. "3"/"6" tops under a settled
+        # "925"). Bright pixels there = the regression is back. Only
+        # the vitals-sized cells are scanned - they are where the ghost
+        # rendered, and their under-band is guaranteed empty (the hero
+        # cells have the MAX WIND label ink right below the cell box,
+        # which would false-positive this scan).
+        vitals = [c for c in self.cols if c["em"] <= 20]
+        self.assertGreater(len(vitals), 0, "no vitals-sized cells found")
+        for col in vitals:
+            l, t, r, b = col["box"]
+            band = (int(l * DPR), int(b * DPR) + 2,
+                    int(r * DPR), int((b + 0.20 * col["em"]) * DPR))
+            px = self.im.crop(band).convert("L")
+            w, h = px.size
+            bright = sum(1 for x in range(w) for y in range(h)
+                         if px.getpixel((x, y)) > 100)
+            self.assertEqual(
+                bright, 0,
+                f"ghost ink below a rolling cell of #{col['odo']} "
+                f"(band {band}): neighbor strip row peeking through "
+                f"the clip slack")
 
 
 if __name__ == "__main__":

@@ -298,9 +298,15 @@ HTML_TEMPLATE = r"""<!doctype html>
          (visibility:hidden keeps layout + baseline) and an absolutely-
          positioned .strip of ten rows that rolls via translateY; the
          strip is out of the baseline calculus entirely.
-       * the only clipping is per-cell clip-path with ±0.18em vertical
-         SLACK - enough to hide neighbor rows (1.15em away), never the
-         visible glyph's ascenders/overshoot.
+       * the only clipping is per-cell clip-path with 0.18em of slack
+         on TOP only (protects the visible glyph's cap/overshoot - the
+         cap top sits <0.18em under the box top at small sizes). The
+         bottom edge gets NO slack: digits carry no descenders and the
+         box bottom already sits ~0.3em below the baseline, while the
+         NEXT strip row's cap top is <0.18em past it - symmetric slack
+         let neighbor cap-tops ghost through under the vitals digits
+         (render-verified cross-engine; pixel-diff proved top-only
+         slack removes exactly the ghost ink and nothing else).
      Digits ride fixed 0.62em cells (tnum); LETTER cells (.ch) are
      auto-width (W in "141.2W" must not clip); white-space:pre keeps
      space cells real. */
@@ -311,7 +317,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   .odo .digit.ch { width: auto; min-width: 0.3em; }
   .odo .col { position: relative; display: inline-block; width: 0.62em;
     height: 1.15em; line-height: 1.15em; text-align: center;
-    clip-path: inset(-0.18em 0); }
+    clip-path: inset(-0.18em 0 0); }
   .odo .col .anchor { visibility: hidden; }
   .odo .col .strip { position: absolute; left: 0; top: 0; width: 100%;
     display: block;
