@@ -211,10 +211,14 @@ class TestIntegratedCard(unittest.TestCase):
                              re.S).group(0)
         # weight 800, not the canon's 900: Metropolis has no Black face,
         # so 900 would silently clamp to 800 - we declare what renders.
-        for attr in ('font-weight="800"', 'fill="#ffffff"',
-                     'paint-order="stroke"', 'stroke="rgba(0,0,0,0.55)"',
-                     'dominant-baseline="central"'):
+        for attr in ('font-weight="800"', 'dominant-baseline="central"'):
             self.assertIn(attr, text_tag)
+        # AD R3: the label wears the CATEGORY COLOR via CSS (follows
+        # category changes); thin dark stroke for the bright ramps.
+        m = re.search(r"\.banner \.glyph text \{([^}]*)\}", self.html)
+        self.assertIsNotNone(m)
+        self.assertIn("fill: var(--cat-accent)", m.group(1))
+        self.assertIn("paint-order: stroke", m.group(1))
 
     def test_canon_label_parity_python_sweep(self):
         # python _sshs_label == the documented canon for every category,

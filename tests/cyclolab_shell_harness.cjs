@@ -134,10 +134,12 @@ const scheduledDelays = [];
   }
 
   function odoCols(id) {
-    // the per-digit column transforms (translateY) - proves the roll moved.
+    // the per-digit strip transforms (translateY) - proves the roll
+    // moved. (AD R3: the transform rides the abspos .strip inside each
+    // .col; the col itself stays put as the in-flow baseline anchor.)
     const el = document.getElementById("odo-" + id);
     if (!el) return [];
-    return Array.prototype.map.call(el.querySelectorAll(".col"),
+    return Array.prototype.map.call(el.querySelectorAll(".col .strip"),
       (c) => c.style.transform || "");
   }
 

@@ -57,6 +57,25 @@ AD ROUND 2 (2026-06-06) - the integrated storm-info "bug" card:
   * Mobile keeps the AD-1 rotation: .bug flattens (display: contents)
     so the banner is the same sticky top bar; heroes + vitals stay ONE
     slim card (.bug-body) above the map.
+
+AD ROUND 3 (2026-06-06) - render-verified fixes (the R2 unit tests were
+green while the RENDERED output stayed broken; every item below was
+reproduced and re-verified by screenshot/ink-scan, cross-engine):
+  * Odometer rebuilt: in-flow invisible anchor digit per rolling cell
+    (TRUE baseline) + abspos strip + per-cell clip slack. Kills BOTH
+    the flat-sheared digit bottoms (box-edge clipping) and the
+    synthesized-baseline drift that made units look superscripted.
+  * Glyph category label wears the CATEGORY COLOR (--cat-accent) with
+    a thin dark stroke - CSS-owned so it follows category changes.
+  * Header glyph + loader eye ride an OVERSIZED viewBox (±44 vs ink
+    reach ~41.4) so a full rotation never clips the swirl tails; box
+    sizes compensate to keep ink size unchanged.
+  * Eyebrow scrim scaled to type size (the 16px glow read as mud at
+    10.5px - the "wordmark looks off" root cause).
+  * Spin slowed: 2.6s -> 3.2s, header + loader coherent.
+  * Loader B = THE pick (render_page default): iris reveal as approved,
+    category-colored eye + glow, loader C's letter-build + shine
+    wordmark (one shared builder).
 """
 from __future__ import annotations
 
@@ -179,8 +198,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-bottom: 1px solid rgba(255,255,255,0.85);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.14),
                 inset 0 -1px 0 rgba(0,0,0,0.40); }
+  /* small-text scrim: the full --ink-scrim's 16px glow (tuned for the
+     30px loader word) reads as MUD at 10.5px and made the wordmark
+     look off vs the loader's clean render - scale the shadow to the
+     type size so the header "CycloLab" matches the loader exactly. */
   .banner .eyebrow { font-size: 10.5px; font-weight: 600;
-    letter-spacing: 1.6px; opacity: 0.92; text-shadow: var(--ink-scrim); }
+    letter-spacing: 1.6px; opacity: 0.92;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.6), 0 0 5px rgba(0,0,0,0.30); }
   /* BRAND CASING RULE: "CycloLab" is always rendered literally - no
      text-transform here, ever. */
   .banner .eyebrow .brand { font-weight: 800; letter-spacing: 0.4px; }
@@ -195,12 +219,22 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     border: 1px solid rgba(255,255,255,0.4);
     text-shadow: 0 1px 1px rgba(0,0,0,0.5); }
-  .banner .glyph { position: absolute; top: 10px; right: 10px;
-    width: 46px; height: 46px; z-index: 1;
+  /* glyph box is OVERSIZED relative to the ink (viewBox ±44 vs path
+     reach ~41.4 when rotated) so a full 360° spin never clips the
+     swirl tails; position compensates to keep the ink center put. */
+  .banner .glyph { position: absolute; top: 3px; right: 3px;
+    width: 60px; height: 60px; z-index: 1;
     filter: drop-shadow(0 0 7px var(--cat-accent))
             drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
-  .banner .glyph .spin { animation: lab-spin 2.6s linear infinite;
+  .banner .glyph .spin { animation: lab-spin 3.2s linear infinite;
     transform-origin: 0 0; }
+  /* the canon category label rides the CATEGORY COLOR (canonical TAT
+     scale via --cat-accent), not white-on-white; a thin dark stroke
+     keeps the bright C1/C2 hues legible on the white glyph. CSS owns
+     the treatment so it follows every category change. */
+  .banner .glyph text { fill: var(--cat-accent);
+    stroke: rgba(0,0,0,0.45); stroke-width: 1.1px;
+    paint-order: stroke; }
   @keyframes lab-spin { from { transform: rotate(360deg); }
                         to { transform: rotate(0deg); } }
   .banner::after { content: ""; position: absolute; top: 0; bottom: 0;
@@ -253,29 +287,38 @@ HTML_TEMPLATE = r"""<!doctype html>
   .vrow.due .val { color: var(--cat-accent); font-size: 12.5px;
     letter-spacing: 0.6px; }
 
-  /* odometer: fixed-height window, digit columns roll via translateY.
-     Digits ride fixed 0.62em cells (tnum alignment); LETTER cells (.ch)
-     are auto-width so wide glyphs (W in "141.2W") don't clip at the
-     strip's overflow edge, and white-space:pre keeps space cells real.
-     CLIPPING IS clip-path, NOT overflow: an overflow:hidden flex box is
-     a scroll container whose baseline is SYNTHESIZED at its bottom
-     edge, which threw every unit/label off the digits' real baseline
-     (the AD R2 "values at different levels" complaint). clip-path clips
-     identically but keeps the true text baseline exported, so the
-     card's align-items:baseline rows actually align. (Fallback:
-     overflow hidden for ancient engines without clip-path.) */
-  .odo { display: inline-flex; overflow: hidden; height: 1.15em;
-    white-space: pre;
+  /* odometer (AD R3 rebuild - render-verified, not just unit-tested).
+     The R2 construction (flex window + box-edge clipping) FLAT-SHEARED
+     the digit bottoms and exported a synthesized baseline, so units
+     looked superscripted and "120" lost its overshoot. New geometry:
+       * .odo is a plain inline-block in normal flow - its baseline is
+         the REAL text baseline of its in-flow cells. No flex, no
+         overflow tricks, nothing structural ever clips ink.
+       * each rolling .col carries an in-flow INVISIBLE anchor digit
+         (visibility:hidden keeps layout + baseline) and an absolutely-
+         positioned .strip of ten rows that rolls via translateY; the
+         strip is out of the baseline calculus entirely.
+       * the only clipping is per-cell clip-path with ±0.18em vertical
+         SLACK - enough to hide neighbor rows (1.15em away), never the
+         visible glyph's ascenders/overshoot.
+     Digits ride fixed 0.62em cells (tnum); LETTER cells (.ch) are
+     auto-width (W in "141.2W" must not clip); white-space:pre keeps
+     space cells real. */
+  .odo { display: inline-block; white-space: pre;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
-  @supports (clip-path: inset(0)) {
-    .odo { overflow: visible; clip-path: inset(0); }
-  }
-  .odo .digit { display: inline-block; width: 0.62em; text-align: center; }
+  .odo .digit { display: inline-block; width: 0.62em; text-align: center;
+    line-height: 1.15em; }
   .odo .digit.ch { width: auto; min-width: 0.3em; }
-  .odo .col { display: flex; flex-direction: column; height: 1.15em;
+  .odo .col { position: relative; display: inline-block; width: 0.62em;
+    height: 1.15em; line-height: 1.15em; text-align: center;
+    clip-path: inset(-0.18em 0); }
+  .odo .col .anchor { visibility: hidden; }
+  .odo .col .strip { position: absolute; left: 0; top: 0; width: 100%;
+    display: block;
     transition: transform calc(var(--motion-slow) * 0.35)
       cubic-bezier(0.22, 1, 0.36, 1); }
-  .odo .col .digit { flex: 0 0 1.15em; height: 1.15em; line-height: 1.15em; }
+  .odo .col .strip .digit { display: block; width: 100%; height: 1.15em;
+    line-height: 1.15em; }
 
   /* section nav with the accent rail */
   .nav-secs { display: flex; flex-direction: column; padding: 10px 0;
@@ -342,11 +385,19 @@ HTML_TEMPLATE = r"""<!doctype html>
   /* a) intensifying ramp: JS steps --cat vars; bg follows the ramp */
   .loader[data-variant="a"] { background: var(--cat-ramp);
     transition: background 0.65s ease; }
-  /* b) eye opens: center glyph; reveal = iris (clip-path) */
-  .loader[data-variant="b"] .eye { width: 120px; height: 120px;
+  /* b) eye opens - THE CHOSEN LOADER (AD R3). Iris reveal approved
+     as-is. The eye wears the storm's CATEGORY color (--cat-accent,
+     canonical TAT scale) with a matching glow - Cat 2 and Cat 5 look
+     different. Oversized viewBox (±44 vs ink reach ~41.4) so the
+     spinning swirl tails NEVER clip; box 155px keeps the ink the
+     visual size the 120px/68-box prototype had. Spin duration matches
+     the header glyph (coherent). Wordmark = loader C's letter-build +
+     shine, shared markup + shared rules below. */
+  .loader[data-variant="b"] .eye { width: 155px; height: 155px;
     margin-bottom: 18px;
     filter: drop-shadow(0 0 14px var(--cat-accent)); }
-  .loader[data-variant="b"] .eye .spin { animation: lab-spin 2.6s linear infinite;
+  .loader[data-variant="b"] .eye path { fill: var(--cat-accent); }
+  .loader[data-variant="b"] .eye .spin { animation: lab-spin 3.2s linear infinite;
     transform-origin: 0 0; }
   .loader[data-variant="b"] { flex-direction: column; }
   .loader[data-variant="b"].done { animation: none;
@@ -354,13 +405,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     animation: lab-iris var(--motion-med) ease-in-out 1 forwards; }
   @keyframes lab-iris { from { clip-path: circle(150% at 50% 46%); }
                         to { clip-path: circle(0% at 50% 46%); } }
-  /* c) wordmark build + shine */
+  /* b+c) wordmark build + shine (ONE canon - b reuses c's treatment) */
+  .loader[data-variant="b"] .word span.ch,
   .loader[data-variant="c"] .word span.ch { display: inline-block;
     opacity: 0; transform: translateY(12px);
     animation: lab-ch 0.55s ease-out forwards;
     animation-delay: calc(var(--i) * 0.09s); }
   @keyframes lab-ch { to { opacity: 1; transform: translateY(0); } }
+  .loader[data-variant="b"] .word,
   .loader[data-variant="c"] .word { position: relative; overflow: hidden; }
+  .loader[data-variant="b"] .word::after,
   .loader[data-variant="c"] .word::after { content: ""; position: absolute;
     top: 0; bottom: 0; width: 40%; left: -50%; transform: skewX(-18deg);
     background: linear-gradient(90deg, transparent,
@@ -392,7 +446,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       align-items: center; gap: 10px; padding: 9px 14px; }
     .banner .eyebrow, .banner .storm-type { display: none; }
     .banner .storm-name { font-size: 17px; margin: 0; flex: 1 1 auto; }
-    .banner .glyph { position: static; width: 30px; height: 30px;
+    .banner .glyph { position: static; width: 39px; height: 39px;
       order: -1; flex: 0 0 auto; }
     .banner > .b-inner { display: flex; align-items: center; gap: 10px;
       flex: 1 1 auto; padding-right: 0; }
@@ -424,7 +478,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       animation-duration: 0.001s !important;
       animation-delay: 0s !important; }
     .banner .glyph .spin, .loader .eye .spin { animation: none !important; }
-    .odo .col { transition-duration: 0.001s !important; }
+    .odo .col .strip { transition-duration: 0.001s !important; }
   }
 </style>
 </head>
@@ -436,18 +490,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="bug">
     <div class="banner" id="banner">
       <div class="old-ramp"></div>
-      <svg class="glyph" viewBox="-34 -34 68 68" aria-hidden="true">
+      <svg class="glyph" viewBox="-44 -44 88 88" aria-hidden="true">
         <g class="spin"><path d="__HPATH__" fill="#ffffff"
           stroke="rgba(0,0,0,0.30)" stroke-width="1"/></g>
         <!-- canonical icon label (tracks-map / storm-card canon:
              generate_tracks_plot.py sshs_label + spinnerSvg) - D / S /
              1-5, stationary while only the path spins. Weight 800, not
              the canon's 900: Metropolis ships no Black face, so 900
-             would silently clamp to 800 anyway - declare what renders. -->
+             would silently clamp to 800 anyway - declare what renders.
+             Fill/stroke live in CSS (.banner .glyph text): the label
+             wears the CATEGORY COLOR per AD R3. -->
         <text id="glyph-cat" y="0" text-anchor="middle"
           dominant-baseline="central" font-size="22" font-weight="800"
-          fill="#ffffff" paint-order="stroke" stroke="rgba(0,0,0,0.55)"
-          stroke-width="2" stroke-linejoin="round">__CAT_LABEL__</text>
+          stroke-linejoin="round">__CAT_LABEL__</text>
       </svg>
       <div class="b-inner">
         <div class="eyebrow">TRIPLE-A-TROPICS · <span class="brand">CycloLab</span></div>
@@ -547,16 +602,22 @@ HTML_TEMPLATE = r"""<!doctype html>
   (function initLoader() {
     var v = loader.getAttribute("data-variant");
     var word = '<div class="word">Loading <span>CycloLab</span></div>';
-    if (v === "b") {
-      loader.innerHTML =
-        '<svg class="eye" viewBox="-34 -34 68 68"><g class="spin">' +
-        '<path d="__HPATH__" fill="#ffffff"/></g></svg>' + word;
-    } else if (v === "c") {
+    // the C-progression wordmark (letter build + shine) - ONE builder,
+    // shared by variants b and c per AD R3. Brand casing rule applies:
+    // always literally "CycloLab".
+    function wordC() {
       var chars = "CycloLab".split("").map(function (ch, i) {
         return '<span class="ch" style="--i:' + i + '">' + ch + "</span>";
       }).join("");
-      loader.innerHTML = '<div class="word"><span class="lite">Loading&nbsp;</span>' +
+      return '<div class="word"><span class="lite">Loading&nbsp;</span>' +
         chars + "</div>";
+    }
+    if (v === "b") {
+      loader.innerHTML =
+        '<svg class="eye" viewBox="-44 -44 88 88"><g class="spin">' +
+        '<path d="__HPATH__"/></g></svg>' + wordC();
+    } else if (v === "c") {
+      loader.innerHTML = wordC();
     } else if (v === "d") {
       loader.innerHTML = '<div class="scan"></div>' + word;
     } else {
@@ -614,18 +675,27 @@ HTML_TEMPLATE = r"""<!doctype html>
       var cell = el.children[i];
       if (/[0-9]/.test(ch)) {
         if (!cell || !cell.classList.contains("col")) {
+          // in-flow invisible anchor = the cell's TRUE baseline + box;
+          // the abspos strip rolls without touching layout or baselines.
           var col = document.createElement("span");
           col.className = "col";
           col.setAttribute("aria-hidden", "true");
+          var anchor = document.createElement("span");
+          anchor.className = "anchor"; anchor.textContent = "0";
+          col.appendChild(anchor);
+          var strip = document.createElement("span");
+          strip.className = "strip";
           for (var d = 0; d <= 9; d++) {
             var s = document.createElement("span");
             s.className = "digit"; s.textContent = String(d);
-            col.appendChild(s);
+            strip.appendChild(s);
           }
+          col.appendChild(strip);
           if (cell) el.replaceChild(col, cell); else el.appendChild(col);
           cell = col;
         }
-        cell.style.transform = "translateY(" + (-1.15 * Number(ch)) + "em)";
+        cell.querySelector(".strip").style.transform =
+          "translateY(" + (-1.15 * Number(ch)) + "em)";
       } else {
         if (!cell || cell.classList.contains("col")) {
           var st = document.createElement("span");
@@ -975,10 +1045,10 @@ def _odo_static(text) -> str:
 
 
 def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
-                ended: bool = False, loader: str = "") -> str:
-    """Render one storm's shell. ``loader`` selects a loading-screen
-    prototype variant ("a"/"b"/"c"/"d"; "" = the plain wipe default until
-    art direction picks one)."""
+                ended: bool = False, loader: str = "b") -> str:
+    """Render one storm's shell. ``loader`` selects the loading screen:
+    "b" (eye opens - THE CHOSEN loader, AD R3 default) or the other
+    prototypes "a"/"c"/"d"; "" = plain wipe."""
     ids = parse_sid(storm["sid"])
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
