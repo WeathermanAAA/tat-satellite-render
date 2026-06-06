@@ -1495,15 +1495,30 @@ HTML_TEMPLATE = r"""<!doctype html>
                                    tp[tp.length - 1][1] - tp[tp.length - 2][1]]
                                 : [1, 0];
     var lsLen = Math.max(1e-6, Math.hypot(lastSeg[0], lastSeg[1]));
-    // max distance from any cone vertex to the NOW point bounds both
-    // the needed stroke width and the extension
-    var nowXY = tp[0];
-    var rmax = 0;
+    // the front's stroke must cover the cone PERPENDICULAR to the
+    // track (its half-width), NOT the radial reach from NOW - a
+    // radially-sized cap uncovered most of the canvas the moment the
+    // draw started (render-verified the hard way). Max half-width =
+    // max distance from any cone vertex to the track polyline.
+    function distToTrack(x, y) {
+      var best = Infinity;
+      for (var si = 1; si < tp.length; si++) {
+        var ax = tp[si - 1][0], ay = tp[si - 1][1];
+        var bx2 = tp[si][0], by2 = tp[si][1];
+        var ex = bx2 - ax, ey = by2 - ay;
+        var L2 = ex * ex + ey * ey;
+        var t2 = L2 ? Math.max(0, Math.min(1,
+            ((x - ax) * ex + (y - ay) * ey) / L2)) : 0;
+        var qx = ax + ex * t2, qy = ay + ey * t2;
+        best = Math.min(best, Math.hypot(x - qx, y - qy));
+      }
+      return best;
+    }
+    var halfW = 0;
     coneRing.forEach(function (c) {
-      var dx = X(c[0]) - nowXY[0], dy = Y(c[1]) - nowXY[1];
-      rmax = Math.max(rmax, Math.hypot(dx, dy));
+      halfW = Math.max(halfW, distToTrack(X(c[0]), Y(c[1])));
     });
-    var ext = rmax * 0.45 + 60;
+    var ext = halfW * 0.9 + 50;
     var tpExt = tp.concat([[
       tp[tp.length - 1][0] + lastSeg[0] / lsLen * ext,
       tp[tp.length - 1][1] + lastSeg[1] / lsLen * ext]]);
@@ -1518,11 +1533,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     var Ltot = cum[cum.length - 1];
     var HOLD_MS = 1000, GROW_MS = 3300;
-    var frontW = 2 * rmax + 120;
+    var frontW0 = 64;                    // apex width at the NOW point
+    var frontW = 2 * halfW + 110;        // enough to clear the far cap
     parts.push('<defs><mask id="ac-mask">' +
       '<rect width="' + W + '" height="' + H + '" fill="#000"/>' +
       '<path class="ac-front" d="' + dTrack + '" fill="none" ' +
-      'stroke="#fff" stroke-width="' + frontW.toFixed(0) + '" ' +
+      'stroke="#fff" stroke-width="' + frontW0 + '" ' +
       'stroke-linecap="round" stroke-linejoin="round" ' +
       'stroke-dasharray="' + Ltot.toFixed(1) + '" stroke-dashoffset="' +
       Ltot.toFixed(1) + '"/></mask></defs>');
@@ -1616,9 +1632,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (!tropical) anyNonTropical = true;
       var cat = pointCat(p);
       var col = tropical ? (SSHS[cat] || SSHS.TD) : "#ffffff";
+      // the round cap leads the front by width/2; width itself grows
+      // with the draw, so the EDGE reaches distance d when the front
+      // center is at d - w(d)/2.
+      var wAt = frontW0 + (frontW - frontW0) * (cum[i] / Ltot);
+      var fEff = Math.max(0.02, (cum[i] - wAt / 2) / Ltot);
       var delayMs = (i === 0)
         ? 400
-        : Math.round(HOLD_MS + GROW_MS * (cum[i] / Ltot));
+        : Math.round(HOLD_MS + GROW_MS * fEff);
       var scale = (i === 0 ? 0.95 : 0.42);   // NOW is the hero (#6)
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
@@ -1672,13 +1693,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     // jump to the final frame
     var front = svg.querySelector(".ac-front");
     if (!reduced && front.animate) {
-      front.animate([{ strokeDashoffset: Ltot },
-                     { strokeDashoffset: 0 }],
+      front.animate([{ strokeDashoffset: Ltot, strokeWidth: frontW0 + "px" },
+                     { strokeDashoffset: 0, strokeWidth: frontW + "px" }],
                     { duration: GROW_MS, delay: HOLD_MS,
                       easing: "linear", fill: "forwards" });
       front.setAttribute("data-reveal", "animated");
     } else {
       front.style.strokeDashoffset = "0";
+      front.style.strokeWidth = frontW + "px";
       front.setAttribute("data-reveal", "final");
     }
 
