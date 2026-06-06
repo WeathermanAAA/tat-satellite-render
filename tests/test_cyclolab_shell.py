@@ -167,6 +167,175 @@ class TestRenderContract(unittest.TestCase):
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
+class TestIntegratedCard(unittest.TestCase):
+    """AD R2: ONE storm-info bug card - structure, canon labels, baked
+    heroes (static render contract, pure python)."""
+
+    def setUp(self):
+        self.storm = load_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+
+    def test_one_card_banner_then_body_no_second_box(self):
+        # the gradient header and the body live inside the SAME .bug card,
+        # in order: bug > banner > bug-body(heroes > vitals).
+        h = self.html
+        i_bug = h.index('<div class="bug">')
+        i_banner = h.index('id="banner"')
+        i_body = h.index('<div class="bug-body">')
+        i_heroes = h.index('<div class="heroes">')
+        i_vitals = h.index('id="vitals"')
+        self.assertTrue(i_bug < i_banner < i_body < i_heroes < i_vitals)
+        # exactly one bug card, one body, one vitals region.
+        self.assertEqual(h.count('<div class="bug">'), 1)
+        self.assertEqual(h.count('<div class="bug-body">'), 1)
+        # the old standalone vitals card chrome is gone: the vitals base
+        # rule carries no own background/border (the .bug owns the card).
+        import re
+        m = re.search(r"\.vitals \{([^}]*)\}", h)
+        self.assertIsNotNone(m)
+        self.assertNotIn("background", m.group(1))
+        self.assertNotIn("border", m.group(1))
+
+    def test_glyph_carries_canon_label_and_stays_stationary(self):
+        # fixture is C4 -> canon label "4", baked into the glyph <text>,
+        # which sits OUTSIDE the spinning group (only the path spins).
+        self.assertRegex(self.html, r'id="glyph-cat"[^>]*')
+        i_spin_close = self.html.index("</g>", self.html.index('class="spin"'))
+        i_text = self.html.index('id="glyph-cat"')
+        self.assertGreater(i_text, i_spin_close)
+        self.assertRegex(self.html,
+                         r'id="glyph-cat"[^>]*>\s*4\s*</text>')
+        # canonical treatment attrs (the tracks-map / placard canon).
+        import re
+        text_tag = re.search(r'<text id="glyph-cat".*?>', self.html,
+                             re.S).group(0)
+        # weight 800, not the canon's 900: Metropolis has no Black face,
+        # so 900 would silently clamp to 800 - we declare what renders.
+        for attr in ('font-weight="800"', 'fill="#ffffff"',
+                     'paint-order="stroke"', 'stroke="rgba(0,0,0,0.55)"',
+                     'dominant-baseline="central"'):
+            self.assertIn(attr, text_tag)
+
+    def test_canon_label_parity_python_sweep(self):
+        # python _sshs_label == the documented canon for every category,
+        # and the baked glyph + Category-hero cells agree with it.
+        want = {"TD": "D", "TS": "S", "C1": "1", "C2": "2", "C3": "3",
+                "C4": "4", "C5": "5"}
+        for cat, label in want.items():
+            self.assertEqual(cyclolab_shell._sshs_label(cat), label)
+            s = copy.deepcopy(self.storm)
+            s["current_category"] = cat
+            h = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+            self.assertRegex(h, r'id="glyph-cat"[^>]*>\s*' + label +
+                             r'\s*</text>')
+            # digits bake as fixed cells; letters carry .ch (auto-width);
+            # the container carries the accessible value, cells are
+            # presentation-only.
+            cell_cls = "digit" if label.isdigit() else "digit ch"
+            self.assertIn(f'id="odo-cat" aria-label="{label}">'
+                          f'<span class="{cell_cls}" aria-hidden="true">'
+                          + label, h)
+
+    def test_heroes_bake_vmax_and_category(self):
+        # fixture last wind 120 -> three baked digit cells + the
+        # accessible value on the container; no-JS render carries real
+        # values.
+        self.assertIn('id="odo-vmax" aria-label="120">'
+                      '<span class="digit" aria-hidden="true">1</span>'
+                      '<span class="digit" aria-hidden="true">2</span>'
+                      '<span class="digit" aria-hidden="true">0</span>',
+                      self.html)
+        self.assertIn('class="hero-cap">Max wind<', self.html)
+        self.assertIn('class="hero-cap">Category<', self.html)
+
+    def test_vmax_promoted_out_of_the_inline_vitals(self):
+        # Max wind is a HERO now - the JS VITALS list must not rebuild it
+        # as an inline row (id collision would double-render).
+        self.assertNotIn('{ id: "vmax"', self.html)
+        # the inline list starts at Min pressure and keeps the AD R2 order.
+        i = self.html.index('var VITALS')
+        block = self.html[i:i + 600]
+        order = [block.index('"mslp"'), block.index('"ace"'),
+                 block.index('"pos"'), block.index('"move"'),
+                 block.index('"fix"'), block.index('"next"')]
+        self.assertEqual(order, sorted(order))
+
+    def test_missing_wind_bakes_em_dash(self):
+        s = copy.deepcopy(self.storm)
+        s["points"] = [dict(s["points"][-1], wind_kt=None)]
+        h = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('id="odo-vmax" aria-label="—">'
+                      '<span class="digit ch" aria-hidden="true">—</span>',
+                      h)
+
+    def test_sshs_label_none_and_empty_match_the_js_guard(self):
+        # exact JS-parity edge: sshsLabel(null) / sshsLabel("") -> "D".
+        self.assertEqual(cyclolab_shell._sshs_label(None), "D")
+        self.assertEqual(cyclolab_shell._sshs_label(""), "D")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestIntegratedCardBehavior(unittest.TestCase):
+    """AD R2 behavior: category switches drive the glyph label + the
+    Category hero through the same canon (node + jsdom)."""
+
+    def setUp(self):
+        self.storm = load_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+
+    def test_category_switch_updates_glyph_and_hero(self):
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [
+                 {"op": "snapshot"},                  # boot: baked C4
+                 {"op": "setCategory", "cat": "C5"},  # number path
+                 {"op": "setCategory", "cat": "TS"},  # letter path
+             ]})
+        boot, c5, ts = (r["state"] for r in recs)
+        # boot keeps the BAKED canon label (setCategory early-returns on
+        # the same cat - the python bake must already be right).
+        self.assertEqual(boot["glyphCat"].strip(), "4")
+        self.assertEqual(boot["heroCatText"], "4")
+        self.assertEqual(c5["glyphCat"], "5")
+        self.assertEqual(c5["odo"]["cat"], "5")
+        self.assertEqual(ts["glyphCat"], "S")
+        self.assertEqual(ts["odo"]["cat"], "S")
+
+    def test_vmax_hero_still_rides_the_odometer(self):
+        # the promoted hero keeps the odometer state machine (data-odo +
+        # rolling columns) - same id, same discipline - and the
+        # accessible value tracks it (the rolling 0-9 stacks are
+        # aria-hidden presentation).
+        s = copy.deepcopy(self.storm)
+        s["points"] = [dict(self.storm["points"][-1], wind_kt=140.0)]
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [{"op": "apply", "storm": s}]})
+        st = recs[-1]["state"]
+        self.assertEqual(st["odo"]["vmax"], "140")
+        self.assertTrue(all(c.startswith("translateY(")
+                            for c in st["odoColsVmax"]))
+        self.assertEqual(st["odoAriaVmax"], "140")
+
+    def test_unknown_category_clamps_to_td_everywhere(self):
+        # the hydrated path applies the SAME validation as render_page:
+        # garbage current_category clamps to TD on every surface (ramp
+        # token, chip, glyph label, Category hero) instead of leaking
+        # raw text + the off-category default-blue ramp.
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [{"op": "setCategory", "cat": "ZZ"}]})
+        st = recs[-1]["state"]
+        self.assertEqual(st["cat"], "TD")
+        self.assertEqual(st["chip"], "Tropical Depression")
+        self.assertEqual(st["glyphCat"], "D")
+        self.assertEqual(st["odo"]["cat"], "D")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
 class TestHydration(unittest.TestCase):
     """apply() drives the live DOM (node + jsdom)."""
 

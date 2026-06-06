@@ -37,6 +37,26 @@ AD ROUND 1 (2026-06-06):
   * Loader framework with four prototype variants (a intensifying
     ramp / b eye opens / c wordmark shine / d broadcast sweep) for
     art-direction selection; default stays the plain wipe until a pick.
+
+AD ROUND 2 (2026-06-06) - the integrated storm-info "bug" card:
+  * Banner + vitals merged into ONE card (.bug): the gradient identity
+    header zone (eyebrow / type word / NAME / chip / corner spinning
+    glyph, glyph stays top-RIGHT) flows directly into a panel body -
+    no second box, no gap.
+  * The corner glyph carries the storm's category number/letter,
+    reusing the CANONICAL icon treatment from the tracks maps + storm
+    cards (generate_tracks_plot.py sshs_label + spinnerSvg: stationary
+    white 900-weight text w/ dark stroke, D / S / 1-5, only the path
+    spins). One canon, no new style.
+  * Max Wind + Category promoted to HERO numbers in the card body
+    (broadcast-reference treatment); both ride the odometer.
+  * Remaining vitals (Min Pressure / Storm ACE / Position / Movement /
+    Last Fix / Next Advisory) are compact LEFT-ALIGNED label-value
+    pairs on a fixed label column - the split-justified
+    value-pinned-right layout is gone (it read as ragged baselines).
+  * Mobile keeps the AD-1 rotation: .bug flattens (display: contents)
+    so the banner is the same sticky top bar; heroes + vitals stay ONE
+    slim card (.bug-body) above the map.
 """
 from __future__ import annotations
 
@@ -144,11 +164,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-right: 1px solid var(--border); }
   .stage { flex: 1 1 auto; min-width: 0; padding: 26px 30px 60px; }
 
-  /* ---- identity banner: broadcast storm-info card on the approved
-         gradient. Corner glyph spins constantly (the one permitted
-         loop); intensity is color, never speed. ---- */
+  /* ---- the integrated storm-info bug card (AD R2): ONE card -
+         gradient identity header zone + hero numbers + inline vitals.
+         No second box, no gap. ---- */
+  .bug { margin: 8px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; }
+
+  /* gradient identity header zone on the approved ramp. Corner glyph
+     spins constantly (the one permitted loop); intensity is color,
+     never speed. */
   .banner { background: var(--cat-ramp); color: var(--cat-ink);
-    padding: 16px 18px 15px; position: relative; overflow: hidden;
+    padding: 16px 16px 15px; position: relative; overflow: hidden;
     border-bottom: 1px solid rgba(255,255,255,0.85);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.14),
                 inset 0 -1px 0 rgba(0,0,0,0.40); }
@@ -191,29 +218,60 @@ HTML_TEMPLATE = r"""<!doctype html>
   @keyframes lab-xfade { from { opacity: 1; } to { opacity: 0; } }
   .banner > .b-inner { position: relative; z-index: 2; padding-right: 48px; }
 
-  /* ---- persistent vitals card (visible in every section) ---- */
-  .vitals { margin: 12px 12px 0; background: var(--panel);
-    border: 1px solid var(--border); border-radius: 12px;
-    padding: 4px 14px 6px; position: relative; overflow: hidden; }
-  .vitals::before { content: ""; position: absolute; left: 0; right: 0;
-    top: 0; height: 3px; background: var(--cat-ramp); }
-  .vrow { display: flex; align-items: baseline; justify-content: space-between;
-    gap: 10px; padding: 7px 0; border-bottom: 1px solid
-    rgba(255,255,255,0.05); }
+  /* ---- card body: HERO numbers (Max Wind + Category, the broadcast
+         reference treatment) over compact inline vitals ---- */
+  .heroes { display: grid; grid-template-columns: 1fr auto 1fr;
+    padding: 13px 16px 11px;
+    border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .hero { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .hero .hero-val { font-size: 40px; font-weight: 800; line-height: 1.05;
+    color: #ffffff; font-feature-settings: "tnum";
+    font-variant-numeric: tabular-nums;
+    display: flex; align-items: baseline; gap: 5px; }
+  .hero .hero-val .unit { font-size: 11px; color: var(--muted);
+    font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; }
+  .hero .hero-cap { font-size: 9.5px; font-weight: 700;
+    letter-spacing: 1.4px; text-transform: uppercase; color: var(--muted); }
+  .hero-div { width: 1px; background: rgba(255,255,255,0.08);
+    margin: 1px 16px; }
+
+  /* inline vitals: LEFT-ALIGNED "Label  value" pairs on a fixed label
+     column + shared baseline (no split justification - the AD R2 fix
+     for values reading at different levels). */
+  .vitals { padding: 3px 16px 9px; }
+  .vrow { display: grid; grid-template-columns: 102px 1fr;
+    align-items: baseline; gap: 10px; padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05); }
   .vrow:last-child { border-bottom: 0; }
   .vrow .lbl { font-size: 10px; font-weight: 700; letter-spacing: 1.3px;
-    text-transform: uppercase; color: var(--muted); flex: 0 0 auto; }
+    text-transform: uppercase; color: var(--muted); }
   .vrow .val { font-size: 15.5px; font-weight: 700; color: #ffffff;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums;
-    white-space: nowrap; display: flex; align-items: baseline; gap: 4px; }
+    white-space: nowrap; justify-self: start;
+    display: inline-flex; align-items: baseline; gap: 4px; }
   .vrow .unit { font-size: 10.5px; color: var(--muted); font-weight: 700; }
   .vrow.due .val { color: var(--cat-accent); font-size: 12.5px;
     letter-spacing: 0.6px; }
 
-  /* odometer: fixed-height window, digit columns roll via translateY */
+  /* odometer: fixed-height window, digit columns roll via translateY.
+     Digits ride fixed 0.62em cells (tnum alignment); LETTER cells (.ch)
+     are auto-width so wide glyphs (W in "141.2W") don't clip at the
+     strip's overflow edge, and white-space:pre keeps space cells real.
+     CLIPPING IS clip-path, NOT overflow: an overflow:hidden flex box is
+     a scroll container whose baseline is SYNTHESIZED at its bottom
+     edge, which threw every unit/label off the digits' real baseline
+     (the AD R2 "values at different levels" complaint). clip-path clips
+     identically but keeps the true text baseline exported, so the
+     card's align-items:baseline rows actually align. (Fallback:
+     overflow hidden for ancient engines without clip-path.) */
   .odo { display: inline-flex; overflow: hidden; height: 1.15em;
+    white-space: pre;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+  @supports (clip-path: inset(0)) {
+    .odo { overflow: visible; clip-path: inset(0); }
+  }
   .odo .digit { display: inline-block; width: 0.62em; text-align: center; }
+  .odo .digit.ch { width: auto; min-width: 0.3em; }
   .odo .col { display: flex; flex-direction: column; height: 1.15em;
     transition: transform calc(var(--motion-slow) * 0.35)
       cubic-bezier(0.22, 1, 0.36, 1); }
@@ -322,11 +380,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     var(--motion-med) ease-in-out 1 forwards; }
   @keyframes lab-wipeleft { to { transform: translateX(100%); } }
 
-  /* ---- mobile rotation: banner -> top bar; vitals -> slim card above
-         the map; nav -> bottom tabs (same DOM) ---- */
+  /* ---- mobile rotation: banner -> top bar; the card body (heroes +
+         vitals) -> ONE slim card above the map; nav -> bottom tabs
+         (same DOM; .bug flattens so the banner sticks exactly as
+         AD-1 approved) ---- */
   @media (max-width: 640px) {
     .lab { flex-direction: column; }
     .side { width: 100%; flex: 0 0 auto; border-right: 0; }
+    .bug { display: contents; }
     .banner { position: sticky; top: 0; z-index: 20; display: flex;
       align-items: center; gap: 10px; padding: 9px 14px; }
     .banner .eyebrow, .banner .storm-type { display: none; }
@@ -335,8 +396,15 @@ HTML_TEMPLATE = r"""<!doctype html>
       order: -1; flex: 0 0 auto; }
     .banner > .b-inner { display: flex; align-items: center; gap: 10px;
       flex: 1 1 auto; padding-right: 0; }
-    .vitals { margin: 10px 12px; padding: 2px 12px 4px; }
-    .vrow { padding: 5px 0; }
+    .bug-body { margin: 10px 12px; background: var(--panel);
+      border: 1px solid var(--border); border-radius: 12px;
+      overflow: hidden; position: relative; }
+    .bug-body::before { content: ""; position: absolute; left: 0;
+      right: 0; top: 0; height: 3px; background: var(--cat-ramp); }
+    .heroes { padding: 13px 14px 9px; }
+    .hero .hero-val { font-size: 26px; }
+    .vitals { padding: 1px 14px 6px; }
+    .vrow { padding: 4px 0; }
     .vrow .val { font-size: 13.5px; }
     .nav-secs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
       flex-direction: row; background: var(--navy-deep);
@@ -365,11 +433,21 @@ HTML_TEMPLATE = r"""<!doctype html>
 <div class="ended-strip">THIS STORM HAS ENDED · final data below · CycloLab archive view</div>
 <div class="lab">
   <aside class="side">
+    <div class="bug">
     <div class="banner" id="banner">
       <div class="old-ramp"></div>
       <svg class="glyph" viewBox="-34 -34 68 68" aria-hidden="true">
         <g class="spin"><path d="__HPATH__" fill="#ffffff"
           stroke="rgba(0,0,0,0.30)" stroke-width="1"/></g>
+        <!-- canonical icon label (tracks-map / storm-card canon:
+             generate_tracks_plot.py sshs_label + spinnerSvg) - D / S /
+             1-5, stationary while only the path spins. Weight 800, not
+             the canon's 900: Metropolis ships no Black face, so 900
+             would silently clamp to 800 anyway - declare what renders. -->
+        <text id="glyph-cat" y="0" text-anchor="middle"
+          dominant-baseline="central" font-size="22" font-weight="800"
+          fill="#ffffff" paint-order="stroke" stroke="rgba(0,0,0,0.55)"
+          stroke-width="2" stroke-linejoin="round">__CAT_LABEL__</text>
       </svg>
       <div class="b-inner">
         <div class="eyebrow">TRIPLE-A-TROPICS · <span class="brand">CycloLab</span></div>
@@ -378,8 +456,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         <span class="chip" id="chip">__CHIP__</span>
       </div>
     </div>
-
-    <div class="vitals" id="vitals"></div>
+    <div class="bug-body">
+      <div class="heroes">
+        <div class="hero">
+          <span class="hero-val"><span class="odo" id="odo-vmax" aria-label="__VMAX_A11Y__">__VMAX_ODO__</span><span class="unit">kt</span></span>
+          <span class="hero-cap">Max wind</span>
+        </div>
+        <div class="hero-div"></div>
+        <div class="hero">
+          <span class="hero-val"><span class="odo" id="odo-cat" aria-label="__CAT_LABEL__">__CAT_ODO__</span></span>
+          <span class="hero-cap">Category</span>
+        </div>
+      </div>
+      <div class="vitals" id="vitals"></div>
+    </div>
+    </div>
 
     <nav class="nav-secs" id="secnav">
       <button class="sec-btn active" data-sec="overview">Overview</button>
@@ -439,6 +530,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (cat === "TD") return "Tropical Depression";
     if (cat === "TS") return "Tropical Storm";
     return BASIN === "WP" ? "Typhoon" : "Hurricane";
+  }
+  // canonical icon letter/number - the SAME treatment the tracks maps +
+  // storm-card placard spinners use (generate_tracks_plot.py sshs_label
+  // / sshsLabel; mirrored in python _sshs_label). One canon, no new style.
+  function sshsLabel(cls) {
+    if (cls === "TD") return "D";
+    if (cls === "TS") return "S";
+    return (cls || "").replace("C", "") || "D";
   }
   var reduced = window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -507,6 +606,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     var want = String(text);
     if (el.getAttribute("data-odo") === want) return;
     el.setAttribute("data-odo", want);
+    // AT reads the value; the rolling 0-9 stacks are presentation only.
+    el.setAttribute("aria-label", want);
     while (el.children.length > want.length) el.removeChild(el.lastChild);
     for (var i = 0; i < want.length; i++) {
       var ch = want[i];
@@ -515,6 +616,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         if (!cell || !cell.classList.contains("col")) {
           var col = document.createElement("span");
           col.className = "col";
+          col.setAttribute("aria-hidden", "true");
           for (var d = 0; d <= 9; d++) {
             var s = document.createElement("span");
             s.className = "digit"; s.textContent = String(d);
@@ -527,18 +629,20 @@ HTML_TEMPLATE = r"""<!doctype html>
       } else {
         if (!cell || cell.classList.contains("col")) {
           var st = document.createElement("span");
-          st.className = "digit";
+          st.className = "digit ch";
+          st.setAttribute("aria-hidden", "true");
           if (cell) el.replaceChild(st, cell); else el.appendChild(st);
           cell = st;
         }
+        cell.classList.add("ch");   // reused baked digit cells too
         cell.textContent = ch;
       }
     }
   }
 
-  // ---- vitals (persistent sidebar card) ------------------------------------
+  // ---- vitals (inline rows in the bug card body; Max Wind + Category
+  //      live above them as the HERO numbers, baked into the template) ----
   var VITALS = [
-    { id: "vmax", lbl: "Max wind", unit: "kt" },
     { id: "mslp", lbl: "Min pressure", unit: "mb" },
     { id: "ace", lbl: "Storm ACE", unit: "" },
     { id: "pos", lbl: "Position", unit: "" },
@@ -607,12 +711,19 @@ HTML_TEMPLATE = r"""<!doctype html>
   var curCat = document.documentElement.getAttribute("data-cat");
   var advTypeWord = null;   // advisory-sourced word wins when present
   function setCategory(cat) {
+    // unknown/garbage categories clamp to TD - the same validation
+    // render_page applies to the static render, so the hydrated
+    // ramp/chip/glyph/hero can never desync from the baked page.
+    if (cat && !CHIP_LABEL[cat]) cat = "TD";
     if (!cat || cat === curCat) return;
     var banner = document.getElementById("banner");
     var oldRamp = getComputedStyle(document.documentElement)
       .getPropertyValue("--cat-ramp");
     document.documentElement.setAttribute("data-cat", cat);
     document.getElementById("chip").textContent = CHIP_LABEL[cat] || cat;
+    // the canon label rides the corner glyph + the Category hero.
+    document.getElementById("glyph-cat").textContent = sshsLabel(cat);
+    odoSet(document.getElementById("odo-cat"), sshsLabel(cat));
     if (!advTypeWord) {
       document.getElementById("storm-type").textContent =
         catWord(cat).toUpperCase();
@@ -840,6 +951,29 @@ def _type_word(cat: str, basin: str) -> str:
     return "Typhoon" if basin == "WP" else "Hurricane"
 
 
+def _sshs_label(cat: str) -> str:
+    """Canonical icon letter/number, D / S / 1-5 - exact mirror of the
+    inline JS sshsLabel (the placard-spinner fallback variant of the
+    canon, generate_tracks_plot.py:1326; ace_core.sshs_label is the
+    strict-dict form), including the None/empty -> "D" guard."""
+    if cat == "TD":
+        return "D"
+    if cat == "TS":
+        return "S"
+    return (cat or "").replace("C", "") or "D"
+
+
+def _odo_static(text) -> str:
+    """Bake an odometer's initial cells (static .digit spans; non-digits
+    carry .ch = auto-width, mirroring odoSet) so the no-JS render carries
+    real values; the first live odoSet() replaces digit cells with
+    rolling columns in place."""
+    return "".join(
+        f'<span class="digit{"" if ch.isdigit() else " ch"}"'
+        f' aria-hidden="true">{_esc(ch)}</span>'
+        for ch in str(text))
+
+
 def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                 ended: bool = False, loader: str = "") -> str:
     """Render one storm's shell. ``loader`` selects a loading-screen
@@ -874,6 +1008,12 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__CAT_CSS__", cat_css())
             .replace("__HPATH__", HURRICANE_PATH)
             .replace("__CAT__", cat)
+            .replace("__CAT_LABEL__", _esc(_sshs_label(cat)))
+            .replace("__CAT_ODO__", _odo_static(_sshs_label(cat)))
+            .replace("__VMAX_A11Y__", _esc(
+                round(float(wind)) if wind is not None else "—"))
+            .replace("__VMAX_ODO__", _odo_static(
+                round(float(wind)) if wind is not None else "—"))
             .replace("__NAME__", _esc(name))
             .replace("__TYPE_WORD__", _esc(type_word.upper()))
             .replace("__CHIP__", _esc(chip))

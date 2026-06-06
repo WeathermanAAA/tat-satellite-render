@@ -181,9 +181,20 @@ const scheduledDelays = [];
       activeNav: activeNav(),
       odo: {
         vmax: odo("vmax"), mslp: odo("mslp"), ace: odo("ace"),
-        pos: odo("pos"), fix: odo("fix"),
+        pos: odo("pos"), fix: odo("fix"), cat: odo("cat"),
       },
       odoColsVmax: odoCols("vmax"),
+      odoAriaVmax: (function () {
+        const el = document.getElementById("odo-vmax");
+        return el ? el.getAttribute("aria-label") : null;
+      })(),
+      // AD R2 integrated card: the canon label on the corner glyph
+      // (+ the Category hero rides odo.cat above).
+      glyphCat: text("glyph-cat"),
+      heroCatText: (function () {
+        const el = document.getElementById("odo-cat");
+        return el ? el.textContent : null;
+      })(),
       bannerClasses: bannerClasses(),
       trackmapChildCount: (document.getElementById("trackmap") || { children: [] })
         .children.length,
