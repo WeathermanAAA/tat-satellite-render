@@ -96,6 +96,7 @@ import json
 
 from ace_core import SSHS_COLORS  # the canonical category palette
 from cyclolab_pages import adv_key, page_url_path
+from cyclolab_intensity import basin_entry
 from storm_ids import parse_sid
 
 FONT_BASE = "https://triple-a-tropics.com/assets/fonts/metropolis"
@@ -478,6 +479,45 @@ HTML_TEMPLATE = r"""<!doctype html>
     .hafs-stage { min-height: 200px; }
   }
 
+  /* ---- Stage 4: THE CONE reveal + advisory panels (§8.1/8.2/8.5).
+     All reveal motion is transform/opacity/clip only; the icon spin is
+     the ONE permitted continuous loop; reduced-motion = final frame. */
+  .adv-cone-stage { background: #0a1019; border-radius: 8px;
+    overflow: hidden; }
+  #advcone, #intensity { display: block; width: 100%; height: auto; }
+  .ac-zoom { animation: ac-pushin calc(var(--motion-med) * 0.85)
+    ease-out 1 both; }
+  @keyframes ac-pushin { from { transform: scale(0.94); }
+                         to { transform: scale(1); } }
+  .ac-placard { transform-box: fill-box; transform-origin: center;
+    animation: ac-pop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 1 both;
+    animation-delay: 1s; }
+  .ac-conegrp circle.ac-revealer { animation: ac-grow 2s ease-out 1 both;
+    animation-delay: 1.4s; }
+  @keyframes ac-grow { from { r: 0; } to { r: var(--ac-rmax, 1200px); } }
+  .ac-icon { transform-box: fill-box; transform-origin: center;
+    animation: ac-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) 1 both; }
+  @keyframes ac-pop { from { transform: scale(0); opacity: 0; }
+                      to { transform: scale(1); opacity: 1; } }
+  .ac-spin { transform-box: fill-box; transform-origin: center;
+    animation: lab-spin 3.2s linear infinite; }
+  .adv-method { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
+  .adv-method summary { cursor: pointer; color: #9fc6f5;
+    font-weight: 600; font-size: 12px; letter-spacing: 0.4px; }
+  .adv-method div { margin-top: 8px; line-height: 1.55;
+    border-left: 2px solid var(--border); padding-left: 12px; }
+  .advtext { background: #0a1019; border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px; margin: 12px 0 0;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas,
+      monospace; color: #dfe6ee; white-space: pre-wrap;
+    max-height: 480px; overflow: auto; }
+  @media (prefers-reduced-motion: reduce) {
+    .ac-zoom, .ac-placard, .ac-conegrp circle.ac-revealer, .ac-icon {
+      animation: none !important; }
+    .ac-conegrp circle.ac-revealer { r: var(--ac-rmax, 1200px); }
+    .ac-spin { animation: none !important; }
+  }
+
   .stub { color: var(--muted); font-size: 14px; padding: 30px 0;
     text-align: center; }
 
@@ -742,7 +782,45 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div></section>
     <section class="sec" id="sec-advisories"><div class="wipe">
       <h2 class="sec-title">Advisories</h2>
-      <div class="stub">Advisory text + the cone reveal land in Stage 4.</div>
+      <div class="card">
+        <h3>Forecast cone</h3>
+        <div class="adv-cone-stage">
+          <svg id="advcone" viewBox="0 0 1000 620"
+               preserveAspectRatio="xMidYMid meet" role="img"
+               aria-label="Forecast track and uncertainty cone"></svg>
+        </div>
+        <p class="hafs-caption" id="advcone-note"></p>
+        <details class="adv-method" id="advcone-method">
+          <summary>How is this drawn?</summary>
+          <div id="advcone-method-body"></div>
+        </details>
+        <div id="advcone-empty" class="stub" style="display:none">No
+          advisory geometry yet for this storm.</div>
+      </div>
+      <div class="card">
+        <h3>Intensity forecast</h3>
+        <svg id="intensity" viewBox="0 0 1000 380"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Forecast intensity with published error range"></svg>
+        <p class="hafs-caption" id="intensity-note" hidden>Derived
+          intensity range &#8212; not an official forecast product.</p>
+        <details class="adv-method" id="intensity-method" hidden>
+          <summary>How is this derived?</summary>
+          <div id="intensity-method-body"></div>
+        </details>
+        <div id="intensity-missing" class="stub" style="display:none"></div>
+      </div>
+      <div class="card">
+        <h3>Advisory text</h3>
+        <div class="hafs-seg-group" id="advtext-tabs" role="group"
+             aria-label="Advisory product">
+          <button type="button" class="hafs-seg active"
+                  data-prod="tcp">Public Advisory</button>
+          <button type="button" class="hafs-seg"
+                  data-prod="tcd">Discussion</button>
+        </div>
+        <pre id="advtext" class="advtext"></pre>
+      </div>
     </div></section>
   </main>
 </div>
@@ -758,6 +836,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   var HAFS_ID = "__HAFS_ID__";        // storm_ids join: 01e
   var FLOATER_ID = "__ATCF_LONG__";   // storm_ids join: ep012026
   var CDN = "https://cdn.triple-a-tropics.com";
+  // Per-basin published intensity-error entry (null = the honesty-guard
+  // case: a labeled "no published statistics" panel, never a borrowed
+  // or invented envelope).
+  var INTENSITY_ERR = __INTENSITY_ERR__;
   var SITE_BASE = "https://triple-a-tropics.com";
   var POLL_MS = 60000;
   var SSHS = __SSHS_JSON__;
@@ -847,6 +929,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (name === "models") initModels();
       else if (name === "satellite") initSatellite();
     }
+    // THE CONE reveal plays once per tab OPEN (not once per session):
+    // rebuilding the SVG re-arms every CSS animation naturally.
+    if (name === "advisories") renderAdvTab();
     // pause-on-hide: a hidden tab must not keep its playback loop alive
     // (the satellite interval kept swapping img.src at 5 fps display:none,
     // and both viewers' timers could run concurrently).
@@ -1201,9 +1286,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
+  var advFull = null;
   function applyAdvisory(adv) {
     if (!adv) return;
     var changed = adv.advisory !== coneAdv;
+    advFull = adv;
     coneAdv = adv.advisory;
     coneRing = adv.cone || null;
     conePts = adv.points || null;
@@ -1225,6 +1312,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           (adv.method || "derived") + ".";
     }
     if (changed && lastStorm) renderTrack(lastStorm);
+    if (changed && inited.advisories) renderAdvTab();
   }
 
   function fetchJson(url) {
@@ -1251,6 +1339,323 @@ HTML_TEMPLATE = r"""<!doctype html>
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   if (!ENDED) poll();
+
+  // ---- Stage 4: THE CONE reveal + intensity cone + advisory text ----------
+  // (§8.1/8.2) The showpiece cone: same projection + brand-blue/white
+  // styling as the Overview map, plus the reveal choreography - push-in
+  // zoom, current-intensity placard pop, the cone drawing itself outward
+  // from the present position (an expanding clip circle), forecast-point
+  // icons popping in sequence as SLOW-SPINNING category-colored cyclone
+  // glyphs with glossy tau+kt placards. Category color lives ONLY in the
+  // icons/placards - the cone itself is uncertainty, never tinted.
+  function catForKt(kt) {
+    if (kt == null) return "TD";
+    if (kt < 34) return "TD";
+    if (kt < 64) return "TS";
+    if (kt < 83) return "C1";
+    if (kt < 96) return "C2";
+    if (kt < 113) return "C3";
+    if (kt < 137) return "C4";
+    return "C5";
+  }
+  var WP_METHOD_COPY =
+    "JTWC issues a forecast track for western Pacific storms but no " +
+    "official \u201ccone of uncertainty.\u201d This envelope is drawn by " +
+    "buffering each forecast point by JTWC\u2019s published average " +
+    "track-forecast error at that lead time (ESCAP/WMO Typhoon Committee " +
+    "verification report, 2015 season, Table 3) and sweeping the " +
+    "boundary. It reflects the historical AVERAGE error of past " +
+    "forecasts \u2014 it is not a probabilistic bound, and the storm can " +
+    "travel outside it. 12 h and 36 h radii are interpolated between " +
+    "published values. Method jtwc-wpac-mean-2015.";
+  var NHC_METHOD_COPY =
+    "This is the official National Hurricane Center forecast cone for " +
+    "this advisory, drawn from NHC\u2019s published GIS product. The cone " +
+    "contains the probable track of the storm center (roughly two-thirds " +
+    "of historical official track errors) \u2014 it says nothing about " +
+    "the storm\u2019s size or impacts, and the storm can travel outside " +
+    "it. Forecast-point icons are colored by the forecast intensity.";
+  function renderAdvCone() {
+    var svg = document.getElementById("advcone");
+    var note = document.getElementById("advcone-note");
+    var empty = document.getElementById("advcone-empty");
+    var method = document.getElementById("advcone-method");
+    if (!advFull || !coneRing || coneRing.length < 4 || !conePts ||
+        !conePts.length) {
+      svg.innerHTML = ""; empty.style.display = "block";
+      note.textContent = ""; method.hidden = true;
+      return;
+    }
+    empty.style.display = "none"; method.hidden = false;
+    var pts = conePts;
+    var lats = [], lons = [];
+    pts.forEach(function (p) { lats.push(p.lat); lons.push(p.lon); });
+    coneRing.forEach(function (c) { lons.push(c[0]); lats.push(c[1]); });
+    var pad = 1.6;
+    var la0 = Math.min.apply(null, lats) - pad,
+        la1 = Math.max.apply(null, lats) + pad;
+    var lo0 = Math.min.apply(null, lons) - pad,
+        lo1 = Math.max.apply(null, lons) + pad;
+    var W = 1000, H = 620;
+    function X(lon) { return (lon - lo0) / (lo1 - lo0) * W; }
+    function Y(lat) { return H - (lat - la0) / (la1 - la0) * H; }
+    var cur = pts[0];
+    var cx = X(cur.lon), cy = Y(cur.lat);
+    // clip radius that covers the whole cone from the current position
+    var rmax = 0;
+    coneRing.forEach(function (c) {
+      var dx = X(c[0]) - cx, dy = Y(c[1]) - cy;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > rmax) rmax = d;
+    });
+    rmax = Math.ceil(rmax + 30);
+    var dC = coneRing.map(function (c, i) {
+      return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
+    }).join(" ") + " Z";
+    var parts = ['<rect width="' + W + '" height="' + H +
+                 '" fill="#0a1019"/>'];
+    parts.push('<g class="ac-zoom" style="transform-origin:' +
+      cx.toFixed(0) + "px " + cy.toFixed(0) + 'px">');
+    parts.push('<defs><filter id="ac-soft" x="-20%" y="-20%" width="140%" ' +
+      'height="140%"><feGaussianBlur stdDeviation="5"/></filter>' +
+      '<clipPath id="ac-clip"><circle class="ac-revealer" cx="' +
+      cx.toFixed(1) + '" cy="' + cy.toFixed(1) + '" r="0" style="--ac-rmax:' +
+      rmax + 'px"/></clipPath></defs>');
+    // the cone (brand blue/white, never category-colored), revealed
+    // outward from the present position by the expanding clip circle
+    parts.push('<g class="ac-conegrp" clip-path="url(#ac-clip)">' +
+      '<path d="' + dC + '" fill="none" stroke="#8cc8ff" stroke-width="9" ' +
+      'stroke-opacity="0.35" filter="url(#ac-soft)"/>' +
+      '<path d="' + dC + '" fill="rgba(255,255,255,0.12)" ' +
+      'stroke="#0a1a2e" stroke-width="2"/>');
+    var dF = pts.map(function (p, i) {
+      return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
+    }).join(" ");
+    parts.push('<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
+      'stroke-width="1.6" stroke-dasharray="2 5" stroke-opacity="0.7"/></g>');
+    // forecast-point icons: slow-spinning glyphs + glossy placards,
+    // staggered after the cone draw (2.4s) at 0.2s per point
+    pts.forEach(function (p, i) {
+      var px = X(p.lon), py = Y(p.lat);
+      var cat = (SSHS[p.dev_label] ? p.dev_label : catForKt(p.intensity_kt));
+      var col = SSHS[cat] || SSHS.TD;
+      var delay = (2.4 + i * 0.2).toFixed(1);
+      var tau = Math.round(p.tau_h || 0);
+      parts.push('<g class="ac-icon" data-tau="' + tau +
+        '" style="animation-delay:' + delay + 's">' +
+        '<g transform="translate(' + px.toFixed(1) + " " + py.toFixed(1) +
+        ') scale(0.42)"><g class="ac-spin"><path d="' + "__HPATH__" +
+        '" fill="' + col + '" stroke="rgba(0,0,0,0.35)" ' +
+        'stroke-width="2"/></g></g>');
+      if (i > 0) {
+        var chipW = 86;
+        parts.push('<g transform="translate(' + (px - chipW / 2).toFixed(1) +
+          " " + (py + 22).toFixed(1) + ')">' +
+          '<rect width="' + chipW + '" height="22" rx="11" fill="' + col +
+          '" fill-opacity="0.92" stroke="rgba(0,0,0,0.3)"/>' +
+          '<rect width="' + chipW + '" height="11" rx="11" ' +
+          'fill="#ffffff" fill-opacity="0.18"/>' +
+          '<text x="' + chipW / 2 + '" y="15.5" text-anchor="middle" ' +
+          'font-size="12.5" font-weight="700" fill="#0b0e13">+' + tau +
+          "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt</text></g>");
+      }
+      parts.push("</g>");
+    });
+    // current-intensity placard at the present position
+    var curCat = (SSHS[cur.dev_label] ? cur.dev_label
+                                      : catForKt(cur.intensity_kt));
+    parts.push('<g class="ac-placard"><g transform="translate(' +
+      (cx - 56).toFixed(1) + " " + (cy - 46).toFixed(1) + ')">' +
+      '<rect width="112" height="26" rx="13" fill="' +
+      (SSHS[curCat] || SSHS.TD) + '" stroke="rgba(0,0,0,0.35)"/>' +
+      '<rect width="112" height="13" rx="13" fill="#ffffff" ' +
+      'fill-opacity="0.18"/>' +
+      '<text x="56" y="18" text-anchor="middle" font-size="13.5" ' +
+      'font-weight="800" fill="#0b0e13">NOW \u00b7 ' +
+      Math.round(cur.intensity_kt || 0) + "kt</text></g></g>");
+    parts.push("</g>");
+    svg.innerHTML = parts.join("");
+    var official = advFull.method === "official-cone";
+    note.textContent = official
+      ? "Official NHC forecast cone \u00b7 advisory " + advFull.advisory +
+        " \u00b7 icons colored by forecast intensity."
+      : "Derived uncertainty envelope \u2014 not an official JTWC " +
+        "product \u00b7 advisory " + advFull.advisory + " \u00b7 method " +
+        (advFull.method || "derived") + ".";
+    document.getElementById("advcone-method-body").textContent =
+      official ? NHC_METHOD_COPY : WP_METHOD_COPY;
+  }
+
+  // (§8.6) THE INTENSITY CONE: forecast-VMAX center line + published-
+  // error envelope on SSHWS bands. Brand-toned translucent envelope -
+  // category color lives ONLY in the icons and bands. Honesty guard:
+  // no registry entry => a labeled panel, never a borrowed envelope.
+  function maeAt(entry, tau) {
+    var table = {};
+    var taus = [];
+    for (var k in entry.mae_kt) {
+      if (entry.mae_kt.hasOwnProperty(k)) {
+        table[+k] = +entry.mae_kt[k]; taus.push(+k);
+      }
+    }
+    taus.sort(function (a, b) { return a - b; });
+    if (tau <= 0) return 0;
+    if (table[tau] != null) return table[tau];
+    var lo = 0, loV = 0;
+    for (var i = 0; i < taus.length; i++) {
+      if (taus[i] > tau) {
+        return loV + (table[taus[i]] - loV) * (tau - lo) / (taus[i] - lo);
+      }
+      lo = taus[i]; loV = table[taus[i]];
+    }
+    return table[taus[taus.length - 1]];
+  }
+  function intensityRows() {
+    if (!INTENSITY_ERR || !advFull || !advFull.points) return null;
+    var rows = [];
+    advFull.points.forEach(function (p) {
+      if (p.intensity_kt == null) return;
+      var tau = +(p.tau_h || 0);
+      var m = maeAt(INTENSITY_ERR, tau);
+      rows.push({ tau: tau, center: +p.intensity_kt,
+                  upper: Math.min(200, p.intensity_kt + m),
+                  lower: Math.max(0, p.intensity_kt - m), mae: m });
+    });
+    return rows;
+  }
+  function renderIntensity() {
+    var svg = document.getElementById("intensity");
+    var note = document.getElementById("intensity-note");
+    var method = document.getElementById("intensity-method");
+    var missing = document.getElementById("intensity-missing");
+    if (!INTENSITY_ERR) {
+      svg.innerHTML = ""; note.hidden = true; method.hidden = true;
+      missing.style.display = "block";
+      missing.textContent = "No published intensity-error statistics " +
+        "for this basin \u2014 an intensity range is not shown rather " +
+        "than borrowed or invented.";
+      return;
+    }
+    var rows = intensityRows();
+    if (!rows || rows.length < 2) {
+      svg.innerHTML = ""; note.hidden = true; method.hidden = true;
+      missing.style.display = "block";
+      missing.textContent = "No forecast intensity points yet for this " +
+        "storm.";
+      return;
+    }
+    missing.style.display = "none"; note.hidden = false;
+    method.hidden = false;
+    var W = 1000, H = 380, padL = 56, padR = 26, padT = 18, padB = 40;
+    var tMax = rows[rows.length - 1].tau || 120;
+    var kMax = 80;
+    rows.forEach(function (r) { if (r.upper + 12 > kMax) kMax = r.upper + 12; });
+    function Xt(t) { return padL + t / tMax * (W - padL - padR); }
+    function Yk(k) { return H - padB - k / kMax * (H - padT - padB); }
+    var parts = ['<rect width="' + W + '" height="' + H +
+                 '" fill="#0a1019"/>'];
+    // SSHWS bands from the canonical palette
+    var bands = [[0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"],
+                 [83, 96, "C2"], [96, 113, "C3"], [113, 137, "C4"],
+                 [137, 999, "C5"]];
+    bands.forEach(function (b) {
+      var top = Math.min(b[1], kMax), bot = b[0];
+      if (bot >= kMax) return;
+      parts.push('<rect x="' + padL + '" y="' + Yk(top).toFixed(1) +
+        '" width="' + (W - padL - padR) + '" height="' +
+        (Yk(bot) - Yk(top)).toFixed(1) + '" fill="' + SSHS[b[2]] +
+        '" fill-opacity="0.10"/>');
+      if (b[1] <= kMax) {
+        parts.push('<text x="' + (W - padR - 6) + '" y="' +
+          (Yk(b[1]) + 12).toFixed(1) + '" text-anchor="end" ' +
+          'font-size="11" fill="' + SSHS[b[2]] + '" fill-opacity="0.8">' +
+          b[2] + "</text>");
+      }
+    });
+    // axes ticks
+    rows.forEach(function (r) {
+      parts.push('<text x="' + Xt(r.tau).toFixed(1) + '" y="' + (H - 14) +
+        '" text-anchor="middle" font-size="11.5" fill="#8b95a5">+' +
+        Math.round(r.tau) + "h</text>");
+    });
+    [0, 25, 50, 75, 100, 125, 150].forEach(function (k) {
+      if (k > kMax) return;
+      parts.push('<text x="' + (padL - 8) + '" y="' +
+        (Yk(k) + 4).toFixed(1) + '" text-anchor="end" font-size="11" ' +
+        'fill="#8b95a5">' + k + "</text>");
+    });
+    // envelope (brand-toned translucent, never category-colored)
+    var up = rows.map(function (r, i) {
+      return (i ? "L" : "M") + Xt(r.tau).toFixed(1) + "," +
+        Yk(r.upper).toFixed(1);
+    }).join(" ");
+    var down = rows.slice().reverse().map(function (r) {
+      return "L" + Xt(r.tau).toFixed(1) + "," + Yk(r.lower).toFixed(1);
+    }).join(" ");
+    parts.push('<path d="' + up + " " + down +
+      ' Z" fill="rgba(255,255,255,0.10)" stroke="#8cc8ff" ' +
+      'stroke-width="1.5" stroke-opacity="0.45"/>');
+    // center line
+    var center = rows.map(function (r, i) {
+      return (i ? "L" : "M") + Xt(r.tau).toFixed(1) + "," +
+        Yk(r.center).toFixed(1);
+    }).join(" ");
+    parts.push('<path d="' + center + '" fill="none" stroke="#ffffff" ' +
+      'stroke-width="2.5" stroke-linejoin="round"/>');
+    // spinning category icons at each forecast point
+    rows.forEach(function (r, i) {
+      var col = SSHS[catForKt(r.center)] || SSHS.TD;
+      parts.push('<g class="ac-icon" style="animation-delay:' +
+        (0.3 + i * 0.15).toFixed(2) + 's"><g transform="translate(' +
+        Xt(r.tau).toFixed(1) + " " + Yk(r.center).toFixed(1) +
+        ') scale(0.3)"><g class="ac-spin"><path d="__HPATH__" fill="' +
+        col + '" stroke="rgba(0,0,0,0.35)" stroke-width="2"/></g></g></g>');
+    });
+    svg.innerHTML = parts.join("");
+    var body = "Center line: the official forecast intensity (VMAX) " +
+      "from advisory " + advFull.advisory + ". Shaded range: \u00b1 the " +
+      (INTENSITY_ERR.agency || "") + " published mean absolute intensity " +
+      "error (" + (INTENSITY_ERR.error_type || "MAE") + ", " +
+      (INTENSITY_ERR.window || "") + " window) at each lead time \u2014 " +
+      "method " + INTENSITY_ERR.method_version + ". Lead times without a " +
+      "published value are interpolated linearly. It reflects the " +
+      "historical average error of past forecasts \u2014 it is not a " +
+      "probabilistic bound, and the storm\u2019s intensity can fall " +
+      "outside it. Do not use for life-safety decisions \u2014 see the " +
+      "official advisory text." +
+      (INTENSITY_ERR.staleness_note ? " " + INTENSITY_ERR.staleness_note
+                                    : "") +
+      (INTENSITY_ERR.vintage_note ? " " + INTENSITY_ERR.vintage_note : "");
+    document.getElementById("intensity-method-body").textContent = body;
+  }
+
+  // (§7.4) advisory text panels - monospace, never tinted
+  var advTextProd = "tcp";
+  function renderAdvText() {
+    var pre = document.getElementById("advtext");
+    var t = (advFull && advFull.text) || {};
+    var body = advTextProd === "tcp" ? t.tcp : t.tcd;
+    pre.textContent = body ||
+      "(advisory text not available for this advisory)";
+    var host = document.getElementById("advtext-tabs");
+    for (var i = 0; i < host.children.length; i++) {
+      var b = host.children[i];
+      b.classList.toggle("active",
+                         b.getAttribute("data-prod") === advTextProd);
+    }
+  }
+  document.getElementById("advtext-tabs").addEventListener("click",
+    function (e) {
+      var b = e.target.closest(".hafs-seg");
+      if (!b) return;
+      advTextProd = b.getAttribute("data-prod");
+      renderAdvText();
+    });
+  function renderAdvTab() {
+    renderAdvCone();
+    renderIntensity();
+    renderAdvText();
+  }
 
   // ---- Stage 3: Models mount (componentized /models/ HafsViewer) ----------
   // One impl, two mounts (CYCLOLAB_DESIGN §7.3): hafs.js is lazy-loaded on
@@ -1457,6 +1862,8 @@ HTML_TEMPLATE = r"""<!doctype html>
                    apply: apply, applyAdvisory: applyAdvisory,
                    odoSet: odoSet,
                    // Stage-3 deterministic hooks (tests + ops)
+                   renderAdvTab: renderAdvTab,
+                   intensityRows: intensityRows,
                    satState: function () {
                      return { band: sat.band, idx: sat.idx,
                               frames: sat.frames.length,
@@ -1555,6 +1962,9 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SID__", _esc(storm["sid"]))
             .replace("__FEED_URL__", _esc(feed_url))
             .replace("__HAFS_ID__", _esc(ids.hafs_id))
+            .replace("__INTENSITY_ERR__",
+                     json.dumps(basin_entry(ids.basin),
+                                separators=(",", ":")))
             .replace("__ATCF_LONG__", _esc(ids.atcf_long))
             .replace("__ADV_URL__", _esc(adv_url or adv_key(storm["sid"])))
             .replace("__BASIN__", ids.basin)

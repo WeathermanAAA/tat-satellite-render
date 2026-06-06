@@ -665,5 +665,149 @@ class TestStage3Mounts(unittest.TestCase):
         self.assertIn('var FLOATER_ID = "ep082026"', self.html)
 
 
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestStage4Advisories(unittest.TestCase):
+    """Stage 4: THE CONE reveal + the intensity cone + advisory text
+    panels (CYCLOLAB_DESIGN §7.4/§8). The reveal is structural here
+    (choreography elements + stagger delays + the one permitted spin
+    loop); the rendered look is the packet's job."""
+
+    def setUp(self):
+        self.storm = load_storm()      # EP08 -> EP registry entry baked
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL,
+                                               loader="")
+
+    @staticmethod
+    def _adv(method="official-cone", points=None, text=None):
+        if points is None:
+            points = [
+                {"tau_h": 0, "lat": 15.0, "lon": -135.0,
+                 "intensity_kt": 30, "dev_label": "TD",
+                 "valid_utc": "2026-06-06T21:00:00Z"},
+                {"tau_h": 12, "lat": 15.5, "lon": -136.0,
+                 "intensity_kt": 35, "dev_label": "TS",
+                 "valid_utc": "2026-06-07T09:00:00Z"},
+                {"tau_h": 24, "lat": 16.0, "lon": -137.2,
+                 "intensity_kt": 45, "dev_label": "TS",
+                 "valid_utc": "2026-06-07T21:00:00Z"},
+                {"tau_h": 48, "lat": 17.0, "lon": -139.6,
+                 "intensity_kt": 70, "dev_label": "HU",
+                 "valid_utc": "2026-06-08T21:00:00Z"},
+            ]
+        ring = [[-140.0, 13.0], [-134.0, 13.0], [-133.5, 18.0],
+                [-140.5, 18.5], [-140.0, 13.0]]
+        return {"sid": "NHC_EP082026", "advisory": 21,
+                "issued_utc": "2026-06-06T21:00:00Z",
+                "source": "nhc", "method": method,
+                "cone": ring, "points": points,
+                "text": text if text is not None else
+                {"tcp": "BULLETIN\nTEST PUBLIC ADVISORY BODY",
+                 "tcd": "TEST DISCUSSION BODY",
+                 "tcp_url": "u1", "tcd_url": "u2"}}
+
+    def _run(self, ops, adv=None):
+        plan = {"ops": [{"op": "applyAdvisory",
+                         "adv": adv or self._adv()}] + ops}
+        return run_harness(self.html, plan)
+
+    def test_cone_reveal_structure_and_stagger(self):
+        recs = self._run([{"op": "openSec", "name": "advisories"}])
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertTrue(a["coneHasRevealer"], "expanding clip circle")
+        self.assertTrue(a["coneHasPlacard"], "current-intensity placard")
+        self.assertEqual(a["coneIcons"], 4)       # one per forecast point
+        self.assertGreaterEqual(a["coneSpinners"], 4)
+        self.assertIn("animation-delay:2.4s", a["coneIconDelays"][0])
+        self.assertIn("animation-delay:2.6s", a["coneIconDelays"][1])
+        self.assertFalse(a["coneEmptyShown"])
+
+    def test_official_cone_copy(self):
+        recs = self._run([{"op": "openSec", "name": "advisories"}])
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertIn("Official NHC forecast cone", a["coneNote"])
+        self.assertIn("advisory 21", a["coneNote"])
+        self.assertIn("official National Hurricane Center",
+                      a["coneMethodBody"])
+
+    def test_derived_cone_copy_wp_disclosure(self):
+        adv = self._adv(method="derived-mean-error-jtwc-wpac-mean-2015")
+        recs = self._run([{"op": "openSec", "name": "advisories"}], adv=adv)
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertIn("not an official JTWC product", a["coneNote"])
+        self.assertIn("no\u2009official" if False else "cone of uncertainty",
+                      a["coneMethodBody"])
+        self.assertIn("jtwc-wpac-mean-2015", a["coneMethodBody"])
+        self.assertIn("interpolated", a["coneMethodBody"])
+
+    def test_intensity_cone_envelope_matches_python_math(self):
+        # the in-page JS mirrors cyclolab_intensity.envelope - pin the
+        # parity on the EP entry (12h 5.7 / 48h 12.9, tau 0 anchored).
+        import cyclolab_intensity as ci
+        recs = self._run([{"op": "openSec", "name": "advisories"}])
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertTrue(a["intRendered"])
+        rows = a["intRows"]
+        self.assertEqual([r["tau"] for r in rows], [0, 12, 24, 48])
+        py = ci.envelope(self._adv()["points"], ci.basin_entry("EP"))
+        for js, p in zip(rows, py):
+            self.assertAlmostEqual(js["upper"], p["upper"], places=6)
+            self.assertAlmostEqual(js["lower"], p["lower"], places=6)
+        self.assertEqual(rows[0]["upper"], rows[0]["lower"])  # tau-0 apex
+        self.assertIn("nhc-ofcl-5yr-2020-2024", a["intMethodBody"])
+        self.assertIn("not a probabilistic bound", a["intMethodBody"])
+
+    def test_intensity_honesty_guard_no_registry_entry(self):
+        # an unregistered basin bakes INTENSITY_ERR = null -> the labeled
+        # panel renders and NO envelope is drawn. Simulate by patching
+        # the baked constant (basin registries are keyed by real basins).
+        html = self.html.replace(
+            'var INTENSITY_ERR = {', 'var INTENSITY_ERR = null; var _x = {')
+        plan = {"ops": [{"op": "applyAdvisory", "adv": self._adv()},
+                        {"op": "openSec", "name": "advisories"}]}
+        recs = run_harness(html, plan)
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertTrue(a["intMissingShown"])
+        self.assertIn("No published intensity-error statistics",
+                      a["intMissingText"])
+        self.assertIn("rather than borrowed or invented",
+                      a["intMissingText"])
+        self.assertFalse(a["intRendered"])
+
+    def test_advisory_text_panels_and_toggle(self):
+        recs = self._run([
+            {"op": "openSec", "name": "advisories"},
+            {"op": "clickAdvTextTab", "prod": "tcd"},
+            {"op": "clickAdvTextTab", "prod": "tcp"}])
+        states = [r["state"]["stage3"]["adv"]["advText"] for r in recs[-3:]]
+        self.assertIn("TEST PUBLIC ADVISORY BODY", states[0])
+        self.assertEqual(states[1], "TEST DISCUSSION BODY")
+        self.assertIn("TEST PUBLIC ADVISORY BODY", states[2])
+
+    def test_missing_text_products_show_placeholder(self):
+        adv = self._adv(text={"tcp_url": "u1", "tcd_url": "u2"})
+        recs = self._run([{"op": "openSec", "name": "advisories"}], adv=adv)
+        self.assertIn("not available",
+                      recs[-1]["state"]["stage3"]["adv"]["advText"])
+
+    def test_no_advisory_shows_cone_empty_state(self):
+        plan = {"ops": [{"op": "openSec", "name": "advisories"}]}
+        recs = run_harness(self.html, plan)
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertTrue(a["coneEmptyShown"])
+        self.assertEqual(a["coneIcons"], 0)
+
+    def test_reveal_replays_on_every_open(self):
+        # re-opening rebuilds the SVG (fresh nodes re-arm the CSS
+        # animations) - prove it by node identity proxy: icon count
+        # stays right after a second open following a detour.
+        recs = self._run([
+            {"op": "openSec", "name": "advisories"},
+            {"op": "openSec", "name": "overview"},
+            {"op": "openSec", "name": "advisories"}])
+        self.assertEqual(recs[-1]["state"]["stage3"]["adv"]["coneIcons"], 4)
+        self.assertTrue(recs[-1]["state"]["stage3"]["adv"]["coneHasRevealer"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

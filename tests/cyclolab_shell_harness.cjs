@@ -246,7 +246,36 @@ const scheduledDelays = [];
     const bandHost = win.document.getElementById("sat-bands");
     const scriptEl = win.document.querySelector(
       'script[src*="/models/hafs.js"]');
+    const coneSvg = win.document.getElementById("advcone");
+    const intSvg = win.document.getElementById("intensity");
+    const adv = {
+      coneIcons: coneSvg
+        ? coneSvg.querySelectorAll(".ac-icon").length : 0,
+      coneIconDelays: coneSvg ? Array.prototype.map.call(
+        coneSvg.querySelectorAll(".ac-icon"),
+        (g) => (g.getAttribute("style") || "")).slice(0, 3) : [],
+      coneHasRevealer: !!(coneSvg &&
+        coneSvg.querySelector("circle.ac-revealer")),
+      coneHasPlacard: !!(coneSvg && coneSvg.querySelector(".ac-placard")),
+      coneSpinners: coneSvg
+        ? coneSvg.querySelectorAll(".ac-spin").length : 0,
+      coneNote: text("advcone-note"),
+      coneMethodBody: text("advcone-method-body"),
+      coneEmptyShown:
+        ((win.document.getElementById("advcone-empty") || {}).style || {})
+          .display === "block",
+      intRendered: !!(intSvg && intSvg.innerHTML.length > 100),
+      intMissingText: text("intensity-missing"),
+      intMissingShown:
+        ((win.document.getElementById("intensity-missing") || {}).style ||
+          {}).display === "block",
+      intMethodBody: text("intensity-method-body"),
+      intRows: win.__lab && win.__lab.intensityRows
+        ? win.__lab.intensityRows() : null,
+      advText: text("advtext"),
+    };
     return {
+      adv: adv,
       hafsCtor: hafs,
       hafsScriptInjected: !!scriptEl,
       hafsScriptSrc: scriptEl ? scriptEl.src : null,
@@ -308,6 +337,14 @@ const scheduledDelays = [];
       window.__lab.setCategory(op.cat);
     } else if (op.op === "apply") {
       window.__lab.apply(op.storm);
+    } else if (op.op === "applyAdvisory") {
+      window.__lab.applyAdvisory(op.adv);
+    } else if (op.op === "clickAdvTextTab") {
+      const host = document.getElementById("advtext-tabs");
+      const btn = host && Array.prototype.find.call(
+        host.children, (b) => b.getAttribute("data-prod") === op.prod);
+      if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
     } else if (op.op === "clickSatPlay") {
       const btn = document.getElementById("sat-play");
       if (btn) btn.dispatchEvent(
