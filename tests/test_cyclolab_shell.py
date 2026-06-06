@@ -334,7 +334,9 @@ class TestIntegratedCardBehavior(unittest.TestCase):
              "ops": [{"op": "setCategory", "cat": "ZZ"}]})
         st = recs[-1]["state"]
         self.assertEqual(st["cat"], "TD")
-        self.assertEqual(st["chip"], "Tropical Depression")
+        # S4-AD1 #10: at TD the chip is HIDDEN (it would duplicate the
+        # type word); the clamp shows as the hidden chip + TD ramp.
+        self.assertFalse(st["chipShown"])
         self.assertEqual(st["glyphCat"], "D")
         self.assertEqual(st["odo"]["cat"], "D")
 
@@ -381,6 +383,7 @@ class TestCategorySwitch(unittest.TestCase):
         st = recs[-1]["state"]
         self.assertEqual(st["cat"], "C5")
         self.assertEqual(st["chip"], "Category 5")
+        self.assertTrue(st["chipShown"])   # C1-5 chips stay (#10)
         # the category-change choreography: crossfade + one shine sweep.
         self.assertIn("xfade", st["bannerClasses"])
         self.assertIn("shine", st["bannerClasses"])
@@ -726,17 +729,85 @@ class TestStage4Advisories(unittest.TestCase):
     def test_cone_reveal_structure_and_stagger(self):
         recs = self._run([{"op": "openSec", "name": "advisories"}])
         a = recs[-1]["state"]["stage3"]["adv"]
-        # jsdom has no WAAPI -> the final frame branch must engage and
-        # the clip must be the FULL circle (cone visible).
+        # jsdom has no WAAPI -> the final-frame branch engages: the
+        # growth-front mask stroke sits at dashoffset 0 (fully drawn).
         self.assertEqual(a["coneReveal"], "final")
-        self.assertIn("circle(", a["coneClipPath"])
-        self.assertNotIn("circle(0px", a["coneClipPath"])
-        self.assertTrue(a["coneHasPlacard"], "current-intensity placard")
+        self.assertEqual(str(a["coneFrontOffset"]), "0")
         self.assertEqual(a["coneIcons"], 4)       # one per forecast point
         self.assertGreaterEqual(a["coneSpinners"], 4)
-        self.assertIn("animation-delay:2.4s", a["coneIconDelays"][0])
-        self.assertIn("animation-delay:2.6s", a["coneIconDelays"][1])
+        # pops RIDE THE WAVEFRONT: NOW during the hold (~0.4s), then
+        # strictly increasing with along-track distance, all after the
+        # 1s hold (S4-AD1 #1).
+        det = a["coneIconsDetail"]
+        self.assertEqual([d["tau"] for d in det], [0, 12, 24, 48])
+        self.assertAlmostEqual(det[0]["delay"], 0.4, places=2)
+        self.assertGreater(det[1]["delay"], 1.0)
+        self.assertLess(det[1]["delay"], det[2]["delay"])
+        self.assertLess(det[2]["delay"], det[3]["delay"])
+        self.assertLessEqual(det[3]["delay"], 4.5)
+        # every point carries a placard; none overlap (S4-AD1 #7)
+        pls = a["conePlacards"]
+        self.assertEqual(len(pls), 4)
+        for i in range(len(pls)):
+            for j in range(i + 1, len(pls)):
+                p, q = pls[i], pls[j]
+                clear = (p["x"] + p["w"] <= q["x"] or
+                         q["x"] + q["w"] <= p["x"] or
+                         p["y"] + p["h"] <= q["y"] or
+                         q["y"] + q["h"] <= p["y"])
+                self.assertTrue(clear, f"placards {i}/{j} overlap")
+        # basemap + auto-fit viewport (S4-AD1 #2/#3)
+        self.assertGreaterEqual(a["coneGraticule"], 2)
+        self.assertTrue(a["coneViewBox"].startswith("0 0 1000 "))
         self.assertFalse(a["coneEmptyShown"])
+
+    def test_non_tropical_points_render_white_with_caption(self):
+        # S4-AD1 #4/#5: post-tropical/remnant taus render WHITE, carry
+        # NO category letter, and the caption gains the one-line key.
+        adv = self._adv(points=[
+            {"tau_h": 0, "lat": 15.0, "lon": -135.0,
+             "intensity_kt": 30, "dev_label": "TD", "valid_utc": "x"},
+            {"tau_h": 12, "lat": 15.5, "lon": -136.0,
+             "intensity_kt": 35, "dev_label": "TS", "valid_utc": "x"},
+            {"tau_h": 24, "lat": 16.0, "lon": -137.2,
+             "intensity_kt": 35, "dev_label": "PT", "valid_utc": "x"},
+            {"tau_h": 48, "lat": 17.0, "lon": -139.6,
+             "intensity_kt": 25, "dev_label": "EX", "valid_utc": "x"},
+        ])
+        recs = self._run([{"op": "openSec", "name": "advisories"}], adv=adv)
+        a = recs[-1]["state"]["stage3"]["adv"]
+        det = a["coneIconsDetail"]
+        self.assertEqual([d["tropical"] for d in det],
+                         [True, True, False, False])
+        self.assertEqual([d["hasCatLabel"] for d in det],
+                         [True, True, False, False],
+                         "white icons carry no SS label")
+        self.assertIn("White icons = forecast non-tropical", a["coneNote"])
+
+    def test_all_tropical_omits_the_white_caption(self):
+        recs = self._run([{"op": "openSec", "name": "advisories"}])
+        self.assertNotIn("White icons",
+                         recs[-1]["state"]["stage3"]["adv"]["coneNote"])
+
+    def test_bunched_taus_never_overlap_placards(self):
+        # S4-AD1 #7: taus bunched within a fraction of a degree - the
+        # collision pass must still separate every placard.
+        adv = self._adv(points=[
+            {"tau_h": t, "lat": 15.0 + 0.05 * i, "lon": -135.0 - 0.07 * i,
+             "intensity_kt": 30 + i, "dev_label": "TS", "valid_utc": "x"}
+            for i, t in enumerate((0, 12, 24, 36, 48, 60))])
+        recs = self._run([{"op": "openSec", "name": "advisories"}], adv=adv)
+        pls = recs[-1]["state"]["stage3"]["adv"]["conePlacards"]
+        self.assertEqual(len(pls), 6)
+        for i in range(len(pls)):
+            for j in range(i + 1, len(pls)):
+                p, q = pls[i], pls[j]
+                clear = (p["x"] + p["w"] <= q["x"] or
+                         q["x"] + q["w"] <= p["x"] or
+                         p["y"] + p["h"] <= q["y"] or
+                         q["y"] + q["h"] <= p["y"])
+                self.assertTrue(clear,
+                                f"bunched placards {i}/{j} overlap: {p} {q}")
 
     def test_official_cone_copy(self):
         recs = self._run([{"op": "openSec", "name": "advisories"}])
@@ -824,6 +895,9 @@ class TestStage4Advisories(unittest.TestCase):
         self.assertEqual(recs[-1]["state"]["stage3"]["adv"]["coneIcons"], 4)
         self.assertEqual(
             recs[-1]["state"]["stage3"]["adv"]["coneReveal"], "final")
+        self.assertEqual(
+            str(recs[-1]["state"]["stage3"]["adv"]["coneFrontOffset"]),
+            "0")
 
 
 if __name__ == "__main__":

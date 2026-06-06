@@ -254,12 +254,34 @@ const scheduledDelays = [];
       coneIconDelays: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll(".ac-icon"),
         (g) => (g.getAttribute("style") || "")).slice(0, 3) : [],
-      coneReveal: coneSvg && coneSvg.querySelector(".ac-conegrp")
-        ? coneSvg.querySelector(".ac-conegrp").getAttribute("data-reveal")
+      coneReveal: coneSvg && coneSvg.querySelector(".ac-front")
+        ? coneSvg.querySelector(".ac-front").getAttribute("data-reveal")
         : null,
-      coneClipPath: coneSvg && coneSvg.querySelector(".ac-conegrp")
-        ? (coneSvg.querySelector(".ac-conegrp").style.clipPath || "")
+      coneFrontOffset: coneSvg && coneSvg.querySelector(".ac-front")
+        ? (coneSvg.querySelector(".ac-front").style.strokeDashoffset
+           || coneSvg.querySelector(".ac-front")
+                .getAttribute("stroke-dashoffset") || "")
         : "",
+      coneViewBox: coneSvg ? (coneSvg.getAttribute("viewBox") || "") : "",
+      coneIconsDetail: coneSvg ? Array.prototype.map.call(
+        coneSvg.querySelectorAll(".ac-icon"), (g) => ({
+          tau: parseInt(g.getAttribute("data-tau"), 10),
+          tropical: g.getAttribute("data-tropical") === "1",
+          delay: parseFloat(((g.getAttribute("style") || "")
+            .match(/animation-delay:([0-9.]+)s/) || [0, "0"])[1]),
+          hasCatLabel: !!g.querySelector("text.ac-cat"),
+        })) : [],
+      conePlacards: coneSvg ? Array.prototype.map.call(
+        coneSvg.querySelectorAll('[data-role="placard"]'), (g) => ({
+          x: parseFloat(g.getAttribute("data-x")),
+          y: parseFloat(g.getAttribute("data-y")),
+          w: parseFloat(g.getAttribute("data-w")),
+          h: parseFloat(g.getAttribute("data-h")),
+        })) : [],
+      coneLand: coneSvg
+        ? coneSvg.querySelectorAll(".ac-land").length : 0,
+      coneGraticule: coneSvg
+        ? coneSvg.querySelectorAll(".ac-graticule line").length : 0,
       coneHasPlacard: !!(coneSvg && coneSvg.querySelector(".ac-placard")),
       coneSpinners: coneSvg
         ? coneSvg.querySelectorAll(".ac-spin").length : 0,
@@ -303,6 +325,10 @@ const scheduledDelays = [];
       cat: document.documentElement.getAttribute("data-cat"),
       ended: document.documentElement.hasAttribute("data-ended"),
       chip: text("chip"),
+      chipShown: (() => {
+        const c = document.getElementById("chip");
+        return !!c && c.style.display !== "none";
+      })(),
       stormName: text("storm-name"),
       activeSection: activeSection(),
       activeNav: activeNav(),

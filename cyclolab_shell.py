@@ -96,6 +96,7 @@ import json
 
 from ace_core import SSHS_COLORS  # the canonical category palette
 from cyclolab_pages import adv_key, page_url_path
+from cyclolab_basemap import basemap_for
 from cyclolab_intensity import basin_entry
 from storm_ids import parse_sid
 
@@ -484,14 +485,16 @@ HTML_TEMPLATE = r"""<!doctype html>
      the ONE permitted continuous loop; reduced-motion = final frame. */
   .adv-cone-stage { background: #0a1019; border-radius: 8px;
     overflow: hidden; }
+  .ac-land { fill: #131b28; stroke: #2b3a50; stroke-width: 1.2; }
+  .ac-graticule line { stroke: #16202e; stroke-width: 1; }
+  .ac-graticule text { fill: #33415a; font-size: 12px; }
+  .ac-ocean { fill: rgba(255,255,255,0.05); font-size: 58px;
+    font-weight: 800; letter-spacing: 14px; }
   #advcone, #intensity { display: block; width: 100%; height: auto; }
   .ac-zoom { animation: ac-pushin calc(var(--motion-med) * 0.85)
     ease-out 1 both; }
   @keyframes ac-pushin { from { transform: scale(0.94); }
                          to { transform: scale(1); } }
-  .ac-placard { transform-box: fill-box; transform-origin: center;
-    animation: ac-pop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 1 both;
-    animation-delay: 1s; }
   .ac-icon { transform-box: fill-box; transform-origin: center;
     animation: ac-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) 1 both; }
   @keyframes ac-pop { from { transform: scale(0); opacity: 0; }
@@ -509,7 +512,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       monospace; color: #dfe6ee; white-space: pre-wrap;
     max-height: 480px; overflow: auto; }
   @media (prefers-reduced-motion: reduce) {
-    .ac-zoom, .ac-placard, .ac-icon { animation: none !important; }
+    .ac-zoom, .ac-icon { animation: none !important; }
     .ac-spin { animation: none !important; }
   }
 
@@ -652,7 +655,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="eyebrow">TRIPLE-A-TROPICS · <span class="brand">CycloLab</span></div>
         <div class="storm-type" id="storm-type">__TYPE_WORD__</div>
         <div class="storm-name" id="storm-name">__NAME__</div>
-        <span class="chip" id="chip">__CHIP__</span>
+        <span class="chip" id="chip"__CHIP_STYLE__>__CHIP__</span>
       </div>
     </div>
     <div class="bug-body">
@@ -835,6 +838,9 @@ HTML_TEMPLATE = r"""<!doctype html>
   // case: a labeled "no published statistics" panel, never a borrowed
   // or invented envelope).
   var INTENSITY_ERR = __INTENSITY_ERR__;
+  // Storm-window basemap (S4-AD1 #2): vendored Natural Earth land,
+  // clipped + antimeridian-normalized at bake time. No runtime fetch.
+  var BASEMAP = __BASEMAP__;
   var SITE_BASE = "https://triple-a-tropics.com";
   var POLL_MS = 60000;
   var SSHS = __SSHS_JSON__;
@@ -1123,7 +1129,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     var oldRamp = getComputedStyle(document.documentElement)
       .getPropertyValue("--cat-ramp");
     document.documentElement.setAttribute("data-cat", cat);
-    document.getElementById("chip").textContent = CHIP_LABEL[cat] || cat;
+    // chip ONLY when it adds information (S4-AD1 #10): CATEGORY 1-5
+    // for hurricanes; at TD/TS it duplicated the type word.
+    var chipEl = document.getElementById("chip");
+    if (cat === "TD" || cat === "TS") {
+      chipEl.style.display = "none";
+    } else {
+      chipEl.style.display = "";
+      chipEl.textContent = CHIP_LABEL[cat] || cat;
+    }
     // the canon label rides the corner glyph + the Category hero.
     document.getElementById("glyph-cat").textContent = sshsLabel(cat);
     odoSet(document.getElementById("odo-cat"), sshsLabel(cat));
@@ -1370,6 +1384,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     "of historical official track errors) \u2014 it says nothing about " +
     "the storm\u2019s size or impacts, and the storm can travel outside " +
     "it. Forecast-point icons are colored by the forecast intensity.";
+  // Dev labels that count as TROPICAL for icon coloring; everything
+  // else (EX/PT/LO/DB/remnants) is the user-ordered WHITE emphasis -
+  // "white = forecast non-tropical" (S4-AD1 #4).
+  var TROPICAL_DEV = { TD: 1, TS: 1, HU: 1, TY: 1, ST: 1, SD: 1, SS: 1 };
+  function pointCat(p) {
+    if (p.dev_label && SSHS[p.dev_label]) return p.dev_label;
+    return catForKt(p.intensity_kt);
+  }
+  function pointTropical(p) {
+    if (!p.dev_label) return true;            // no label: color by kt
+    return !!TROPICAL_DEV[p.dev_label];
+  }
   function renderAdvCone() {
     var svg = document.getElementById("advcone");
     var note = document.getElementById("advcone-note");
@@ -1383,116 +1409,287 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     empty.style.display = "none"; method.hidden = false;
     var pts = conePts;
+
+    // ---- shared lon frame: everything joins the BASEMAP window ------
+    var frameLon = (BASEMAP.window[2] + BASEMAP.window[3]) / 2.0;
+    function normLon(lon) {
+      while (lon - frameLon > 180) lon -= 360;
+      while (lon - frameLon < -180) lon += 360;
+      return lon;
+    }
+
+    // ---- uniform-scale auto-fit projection (S4-AD1 #3) --------------
+    // nm-ish planar units (lon scaled by cos mid-lat) -> fitted into a
+    // fixed-width 1000-unit canvas with margin; the viewBox HEIGHT
+    // follows the content so the envelope is NEVER clipped at any
+    // panel aspect (meet-scaling does the rest).
     var lats = [], lons = [];
-    pts.forEach(function (p) { lats.push(p.lat); lons.push(p.lon); });
-    coneRing.forEach(function (c) { lons.push(c[0]); lats.push(c[1]); });
-    var pad = 1.6;
-    var la0 = Math.min.apply(null, lats) - pad,
-        la1 = Math.max.apply(null, lats) + pad;
-    var lo0 = Math.min.apply(null, lons) - pad,
-        lo1 = Math.max.apply(null, lons) + pad;
-    var W = 1000, H = 620;
-    function X(lon) { return (lon - lo0) / (lo1 - lo0) * W; }
-    function Y(lat) { return H - (lat - la0) / (la1 - la0) * H; }
-    var cur = pts[0];
-    var cx = X(cur.lon), cy = Y(cur.lat);
-    // clip radius that covers the whole cone from the current position
-    var rmax = 0;
+    pts.forEach(function (p) { lats.push(p.lat); lons.push(normLon(p.lon)); });
     coneRing.forEach(function (c) {
-      var dx = X(c[0]) - cx, dy = Y(c[1]) - cy;
-      var d = Math.sqrt(dx * dx + dy * dy);
-      if (d > rmax) rmax = d;
+      lons.push(normLon(c[0])); lats.push(c[1]);
     });
-    rmax = Math.ceil(rmax + 30);
-    var dC = coneRing.map(function (c, i) {
-      return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
-    }).join(" ") + " Z";
+    var latMid = (Math.min.apply(null, lats) +
+                  Math.max.apply(null, lats)) / 2;
+    var K = Math.max(0.2, Math.cos(latMid * Math.PI / 180));
+    function pxu(lon) { return lon * 60 * K; }
+    function pyu(lat) { return -lat * 60; }
+    var xs = lons.map(pxu), ys = lats.map(pyu);
+    var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+    var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+    var W = 1000, MARGIN = 110;
+    var S = (W - 2 * MARGIN) / Math.max(1e-6, x1 - x0);
+    var H = Math.max(540, Math.min(1500,
+        Math.round((y1 - y0) * S + 2 * MARGIN)));
+    var offY = (H - (y1 - y0) * S) / 2;
+    function X(lon) { return (pxu(normLon(lon)) - x0) * S + MARGIN; }
+    function Y(lat) { return (pyu(lat) - y0) * S + offY; }
+    function lonAt(x) { return ((x - MARGIN) / S + x0) / (60 * K); }
+    function latAt(y) { return -((y - offY) / S + y0) / 60; }
+
     var parts = ['<rect width="' + W + '" height="' + H +
                  '" fill="#0a1019"/>'];
-    parts.push('<g class="ac-zoom" style="transform-origin:' +
-      cx.toFixed(0) + "px " + cy.toFixed(0) + 'px">');
-    parts.push('<defs><filter id="ac-soft" x="-20%" y="-20%" width="140%" ' +
-      'height="140%"><feGaussianBlur stdDeviation="5"/></filter></defs>');
-    // the cone (brand blue/white, never category-colored), revealed
-    // outward from the present position by an expanding clip circle.
-    // The clip animates via WAAPI on the group's clip-path basic shape
-    // (a CSS r keyframe inside <clipPath> does not animate and left the
-    // cone invisible - render-verified the hard way).
-    parts.push('<g class="ac-conegrp" data-cx="' + cx.toFixed(1) +
-      '" data-cy="' + cy.toFixed(1) + '" data-rmax="' + rmax + '">' +
-      '<path d="' + dC + '" fill="none" stroke="#8cc8ff" stroke-width="9" ' +
-      'stroke-opacity="0.35" filter="url(#ac-soft)"/>' +
-      '<path d="' + dC + '" fill="rgba(255,255,255,0.12)" ' +
-      'stroke="#0a1a2e" stroke-width="2"/>');
-    var dF = pts.map(function (p, i) {
-      return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
+
+    // ---- basemap: land, graticule, ocean watermark (S4-AD1 #2) ------
+    var lonL = lonAt(0), lonR = lonAt(W);
+    var latT = latAt(0), latB = latAt(H);
+    parts.push('<g class="ac-graticule">');
+    for (var gl = Math.ceil(lonL / 5) * 5; gl <= lonR; gl += 5) {
+      var gx = X(gl);
+      parts.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' +
+        gx.toFixed(1) + '" y2="' + H + '"/>');
+      var gn = ((gl % 360) + 360) % 360;
+      var glab = gn > 180 ? (360 - gn) + "\u00b0W"
+                          : (gn === 0 || gn === 180 ? gn + "\u00b0"
+                                                    : gn + "\u00b0E");
+      parts.push('<text x="' + (gx + 5).toFixed(1) + '" y="' + (H - 10) +
+        '">' + glab + "</text>");
+    }
+    for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
+      var gy = Y(ga);
+      parts.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
+        '" y2="' + gy.toFixed(1) + '"/>');
+      parts.push('<text x="8" y="' + (gy - 5).toFixed(1) + '">' +
+        Math.abs(ga) + "\u00b0" + (ga >= 0 ? "N" : "S") + "</text>");
+    }
+    parts.push("</g>");
+    (BASEMAP.land || []).forEach(function (ring) {
+      var d = ring.map(function (c, i) {
+        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+          Y(c[1]).toFixed(1);
+      }).join(" ") + " Z";
+      parts.push('<path class="ac-land" d="' + d + '"/>');
+    });
+    parts.push('<text class="ac-ocean" x="' + (W / 2) + '" y="' +
+      Math.round(H * 0.45) + '" text-anchor="middle">' +
+      (BASEMAP.ocean || "") + "</text>");
+
+    // ---- reveal mask (S4-AD1 #1): a fat round-capped stroke that
+    // FOLLOWS THE TRACK, drawn by dashoffset - the inflating front
+    // extruded from NOW along the track. The cone polygon bounds what
+    // the front uncovers; near NOW the cone is narrow, so the full
+    // local envelope appears as the front passes. ---------------------
+    var tp = pts.map(function (p) { return [X(p.lon), Y(p.lat)]; });
+    // extend past the last point along the final bearing so the far
+    // cap (which bulges past the last tau) is fully uncovered
+    var lastSeg = tp.length > 1 ? [tp[tp.length - 1][0] - tp[tp.length - 2][0],
+                                   tp[tp.length - 1][1] - tp[tp.length - 2][1]]
+                                : [1, 0];
+    var lsLen = Math.max(1e-6, Math.hypot(lastSeg[0], lastSeg[1]));
+    // max distance from any cone vertex to the NOW point bounds both
+    // the needed stroke width and the extension
+    var nowXY = tp[0];
+    var rmax = 0;
+    coneRing.forEach(function (c) {
+      var dx = X(c[0]) - nowXY[0], dy = Y(c[1]) - nowXY[1];
+      rmax = Math.max(rmax, Math.hypot(dx, dy));
+    });
+    var ext = rmax * 0.45 + 60;
+    var tpExt = tp.concat([[
+      tp[tp.length - 1][0] + lastSeg[0] / lsLen * ext,
+      tp[tp.length - 1][1] + lastSeg[1] / lsLen * ext]]);
+    var dTrack = tpExt.map(function (q, i) {
+      return (i ? "L" : "M") + q[0].toFixed(1) + "," + q[1].toFixed(1);
     }).join(" ");
-    parts.push('<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
-      'stroke-width="1.6" stroke-dasharray="2 5" stroke-opacity="0.7"/></g>');
-    // forecast-point icons: slow-spinning glyphs + glossy placards,
-    // staggered after the cone draw (2.4s) at 0.2s per point
+    // cumulative lengths -> pop timing rides the wavefront
+    var cum = [0];
+    for (var ci = 1; ci < tpExt.length; ci++) {
+      cum.push(cum[ci - 1] + Math.hypot(tpExt[ci][0] - tpExt[ci - 1][0],
+                                        tpExt[ci][1] - tpExt[ci - 1][1]));
+    }
+    var Ltot = cum[cum.length - 1];
+    var HOLD_MS = 1000, GROW_MS = 3300;
+    var frontW = 2 * rmax + 120;
+    parts.push('<defs><mask id="ac-mask">' +
+      '<rect width="' + W + '" height="' + H + '" fill="#000"/>' +
+      '<path class="ac-front" d="' + dTrack + '" fill="none" ' +
+      'stroke="#fff" stroke-width="' + frontW.toFixed(0) + '" ' +
+      'stroke-linecap="round" stroke-linejoin="round" ' +
+      'stroke-dasharray="' + Ltot.toFixed(1) + '" stroke-dashoffset="' +
+      Ltot.toFixed(1) + '"/></mask></defs>');
+
+    // ---- the cone (S4-AD1 #8 restyle): crisp navy/white boundary,
+    // subtle white-blue interior, NO glow filters -----------------------
+    var dC = coneRing.map(function (c, i) {
+      return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+        Y(c[1]).toFixed(1);
+    }).join(" ") + " Z";
+    var dF = pts.map(function (p, i) {
+      return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," +
+        Y(p.lat).toFixed(1);
+    }).join(" ");
+    parts.push('<g class="ac-conegrp" mask="url(#ac-mask)">' +
+      '<path d="' + dC + '" fill="rgba(205,228,255,0.13)" ' +
+      'stroke="#0a1a2e" stroke-width="4.5"/>' +
+      '<path d="' + dC + '" fill="none" stroke="#dceaff" ' +
+      'stroke-width="1.8"/>' +
+      '<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
+      'stroke-width="1.6" stroke-dasharray="2 5" ' +
+      'stroke-opacity="0.7"/></g>');
+
+    // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
+    // collision-aware placard layout: alternate sides of the track,
+    // push outward on overlap, leader line when pushed far.
+    var rects = [];      // occupied rects: icons first, then placards
+    function overlaps(r) {
+      for (var k = 0; k < rects.length; k++) {
+        var o = rects[k];
+        if (r.x < o.x + o.w && r.x + r.w > o.x &&
+            r.y < o.y + o.h && r.y + r.h > o.y) return true;
+      }
+      return false;
+    }
+    var iconR = [];      // per-point icon half-size (canvas units)
     pts.forEach(function (p, i) {
-      var px = X(p.lon), py = Y(p.lat);
-      var cat = (SSHS[p.dev_label] ? p.dev_label : catForKt(p.intensity_kt));
-      var col = SSHS[cat] || SSHS.TD;
-      var delay = (2.4 + i * 0.2).toFixed(1);
+      var half = (i === 0 ? 42 : 20);
+      iconR.push(half);
+      rects.push({ x: tp[i][0] - half, y: tp[i][1] - half,
+                   w: 2 * half, h: 2 * half });
+    });
+    var placards = [];
+    pts.forEach(function (p, i) {
+      var pw = (i === 0 ? 112 : 86), ph = (i === 0 ? 26 : 22);
+      // local track direction -> perpendicular placement sides
+      var a = tp[Math.max(0, i - 1)], b = tp[Math.min(tp.length - 1, i + 1)];
+      var vx = b[0] - a[0], vy = b[1] - a[1];
+      var vl = Math.max(1e-6, Math.hypot(vx, vy));
+      var nx = -vy / vl, ny = vx / vl;
+      var side = (i % 2 === 0) ? 1 : -1;
+      if (i === 0) side = -1;            // NOW placard prefers up-track
+      var placed = null, leader = false;
+      var offs = [34, 48, 62, 76, 92, 110];
+      var nudges = [0, 30, -30, 60, -60, 90, -90];
+      // preferred side first, then the opposite; outward pushes, then
+      // along-track nudges - placards NEVER overlap (S4-AD1 #7).
+      var sides = [side, -side];
+      for (var si = 0; si < sides.length && !placed; si++) {
+        for (var oi = 0; oi < offs.length && !placed; oi++) {
+          for (var ni = 0; ni < nudges.length && !placed; ni++) {
+            var cx2 = tp[i][0] + nx * sides[si] * offs[oi]
+                      + (vx / vl) * nudges[ni];
+            var cy2 = tp[i][1] + ny * sides[si] * offs[oi]
+                      + (vy / vl) * nudges[ni];
+            var r2 = { x: cx2 - pw / 2, y: cy2 - ph / 2, w: pw, h: ph };
+            r2.x = Math.max(6, Math.min(W - pw - 6, r2.x));
+            r2.y = Math.max(6, Math.min(H - ph - 6, r2.y));
+            if (!overlaps(r2)) {
+              placed = r2;
+              leader = offs[oi] > 48 || Math.abs(nudges[ni]) > 30;
+            }
+          }
+        }
+      }
+      if (!placed) {                     // pathological: park it below
+        placed = { x: Math.max(6, Math.min(W - pw - 6,
+                       tp[i][0] - pw / 2)),
+                   y: Math.min(H - ph - 6, 6 + i * (ph + 4)),
+                   w: pw, h: ph };
+        leader = true;
+      }
+      rects.push(placed);
+      placards.push({ rect: placed, leader: leader });
+    });
+
+    var anyNonTropical = false;
+    pts.forEach(function (p, i) {
+      var px2 = tp[i][0], py2 = tp[i][1];
+      var tropical = pointTropical(p);
+      if (!tropical) anyNonTropical = true;
+      var cat = pointCat(p);
+      var col = tropical ? (SSHS[cat] || SSHS.TD) : "#ffffff";
+      var delayMs = (i === 0)
+        ? 400
+        : Math.round(HOLD_MS + GROW_MS * (cum[i] / Ltot));
+      var scale = (i === 0 ? 0.95 : 0.42);   // NOW is the hero (#6)
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
-        '" style="animation-delay:' + delay + 's">' +
-        '<g transform="translate(' + px.toFixed(1) + " " + py.toFixed(1) +
-        ') scale(0.42)"><g class="ac-spin"><path d="' + "__HPATH__" +
-        '" fill="' + col + '" stroke="rgba(0,0,0,0.35)" ' +
-        'stroke-width="2"/></g></g>');
-      if (i > 0) {
-        var chipW = 86;
-        parts.push('<g transform="translate(' + (px - chipW / 2).toFixed(1) +
-          " " + (py + 22).toFixed(1) + ')">' +
-          '<rect width="' + chipW + '" height="22" rx="11" fill="' + col +
-          '" fill-opacity="0.92" stroke="rgba(0,0,0,0.3)"/>' +
-          '<rect width="' + chipW + '" height="11" rx="11" ' +
-          'fill="#ffffff" fill-opacity="0.18"/>' +
-          '<text x="' + chipW / 2 + '" y="15.5" text-anchor="middle" ' +
-          'font-size="12.5" font-weight="700" fill="#0b0e13">+' + tau +
-          "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt</text></g>");
+        '" data-tropical="' + (tropical ? 1 : 0) +
+        '" style="animation-delay:' + (delayMs / 1000).toFixed(2) +
+        's">' + '<g transform="translate(' + px2.toFixed(1) + " " +
+        py2.toFixed(1) + ') scale(' + scale + ')">' +
+        '<g class="ac-spin"><path d="__HPATH__" fill="' + col +
+        '" stroke="rgba(0,0,0,0.35)" stroke-width="2"/></g>' +
+        (tropical
+          ? '<text class="ac-cat" y="12" text-anchor="middle" ' +
+            'font-size="34" font-weight="800" fill="#ffffff" ' +
+            'stroke="rgba(0,0,0,0.45)" stroke-width="1">' +
+            sshsLabel(cat) + "</text>"
+          : "") +
+        "</g>");
+      // placard (skip none - NOW gets one too), with leader if pushed
+      var pl = placards[i];
+      var chipFill = tropical ? col : "#8b95a5";
+      var label = (i === 0)
+        ? "NOW \u00b7 " + Math.round(p.intensity_kt || 0) + "kt"
+        : "+" + tau + "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt";
+      var pw2 = pl.rect.w, ph2 = pl.rect.h;
+      if (pl.leader) {
+        parts.push('<line x1="' + px2.toFixed(1) + '" y1="' +
+          py2.toFixed(1) + '" x2="' + (pl.rect.x + pw2 / 2).toFixed(1) +
+          '" y2="' + (pl.rect.y + ph2 / 2).toFixed(1) +
+          '" stroke="rgba(255,255,255,0.45)" stroke-width="1.2"/>');
       }
+      parts.push('<g data-role="placard" data-x="' +
+        pl.rect.x.toFixed(1) + '" data-y="' + pl.rect.y.toFixed(1) +
+        '" data-w="' + pw2 + '" data-h="' + ph2 +
+        '" transform="translate(' + pl.rect.x.toFixed(1) +
+        " " + pl.rect.y.toFixed(1) + ')">' +
+        '<rect width="' + pw2 + '" height="' + ph2 + '" rx="' +
+        (ph2 / 2) + '" fill="' + chipFill +
+        '" fill-opacity="0.92" stroke="rgba(0,0,0,0.3)"/>' +
+        '<rect width="' + pw2 + '" height="' + (ph2 / 2) + '" rx="' +
+        (ph2 / 2) + '" fill="#ffffff" fill-opacity="0.18"/>' +
+        '<text x="' + (pw2 / 2) + '" y="' + (ph2 - 7) +
+        '" text-anchor="middle" font-size="' + (i === 0 ? 13.5 : 12.5) +
+        '" font-weight="' + (i === 0 ? 800 : 700) +
+        '" fill="#0b0e13">' + label + "</text></g>");
       parts.push("</g>");
     });
-    // current-intensity placard at the present position
-    var curCat = (SSHS[cur.dev_label] ? cur.dev_label
-                                      : catForKt(cur.intensity_kt));
-    parts.push('<g class="ac-placard"><g transform="translate(' +
-      (cx - 56).toFixed(1) + " " + (cy - 46).toFixed(1) + ')">' +
-      '<rect width="112" height="26" rx="13" fill="' +
-      (SSHS[curCat] || SSHS.TD) + '" stroke="rgba(0,0,0,0.35)"/>' +
-      '<rect width="112" height="13" rx="13" fill="#ffffff" ' +
-      'fill-opacity="0.18"/>' +
-      '<text x="56" y="18" text-anchor="middle" font-size="13.5" ' +
-      'font-weight="800" fill="#0b0e13">NOW \u00b7 ' +
-      Math.round(cur.intensity_kt || 0) + "kt</text></g></g>");
-    parts.push("</g>");
+
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     svg.innerHTML = parts.join("");
-    var grp = svg.querySelector(".ac-conegrp");
-    var at = " at " + grp.getAttribute("data-cx") + "px " +
-             grp.getAttribute("data-cy") + "px";
-    var full = "circle(" + grp.getAttribute("data-rmax") + "px" + at + ")";
-    if (!reduced && grp.animate) {
-      grp.style.clipPath = "circle(0px" + at + ")";
-      grp.animate([{ clipPath: "circle(0px" + at + ")" },
-                   { clipPath: full }],
-                  { duration: 2000, delay: 1400, easing: "ease-out",
-                    fill: "forwards" });
-      grp.setAttribute("data-reveal", "animated");
+
+    // arm the growth front (WAAPI dashoffset); reduced motion / jsdom
+    // jump to the final frame
+    var front = svg.querySelector(".ac-front");
+    if (!reduced && front.animate) {
+      front.animate([{ strokeDashoffset: Ltot },
+                     { strokeDashoffset: 0 }],
+                    { duration: GROW_MS, delay: HOLD_MS,
+                      easing: "linear", fill: "forwards" });
+      front.setAttribute("data-reveal", "animated");
     } else {
-      grp.style.clipPath = full;        // reduced motion / no WAAPI:
-      grp.setAttribute("data-reveal", "final");   // final frame instantly
+      front.style.strokeDashoffset = "0";
+      front.setAttribute("data-reveal", "final");
     }
+
     var official = advFull.method === "official-cone";
-    note.textContent = official
+    note.textContent = (official
       ? "Official NHC forecast cone \u00b7 advisory " + advFull.advisory +
         " \u00b7 icons colored by forecast intensity."
       : "Derived uncertainty envelope \u2014 not an official JTWC " +
         "product \u00b7 advisory " + advFull.advisory + " \u00b7 method " +
-        (advFull.method || "derived") + ".";
+        (advFull.method || "derived") + ".") +
+      (anyNonTropical ? " White icons = forecast non-tropical." : "");
     document.getElementById("advcone-method-body").textContent =
       official ? NHC_METHOD_COPY : WP_METHOD_COPY;
   }
@@ -1969,6 +2166,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__NAME__", _esc(name))
             .replace("__TYPE_WORD__", _esc(type_word.upper()))
             .replace("__CHIP__", _esc(chip))
+            .replace("__CHIP_STYLE__",
+                     ' style="display:none"' if cat in ("TD", "TS") else "")
             .replace("__OG_TITLE__", _esc(og_title))
             .replace("__OG_DESC__", _esc(og_desc))
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
@@ -1978,6 +2177,11 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__OG_IMAGE__",
                      ('\n<meta property="og:image" content="' +
                       _esc(og_image_url) + '">') if og_image_url else "")
+            .replace("__BASEMAP__",
+                     json.dumps(basemap_for(
+                         float(last.get("lat") or 15.0),
+                         float(last.get("lon") or -140.0), ids.basin),
+                         separators=(",", ":")))
             .replace("__INTENSITY_ERR__",
                      json.dumps(basin_entry(ids.basin),
                                 separators=(",", ":")))
