@@ -45,3 +45,107 @@ def page_url_path(sid: str) -> str:
     og:url value)."""
     ids: StormIds = parse_sid(sid)
     return f"/cyclolab/{ids.sid}/"
+
+
+# ---------------------------------------------------------------------------
+# The per-storm page LIFECYCLE writer (CYCLOLAB_DESIGN.md §3.1/§3.4).
+# Mirrors the GlobalGeojsonComposer pattern: one shared instance, fed by
+# every basin source AFTER its feeds are safely written; best-effort by
+# contract (a page-write blip never fails or stales a basin's feeds).
+# ---------------------------------------------------------------------------
+import logging as _logging
+import os as _os
+
+_log = _logging.getLogger("cyclolab-pages")
+
+PAGES_ENABLED = (_os.environ.get("CYCLOLAB_PAGES") or "1").lower() \
+    not in ("0", "false", "no")
+# Dissipation debounce: a storm must be absent/inactive this many
+# consecutive polls before its page freezes (the system's standard
+# transient guard - one flaky poll must not bury a live storm).
+ENDED_DEBOUNCE_POLLS = 2
+
+
+class CycloLabPageWriter:
+    """Owns the /cyclolab/{sid}/ page lifecycle:
+
+    BIRTH   first time a designated storm appears active in a basin feed
+            -> render + write the live shell.
+    REFRESH category change or a new fix -> rewrite (cheap: the page is
+            ~26 KB; the baked snapshot + OG intensity stay current).
+    ENDED   storm leaves the active set for ENDED_DEBOUNCE_POLLS polls
+            -> write the frozen archive page ONCE (last snapshot baked,
+            polling disabled); the key stays live so links never 404.
+
+    Shadow-first: prefix defaults to the advisories Source's
+    CYCLOLAB_PREFIX (one promote knob for pages + advisories together).
+    """
+
+    def __init__(self, sink, *, prefix: str | None = None,
+                 feed_base: str = "https://cdn.triple-a-tropics.com/feeds",
+                 cdn_base: str = "https://cdn.triple-a-tropics.com"):
+        from cyclolab_advisories import CYCLOLAB_PREFIX
+        self.sink = sink
+        self.prefix = (prefix if prefix is not None else CYCLOLAB_PREFIX).rstrip("/")
+        self.feed_base = feed_base.rstrip("/")
+        self.cdn_base = cdn_base.rstrip("/")
+        # sid -> {"cat": str, "fix": str|None, "missing": int,
+        #         "ended": bool, "last": dict (snapshot)}
+        self._state: dict[str, dict] = {}
+
+    def _adv_url(self, sid: str) -> str:
+        # Live prefix -> same-origin relative path through the Worker;
+        # shadow -> absolute cdn URL (the Worker never serves shadow).
+        if self.prefix == LIVE_PREFIX:
+            return f"/cyclolab/adv/{sid}.json"
+        return f"{self.cdn_base}/{adv_key(sid, prefix=self.prefix)}"
+
+    def update(self, basin: str, tracks_feed: dict, now=None) -> None:
+        """Feed one basin's freshly-written tracks feed through the
+        lifecycle. NEVER raises (best-effort contract)."""
+        try:
+            self._update(basin, tracks_feed)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("page lifecycle update failed (%s): %s", basin, e)
+
+    def _update(self, basin: str, tracks_feed: dict) -> None:
+        from cyclolab_shell import render_page
+        feed_url = f"{self.feed_base}/{basin}_tracks_data.json"
+        seen_active: set[str] = set()
+        for storm in tracks_feed.get("storms", []) or []:
+            sid = storm.get("sid") or ""
+            try:
+                parse_sid(sid)          # designated storms only (V1)
+            except Exception:           # noqa: BLE001 - invests/malformed
+                continue
+            if not storm.get("is_active"):
+                continue
+            seen_active.add(sid)
+            st = self._state.get(sid)
+            cat = storm.get("current_category") or "TD"
+            fix = storm.get("latest_fix_valid_utc")
+            if st is None or st["ended"] or st["cat"] != cat or st["fix"] != fix:
+                html = render_page(storm, feed_url=feed_url,
+                                   adv_url=self._adv_url(sid))
+                self.sink.write_html(page_key(sid, prefix=self.prefix), html)
+                _log.info("cyclolab page %s: %s (%s, fix %s)",
+                          "BIRTH" if st is None else "refresh", sid, cat, fix)
+            self._state[sid] = {"cat": cat, "fix": fix, "missing": 0,
+                                "ended": False, "last": storm}
+        # dissipation sweep: previously-known storms of THIS basin's feed
+        # that are no longer active (absent or is_active False).
+        for sid, st in list(self._state.items()):
+            if sid in seen_active or st["ended"]:
+                continue
+            # only sweep sids whose basin matches this feed (the writer is
+            # shared across basin sources).
+            if parse_sid(sid).basin.lower() != (tracks_feed.get("basin") or "").lower():
+                continue
+            st["missing"] += 1
+            if st["missing"] >= ENDED_DEBOUNCE_POLLS:
+                from cyclolab_shell import render_page as _rp
+                html = _rp(st["last"], feed_url=feed_url,
+                           adv_url=self._adv_url(sid), ended=True)
+                self.sink.write_html(page_key(sid, prefix=self.prefix), html)
+                st["ended"] = True
+                _log.info("cyclolab page ENDED (frozen): %s", sid)

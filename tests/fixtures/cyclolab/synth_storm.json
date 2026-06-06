@@ -1,0 +1,136 @@
+{
+ "sid": "NHC_EP082026",
+ "name": "SYNTH",
+ "season": 2026,
+ "start": "2026-06-01T00:00:00",
+ "end": "2026-06-04T00:00:00",
+ "peak_wind_kt": 140.0,
+ "peak_pressure_mb": 905.0,
+ "ace": 4.821,
+ "latest_fix_valid_utc": "2026-06-04T00:00:00Z",
+ "max_category": "C5",
+ "current_category": "C4",
+ "is_active": true,
+ "is_invest": false,
+ "recent_invest": false,
+ "atcf_id": null,
+ "points": [
+  {
+   "t": "2026-06-01T00:00:00",
+   "lat": 12.0,
+   "lon": -128.0,
+   "wind_kt": 25.0,
+   "pressure_mb": 1006.0,
+   "cls": "TD",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-01T06:00:00",
+   "lat": 12.7,
+   "lon": -129.1,
+   "wind_kt": 30.0,
+   "pressure_mb": 1004.0,
+   "cls": "TD",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-01T12:00:00",
+   "lat": 13.4,
+   "lon": -130.2,
+   "wind_kt": 35.0,
+   "pressure_mb": 1000.0,
+   "cls": "TS",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-01T18:00:00",
+   "lat": 14.1,
+   "lon": -131.3,
+   "wind_kt": 45.0,
+   "pressure_mb": 994.0,
+   "cls": "TS",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-02T00:00:00",
+   "lat": 14.8,
+   "lon": -132.4,
+   "wind_kt": 60.0,
+   "pressure_mb": 985.0,
+   "cls": "TS",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-02T06:00:00",
+   "lat": 15.5,
+   "lon": -133.5,
+   "wind_kt": 70.0,
+   "pressure_mb": 977.0,
+   "cls": "C1",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-02T12:00:00",
+   "lat": 16.2,
+   "lon": -134.6,
+   "wind_kt": 80.0,
+   "pressure_mb": 970.0,
+   "cls": "C1",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-02T18:00:00",
+   "lat": 16.9,
+   "lon": -135.7,
+   "wind_kt": 95.0,
+   "pressure_mb": 955.0,
+   "cls": "C2",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-03T00:00:00",
+   "lat": 17.6,
+   "lon": -136.8,
+   "wind_kt": 110.0,
+   "pressure_mb": 938.0,
+   "cls": "C3",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-03T06:00:00",
+   "lat": 18.3,
+   "lon": -137.9,
+   "wind_kt": 125.0,
+   "pressure_mb": 921.0,
+   "cls": "C4",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-03T12:00:00",
+   "lat": 19.0,
+   "lon": -139.0,
+   "wind_kt": 140.0,
+   "pressure_mb": 905.0,
+   "cls": "C5",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-03T18:00:00",
+   "lat": 19.7,
+   "lon": -140.1,
+   "wind_kt": 130.0,
+   "pressure_mb": 915.0,
+   "cls": "C4",
+   "nature": "TS"
+  },
+  {
+   "t": "2026-06-04T00:00:00",
+   "lat": 20.4,
+   "lon": -141.2,
+   "wind_kt": 120.0,
+   "pressure_mb": 925.0,
+   "cls": "C4",
+   "nature": "TS"
+  }
+ ]
+}

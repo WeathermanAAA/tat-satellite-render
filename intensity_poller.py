@@ -438,6 +438,7 @@ def make_basin_source(basin: str, session: requests.Session,
                       base_reader: Optional[Callable[[str, str], dict]] = None,
                       names_fetcher: Optional[Callable[[dict, int], dict]] = None,
                       geojson: Optional[GlobalGeojsonComposer] = None,
+                      pages=None,
                       clock: Callable[[], dt.datetime] = pf.utcnow) -> pf.Source:
     """Build the Source for one basin. ``live_fetcher`` / ``invest_fetcher`` /
     ``base_reader`` / ``names_fetcher`` are injectable for offline tests; the
@@ -506,6 +507,12 @@ def make_basin_source(basin: str, session: requests.Session,
         # shadow - the cron still owns the live geojson until promotion).
         if geojson is not None:
             geojson.update(basin, tracks_feed, now=ctx.now)
+        # CycloLab per-storm page lifecycle (CYCLOLAB_DESIGN.md §3.4):
+        # birth/refresh/ended pages from the freshly-written feed. Same
+        # best-effort contract as the geojson composer (update() never
+        # raises); gated by CYCLOLAB_PAGES at engine assembly.
+        if pages is not None:
+            pages.update(basin, tracks_feed, now=ctx.now)
 
     # restamp=True: re-emit the feeds EVERY cycle so generated_utc ticks on the
     # poll cadence (the "poller alive / last checked" stamp) and staleness_minutes
@@ -523,13 +530,21 @@ def build_engine(sink: pf.Sink, *, basins=BASINS,
                  sleep: Callable[[float], None] = time.sleep,
                  geojson_key: Optional[str] = None,
                  cyclolab: Optional[bool] = None,
+                 cyclolab_pages_on: Optional[bool] = None,
                  **source_kwargs) -> pf.PollerEngine:
     session = session or requests.Session()
     composer = GlobalGeojsonComposer(
         sink, GLOBAL_GEOJSON_KEY if geojson_key is None else geojson_key,
         basins, clock=clock)
+    pages = None
+    if cyclolab_pages_on is None:
+        from cyclolab_pages import PAGES_ENABLED as cyclolab_pages_on
+    if cyclolab_pages_on:
+        from cyclolab_pages import CycloLabPageWriter
+        pages = CycloLabPageWriter(sink)
     sources = [make_basin_source(b, session, sink, clock=clock,
-                                 geojson=composer, **source_kwargs)
+                                 geojson=composer, pages=pages,
+                                 **source_kwargs)
                for b in basins]
     # CycloLab advisories+cone Source (CYCLOLAB_DESIGN.md §9) rides the
     # same engine - per-source isolation means an NHC outage can never
