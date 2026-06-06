@@ -634,6 +634,32 @@ class TestStage3Mounts(unittest.TestCase):
         self.assertTrue(st["satEmptyShown"])
         self.assertEqual(st["sat"]["frames"], 0)
 
+    def test_leaving_satellite_tab_pauses_playback(self):
+        # pause-on-hide: a hidden tab must not keep its 5fps loop alive.
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "openSec", "name": "satellite"},
+                    {"op": "clickSatPlay"},
+                    {"op": "openSec", "name": "overview"}]})
+        playing_after_click = recs[1]["state"]["stage3"]["sat"]["playing"]
+        playing_after_leave = recs[2]["state"]["stage3"]["sat"]["playing"]
+        self.assertTrue(playing_after_click)
+        self.assertFalse(playing_after_leave,
+                         "leaving the tab must pause satellite playback")
+
+    def test_band_emptied_by_prune_shows_empty_state(self):
+        man = self._floater_storm()
+        man["bands"]["wv_up"]["frames"] = []     # server prune left the key
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(), "floater_storm": man,
+            "ops": [{"op": "openSec", "name": "satellite"},
+                    {"op": "clickSatBand", "slug": "wv_up"}]})
+        st = recs[-1]["state"]["stage3"]
+        self.assertTrue(st["satEmptyShown"],
+                        "empty band must show the empty state, not freeze")
+        self.assertEqual(st["sat"]["frames"], 0)
+
     def test_baked_ids_ride_the_template(self):
         self.assertIn('var HAFS_ID = "08e"', self.html)
         self.assertIn('var FLOATER_ID = "ep082026"', self.html)

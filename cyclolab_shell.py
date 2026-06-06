@@ -847,6 +847,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (name === "models") initModels();
       else if (name === "satellite") initSatellite();
     }
+    // pause-on-hide: a hidden tab must not keep its playback loop alive
+    // (the satellite interval kept swapping img.src at 5 fps display:none,
+    // and both viewers' timers could run concurrently).
+    if (name !== "satellite") satPause();
+    if (name !== "models" && hafsViewer && hafsViewer._pause) {
+      hafsViewer._pause();
+    }
     var w = document.querySelector("#sec-" + name + " .wipe");
     if (w) { w.style.animation = "none"; void w.offsetWidth; w.style.animation = ""; }
   }
@@ -1353,6 +1360,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     sat.frames = (b && b.frames) || [];
     satEl("scrub").max = String(Math.max(0, sat.frames.length - 1));
     satEl("band-label").textContent = b ? (b.label || slug) : "";
+    // a band key can survive a server-side prune with zero frames left:
+    // honest per-band empty state instead of freezing on the old frame.
+    satEl("empty").style.display = sat.frames.length ? "none" : "block";
+    if (!sat.frames.length) {
+      satEl("img").removeAttribute("src");
+      satEl("time").textContent = "\u2014";
+    }
     var host = satEl("bands");
     for (var i = 0; i < host.children.length; i++) {
       var btn = host.children[i];
@@ -1425,6 +1439,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         satPause(); satShow(Number(this.value));
       });
       satEl("card").addEventListener("keydown", function (e) {
+        // native control focused (scrub slider, buttons): let it own keys
+        // except the arrows on the slider, where step == native move.
+        if (/^(select|textarea)$/i.test(e.target.tagName)) return;
+        if (e.target.tagName === "BUTTON" &&
+            (e.key === " " || e.key === "Spacebar")) return;
         if (e.key === "ArrowLeft") { satStep(-1); e.preventDefault(); }
         else if (e.key === "ArrowRight") { satStep(1); e.preventDefault(); }
         else if (e.key === " " || e.key === "Spacebar") {

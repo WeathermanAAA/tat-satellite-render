@@ -224,10 +224,22 @@ const scheduledDelays = [];
         manifestUrl: o.manifestUrl || null,
         assetBase: o.assetBase || null,
         elsKeys: o.els ? Object.keys(o.els).sort() : [],
-        elsWired: !!(o.els && o.els.img &&
-                     o.els.img === win.document.getElementById("cl-hafs-img") &&
-                     o.els.stormSel ===
-                       win.document.getElementById("cl-hafs-storm")),
+        elsWired: (function () {
+          // EVERY key identity-checked against its cl-hafs-* element (a
+          // 2-key spot check let 22 silent mis-wirings through review).
+          const idmap = { stage: "stage", img: "img", status: "status",
+            empty: "empty", controls: "controls",
+            cycleGroup: "cycle-group", cycles: "cycles",
+            stormSel: "storm", models: "models", domains: "domains",
+            products: "products", hours: "hours", play: "play",
+            stepB: "step-back", stepF: "step-fwd", speed: "speed",
+            fhour: "fhour", valid: "valid", meta: "meta", badge: "badge",
+            pill: "pill", buffer: "buffer", player: "player",
+            caption: "caption" };
+          if (!o.els) return false;
+          return Object.keys(idmap).every((k) =>
+            o.els[k] === win.document.getElementById("cl-hafs-" + idmap[k]));
+        })(),
       };
     }
     const sat = win.__lab && win.__lab.satState ? win.__lab.satState() : null;
@@ -296,6 +308,10 @@ const scheduledDelays = [];
       window.__lab.setCategory(op.cat);
     } else if (op.op === "apply") {
       window.__lab.apply(op.storm);
+    } else if (op.op === "clickSatPlay") {
+      const btn = document.getElementById("sat-play");
+      if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
     } else if (op.op === "clickSatBand") {
       // Stage-3 satellite: click a band toggle by slug.
       const host = document.getElementById("sat-bands");
