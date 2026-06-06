@@ -1,50 +1,82 @@
-"""CycloLab per-storm shell - template + renderer (Stage 2).
+"""CycloLab per-storm shell - template + renderer (Stage 2, AD round 1).
 
 The poller renders this template on storm birth and PUTs it via
 R2Sink.write_html at cyclolab_pages.page_key(sid) (the Worker-pinned
 edge contract). One self-contained document per storm: inline CSS
-(the 7 category token sets + shell layout + motion), inline vanilla JS
+(category token sets + shell layout + motion), inline vanilla JS
 (hydration on the poll+diff-merge discipline), real per-storm OG tags.
-No CDN deps, no external CSS - the page must outlive site refactors.
+No CDN deps; typography is self-hosted Metropolis (vendored in the main
+repo at /assets/fonts/metropolis, public domain) referenced absolutely
+so both the live origin and the cdn-origin shadow pages load it (Pages
+serves ACAO:*).
 
-LAYOUT (CYCLOLAB_DESIGN.md §4): desktop = left sidebar (identity
-banner / section nav with accent rail / back-to-map) + content stage;
-<=640px the SAME DOM rearranges to a slim top bar + bottom tab bar.
-
-VISUAL (§5): one `data-cat` attribute on <html> switches the token set
-(--cat-ramp/--cat-accent/--cat-ink). Ramps are 5-stop banded gradients
-(dark edge / lit middle / dark edge - the LIVE-STATUS chrome gloss).
-Body text and data tables are NEVER tinted.
-
-MOTION (§6): ~4-5s, transform/opacity only, state-change triggered;
-prefers-reduced-motion lands every animation on its final frame. The
-hydration JS adds `data-anim` hooks; tests drive them deterministically.
-
-V1 sections: Overview implemented (stats banner + ACE odometer + track
-map + wind/pressure SVG timeline); Satellite/Models/Advisories are
-stubbed panels wired for lazy init (Stages 3-4 fill them).
+AD ROUND 1 (2026-06-06):
+  * Metropolis everywhere; wordmark "CycloLab" in Extra Bold with the
+    BRAND CASING RULE - always literally "CycloLab", never uppercased.
+  * Banner = broadcast storm-info card: eyebrow / storm-type word (from
+    the advisory's tau-0 dev_label - the second-pass-fixed path - with a
+    category+basin fallback) / dominant NAME / chip, plus a corner
+    spinning hurricane glyph (white, category-tinted glow, CONSTANT
+    2.6s rotation - intensity is carried by color, never speed; the one
+    permitted continuous loop, reduced-motion = static; same gate the
+    cone's forecast icons will share in Stage 4).
+  * Ramps re-based on the CANONICAL TAT Saffir-Simpson palette
+    (ace_core.SSHS_COLORS - the same single source the tracks maps and
+    category pills use); gloss derived from the canonical base. NO ink
+    flip anywhere: labels stay light, legibility on the bright C1/C2
+    ramps comes from a soft dark text-shadow scrim.
+  * Layout inverted: vitals live in a PERSISTENT sidebar card (visible
+    in every section) incl. Movement and the advisory countdown; the
+    main stage's home view is MAP + CONE (cone polygon rendered from
+    the Stage-1 advisory JSON in the brand blue/white treatment; the
+    Stage-4 choreography animates it later). Mobile: vitals collapse to
+    a slim card above the map; bottom tabs unchanged.
+  * Advisory countdown ticks toward the advisory's OWN stated
+    next-advisory time (parsed by the poller into the adv JSON - never
+    wall-clock cadence); past due -> "ADVISORY DUE · updating".
+  * Loader framework with four prototype variants (a intensifying
+    ramp / b eye opens / c wordmark shine / d broadcast sweep) for
+    art-direction selection; default stays the plain wipe until a pick.
 """
 from __future__ import annotations
 
 import html as _html
 import json
 
+from ace_core import SSHS_COLORS  # the canonical category palette
 from cyclolab_pages import adv_key, page_url_path
 from storm_ids import parse_sid
 
+FONT_BASE = "https://triple-a-tropics.com/assets/fonts/metropolis"
+
+# The site's hurricane glyph (the same path the maps + banners spin).
+HURRICANE_PATH = "M 16.37,-28.27 C 13.58,-28.13 11.51,-27.90 9.23,-27.49 C 1.27,-26.06 -5.88,-22.70 -10.92,-18.02 C -14.83,-14.40 -17.41,-10.06 -18.49,-5.32 C -18.95,-3.30 -19.15,-1.42 -19.15,0.91 C -19.15,2.53 -19.09,3.28 -18.89,4.45 C -18.38,7.38 -17.47,9.46 -15.41,12.37 C -13.88,14.54 -13.43,15.31 -13.20,16.13 C -13.11,16.44 -13.09,16.62 -13.09,17.14 C -13.10,17.93 -13.20,18.32 -13.67,19.28 C -15.30,22.59 -18.65,24.93 -23.49,26.14 C -25.26,26.58 -27.29,26.87 -29.18,26.95 L -30.00,26.98 L -29.65,27.06 C -27.33,27.62 -24.41,28.05 -21.57,28.27 C -20.04,28.38 -16.31,28.38 -14.80,28.27 C -12.93,28.13 -11.43,27.95 -9.77,27.67 C -0.59,26.14 7.56,22.03 12.68,16.37 C 16.22,12.45 18.28,8.10 18.93,3.13 C 19.64,-2.25 18.99,-6.47 16.84,-10.16 C 16.48,-10.80 15.79,-11.82 14.99,-12.95 C 13.61,-14.89 13.18,-15.77 13.12,-16.83 C 13.07,-17.61 13.23,-18.26 13.71,-19.23 C 14.97,-21.79 17.38,-23.84 20.67,-25.16 C 23.13,-26.14 26.24,-26.77 29.15,-26.87 L 30.00,-26.90 L 29.67,-26.98 C 29.13,-27.12 27.57,-27.44 26.66,-27.58 C 24.96,-27.87 23.39,-28.05 21.66,-28.18 C 20.72,-28.25 17.16,-28.30 16.37,-28.27 Z"
+
+
 # --------------------------------------------------------------------------
-# §5 - the seven category token sets (5-stop banded ramps, status-head gloss)
+# Category token sets, DERIVED from the canonical palette (no eyeballing).
 # --------------------------------------------------------------------------
-# anchor: the flat accent; edge/mid derived shades keep one construction.
-CAT_TOKENS: dict[str, dict] = {
-    "TD": {"edge": "#16324a", "mid": "#2c5a80", "accent": "#3f7cab", "ink": "#ffffff"},
-    "TS": {"edge": "#0d3b2a", "mid": "#1d6f4f", "accent": "#2aa169", "ink": "#ffffff"},
-    "C1": {"edge": "#4a3a08", "mid": "#9a7a14", "accent": "#d9a91f", "ink": "#0a1324"},
-    "C2": {"edge": "#4d2a0c", "mid": "#a35a1c", "accent": "#e07b28", "ink": "#0a1324"},
-    "C3": {"edge": "#46140f", "mid": "#992b21", "accent": "#d23b2e", "ink": "#ffffff"},
-    "C4": {"edge": "#471035", "mid": "#9c2273", "accent": "#d62fa0", "ink": "#ffffff"},
-    "C5": {"edge": "#2a1454", "mid": "#5829ad", "accent": "#7a3df0", "ink": "#ffffff"},
-}
+def _shade(hex_color: str, factor: float) -> str:
+    """Scale a hex color toward black (factor 0..1 of original light)."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return "#{:02x}{:02x}{:02x}".format(
+        round(r * factor), round(g * factor), round(b * factor))
+
+
+def _derive_tokens() -> dict[str, dict]:
+    """edge/mid derived from each category's CANONICAL accent
+    (ace_core.SSHS_COLORS) so the ramp reads as the real TAT category
+    color with the approved gloss construction. Ink is ALWAYS light
+    (AD rule: no black-text flip; scrims handle the bright ramps)."""
+    out = {}
+    for cat, accent in SSHS_COLORS.items():
+        out[cat] = {"edge": _shade(accent, 0.30), "mid": _shade(accent, 0.62),
+                    "accent": accent, "ink": "#ffffff"}
+    return out
+
+
+CAT_TOKENS: dict[str, dict] = _derive_tokens()
 
 
 def _ramp(c: dict) -> str:
@@ -53,7 +85,6 @@ def _ramp(c: dict) -> str:
 
 
 def cat_css() -> str:
-    """The data-cat token sets, one rule per category."""
     rules = []
     for cat, c in CAT_TOKENS.items():
         rules.append(
@@ -62,10 +93,19 @@ def cat_css() -> str:
     return "\n  ".join(rules)
 
 
-# --------------------------------------------------------------------------
-# The document template. Placeholders are __DOUBLE_UNDERSCORE__ tokens
-# (str.replace, no str.format - the CSS/JS braces stay untouched).
-# --------------------------------------------------------------------------
+def font_css() -> str:
+    faces = []
+    for w in (400, 500, 600, 700, 800):
+        faces.append(
+            "@font-face { font-family: Metropolis; font-style: normal; "
+            f"font-weight: {w}; font-display: swap; "
+            f"src: url('{FONT_BASE}/metropolis-latin-{w}-normal.woff2') "
+            "format('woff2'), "
+            f"url('{FONT_BASE}/metropolis-latin-{w}-normal.woff') "
+            "format('woff'); }")
+    return "\n  ".join(faces)
+
+
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en" data-cat="__CAT__">
 <head>
@@ -79,43 +119,63 @@ HTML_TEMPLATE = r"""<!doctype html>
 <meta property="og:url" content="https://triple-a-tropics.com__PAGE_PATH__">
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
+  __FONT_CSS__
+
   :root {
     --bg: #0b0e13; --panel: #11161f; --border: #232a36;
     --fg: #e8eef5; --muted: #8ea2bd; --navy-deep: #0a1a2e;
-    --cat-ramp: linear-gradient(180deg,#16324a,#3f7cab,#16324a);
-    --cat-accent: #3f7cab; --cat-ink: #ffffff;
+    --cat-ramp: linear-gradient(180deg,#132c40,#3fa4ff,#132c40);
+    --cat-accent: #3fa4ff; --cat-ink: #ffffff;
     --motion-slow: 4.5s; --motion-med: 1.2s; --motion-fast: 0.6s;
+    /* the soft dark scrim that holds light text on bright ramps */
+    --ink-scrim: 0 1px 2px rgba(0,0,0,0.65), 0 0 16px rgba(0,0,0,0.38);
   }
   __CAT_CSS__
 
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
-    font-family: "Metropolis", "Helvetica Neue", Arial, sans-serif; }
+    font-family: Metropolis, "Helvetica Neue", Arial, sans-serif; }
   a { color: #5dd3ff; text-decoration: none; }
 
   /* ---- shell: sidebar + stage (one DOM, CSS-rearranged on phones) ---- */
   .lab { display: flex; min-height: 100vh; }
-  .side { width: 264px; flex: 0 0 264px; display: flex; flex-direction: column;
+  .side { width: 288px; flex: 0 0 288px; display: flex; flex-direction: column;
     background: linear-gradient(180deg, #0a1a2e 0%, #0d1420 30%, #0b0e13 100%);
     border-right: 1px solid var(--border); }
   .stage { flex: 1 1 auto; min-width: 0; padding: 26px 30px 60px; }
 
-  /* identity banner - wears the storm (NO pulsing dot by design) */
+  /* ---- identity banner: broadcast storm-info card on the approved
+         gradient. Corner glyph spins constantly (the one permitted
+         loop); intensity is color, never speed. ---- */
   .banner { background: var(--cat-ramp); color: var(--cat-ink);
-    padding: 18px 18px 16px; position: relative; overflow: hidden;
+    padding: 16px 18px 15px; position: relative; overflow: hidden;
     border-bottom: 1px solid rgba(255,255,255,0.85);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.14),
                 inset 0 -1px 0 rgba(0,0,0,0.40); }
-  .banner .wordmark { font-size: 11px; font-weight: 800; letter-spacing: 2px;
-    text-transform: uppercase; opacity: 0.85; }
-  .banner .storm-name { font-size: 26px; font-weight: 900; line-height: 1.1;
-    letter-spacing: 0.5px; text-transform: uppercase; margin: 6px 0 8px;
-    text-shadow: 0 1px 0 rgba(0,0,0,0.35), 0 2px 4px rgba(0,0,0,0.35); }
+  .banner .eyebrow { font-size: 10.5px; font-weight: 600;
+    letter-spacing: 1.6px; opacity: 0.92; text-shadow: var(--ink-scrim); }
+  /* BRAND CASING RULE: "CycloLab" is always rendered literally - no
+     text-transform here, ever. */
+  .banner .eyebrow .brand { font-weight: 800; letter-spacing: 0.4px; }
+  .banner .storm-type { font-size: 12px; font-weight: 700;
+    letter-spacing: 2.2px; text-transform: uppercase; margin-top: 9px;
+    opacity: 0.95; text-shadow: var(--ink-scrim); }
+  .banner .storm-name { font-size: 30px; font-weight: 800; line-height: 1.05;
+    letter-spacing: 0.5px; text-transform: uppercase; margin: 2px 0 9px;
+    text-shadow: var(--ink-scrim); }
   .chip { display: inline-block; padding: 4px 12px; border-radius: 999px;
-    background: rgba(0,0,0,0.30); color: #ffffff; font-size: 12.5px;
-    font-weight: 800; letter-spacing: 1px; text-transform: uppercase;
-    border: 1px solid rgba(255,255,255,0.35); }
-  /* category-change shine sweep (one pass, state-change triggered) */
+    background: rgba(0,0,0,0.32); color: #ffffff; font-size: 12px;
+    font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+    border: 1px solid rgba(255,255,255,0.4);
+    text-shadow: 0 1px 1px rgba(0,0,0,0.5); }
+  .banner .glyph { position: absolute; top: 10px; right: 10px;
+    width: 46px; height: 46px; z-index: 1;
+    filter: drop-shadow(0 0 7px var(--cat-accent))
+            drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
+  .banner .glyph .spin { animation: lab-spin 2.6s linear infinite;
+    transform-origin: 0 0; }
+  @keyframes lab-spin { from { transform: rotate(360deg); }
+                        to { transform: rotate(0deg); } }
   .banner::after { content: ""; position: absolute; top: 0; bottom: 0;
     width: 55%; left: -60%; transform: skewX(-18deg);
     background: linear-gradient(90deg, transparent,
@@ -124,32 +184,58 @@ HTML_TEMPLATE = r"""<!doctype html>
   .banner.shine::after { animation: lab-shine var(--motion-med) ease-out 1; }
   @keyframes lab-shine { 0% { opacity: 1; left: -60%; }
                          100% { opacity: 1; left: 110%; } }
-  /* gradient crossfade: a stacked overlay fades out the OLD ramp */
-  .banner .old-ramp { position: absolute; inset: 0; background: var(--old-ramp, none);
-    opacity: 0; pointer-events: none; }
+  .banner .old-ramp { position: absolute; inset: 0;
+    background: var(--old-ramp, none); opacity: 0; pointer-events: none; }
   .banner.xfade .old-ramp { opacity: 1;
     animation: lab-xfade calc(var(--motion-slow) * 0.5) ease-in-out 1 forwards; }
   @keyframes lab-xfade { from { opacity: 1; } to { opacity: 0; } }
-  .banner > .b-inner { position: relative; z-index: 1; }
+  .banner > .b-inner { position: relative; z-index: 2; padding-right: 48px; }
+
+  /* ---- persistent vitals card (visible in every section) ---- */
+  .vitals { margin: 12px 12px 0; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 4px 14px 6px; position: relative; overflow: hidden; }
+  .vitals::before { content: ""; position: absolute; left: 0; right: 0;
+    top: 0; height: 3px; background: var(--cat-ramp); }
+  .vrow { display: flex; align-items: baseline; justify-content: space-between;
+    gap: 10px; padding: 7px 0; border-bottom: 1px solid
+    rgba(255,255,255,0.05); }
+  .vrow:last-child { border-bottom: 0; }
+  .vrow .lbl { font-size: 10px; font-weight: 700; letter-spacing: 1.3px;
+    text-transform: uppercase; color: var(--muted); flex: 0 0 auto; }
+  .vrow .val { font-size: 15.5px; font-weight: 700; color: #ffffff;
+    font-feature-settings: "tnum"; font-variant-numeric: tabular-nums;
+    white-space: nowrap; display: flex; align-items: baseline; gap: 4px; }
+  .vrow .unit { font-size: 10.5px; color: var(--muted); font-weight: 700; }
+  .vrow.due .val { color: var(--cat-accent); font-size: 12.5px;
+    letter-spacing: 0.6px; }
+
+  /* odometer: fixed-height window, digit columns roll via translateY */
+  .odo { display: inline-flex; overflow: hidden; height: 1.15em;
+    font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+  .odo .digit { display: inline-block; width: 0.62em; text-align: center; }
+  .odo .col { display: flex; flex-direction: column; height: 1.15em;
+    transition: transform calc(var(--motion-slow) * 0.35)
+      cubic-bezier(0.22, 1, 0.36, 1); }
+  .odo .col .digit { flex: 0 0 1.15em; height: 1.15em; line-height: 1.15em; }
 
   /* section nav with the accent rail */
-  .nav-secs { display: flex; flex-direction: column; padding: 14px 0;
+  .nav-secs { display: flex; flex-direction: column; padding: 10px 0;
     flex: 1 1 auto; }
   .sec-btn { display: flex; align-items: center; gap: 10px;
-    padding: 14px 18px; min-height: 48px; background: transparent;
+    padding: 13px 18px; min-height: 48px; background: transparent;
     color: var(--muted); border: 0; border-left: 3px solid transparent;
-    font: inherit; font-size: 14px; font-weight: 700;
+    font: inherit; font-size: 13.5px; font-weight: 700;
     letter-spacing: 1.1px; text-transform: uppercase; cursor: pointer;
     text-align: left; }
   .sec-btn:hover { color: var(--fg); }
   .sec-btn.active { color: #ffffff; border-left-color: var(--cat-accent);
     background: linear-gradient(90deg, rgba(255,255,255,0.05), transparent); }
   .back-map { padding: 16px 18px; border-top: 1px solid var(--border);
-    font-size: 13px; font-weight: 700; letter-spacing: 0.8px;
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.8px;
     text-transform: uppercase; min-height: 48px; display: flex;
     align-items: center; }
 
-  /* ENDED banner strip (frozen state) */
   .ended-strip { display: none; background: #2a2f3a; color: #e8eef5;
     padding: 10px 16px; font-size: 13px; font-weight: 700;
     letter-spacing: 0.6px; text-align: center;
@@ -159,48 +245,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   /* ---- sections ---- */
   .sec { display: none; }
   .sec.active { display: block; }
-  .sec-title { font-size: 18px; font-weight: 800; letter-spacing: 1.2px;
-    text-transform: uppercase; color: #ffffff; margin: 0 0 16px; }
-  /* section wipe-in (state-change: on switch) */
+  .sec-title { font-size: 17px; font-weight: 800; letter-spacing: 1.2px;
+    text-transform: uppercase; color: #ffffff; margin: 0 0 14px; }
   .sec.active .wipe { animation: lab-wipe var(--motion-fast) ease-out 1; }
   @keyframes lab-wipe { from { opacity: 0; transform: translateX(14px); }
                         to   { opacity: 1; transform: translateX(0); } }
 
-  /* stats banner (Overview) */
-  .stats { display: grid; gap: 12px;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    margin-bottom: 22px; }
-  .stat { background: var(--panel); border: 1px solid var(--border);
-    border-radius: 12px; padding: 12px 14px; position: relative;
-    overflow: hidden; }
-  .stat::before { content: ""; position: absolute; left: 0; right: 0;
-    top: 0; height: 3px; background: var(--cat-ramp); }
-  .stat .lbl { font-size: 10.5px; font-weight: 800; letter-spacing: 1.2px;
-    text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
-  .stat .val { font-size: 22px; font-weight: 800; color: #ffffff;
-    font-variant-numeric: tabular-nums; display: flex; align-items: baseline;
-    gap: 5px; white-space: nowrap; }
-  .stat .unit { font-size: 12px; color: var(--muted); font-weight: 700; }
-  /* text-y stats (position, last fix) run long - smaller type so they
-     never clip their card */
-  .stat.small .val { font-size: 15px; line-height: 1.5; }
-
-  /* odometer: fixed-height window, digit columns roll via translateY */
-  .odo { display: inline-flex; overflow: hidden; height: 1.15em; }
-  .odo .digit { display: inline-block; width: 0.62em; text-align: center; }
-  .odo .col { display: flex; flex-direction: column; height: 1.15em; }
-  .odo .col .digit { flex: 0 0 1.15em; height: 1.15em; line-height: 1.15em; }
-  .odo .col { transition: transform calc(var(--motion-slow) * 0.35)
-    cubic-bezier(0.22, 1, 0.36, 1); }
-
-  /* track map + chart cards */
   .card { background: var(--panel); border: 1px solid var(--border);
     border-radius: 12px; padding: 14px; margin-bottom: 20px; }
-  .card h3 { margin: 0 0 10px; font-size: 12px; font-weight: 800;
+  .card h3 { margin: 0 0 10px; font-size: 11.5px; font-weight: 800;
     letter-spacing: 1.4px; text-transform: uppercase; color: var(--muted); }
   .card svg { width: 100%; height: auto; display: block;
     touch-action: pan-y; }
-  /* chart draw-in (state-change: first open) */
+  .card .note { font-size: 10.5px; color: var(--muted); margin-top: 8px;
+    letter-spacing: 0.3px; }
   .draw path.series { stroke-dasharray: var(--len, 2000);
     stroke-dashoffset: var(--len, 2000);
     animation: lab-draw calc(var(--motion-slow) * 0.55) ease-out 1 forwards; }
@@ -213,58 +271,116 @@ HTML_TEMPLATE = r"""<!doctype html>
   .stub { color: var(--muted); font-size: 14px; padding: 30px 0;
     text-align: center; }
 
-  /* launch wipe (plays once on load) */
-  .launch { position: fixed; inset: 0; z-index: 50; background: var(--cat-ramp);
-    transform-origin: top; pointer-events: none;
-    animation: lab-launch var(--motion-med) ease-in-out 1 forwards;
-    animation-delay: 0.25s; }
+  /* ---- loader framework (variant prototypes a-d + default wipe) ---- */
+  .loader { position: fixed; inset: 0; z-index: 50; display: flex;
+    align-items: center; justify-content: center; pointer-events: none;
+    background: var(--navy-deep); }
+  .loader .word { font-size: 30px; font-weight: 800; color: #ffffff;
+    letter-spacing: 0.5px; text-shadow: var(--ink-scrim); z-index: 2; }
+  .loader .word .lite { font-weight: 500; opacity: 0.85; }
+  .loader.done { animation: lab-launch var(--motion-med) ease-in-out 1 forwards; }
   @keyframes lab-launch { to { transform: scaleY(0); } }
+  .loader { transform-origin: top; }
+  /* a) intensifying ramp: JS steps --cat vars; bg follows the ramp */
+  .loader[data-variant="a"] { background: var(--cat-ramp);
+    transition: background 0.65s ease; }
+  /* b) eye opens: center glyph; reveal = iris (clip-path) */
+  .loader[data-variant="b"] .eye { width: 120px; height: 120px;
+    margin-bottom: 18px;
+    filter: drop-shadow(0 0 14px var(--cat-accent)); }
+  .loader[data-variant="b"] .eye .spin { animation: lab-spin 2.6s linear infinite;
+    transform-origin: 0 0; }
+  .loader[data-variant="b"] { flex-direction: column; }
+  .loader[data-variant="b"].done { animation: none;
+    clip-path: circle(150% at 50% 46%);
+    animation: lab-iris var(--motion-med) ease-in-out 1 forwards; }
+  @keyframes lab-iris { from { clip-path: circle(150% at 50% 46%); }
+                        to { clip-path: circle(0% at 50% 46%); } }
+  /* c) wordmark build + shine */
+  .loader[data-variant="c"] .word span.ch { display: inline-block;
+    opacity: 0; transform: translateY(12px);
+    animation: lab-ch 0.55s ease-out forwards;
+    animation-delay: calc(var(--i) * 0.09s); }
+  @keyframes lab-ch { to { opacity: 1; transform: translateY(0); } }
+  .loader[data-variant="c"] .word { position: relative; overflow: hidden; }
+  .loader[data-variant="c"] .word::after { content: ""; position: absolute;
+    top: 0; bottom: 0; width: 40%; left: -50%; transform: skewX(-18deg);
+    background: linear-gradient(90deg, transparent,
+      rgba(255,255,255,0.5), transparent);
+    animation: lab-shine 1.1s ease-out 1; animation-delay: 1.3s; }
+  /* d) broadcast sweep: luminous scanline; text fades up in its wake */
+  .loader[data-variant="d"] .scan { position: absolute; top: 0; bottom: 0;
+    width: 3px; left: 0; background: #ffffff;
+    box-shadow: 0 0 18px 6px rgba(140,200,255,0.75);
+    animation: lab-scan 1.8s cubic-bezier(0.6,0,0.35,1) 1 forwards; }
+  @keyframes lab-scan { from { left: -2%; } to { left: 102%; } }
+  .loader[data-variant="d"] .word { opacity: 0;
+    animation: lab-fadeup 1s ease-out 0.9s 1 forwards; }
+  @keyframes lab-fadeup { from { opacity: 0; transform: translateY(8px); }
+                          to { opacity: 1; transform: translateY(0); } }
+  .loader[data-variant="d"].done { animation: lab-wipeleft
+    var(--motion-med) ease-in-out 1 forwards; }
+  @keyframes lab-wipeleft { to { transform: translateX(100%); } }
 
-  /* mobile rotation: banner -> top bar, nav -> bottom tabs (same DOM) */
+  /* ---- mobile rotation: banner -> top bar; vitals -> slim card above
+         the map; nav -> bottom tabs (same DOM) ---- */
   @media (max-width: 640px) {
     .lab { flex-direction: column; }
-    .side { width: 100%; flex: 0 0 auto; flex-direction: row;
-      flex-wrap: wrap; border-right: 0; position: sticky; top: 0; z-index: 20;
-      border-bottom: 1px solid var(--border); }
-    .banner { flex: 1 1 100%; padding: 10px 14px; display: flex;
-      align-items: center; gap: 10px; }
-    .banner .wordmark { display: none; }
+    .side { width: 100%; flex: 0 0 auto; border-right: 0; }
+    .banner { position: sticky; top: 0; z-index: 20; display: flex;
+      align-items: center; gap: 10px; padding: 9px 14px; }
+    .banner .eyebrow, .banner .storm-type { display: none; }
     .banner .storm-name { font-size: 17px; margin: 0; flex: 1 1 auto; }
-    .nav-secs { order: 3; flex: 1 1 100%; flex-direction: row;
-      position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
-      background: var(--navy-deep); border-top: 1px solid var(--border);
-      padding: 0; }
+    .banner .glyph { position: static; width: 30px; height: 30px;
+      order: -1; flex: 0 0 auto; }
+    .banner > .b-inner { display: flex; align-items: center; gap: 10px;
+      flex: 1 1 auto; padding-right: 0; }
+    .vitals { margin: 10px 12px; padding: 2px 12px 4px; }
+    .vrow { padding: 5px 0; }
+    .vrow .val { font-size: 13.5px; }
+    .nav-secs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
+      flex-direction: row; background: var(--navy-deep);
+      border-top: 1px solid var(--border); padding: 0; }
     .sec-btn { flex: 1 1 25%; justify-content: center; padding: 12px 4px;
-      min-height: 52px; font-size: 11px; border-left: 0;
+      min-height: 52px; font-size: 10.5px; border-left: 0;
       border-top: 3px solid transparent; }
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
-    .back-map { border-top: 0; padding: 10px 12px; min-height: 0; }
-    .stage { padding: 16px 14px 86px; }
+    .back-map { border-top: 0; padding: 8px 12px; min-height: 0; }
+    .stage { padding: 4px 14px 86px; }
   }
 
-  /* reduced motion: every animation lands on its final frame */
   @media (prefers-reduced-motion: reduce) {
-    .launch, .banner.shine::after, .banner.xfade .old-ramp,
+    .loader, .loader::after, .loader .scan, .loader .word,
+    .loader .word span.ch, .banner.shine::after, .banner.xfade .old-ramp,
     .sec.active .wipe, .draw path.series, .draw .fill {
       animation-duration: 0.001s !important;
       animation-delay: 0s !important; }
+    .banner .glyph .spin, .loader .eye .spin { animation: none !important; }
     .odo .col { transition-duration: 0.001s !important; }
   }
 </style>
 </head>
 <body>
-<div class="launch" id="launch"></div>
+<div class="loader" id="loader" data-variant="__LOADER__"></div>
 <div class="ended-strip">THIS STORM HAS ENDED · final data below · CycloLab archive view</div>
 <div class="lab">
   <aside class="side">
     <div class="banner" id="banner">
       <div class="old-ramp"></div>
+      <svg class="glyph" viewBox="-34 -34 68 68" aria-hidden="true">
+        <g class="spin"><path d="__HPATH__" fill="#ffffff"
+          stroke="rgba(0,0,0,0.30)" stroke-width="1"/></g>
+      </svg>
       <div class="b-inner">
-        <div class="wordmark">Triple-A-Tropics · CycloLab</div>
+        <div class="eyebrow">TRIPLE-A-TROPICS · <span class="brand">CycloLab</span></div>
+        <div class="storm-type" id="storm-type">__TYPE_WORD__</div>
         <div class="storm-name" id="storm-name">__NAME__</div>
         <span class="chip" id="chip">__CHIP__</span>
       </div>
     </div>
+
+    <div class="vitals" id="vitals"></div>
+
     <nav class="nav-secs" id="secnav">
       <button class="sec-btn active" data-sec="overview">Overview</button>
       <button class="sec-btn" data-sec="satellite">Satellite</button>
@@ -277,13 +393,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="stage">
     <section class="sec active" id="sec-overview">
       <div class="wipe">
-        <h2 class="sec-title">Overview</h2>
-        <div class="stats" id="stats"></div>
-        <div class="card"><h3>Track</h3>
-          <svg id="trackmap" viewBox="0 0 1000 560"
-               preserveAspectRatio="xMidYMid meet"></svg></div>
+        <div class="card"><h3>Track &amp; forecast cone</h3>
+          <svg id="trackmap" viewBox="0 0 1000 620"
+               preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="note" id="cone-note" hidden></div></div>
         <div class="card"><h3>Wind &amp; pressure</h3>
-          <svg id="chart" viewBox="0 0 1000 360"
+          <svg id="chart" viewBox="0 0 1000 320"
                preserveAspectRatio="xMidYMid meet"></svg></div>
       </div>
     </section>
@@ -297,7 +412,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div></section>
     <section class="sec" id="sec-advisories"><div class="wipe">
       <h2 class="sec-title">Advisories</h2>
-      <div class="stub">Advisory text + the forecast cone land in Stage 4.</div>
+      <div class="stub">Advisory text + the cone reveal land in Stage 4.</div>
     </div></section>
   </main>
 </div>
@@ -309,16 +424,66 @@ HTML_TEMPLATE = r"""<!doctype html>
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   var ENDED = __ENDED__;
+  var BASIN = "__BASIN__";
   var POLL_MS = 60000;
-  var SSHS = { TD:"#3fa4ff", TS:"#46c56a", C1:"#ffe14d", C2:"#ff9a2f",
-               C3:"#ff4d3b", C4:"#e33ad4", C5:"#b03bff" };
-  var CHIP_LABEL = { TD:"Tropical Depression", TS:"Tropical Storm",
-    C1:"Category 1", C2:"Category 2", C3:"Category 3", C4:"Category 4",
-    C5:"Category 5" };
+  var SSHS = __SSHS_JSON__;
+  var CHIP_LABEL = { TD: "Tropical Depression", TS: "Tropical Storm",
+    C1: "Category 1", C2: "Category 2", C3: "Category 3",
+    C4: "Category 4", C5: "Category 5" };
+  // storm-type word: advisory dev_label first (the tau-0 second-pass
+  // path), category+basin fallback otherwise.
+  var DEV_WORD = { TD: "Tropical Depression", TS: "Tropical Storm",
+    HU: "Hurricane", MH: "Major Hurricane", STS: "Subtropical Storm",
+    PTC: "Post-Tropical Cyclone", L: "Low" };
+  function catWord(cat) {
+    if (cat === "TD") return "Tropical Depression";
+    if (cat === "TS") return "Tropical Storm";
+    return BASIN === "WP" ? "Typhoon" : "Hurricane";
+  }
   var reduced = window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // ---- section nav (lazy init on first open) ----------------------------
+  // ---- loader -------------------------------------------------------------
+  var loader = document.getElementById("loader");
+  (function initLoader() {
+    var v = loader.getAttribute("data-variant");
+    var word = '<div class="word">Loading <span>CycloLab</span></div>';
+    if (v === "b") {
+      loader.innerHTML =
+        '<svg class="eye" viewBox="-34 -34 68 68"><g class="spin">' +
+        '<path d="__HPATH__" fill="#ffffff"/></g></svg>' + word;
+    } else if (v === "c") {
+      var chars = "CycloLab".split("").map(function (ch, i) {
+        return '<span class="ch" style="--i:' + i + '">' + ch + "</span>";
+      }).join("");
+      loader.innerHTML = '<div class="word"><span class="lite">Loading&nbsp;</span>' +
+        chars + "</div>";
+    } else if (v === "d") {
+      loader.innerHTML = '<div class="scan"></div>' + word;
+    } else {
+      loader.innerHTML = word;
+    }
+    if (v === "a") {           // intensifying ramp up to the real category
+      var seq = ["TD", "TS", "C1", "C2", "C3", "C4", "C5"];
+      var target = document.documentElement.getAttribute("data-cat");
+      var stop = seq.indexOf(target); if (stop < 0) stop = 0;
+      var i = 0;
+      var iv = setInterval(function () {
+        document.documentElement.setAttribute("data-cat", seq[i]);
+        if (i >= stop) { clearInterval(iv);
+          document.documentElement.setAttribute("data-cat", target); }
+        i++;
+      }, reduced ? 1 : 480);
+    }
+    var hold = reduced ? 50 : (v ? 2700 : 900);
+    setTimeout(function () {
+      loader.classList.add("done");
+      setTimeout(function () { if (loader.parentNode) loader.remove(); },
+                 reduced ? 60 : 1400);
+    }, hold);
+  })();
+
+  // ---- section nav (lazy init on first open) ------------------------------
   var inited = {};
   function openSec(name) {
     if (!document.getElementById("sec-" + name)) return;  // unknown: no-op
@@ -328,8 +493,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.querySelectorAll(".sec-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-sec") === name);
     });
-    if (!inited[name]) { inited[name] = true; /* lazy hooks: stages 3-4 */ }
-    // restart the wipe (state-change animation)
+    if (!inited[name]) { inited[name] = true; /* stages 3-4 hooks */ }
     var w = document.querySelector("#sec-" + name + " .wipe");
     if (w) { w.style.animation = "none"; void w.offsetWidth; w.style.animation = ""; }
   }
@@ -338,9 +502,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (b) openSec(b.getAttribute("data-sec"));
   });
 
-  // ---- odometer (transform-only digit rolls) ----------------------------
+  // ---- odometer ------------------------------------------------------------
   function odoSet(el, text) {
-    // builds/updates digit columns; non-digits render as static chars
     var want = String(text);
     if (el.getAttribute("data-odo") === want) return;
     el.setAttribute("data-odo", want);
@@ -373,33 +536,76 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
-  // ---- stats banner ------------------------------------------------------
-  var STATS = [
+  // ---- vitals (persistent sidebar card) ------------------------------------
+  var VITALS = [
     { id: "vmax", lbl: "Max wind", unit: "kt" },
     { id: "mslp", lbl: "Min pressure", unit: "mb" },
     { id: "ace", lbl: "Storm ACE", unit: "" },
-    { id: "pos", lbl: "Position", unit: "", small: true },
-    { id: "fix", lbl: "Last fix", unit: "UTC", small: true },
+    { id: "pos", lbl: "Position", unit: "" },
+    { id: "move", lbl: "Movement", unit: "" },
+    { id: "fix", lbl: "Last fix", unit: "UTC" },
+    { id: "next", lbl: "Next advisory", unit: "" },
   ];
-  function buildStats() {
-    var host = document.getElementById("stats");
-    host.innerHTML = STATS.map(function (s) {
-      return '<div class="stat' + (s.small ? ' small' : '') + '">' +
-        '<div class="lbl">' + s.lbl + '</div>' +
-        '<div class="val"><span class="odo" id="odo-' + s.id + '"></span>' +
+  function buildVitals() {
+    document.getElementById("vitals").innerHTML = VITALS.map(function (s) {
+      return '<div class="vrow" id="vrow-' + s.id + '">' +
+        '<span class="lbl">' + s.lbl + '</span>' +
+        '<span class="val"><span class="odo" id="odo-' + s.id + '"></span>' +
         (s.unit ? '<span class="unit">' + s.unit + '</span>' : "") +
-        '</div></div>';
+        "</span></div>";
     }).join("");
   }
-
   function fmtPos(lat, lon) {
     if (lat == null || lon == null) return "—";
     return Math.abs(lat).toFixed(1) + (lat >= 0 ? "N" : "S") + " " +
            Math.abs(lon).toFixed(1) + (lon >= 0 ? "E" : "W");
   }
+  function movement(pts) {
+    if (!pts || pts.length < 2) return "—";
+    for (var i = pts.length - 2; i >= 0; i--) {
+      var a = pts[i], b = pts[pts.length - 1];
+      var dtH = (new Date(b.t) - new Date(a.t)) / 3600000;
+      if (dtH < 1) continue;
+      var latm = (b.lat - a.lat) * 60;
+      var lonm = (b.lon - a.lon) * 60 *
+        Math.cos((a.lat + b.lat) / 2 * Math.PI / 180);
+      var dist = Math.sqrt(latm * latm + lonm * lonm);
+      if (dist < 0.5) return "Stationary";
+      var dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+                  "S","SSW","SW","WSW","W","WNW","NW","NNW"];
+      var brg = (Math.atan2(lonm, latm) * 180 / Math.PI + 360) % 360;
+      return dirs[Math.round(brg / 22.5) % 16] + " " +
+        Math.round(dist / dtH) + " kt";
+    }
+    return "—";
+  }
 
-  // ---- category state (the app wears the storm) --------------------------
+  // ---- advisory countdown (source of truth = the advisory's OWN stated
+  //      next-advisory time, parsed by the poller; never wall-clock) -----
+  var nextAdvUtc = null;
+  function tickCountdown() {
+    var el = document.getElementById("odo-next");
+    var row = document.getElementById("vrow-next");
+    if (!el) return;
+    if (!nextAdvUtc) { odoSet(el, "—"); return; }
+    var ms = new Date(nextAdvUtc) - new Date();
+    if (ms <= 0) {
+      row.classList.add("due");
+      odoSet(el, "DUE · updating");
+      return;
+    }
+    row.classList.remove("due");
+    var h = Math.floor(ms / 3600000);
+    var m = Math.floor(ms % 3600000 / 60000);
+    var s = Math.floor(ms % 60000 / 1000);
+    odoSet(el, h > 0 ? (h + "h " + (m < 10 ? "0" : "") + m + "m")
+                     : (m + "m " + (s < 10 ? "0" : "") + s + "s"));
+  }
+  setInterval(tickCountdown, 1000);
+
+  // ---- category + type word -------------------------------------------------
   var curCat = document.documentElement.getAttribute("data-cat");
+  var advTypeWord = null;   // advisory-sourced word wins when present
   function setCategory(cat) {
     if (!cat || cat === curCat) return;
     var banner = document.getElementById("banner");
@@ -407,6 +613,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       .getPropertyValue("--cat-ramp");
     document.documentElement.setAttribute("data-cat", cat);
     document.getElementById("chip").textContent = CHIP_LABEL[cat] || cat;
+    if (!advTypeWord) {
+      document.getElementById("storm-type").textContent =
+        catWord(cat).toUpperCase();
+    }
     curCat = cat;
     if (reduced) return;
     banner.querySelector(".old-ramp").style.setProperty("--old-ramp", oldRamp);
@@ -414,47 +624,69 @@ HTML_TEMPLATE = r"""<!doctype html>
     banner.classList.add("xfade", "shine");
   }
 
-  // ---- track map (client-rendered; equirect like the basin pages) -------
+  // ---- map + cone (the home view showstopper) -------------------------------
+  var coneRing = null, coneAdv = null, conePts = null;
   function renderTrack(storm) {
     var svg = document.getElementById("trackmap");
     var pts = storm.points || [];
-    if (!pts.length) { svg.innerHTML = ""; return; }
-    var lats = pts.map(function (p) { return p.lat; });
-    var lons = pts.map(function (p) { return p.lon; });
-    var pad = 2.5;
+    if (!pts.length && !coneRing) { svg.innerHTML = ""; return; }
+    var lats = [], lons = [];
+    pts.forEach(function (p) { lats.push(p.lat); lons.push(p.lon); });
+    (coneRing || []).forEach(function (c) { lons.push(c[0]); lats.push(c[1]); });
+    var pad = 1.8;
     var la0 = Math.min.apply(null, lats) - pad, la1 = Math.max.apply(null, lats) + pad;
     var lo0 = Math.min.apply(null, lons) - pad, lo1 = Math.max.apply(null, lons) + pad;
-    var W = 1000, H = 560;
+    var W = 1000, H = 620;
     function X(lon) { return (lon - lo0) / (lo1 - lo0) * W; }
     function Y(lat) { return H - (lat - la0) / (la1 - la0) * H; }
-    var d = pts.map(function (p, i) {
-      return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
-    }).join(" ");
     var parts = ['<rect width="' + W + '" height="' + H + '" fill="#0a1019"/>'];
-    parts.push('<path d="' + d + '" fill="none" stroke="var(--cat-accent)" ' +
-               'stroke-width="2.5" stroke-opacity="0.85" ' +
-               'stroke-linejoin="round" stroke-linecap="round"/>');
-    pts.forEach(function (p) {
-      var c = SSHS[p.cls] || SSHS.TD;
-      parts.push('<circle cx="' + X(p.lon).toFixed(1) + '" cy="' +
-        Y(p.lat).toFixed(1) + '" r="5" fill="' + c +
-        '" stroke="#fff" stroke-width="1"/>');
-    });
-    var last = pts[pts.length - 1];
-    parts.push('<circle cx="' + X(last.lon).toFixed(1) + '" cy="' +
-      Y(last.lat).toFixed(1) + '" r="11" fill="none" ' +
-      'stroke="var(--cat-accent)" stroke-width="3"/>');
+    // CONE: brand blue/white, never category-colored (uncertainty area).
+    if (coneRing && coneRing.length > 3) {
+      var dC = coneRing.map(function (c, i) {
+        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
+      }).join(" ") + " Z";
+      parts.push('<defs><filter id="cone-soft" x="-20%" y="-20%" ' +
+        'width="140%" height="140%"><feGaussianBlur stdDeviation="5"/>' +
+        "</filter></defs>");
+      parts.push('<path d="' + dC + '" fill="none" stroke="#8cc8ff" ' +
+        'stroke-width="9" stroke-opacity="0.35" filter="url(#cone-soft)"/>');
+      parts.push('<path d="' + dC + '" fill="rgba(255,255,255,0.12)" ' +
+        'stroke="#0a1a2e" stroke-width="2"/>');
+      if (conePts && conePts.length > 1) {
+        var dF = conePts.map(function (p, i) {
+          return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
+        }).join(" ");
+        parts.push('<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
+          'stroke-width="1.6" stroke-dasharray="2 5" stroke-opacity="0.7"/>');
+      }
+    }
+    if (pts.length) {
+      var d = pts.map(function (p, i) {
+        return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
+      }).join(" ");
+      parts.push('<path d="' + d + '" fill="none" stroke="var(--cat-accent)" ' +
+        'stroke-width="2.5" stroke-opacity="0.85" stroke-linejoin="round" ' +
+        'stroke-linecap="round"/>');
+      pts.forEach(function (p) {
+        parts.push('<circle cx="' + X(p.lon).toFixed(1) + '" cy="' +
+          Y(p.lat).toFixed(1) + '" r="4.5" fill="' +
+          (SSHS[p.cls] || SSHS.TD) + '" stroke="#fff" stroke-width="1"/>');
+      });
+      var last = pts[pts.length - 1];
+      parts.push('<circle cx="' + X(last.lon).toFixed(1) + '" cy="' +
+        Y(last.lat).toFixed(1) + '" r="10" fill="none" ' +
+        'stroke="var(--cat-accent)" stroke-width="3"/>');
+    }
     svg.innerHTML = parts.join("");
   }
 
-  // ---- wind/pressure timeline (hand-rolled, draw-in on first render) ----
   var chartDrawn = false;
   function renderChart(storm) {
     var svg = document.getElementById("chart");
     var pts = (storm.points || []).filter(function (p) {
       return p.wind_kt != null; });
     if (pts.length < 2) { svg.innerHTML = ""; return; }
-    var W = 1000, H = 360, padL = 56, padR = 56, padT = 18, padB = 30;
+    var W = 1000, H = 320, padL = 56, padR = 56, padT = 16, padB = 28;
     var wMax = Math.max(140, Math.max.apply(null, pts.map(function (p) {
       return p.wind_kt; })) + 10);
     var prs = pts.map(function (p) { return p.pressure_mb; })
@@ -464,18 +696,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     function Xi(i) { return padL + i / (pts.length - 1) * (W - padL - padR); }
     function Yw(w) { return H - padB - (w / wMax) * (H - padT - padB); }
     function Yp(p) { return H - padB - ((p - p0) / (p1 - p0)) * (H - padT - padB); }
-    var bands = [[34, "TS"], [64, "C1"], [83, "C2"], [96, "C3"],
-                 [113, "C4"], [137, "C5"]];
     var parts = ['<rect width="' + W + '" height="' + H + '" fill="#0a1019"/>'];
-    bands.forEach(function (b) {
-      parts.push('<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' +
-        Yw(b[0]).toFixed(1) + '" y2="' + Yw(b[0]).toFixed(1) +
-        '" stroke="' + SSHS[b[1]] + '" stroke-opacity="0.25" ' +
-        'stroke-dasharray="3 5"/>');
-      parts.push('<text x="' + (W - padR + 6) + '" y="' +
-        (Yw(b[0]) + 4).toFixed(1) + '" fill="' + SSHS[b[1]] +
-        '" font-size="11" opacity="0.8">' + b[1] + '</text>');
-    });
+    [[34, "TS"], [64, "C1"], [83, "C2"], [96, "C3"], [113, "C4"], [137, "C5"]]
+      .forEach(function (b) {
+        parts.push('<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' +
+          Yw(b[0]).toFixed(1) + '" y2="' + Yw(b[0]).toFixed(1) +
+          '" stroke="' + SSHS[b[1]] + '" stroke-opacity="0.25" ' +
+          'stroke-dasharray="3 5"/>');
+        parts.push('<text x="' + (W - padR + 6) + '" y="' +
+          (Yw(b[0]) + 4).toFixed(1) + '" fill="' + SSHS[b[1]] +
+          '" font-size="11" opacity="0.8">' + b[1] + "</text>");
+      });
     var dWind = pts.map(function (p, i) {
       return (i ? "L" : "M") + Xi(i).toFixed(1) + "," + Yw(p.wind_kt).toFixed(1);
     }).join(" ");
@@ -496,7 +727,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       parts.push('<path d="' + dPres + '" fill="none" stroke="#8ea2bd" ' +
         'stroke-width="2" stroke-dasharray="5 4" stroke-opacity="0.9"/>');
     }
-    parts.push('<text x="' + padL + '" y="14" fill="#8ea2bd" font-size="11">' +
+    parts.push('<text x="' + padL + '" y="13" fill="#8ea2bd" font-size="11">' +
       'wind kt (solid) · pressure mb (dashed)</text>');
     svg.innerHTML = parts.join("");
     if (!chartDrawn && !reduced) {
@@ -508,13 +739,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     chartDrawn = true;
   }
 
-  // ---- hydration (poll + diff-merge: grow state, never reset the user) --
+  // ---- hydration (poll + diff-merge: grow state, never reset the user) ----
   var lastFixKey = null;
+  var lastStorm = null;
   function apply(storm) {
-    var cat = storm.current_category || "TD";
-    setCategory(cat);
-    var name = (storm.name || SID).toUpperCase();
-    document.getElementById("storm-name").textContent = name;
+    lastStorm = storm;
+    setCategory(storm.current_category || "TD");
+    document.getElementById("storm-name").textContent =
+      (storm.name || SID).toUpperCase();
     var pts = storm.points || [];
     var last = pts[pts.length - 1] || {};
     var fixKey = last.t || null;
@@ -525,42 +757,70 @@ HTML_TEMPLATE = r"""<!doctype html>
     odoSet(document.getElementById("odo-ace"),
            storm.ace != null ? storm.ace.toFixed(2) : "0.00");
     odoSet(document.getElementById("odo-pos"), fmtPos(last.lat, last.lon));
+    odoSet(document.getElementById("odo-move"), movement(pts));
     odoSet(document.getElementById("odo-fix"),
            fixKey ? fixKey.slice(5, 16).replace("T", " ") : "—");
-    if (fixKey !== lastFixKey) {       // NEW FIX -> redraw map; chart grows
+    if (fixKey !== lastFixKey) {
       renderTrack(storm);
       renderChart(storm);
       lastFixKey = fixKey;
     }
   }
 
-  function poll() {
-    fetch(FEED_URL + (FEED_URL.indexOf("?") >= 0 ? "&" : "?") + "t=" +
-          Date.now(), { cache: "no-store" })
+  function applyAdvisory(adv) {
+    if (!adv) return;
+    var changed = adv.advisory !== coneAdv;
+    coneAdv = adv.advisory;
+    coneRing = adv.cone || null;
+    conePts = adv.points || null;
+    nextAdvUtc = adv.next_advisory_utc || null;
+    tickCountdown();
+    if (adv.points && adv.points.length &&
+        DEV_WORD[adv.points[0].dev_label]) {
+      advTypeWord = DEV_WORD[adv.points[0].dev_label];
+      document.getElementById("storm-type").textContent =
+        advTypeWord.toUpperCase();
+    }
+    var note = document.getElementById("cone-note");
+    if (note && coneRing) {
+      note.hidden = false;
+      note.textContent = (adv.method === "official-cone")
+        ? "Cone: official NHC forecast cone, advisory " + coneAdv + "."
+        : "Derived uncertainty envelope (advisory " + coneAdv +
+          ") — not an official JTWC product. Method: " +
+          (adv.method || "derived") + ".";
+    }
+    if (changed && lastStorm) renderTrack(lastStorm);
+  }
+
+  function fetchJson(url) {
+    return fetch(url + (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now(),
+                 { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (feed) {
-        if (!feed || !feed.storms) return;
-        var storm = feed.storms.filter(function (s) {
-          return s && s.sid === SID; })[0];
-        if (storm) apply(storm);
+      .catch(function () { return null; });
+  }
+  function poll() {
+    Promise.all([fetchJson(FEED_URL), fetchJson(ADV_URL)])
+      .then(function (res) {
+        var feed = res[0], adv = res[1];
+        if (feed && feed.storms) {
+          var storm = feed.storms.filter(function (s) {
+            return s && s.sid === SID; })[0];
+          if (storm) apply(storm);
+        }
+        applyAdvisory(adv);
       })
-      .catch(function () { /* baked snapshot stands */ })
       .then(function () { if (!ENDED) setTimeout(poll, POLL_MS); });
   }
 
-  buildStats();
+  buildVitals();
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   if (!ENDED) poll();
 
-  // launch wipe element removes itself after playing
-  var l = document.getElementById("launch");
-  l.addEventListener("animationend", function () { l.remove(); });
-  if (reduced) l.remove();
-
-  // exposed for the node harness + recording rig (deterministic drives)
   window.__lab = { openSec: openSec, setCategory: setCategory,
-                   apply: apply, odoSet: odoSet };
+                   apply: apply, applyAdvisory: applyAdvisory,
+                   odoSet: odoSet };
 })();
 </script>
 </body>
@@ -572,11 +832,19 @@ def _esc(s) -> str:
     return _html.escape(str(s if s is not None else ""), quote=True)
 
 
+def _type_word(cat: str, basin: str) -> str:
+    if cat == "TD":
+        return "Tropical Depression"
+    if cat == "TS":
+        return "Tropical Storm"
+    return "Typhoon" if basin == "WP" else "Hurricane"
+
+
 def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
-                ended: bool = False) -> str:
-    """Render one storm's shell. ``storm`` is the tracks-feed storm dict
-    (the baked snapshot); ``feed_url`` the basin feed the page hydrates
-    from. ``ended=True`` bakes the frozen archive variant (no polling)."""
+                ended: bool = False, loader: str = "") -> str:
+    """Render one storm's shell. ``loader`` selects a loading-screen
+    prototype variant ("a"/"b"/"c"/"d"; "" = the plain wipe default until
+    art direction picks one)."""
     ids = parse_sid(storm["sid"])
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
@@ -587,6 +855,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     chip = {"TD": "Tropical Depression", "TS": "Tropical Storm",
             "C1": "Category 1", "C2": "Category 2", "C3": "Category 3",
             "C4": "Category 4", "C5": "Category 5"}.get(cat, cat)
+    type_word = _type_word(cat, ids.basin)
     og_title = f"{name} · {chip} · CycloLab"
     bits = []
     if wind is not None:
@@ -598,14 +867,15 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                + (f" — {' · '.join(bits)}" if bits else "")
                + " · Triple-A-Tropics CycloLab")
 
-    # The baked snapshot keeps the page meaningful before/without JS and
-    # is the frozen content of an ENDED page.
     baked = json.dumps(storm, separators=(",", ":"))
 
     html = (HTML_TEMPLATE
+            .replace("__FONT_CSS__", font_css())
             .replace("__CAT_CSS__", cat_css())
+            .replace("__HPATH__", HURRICANE_PATH)
             .replace("__CAT__", cat)
             .replace("__NAME__", _esc(name))
+            .replace("__TYPE_WORD__", _esc(type_word.upper()))
             .replace("__CHIP__", _esc(chip))
             .replace("__OG_TITLE__", _esc(og_title))
             .replace("__OG_DESC__", _esc(og_desc))
@@ -613,6 +883,9 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SID__", _esc(storm["sid"]))
             .replace("__FEED_URL__", _esc(feed_url))
             .replace("__ADV_URL__", _esc(adv_url or adv_key(storm["sid"])))
+            .replace("__BASIN__", ids.basin)
+            .replace("__LOADER__", _esc(loader))
+            .replace("__SSHS_JSON__", json.dumps(SSHS_COLORS))
             .replace("__ENDED__", "true" if ended else "false")
             .replace("__BAKED__", baked))
     if ended:

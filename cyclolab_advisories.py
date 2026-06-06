@@ -37,7 +37,8 @@ from typing import Callable, Optional
 import requests
 
 import poller_framework as pf
-from kml_advisories import AdvisoryParseError, build_advisory_json
+from kml_advisories import (AdvisoryParseError, build_advisory_json,
+                            parse_next_advisory)
 from storm_ids import InvestSidError, parse_sid
 
 log = logging.getLogger("cyclolab-advisories")
@@ -162,6 +163,23 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                         f"(cone={bool(cone_b)}, track={bool(track_b)})")
                 payload = build_advisory_json(sid, cone_b, track_b,
                                               text_urls=e["text"])
+                # NEXT-ADVISORY countdown source (the advisory's OWN
+                # stated time - never wall-clock cadence). Best-effort:
+                # a TCP fetch/parse failure leaves the fields absent and
+                # the shell simply shows no countdown this cycle.
+                try:
+                    tcp_url = (e["text"] or {}).get("tcp_url")
+                    tcp_txt = get_text(tcp_url) if tcp_url else None
+                    if tcp_txt:
+                        nxt = parse_next_advisory(tcp_txt,
+                                                  payload["issued_utc"])
+                        payload["next_advisory_utc"] = nxt["next_advisory_utc"]
+                        payload["next_advisory_kind"] = nxt["kind"]
+                        payload["next_complete_utc"] = nxt["next_complete_utc"]
+                        payload["next_advisory_stated"] = nxt["stated"]
+                except Exception as nx:  # noqa: BLE001
+                    log.warning("%s adv %d: next-advisory parse skipped: %s",
+                                sid, adv, nx)
                 # ISSUANCE-REGRESSION GUARD: never replace cached state
                 # with an OLDER advisory (stale mirror / CDN echo).
                 if known and payload["issued_utc"] < known["issued"]:

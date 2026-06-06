@@ -445,3 +445,184 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
         "text": text,
         "provenance": provenance,
     }
+
+
+# ---------------------------------------------------------------------------
+# NEXT ADVISORY (Public Advisory / TCP footer countdown - CYCLOLAB_DESIGN
+# advisory-countdown, source-of-truth rule)
+# ---------------------------------------------------------------------------
+#
+# NHC Public Advisories (TCP) state the next advisory time EXPLICITLY in a
+# footer block, e.g.::
+#
+#     NEXT ADVISORY
+#     -------------
+#     Next complete advisory at 1100 PM HST.
+#
+# or, while intermediate ("A") advisories are active (3-hourly, watches /
+# warnings in effect)::
+#
+#     Next intermediate advisory at 700 PM CDT.
+#     Next complete advisory at 1000 PM CDT.
+#
+# The countdown shell MUST display the STATED time - never a cadence guessed
+# from the wall clock. The footer times carry no date, so we resolve each
+# stated local time against ``issued_utc``'s date IN THAT ZONE, rolling
+# forward one day when the resolved instant is <= issued (an advisory never
+# states a time already in the past).
+#
+# Ending storms drop the block entirely or replace it with "This is the last
+# public advisory ..."; that is the graceful no-countdown case (stated False).
+
+# Pull the local-zone time off a "Next ... advisory at HHMM AM|PM TZ." line.
+# Minutes are optional in the wild ("at noon" never occurs; NHC always emits
+# HMM/HHMM), TZ is the same 3-letter abbreviation _TZ_OFFSET already covers.
+_NEXT_ADV_RE = re.compile(
+    r"Next\s+(intermediate|complete)\s+advisory\s+at\s+"
+    r"(\d{1,2})(\d{2})\s+(AM|PM)\s+([A-Z]{3})",
+    re.I,
+)
+
+# Footer phrasing for a final advisory (real NHC text). Presence of this
+# anywhere in the NEXT ADVISORY region means the storm is ending.
+_LAST_ADV_RE = re.compile(
+    r"This\s+is\s+the\s+last\s+(?:public\s+)?advisory", re.I)
+
+_PRE_RE = re.compile(r"<pre\b[^>]*>(.*?)</pre>", re.S | re.I)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """Return the advisory product text from a .shtml page or a bare product.
+
+    NHC serves the product wrapped in a ``<pre>`` block inside boilerplate
+    HTML; the raw product has no tags at all. We use the first ``<pre>``
+    block when present, else strip any stray tags, and unescape the handful
+    of entities NHC emits (``&amp;`` / ``&lt;`` / ``&gt;`` / ``&#176;``...).
+    Bare text passes through unchanged.
+    """
+    m = _PRE_RE.search(text)
+    body = m.group(1) if m else _TAG_RE.sub("", text)
+    # Minimal entity unescape (stdlib html.unescape would also work, but the
+    # module is intentionally dependency-light and these are all NHC emits).
+    return (body
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'"))
+
+
+def _resolve_footer_time(hh: int, mm: int, ampm: str, tz: str,
+                         issued: datetime) -> datetime:
+    """Resolve a dateless footer time against ``issued``'s date in its zone.
+
+    ``issued`` is an aware UTC datetime (the advisory's own issuance, parsed
+    upstream - the clock-free source-freshness rule). We anchor the stated
+    HH:MM in ``tz`` on the SAME calendar date ``issued`` falls on within that
+    zone, then roll forward whole days until the instant is strictly after
+    ``issued`` (NHC never states a time already past). Returns aware UTC.
+    """
+    tz = tz.upper()
+    if tz not in _TZ_OFFSET:
+        raise AdvisoryParseError(f"unknown timezone {tz!r} in NEXT ADVISORY")
+    if ampm.upper() == "PM" and hh != 12:
+        hh += 12
+    elif ampm.upper() == "AM" and hh == 12:
+        hh = 0
+    zone = timezone(timedelta(hours=_TZ_OFFSET[tz]))
+    issued_local = issued.astimezone(zone)
+    cand = issued_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    # Roll forward a day at a time until strictly after issuance. A footer
+    # time equal to issuance is also a future advisory (>= would keep it),
+    # but NHC never restates the current time, so strict > is correct and
+    # the loop runs at most once in practice.
+    while cand <= issued_local:
+        cand += timedelta(days=1)
+    return cand.astimezone(timezone.utc)
+
+
+def parse_next_advisory(tcp_text: str, issued_utc: str) -> dict:
+    """Parse a Public Advisory (TCP) footer into the next-advisory countdown.
+
+    ``tcp_text`` is the RAW advisory product OR the ``.shtml`` page that wraps
+    it (we strip HTML / read the ``<pre>`` block automatically). ``issued_utc``
+    is the advisory's own issuance instant as ``YYYY-MM-DDTHH:MM:SSZ`` - the
+    dateless footer times resolve against THIS, never the wall clock.
+
+    Returns::
+
+        {"next_advisory_utc": iso-z | None,
+         "kind": "intermediate" | "complete" | None,
+         "next_complete_utc": iso-z | None,
+         "stated": bool}
+
+    When both an intermediate and a complete time are stated, the
+    intermediate (earlier) wins ``next_advisory_utc``/``kind`` and the
+    complete time is also returned in ``next_complete_utc``. With only a
+    complete time stated, ``next_complete_utc`` mirrors ``next_advisory_utc``.
+
+    A final advisory ("This is the last public advisory ...") or any product
+    with no parseable NEXT ADVISORY footer is the graceful no-countdown case:
+    all fields ``None`` / ``stated`` False (the shell shows no countdown - the
+    storm is ending). :class:`AdvisoryParseError` is raised ONLY for garbage
+    input (empty / None / non-string, or an unparseable ``issued_utc``); an
+    absent footer is NOT an error.
+    """
+    if not tcp_text or not isinstance(tcp_text, str):
+        raise AdvisoryParseError("tcp_text is empty or not a string")
+    try:
+        issued = datetime.strptime(
+            issued_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError) as exc:
+        raise AdvisoryParseError(
+            f"issued_utc must be ISO-Z, got {issued_utc!r}") from exc
+
+    none_result = {
+        "next_advisory_utc": None,
+        "kind": None,
+        "next_complete_utc": None,
+        "stated": False,
+    }
+
+    body = _strip_html(tcp_text)
+
+    # Last advisory -> no countdown (graceful), even if the NEXT ADVISORY
+    # header is present (NHC keeps the header and prints the last-advisory
+    # paragraph in place of a time).
+    if _LAST_ADV_RE.search(body):
+        return none_result
+
+    intermediate_utc = None
+    complete_utc = None
+    for m in _NEXT_ADV_RE.finditer(body):
+        kind, hh, mm, ampm, tz = m.groups()
+        resolved = _resolve_footer_time(
+            int(hh), int(mm), ampm, tz, issued)
+        if kind.lower() == "intermediate":
+            # Keep the earliest if NHC ever repeated the line (it doesn't).
+            if intermediate_utc is None or resolved < intermediate_utc:
+                intermediate_utc = resolved
+        else:
+            if complete_utc is None or resolved < complete_utc:
+                complete_utc = resolved
+
+    if intermediate_utc is None and complete_utc is None:
+        return none_result
+
+    if intermediate_utc is not None:
+        # Intermediate is always the nearer upcoming advisory when stated.
+        return {
+            "next_advisory_utc": _iso_z(intermediate_utc),
+            "kind": "intermediate",
+            "next_complete_utc": (_iso_z(complete_utc)
+                                  if complete_utc is not None else None),
+            "stated": True,
+        }
+
+    return {
+        "next_advisory_utc": _iso_z(complete_utc),
+        "kind": "complete",
+        "next_complete_utc": _iso_z(complete_utc),
+        "stated": True,
+    }
