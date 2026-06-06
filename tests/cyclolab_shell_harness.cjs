@@ -84,10 +84,47 @@ const scheduledDelays = [];
         }
       }
 
-      // fetch: resolve the plan's embedded feed (the storms array the page's
-      // poll() filters by sid). No feed -> a !ok response, so the baked
-      // snapshot stands and no live apply() fires from the poll.
-      window.fetch = function () {
+      // fetch: URL-routed plan fixtures. Stage-3 mounts fetch the floater
+      // manifests (plan.floaters = top index, plan.floater_storm = the
+      // per-storm manifest); everything else keeps the legacy behavior -
+      // resolve plan.feed (the storms array poll() filters by sid), or a
+      // !ok response when no feed is embedded.
+      const FLOATERS = Array.isArray(PLAN) ? null : (PLAN.floaters || null);
+      const FLOATER_STORM = Array.isArray(PLAN) ? null
+        : (PLAN.floater_storm || null);
+      window.__fetched = [];
+      function jsonResponse(body) {
+        if (body == null) {
+          return Promise.resolve({
+            ok: false,
+            json() { return Promise.reject(new Error("no fixture")); },
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json() { return Promise.resolve(body); },
+        });
+      }
+      // Stage-3 models mount: a recorder stub stands in for the real
+      // /models/hafs.js (jsdom has no network). withHafsViewer() sees
+      // window.HafsViewer and constructs immediately; the snapshot
+      // exposes what the mount passed.
+      if (!Array.isArray(PLAN) && PLAN.hafs_stub) {
+        window.__hafsCtor = null;
+        window.HafsViewer = function (root, opts) {
+          window.__hafsCtor = { root: root, opts: opts || {} };
+        };
+      }
+
+      window.fetch = function (url) {
+        url = String(url);
+        window.__fetched.push(url);
+        if (/floaters\/manifest\.json/.test(url)) {
+          return jsonResponse(FLOATERS);
+        }
+        if (/floaters\/[^/]+\/manifest\.json/.test(url)) {
+          return jsonResponse(FLOATER_STORM);
+        }
         if (FEED == null) {
           return Promise.resolve({
             ok: false,
@@ -173,8 +210,51 @@ const scheduledDelays = [];
     return el ? el.textContent : null;
   }
 
+  function stage3Probe() {
+    // Stage-3 mounts: what the models mount constructed + the satellite
+    // viewer's state + lazy-load evidence (script tag / fetched URLs).
+    const win = dom.window;
+    const ctor = win.__hafsCtor || null;
+    let hafs = null;
+    if (ctor) {
+      const o = ctor.opts;
+      hafs = {
+        rootId: ctor.root ? ctor.root.id : null,
+        stormLock: o.stormLock || null,
+        manifestUrl: o.manifestUrl || null,
+        assetBase: o.assetBase || null,
+        elsKeys: o.els ? Object.keys(o.els).sort() : [],
+        elsWired: !!(o.els && o.els.img &&
+                     o.els.img === win.document.getElementById("cl-hafs-img") &&
+                     o.els.stormSel ===
+                       win.document.getElementById("cl-hafs-storm")),
+      };
+    }
+    const sat = win.__lab && win.__lab.satState ? win.__lab.satState() : null;
+    const bandHost = win.document.getElementById("sat-bands");
+    const scriptEl = win.document.querySelector(
+      'script[src*="/models/hafs.js"]');
+    return {
+      hafsCtor: hafs,
+      hafsScriptInjected: !!scriptEl,
+      hafsScriptSrc: scriptEl ? scriptEl.src : null,
+      sat: sat,
+      satBands: bandHost ? Array.prototype.map.call(
+        bandHost.children,
+        (b) => ({ slug: b.getAttribute("data-slug"),
+                  active: b.classList.contains("active") })) : [],
+      satImgSrc: (win.document.getElementById("sat-img") || {}).src || "",
+      satTime: text("sat-time"),
+      satEmptyShown:
+        ((win.document.getElementById("sat-empty") || {}).style || {})
+          .display === "block",
+      fetched: (win.__fetched || []).slice(),
+    };
+  }
+
   function snapshot() {
     return {
+      stage3: stage3Probe(),
       cat: document.documentElement.getAttribute("data-cat"),
       ended: document.documentElement.hasAttribute("data-ended"),
       chip: text("chip"),
@@ -216,6 +296,13 @@ const scheduledDelays = [];
       window.__lab.setCategory(op.cat);
     } else if (op.op === "apply") {
       window.__lab.apply(op.storm);
+    } else if (op.op === "clickSatBand") {
+      // Stage-3 satellite: click a band toggle by slug.
+      const host = document.getElementById("sat-bands");
+      const btn = host && Array.prototype.find.call(
+        host.children, (b) => b.getAttribute("data-slug") === op.slug);
+      if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
     } else if (op.op === "removeBannerClasses") {
       // test helper: clear banner anim classes to detect re-add / churn.
       const b = document.getElementById("banner");

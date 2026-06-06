@@ -517,5 +517,127 @@ class TestEndedPage(unittest.TestCase):
         self.assertIn(60000, st["scheduledDelays"])
 
 
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestStage3Mounts(unittest.TestCase):
+    """Stage 3: the Satellite + Models mounts (CYCLOLAB_DESIGN §7.2/§7.3).
+    Models = the componentized /models/ HafsViewer constructed with THIS
+    page's element table + the storm lock from the id join; Satellite =
+    the storm-scoped floater viewer. Both are LAZY - nothing fetched, no
+    script injected, no viewer constructed until the tab first opens."""
+
+    def setUp(self):
+        self.storm = load_storm()          # NHC_EP082026 -> 08e / ep082026
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL,
+                                               loader="")
+
+    @staticmethod
+    def _floaters_top(include=True):
+        entry = {"id": "ep082026", "slug": "ep08", "name": "SYNTH",
+                 "basin": "EP", "bands": ["ir", "wv_up"],
+                 "manifest": "floaters/ep08/manifest.json"}
+        other = {"id": "ep992026", "slug": "ep99", "name": "OTHER",
+                 "basin": "EP", "bands": ["ir"],
+                 "manifest": "floaters/ep99/manifest.json"}
+        return {"generated_utc": "2026-06-06T20:00:00Z",
+                "storms": ([entry] if include else []) + [other]}
+
+    @staticmethod
+    def _floater_storm():
+        def fr(hhmm):
+            return {"t": f"2026-06-06T{hhmm}:00Z",
+                    "key": f"floaters/ep08/x/{hhmm.replace(':', '')}.png"}
+        return {"id": "ep082026", "slug": "ep08", "name": "SYNTH",
+                "basin": "EP",
+                "bands": {
+                    "ir": {"label": "Clean IR",
+                           "frames": [fr("10:00"), fr("10:10"), fr("10:20")]},
+                    "wv_up": {"label": "WV (upper)",
+                              "frames": [fr("10:02"), fr("10:12"),
+                                         fr("10:40")]},
+                }}
+
+    def test_mounts_are_lazy_until_tab_opens(self):
+        recs = run_harness(self.html, {
+            "hafs_stub": True, "floaters": self._floaters_top(),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "snapshot"}]})
+        st = recs[-1]["state"]["stage3"]
+        self.assertIsNone(st["hafsCtor"])
+        self.assertFalse(st["hafsScriptInjected"])
+        self.assertFalse([u for u in st["fetched"] if "floaters" in u],
+                         "satellite fetched before the tab opened")
+
+    def test_models_tab_constructs_storm_locked_viewer(self):
+        recs = run_harness(self.html, {
+            "hafs_stub": True,
+            "ops": [{"op": "openSec", "name": "models"}]})
+        h = recs[-1]["state"]["stage3"]["hafsCtor"]
+        self.assertIsNotNone(h, "HafsViewer not constructed on tab open")
+        self.assertEqual(h["rootId"], "cl-hafs-root")
+        self.assertEqual(h["stormLock"], "08e")
+        self.assertEqual(
+            h["manifestUrl"],
+            "https://cdn.triple-a-tropics.com/models/hafs/manifest.json")
+        self.assertEqual(h["assetBase"],
+                         "https://cdn.triple-a-tropics.com/models/hafs/")
+        self.assertTrue(h["elsWired"],
+                        "els table not wired to the cl-hafs-* elements")
+        self.assertEqual(len(h["elsKeys"]), 24)
+
+    def test_models_without_stub_lazy_loads_the_house_script(self):
+        recs = run_harness(self.html, {
+            "ops": [{"op": "openSec", "name": "models"}]})
+        st = recs[-1]["state"]["stage3"]
+        self.assertTrue(st["hafsScriptInjected"])
+        self.assertIn("https://triple-a-tropics.com/models/hafs.js",
+                      st["hafsScriptSrc"])
+        self.assertIsNone(st["hafsCtor"],
+                          "ctor must wait for the script's onload")
+
+    def test_satellite_tab_mounts_newest_frame_first(self):
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "openSec", "name": "satellite"}]})
+        st = recs[-1]["state"]["stage3"]
+        self.assertEqual(st["sat"]["band"], "ir")
+        self.assertEqual(st["sat"]["frames"], 3)
+        self.assertEqual(st["sat"]["idx"], 2, "newest frame first")
+        self.assertIn("floaters/ep08/x/1020.png", st["satImgSrc"])
+        self.assertEqual([b["slug"] for b in st["satBands"]],
+                         ["ir", "wv_up"])
+        self.assertTrue(st["satBands"][0]["active"])
+        self.assertIn("2026-06-06 10:20Z", st["satTime"])
+
+    def test_satellite_band_switch_keeps_the_moment(self):
+        # at ir 10:20, switching to wv_up must pick the NEAREST frame
+        # (10:12, idx 1) - not the band's newest (10:40, idx 2). The
+        # availability-aware scrub on a time axis.
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "openSec", "name": "satellite"},
+                    {"op": "clickSatBand", "slug": "wv_up"}]})
+        st = recs[-1]["state"]["stage3"]
+        self.assertEqual(st["sat"]["band"], "wv_up")
+        self.assertEqual(st["sat"]["idx"], 1,
+                         "band switch must keep the moment (nearest frame)")
+        self.assertIn("floaters/ep08/x/1012.png", st["satImgSrc"])
+
+    def test_satellite_absent_storm_shows_empty_state(self):
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(include=False),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "openSec", "name": "satellite"}]})
+        st = recs[-1]["state"]["stage3"]
+        self.assertTrue(st["satEmptyShown"])
+        self.assertEqual(st["sat"]["frames"], 0)
+
+    def test_baked_ids_ride_the_template(self):
+        self.assertIn('var HAFS_ID = "08e"', self.html)
+        self.assertIn('var FLOATER_ID = "ep082026"', self.html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

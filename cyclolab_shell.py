@@ -393,6 +393,91 @@ HTML_TEMPLATE = r"""<!doctype html>
     animation-delay: calc(var(--motion-slow) * 0.45); }
   @keyframes lab-fill { to { opacity: 1; } }
 
+  /* ---- Stage 3 mounts: shared viewer chrome (hafs.js vocabulary). The
+     Models tab hosts the componentized /models/ HafsViewer (one impl, two
+     mounts - CYCLOLAB_DESIGN §7.3); the Satellite tab reuses the same
+     seg/btn/stage idiom for the floater viewer (§7.2). Colors ride the
+     category tokens - the app wears the storm here too. */
+  .hafs-group { display: flex; flex-direction: column; gap: 4px; }
+  .hafs-group > label { font-size: 10px; font-weight: 700; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--muted); }
+  .hafs-controls { display: flex; flex-wrap: wrap; gap: 12px 18px;
+    padding: 0 0 12px; align-items: flex-end; }
+  .hafs-controls select { background: var(--bg); color: #e8eef5;
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px;
+    font: inherit; font-size: 13px; }
+  .hafs-seg-group { display: flex; flex-wrap: wrap; gap: 0; }
+  .hafs-seg { background: var(--bg); color: var(--muted);
+    border: 1px solid var(--border); border-right: none;
+    padding: 7px 12px; font: inherit; font-size: 12.5px; font-weight: 600;
+    cursor: pointer; }
+  .hafs-seg:first-child { border-radius: 6px 0 0 6px; }
+  .hafs-seg:last-child { border-radius: 0 6px 6px 0;
+    border-right: 1px solid var(--border); }
+  .hafs-seg:hover { color: #ffffff; }
+  .hafs-seg.active { background: var(--cat-accent); color: var(--cat-ink);
+    border-color: var(--cat-accent); }
+  .hafs-stage { position: relative; background: #0a0d12; min-height: 280px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 8px; overflow: hidden; }
+  .hafs-stage img { display: block; max-width: 100%; max-height: 72vh;
+    width: auto; height: auto; }
+  .hafs-statusbox { position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; gap: 10px;
+    color: var(--muted); background: rgba(10,13,18,0.6); font-size: 13.5px; }
+  .hafs-spinner { width: 20px; height: 20px; border-radius: 50%;
+    border: 3px solid var(--border); border-top-color: var(--cat-accent);
+    animation: lab-hafs-spin 0.9s linear infinite; }
+  @keyframes lab-hafs-spin { to { transform: rotate(360deg); } }
+  #cl-hafs-buffer { position: absolute; left: 10px; bottom: 10px;
+    display: none; background: rgba(10,13,18,0.7); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px;
+    font-size: 10.5px; letter-spacing: 0.4px; }
+  .hafs-player { display: flex; align-items: center; gap: 12px;
+    padding: 12px 2px; flex-wrap: wrap; }
+  .hafs-btn { background: var(--bg); color: #e8eef5;
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 12px;
+    font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    white-space: nowrap; }
+  .hafs-btn:hover { border-color: var(--cat-accent); color: var(--cat-accent); }
+  .hafs-play { min-width: 86px; }
+  .hafs-readout { display: flex; flex-direction: column; gap: 2px;
+    min-width: 150px; flex: 1 1 auto;
+    font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+  .hafs-readout span:first-child { font-size: 14px; font-weight: 700; }
+  .hafs-readout span:last-child { font-size: 11.5px; color: var(--muted); }
+  .hafs-hours { display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+    gap: 4px; padding: 2px 0 10px; }
+  .hafs-hr { background: var(--bg); color: #e8eef5;
+    border: 1px solid var(--border); border-radius: 5px; padding: 4px 0;
+    font: inherit; font-size: 11.5px; font-weight: 600; text-align: center;
+    font-variant-numeric: tabular-nums; cursor: pointer;
+    transition: background 0.2s, color 0.2s, opacity 0.2s; }
+  .hafs-hr.lit:hover { border-color: var(--cat-accent);
+    color: var(--cat-accent); }
+  .hafs-hr.pending { color: var(--muted); background: transparent;
+    opacity: 0.55; cursor: default; }
+  .hafs-hr.current { background: var(--cat-accent); color: var(--cat-ink);
+    border-color: var(--cat-accent); font-weight: 700; }
+  .hafs-caption { color: var(--muted); font-size: 12px; line-height: 1.5;
+    margin: 8px 0 0; }
+  .hafs-footer { display: flex; align-items: center; gap: 10px;
+    flex-wrap: wrap; color: var(--muted); font-size: 11.5px;
+    padding-top: 6px; }
+  .hafs-pill, .hafs-badge { border: 1px solid var(--border);
+    border-radius: 99px; padding: 2px 10px; font-size: 11px; }
+  .hafs-badge .hafs-badge-btn { background: none; border: none;
+    color: var(--cat-accent); font: inherit; cursor: pointer;
+    text-decoration: underline; padding: 0 0 0 4px; }
+  .hafs-preannounce { color: var(--muted); }
+  #sat-scrub { flex: 2 1 160px; accent-color: var(--cat-accent);
+    min-width: 120px; }
+  @media (max-width: 700px) {
+    .hafs-hours { grid-template-columns: repeat(auto-fill, minmax(38px, 1fr)); }
+    .hafs-stage { min-height: 200px; }
+  }
+
   .stub { color: var(--muted); font-size: 14px; padding: 30px 0;
     text-align: center; }
 
@@ -574,11 +659,86 @@ HTML_TEMPLATE = r"""<!doctype html>
     </section>
     <section class="sec" id="sec-satellite"><div class="wipe">
       <h2 class="sec-title">Satellite</h2>
-      <div class="stub">Floater imagery lands in Stage 3.</div>
+      <div class="card" id="sat-card" tabindex="0">
+        <div class="hafs-controls">
+          <div class="hafs-group"><label>Band</label>
+            <div id="sat-bands" class="hafs-seg-group" role="group"
+                 aria-label="Satellite band"></div></div>
+        </div>
+        <div class="hafs-stage" id="sat-stage">
+          <img id="sat-img" alt="Storm floater satellite frame">
+          <div id="sat-status" class="hafs-statusbox">
+            <div class="hafs-spinner"></div><span>Loading…</span></div>
+        </div>
+        <div class="hafs-player">
+          <button id="sat-step-back" class="hafs-btn" type="button"
+                  title="Previous frame (&#8592;)">&#9664;</button>
+          <button id="sat-play" class="hafs-btn hafs-play" type="button"
+                  title="Play / pause (space)">&#9654; Play</button>
+          <button id="sat-step-fwd" class="hafs-btn" type="button"
+                  title="Next frame (&#8594;)">&#9654;</button>
+          <input id="sat-scrub" type="range" min="0" max="0" value="0"
+                 step="1" aria-label="Frame time">
+          <div class="hafs-readout"><span id="sat-time">&#8212;</span>
+            <span id="sat-band-label"></span></div>
+        </div>
+        <div id="sat-empty" class="stub" style="display:none">No floater
+          imagery for this storm right now.</div>
+        <p class="hafs-caption">GOES floater imagery centered on the storm,
+          newest frame first. Frames land every few minutes while the
+          floater is active.</p>
+      </div>
     </div></section>
     <section class="sec" id="sec-models"><div class="wipe">
       <h2 class="sec-title">Models</h2>
-      <div class="stub">The storm-scoped HAFS viewer lands in Stage 3.</div>
+      <div class="card" id="cl-hafs-root" tabindex="0">
+        <div id="cl-hafs-controls" class="hafs-controls">
+          <div id="cl-hafs-cycle-group" class="hafs-group" style="display:none">
+            <label>Cycle</label>
+            <div id="cl-hafs-cycles" class="hafs-seg-group"></div></div>
+          <div class="hafs-group" style="display:none">
+            <label for="cl-hafs-storm">Storm</label>
+            <select id="cl-hafs-storm"></select></div>
+          <div class="hafs-group"><label>Model</label>
+            <div id="cl-hafs-models" class="hafs-seg-group"></div></div>
+          <div class="hafs-group"><label>Domain</label>
+            <div id="cl-hafs-domains" class="hafs-seg-group"></div></div>
+          <div class="hafs-group"><label>Product</label>
+            <div id="cl-hafs-products" class="hafs-seg-group"></div></div>
+        </div>
+        <div id="cl-hafs-stage" class="hafs-stage">
+          <img id="cl-hafs-img" alt="HAFS forecast frame for this storm">
+          <div id="cl-hafs-status" class="hafs-statusbox">
+            <div class="hafs-spinner"></div><span>Loading&#8230;</span></div>
+          <div id="cl-hafs-buffer"></div>
+        </div>
+        <div id="cl-hafs-player" class="hafs-player">
+          <button id="cl-hafs-step-back" class="hafs-btn" type="button"
+                  title="Previous hour (&#8592;)">&#9664;</button>
+          <button id="cl-hafs-play" class="hafs-btn hafs-play" type="button"
+                  title="Play / pause (space)">&#9654; Play</button>
+          <button id="cl-hafs-step-fwd" class="hafs-btn" type="button"
+                  title="Next hour (&#8594;)">&#9654;</button>
+          <div class="hafs-readout">
+            <span id="cl-hafs-fhour">F000</span>
+            <span id="cl-hafs-valid"></span></div>
+          <div class="hafs-group"><label for="cl-hafs-speed">Speed</label>
+            <select id="cl-hafs-speed"></select></div>
+        </div>
+        <div id="cl-hafs-hours" class="hafs-hours" role="group"
+             aria-label="Forecast hour"></div>
+        <div id="cl-hafs-empty" class="stub" style="display:none">No model
+          guidance for this storm in the current cycles.</div>
+        <p id="cl-hafs-caption" class="hafs-caption">HAFS guidance scoped to
+          this storm - the storm-nest domain follows the cyclone, so playback
+          is roughly storm-centered. Same renders as the site-wide
+          <a href="/models/">/models/</a> viewer.</p>
+        <div class="hafs-footer">
+          <span id="cl-hafs-meta"></span>
+          <span id="cl-hafs-pill" class="hafs-pill" style="display:none"></span>
+          <span id="cl-hafs-badge" class="hafs-badge" style="display:none"></span>
+        </div>
+      </div>
     </div></section>
     <section class="sec" id="sec-advisories"><div class="wipe">
       <h2 class="sec-title">Advisories</h2>
@@ -595,6 +755,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   var ADV_URL = "__ADV_URL__";
   var ENDED = __ENDED__;
   var BASIN = "__BASIN__";
+  var HAFS_ID = "__HAFS_ID__";        // storm_ids join: 01e
+  var FLOATER_ID = "__ATCF_LONG__";   // storm_ids join: ep012026
+  var CDN = "https://cdn.triple-a-tropics.com";
+  var SITE_BASE = "https://triple-a-tropics.com";
   var POLL_MS = 60000;
   var SSHS = __SSHS_JSON__;
   var CHIP_LABEL = { TD: "Tropical Depression", TS: "Tropical Storm",
@@ -677,7 +841,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.querySelectorAll(".sec-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-sec") === name);
     });
-    if (!inited[name]) { inited[name] = true; /* stages 3-4 hooks */ }
+    if (!inited[name]) {
+      inited[name] = true;
+      // Stage 3: nothing is fetched until the tab opens (lazy mounts).
+      if (name === "models") initModels();
+      else if (name === "satellite") initSatellite();
+    }
     var w = document.querySelector("#sec-" + name + " .wipe");
     if (w) { w.style.animation = "none"; void w.offsetWidth; w.style.animation = ""; }
   }
@@ -1076,9 +1245,205 @@ HTML_TEMPLATE = r"""<!doctype html>
   if (BAKED) apply(BAKED);
   if (!ENDED) poll();
 
+  // ---- Stage 3: Models mount (componentized /models/ HafsViewer) ----------
+  // One impl, two mounts (CYCLOLAB_DESIGN §7.3): hafs.js is lazy-loaded on
+  // first tab open from the house origin, then constructed with THIS page's
+  // element table and the storm lock from the id join (sid -> hafs id). The
+  // /models/ auto-boot keys off #hafs-viewer, absent here - no double-boot.
+  var hafsViewer = null;
+  function withHafsViewer(cb, onerr) {
+    if (window.HafsViewer) { cb(); return; }
+    var s = document.createElement("script");
+    s.src = SITE_BASE + "/models/hafs.js";
+    s.onload = function () {
+      if (window.HafsViewer) cb(); else onerr();
+    };
+    s.onerror = onerr;
+    document.head.appendChild(s);
+  }
+  function initModels() {
+    function cl(id) { return document.getElementById("cl-hafs-" + id); }
+    var status = cl("status");
+    status.style.display = "flex";
+    function fail() {
+      status.querySelector("span").textContent =
+        "Model viewer failed to load - reload to retry.";
+    }
+    withHafsViewer(function () {
+      hafsViewer = new window.HafsViewer(cl("root") ||
+          document.getElementById("cl-hafs-root"), {
+        manifestUrl: CDN + "/models/hafs/manifest.json",
+        assetBase: CDN + "/models/hafs/",
+        stormLock: HAFS_ID,
+        els: { stage: cl("stage"), img: cl("img"), status: status,
+               empty: cl("empty"), controls: cl("controls"),
+               cycleGroup: cl("cycle-group"), cycles: cl("cycles"),
+               stormSel: cl("storm"), models: cl("models"),
+               domains: cl("domains"), products: cl("products"),
+               hours: cl("hours"), play: cl("play"),
+               stepB: cl("step-back"), stepF: cl("step-fwd"),
+               speed: cl("speed"), fhour: cl("fhour"), valid: cl("valid"),
+               meta: cl("meta"), badge: cl("badge"), pill: cl("pill"),
+               buffer: cl("buffer"), player: cl("player"),
+               caption: cl("caption") }
+      });
+    }, fail);
+  }
+
+  // ---- Stage 3: Satellite mount (storm-scoped floater viewer, §7.2) -------
+  // Lazy (nothing fetched until the tab opens); newest frame first, then a
+  // small bounded backward preload window; band switches keep the MOMENT
+  // (nearest frame in the new band's availability - the hour-grid idiom on
+  // a time axis).
+  var sat = { man: null, band: null, frames: [], idx: 0, playing: false,
+              timer: null, gen: 0, preloaded: {} };
+  function satEl(id) { return document.getElementById("sat-" + id); }
+  function satStatus(show, msg) {
+    var box = satEl("status");
+    box.style.display = show ? "flex" : "none";
+    if (msg != null) box.querySelector("span").textContent = msg;
+  }
+  function satShow(i) {
+    var n = sat.frames.length;
+    if (!n) return;
+    if (i < 0) i = 0;
+    if (i >= n) i = n - 1;
+    sat.idx = i;
+    var f = sat.frames[i];
+    satEl("img").src = CDN + "/" + f.key;
+    satEl("scrub").value = String(i);
+    satEl("time").textContent =
+      f.t.slice(0, 16).replace("T", " ") + "Z";
+  }
+  function satPreload() {
+    // newest-backwards, bounded window, ~3 in flight (P3-b loader pattern).
+    var gen = ++sat.gen;
+    var want = [];
+    for (var k = sat.frames.length - 1;
+         k >= 0 && want.length < 12; k--) want.push(sat.frames[k]);
+    var inflight = 0, qi = 0;
+    function next() {
+      if (gen !== sat.gen) return;
+      while (inflight < 3 && qi < want.length) {
+        var f = want[qi++];
+        var u = CDN + "/" + f.key;
+        if (sat.preloaded[u]) continue;
+        inflight++;
+        var im = new Image();
+        sat.preloaded[u] = im;
+        im.onload = im.onerror = function () { inflight--; next(); };
+        im.src = u;
+      }
+    }
+    next();
+  }
+  function satNearest(t) {
+    var best = sat.frames.length - 1, dBest = Infinity;
+    var want = new Date(t).getTime();
+    for (var i = 0; i < sat.frames.length; i++) {
+      var d = Math.abs(new Date(sat.frames[i].t).getTime() - want);
+      if (d < dBest) { dBest = d; best = i; }
+    }
+    return best;
+  }
+  function satSelectBand(slug, keepTime) {
+    var prevT = (keepTime && sat.frames.length) ? sat.frames[sat.idx].t : null;
+    sat.band = slug;
+    var b = (sat.man && sat.man.bands && sat.man.bands[slug]) || null;
+    sat.frames = (b && b.frames) || [];
+    satEl("scrub").max = String(Math.max(0, sat.frames.length - 1));
+    satEl("band-label").textContent = b ? (b.label || slug) : "";
+    var host = satEl("bands");
+    for (var i = 0; i < host.children.length; i++) {
+      var btn = host.children[i];
+      btn.classList.toggle("active", btn.getAttribute("data-slug") === slug);
+    }
+    satShow(prevT != null ? satNearest(prevT) : sat.frames.length - 1);
+    satPreload();
+  }
+  function satStep(d) { satPause(); satShow(sat.idx + d); }
+  function satPause() {
+    sat.playing = false;
+    if (sat.timer) { clearInterval(sat.timer); sat.timer = null; }
+    satEl("play").innerHTML = "&#9654; Play";
+  }
+  function satTogglePlay() {
+    if (sat.playing) { satPause(); return; }
+    if (!sat.frames.length) return;
+    sat.playing = true;
+    satEl("play").innerHTML = "&#10074;&#10074; Pause";
+    sat.timer = setInterval(function () {
+      satShow(sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1);
+    }, 200);
+  }
+  function initSatellite() {
+    satStatus(true, "Loading\u2026");
+    fetchJson(CDN + "/floaters/manifest.json").then(function (top) {
+      var entry = null;
+      var storms = (top && top.storms) || [];
+      for (var i = 0; i < storms.length; i++) {
+        if (String(storms[i].id).toLowerCase() === FLOATER_ID) {
+          entry = storms[i]; break;
+        }
+      }
+      if (!entry || !entry.manifest) return null;
+      return fetchJson(CDN + "/" + entry.manifest);
+    }).then(function (man) {
+      if (!man || !man.bands) {
+        satStatus(false);
+        satEl("empty").style.display = "block";
+        return;
+      }
+      sat.man = man;
+      satStatus(false);
+      var host = satEl("bands");
+      host.innerHTML = "";
+      var slugs = [];
+      for (var slug in man.bands) {
+        if (!man.bands.hasOwnProperty(slug)) continue;
+        slugs.push(slug);
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "hafs-seg";
+        b.setAttribute("data-slug", slug);
+        b.textContent = man.bands[slug].label || slug;
+        b.addEventListener("click", function () {
+          satPause();
+          satSelectBand(this.getAttribute("data-slug"), true);
+        });
+        host.appendChild(b);
+      }
+      if (!slugs.length) {
+        satEl("empty").style.display = "block";
+        return;
+      }
+      satSelectBand(slugs.indexOf("ir") >= 0 ? "ir" : slugs[0], false);
+      satEl("step-back").addEventListener("click", function () { satStep(-1); });
+      satEl("step-fwd").addEventListener("click", function () { satStep(1); });
+      satEl("play").addEventListener("click", satTogglePlay);
+      satEl("scrub").addEventListener("input", function () {
+        satPause(); satShow(Number(this.value));
+      });
+      satEl("card").addEventListener("keydown", function (e) {
+        if (e.key === "ArrowLeft") { satStep(-1); e.preventDefault(); }
+        else if (e.key === "ArrowRight") { satStep(1); e.preventDefault(); }
+        else if (e.key === " " || e.key === "Spacebar") {
+          satTogglePlay(); e.preventDefault();
+        }
+      });
+    });
+  }
+
   window.__lab = { openSec: openSec, setCategory: setCategory,
                    apply: apply, applyAdvisory: applyAdvisory,
-                   odoSet: odoSet };
+                   odoSet: odoSet,
+                   // Stage-3 deterministic hooks (tests + ops)
+                   satState: function () {
+                     return { band: sat.band, idx: sat.idx,
+                              frames: sat.frames.length,
+                              playing: sat.playing };
+                   },
+                   hafsViewer: function () { return hafsViewer; } };
 })();
 </script>
 </body>
@@ -1170,6 +1535,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
             .replace("__SID__", _esc(storm["sid"]))
             .replace("__FEED_URL__", _esc(feed_url))
+            .replace("__HAFS_ID__", _esc(ids.hafs_id))
+            .replace("__ATCF_LONG__", _esc(ids.atcf_long))
             .replace("__ADV_URL__", _esc(adv_url or adv_key(storm["sid"])))
             .replace("__BASIN__", ids.basin)
             .replace("__LOADER__", _esc(loader))
