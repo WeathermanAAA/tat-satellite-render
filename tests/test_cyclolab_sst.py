@@ -271,6 +271,38 @@ class TestWriterLifecycle(unittest.TestCase):
         self.assertEqual(sink.log, [])
 
 
+class TestShellFixtureMirrorsWriter(unittest.TestCase):
+    """The jsdom suite's SST_META fixture must stay a faithful mirror
+    of what SstHeroWriter actually writes (adversarial-review find: a
+    hand-fixture can drift and the picker tests would keep passing
+    against a shape the poller never produces)."""
+
+    def test_fixture_layers_match_writer_meta(self):
+        from test_cyclolab_shell import SST_META
+        sink = _PngSink()
+        fetch_day, read_box = _fake_io()
+        with tempfile.TemporaryDirectory() as td:
+            w = cs.SstHeroWriter(
+                sink, prefix="shadow/cyclolab", cache_dir=Path(td),
+                fetch_day=fetch_day, read_box=read_box,
+                today=lambda: dt.date(2026, 6, 6))
+            w.maybe_render("NHC_EP012026", _storm(), "EP")
+        meta = sink.json["shadow/cyclolab/NHC_EP012026/sst/meta.json"]
+        fix_layers = SST_META["layers"]
+        real_layers = meta["layers"]
+        self.assertEqual([x["slug"] for x in fix_layers],
+                         [x["slug"] for x in real_layers])
+        for fx, rl in zip(fix_layers, real_layers):
+            for key in ("label", "title", "field", "file", "source"):
+                self.assertEqual(fx[key], rl[key],
+                                 f"{fx['slug']}.{key} drifted")
+            self.assertEqual(fx.get("note"), rl.get("note"),
+                             f"{fx['slug']}.note drifted")
+        # the shell fixture's top-level keys the picker reads
+        for key in ("valid_date", "updated_utc"):
+            self.assertIn(key, meta)
+
+
 class TestColormapContract(unittest.TestCase):
     """The ramps are byte-pinned MIRRORS of the house generator
     (generate_sst_plots.py _sst_actual_cmap/_sst_anom_cmap). If the

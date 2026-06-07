@@ -71,10 +71,16 @@ SST_ENABLED = (os.environ.get("CYCLOLAB_SST") or "1").lower() \
 # ---------------------------------------------------------------------------
 CRW_BASE = ("https://www.star.nesdis.noaa.gov/pub/sod/mecb/crw/data/5km/"
             "v3.1_op/nc/v1.0/daily")
+FETCH_CONNECT_TIMEOUT = 8
 FETCH_TIMEOUT = 45
 LATENCY_TRIES = 7
 LATEST_PROBE_TTL_S = 1800        # re-probe upstream at most every 30 min
 CACHE_KEEP_DAYS = 3
+# HARD per-call wall-clock budget (adversarial-review find): the writer
+# runs INLINE on the single poll thread - a cold/slow CRW upstream must
+# never stall the other sources or the health heartbeat for minutes.
+CALL_BUDGET_S = 90
+PARTIAL_RETRY_S = 600            # re-try a missing layer (SSTA lag) after
 
 # ---------------------------------------------------------------------------
 # Render geometry: full-bleed, panel-aspect, storm-centered
@@ -159,9 +165,11 @@ def crw_url_for(product: str, d: dt.date) -> str:
 
 
 def fetch_crw_day(product: str, d: dt.date, cache_dir: Path,
-                  session=None) -> Path | None:
-    """Download one CRW daily file, disk-cached (house contract: 45 s
-    timeout, >100 KB validity guard, 404 -> None)."""
+                  session=None, read_timeout: float = FETCH_TIMEOUT
+                  ) -> Path | None:
+    """Download one CRW daily file, disk-cached (house contract:
+    >100 KB validity guard, 404 -> None; connect timeout is short so a
+    black-holed upstream can't eat the poll thread's budget)."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     cp = cache_dir / f"crw_{product}.{d:%Y%m%d}.nc"
     if cp.exists() and cp.stat().st_size > 100_000:
@@ -170,7 +178,8 @@ def fetch_crw_day(product: str, d: dt.date, cache_dir: Path,
         import requests as session  # noqa: PLC0415
     url = crw_url_for(product, d)
     try:
-        r = session.get(url, timeout=FETCH_TIMEOUT)
+        r = session.get(url, timeout=(FETCH_CONNECT_TIMEOUT,
+                                      max(5.0, read_timeout)))
     except Exception as e:  # noqa: BLE001
         log.warning("CRW %s %s fetch error: %s", product, d, e)
         return None
@@ -184,8 +193,11 @@ def fetch_crw_day(product: str, d: dt.date, cache_dir: Path,
 
 def prune_cache(cache_dir: Path, *, today: dt.date) -> None:
     cutoff = today - dt.timedelta(days=CACHE_KEEP_DAYS)
-    for p in cache_dir.glob("crw_*.nc"):
+    for p in list(cache_dir.glob("crw_*.nc")) + \
+            list(cache_dir.glob("crw_*.part")):
         try:
+            # interrupted downloads leave .part orphans - age them out
+            # with the same date stamp (crw_{prod}.{YYYYMMDD}.{ext}).
             stamp = dt.datetime.strptime(
                 p.name.rsplit(".", 2)[-2], "%Y%m%d").date()
             if stamp < cutoff:
@@ -210,10 +222,14 @@ def read_crw_box(path: Path, var_name: str, clat: float, clon: float,
     try:
         if var_name in ds.variables:
             v = ds.variables[var_name]
-        else:  # house fallback: first non-coord var with ndim >= 2
-            v = next(ds.variables[k] for k in ds.variables
-                     if ds.variables[k].ndim >= 2
-                     and k not in ("lat", "lon", "time"))
+        else:
+            # NO loose fallback (adversarial-review find): the CRW
+            # files also carry mask/analysis_error/sea_ice_fraction -
+            # silently rendering one of those as the field would be a
+            # lie. Fail loudly; the per-layer isolation logs + skips.
+            raise KeyError(
+                f"variable {var_name!r} missing from {path.name} "
+                f"(has: {', '.join(ds.variables)})")
         lat = np.asarray(ds.variables["lat"][:], dtype=np.float64)
         lon = np.asarray(ds.variables["lon"][:], dtype=np.float64)
 
@@ -258,8 +274,20 @@ def render_hero_layer(layer: dict, data: np.ndarray, lats: np.ndarray,
                       lons: np.ndarray, *, basin: str, clat: float,
                       clon: float) -> bytes:
     """Render ONE storm-centered hero layer PNG (full-bleed; the storm
-    at the exact canvas center). Pure - returns PNG bytes."""
+    at the exact canvas center). Pure - returns PNG bytes. The figure
+    is ALWAYS closed (try/finally) - a raise mid-render must not leak
+    figures into the long-lived poller process."""
     fig = plt.figure(figsize=(FIG_W_IN, FIG_H_IN), dpi=DPI)
+    try:
+        return _render_hero_layer(fig, layer, data, lats, lons,
+                                  basin=basin, clat=clat, clon=clon)
+    finally:
+        plt.close(fig)
+
+
+def _render_hero_layer(fig, layer: dict, data: np.ndarray,
+                       lats: np.ndarray, lons: np.ndarray, *,
+                       basin: str, clat: float, clon: float) -> bytes:
     ax = fig.add_axes([0, 0, 1, 1])           # FULL BLEED: registration
     ax.set_facecolor(LAND_COLOR)              # no-data == land gray
     LON2, LAT2 = np.meshgrid(lons, lats)
@@ -323,8 +351,7 @@ def render_hero_layer(layer: dict, data: np.ndarray, lats: np.ndarray,
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=DPI)
-    plt.close(fig)
-    return buf.getvalue()
+    return buf.getvalue()       # caller's finally closes the figure
 
 
 class SstHeroWriter:
@@ -347,10 +374,26 @@ class SstHeroWriter:
         self._fetch_day = fetch_day
         self._read_box = read_box
         self._today = today or (lambda: dt.datetime.now(dt.UTC).date())
-        # sid -> {"date": iso, "lat": f, "lon": f}
+        # sid -> {"date": iso, "lat": f, "lon": f,
+        #         "layers": [slugs], "t": monotonic}
         self._state: dict[str, dict] = {}
         # product -> (probed_monotonic, date|None) latest-day cache
         self._latest: dict[str, tuple[float, dt.date | None]] = {}
+        self._deadline = 0.0     # per-call wall-clock budget marker
+
+    def _remaining(self) -> float:
+        import time
+        return self._deadline - time.monotonic()
+
+    def _fetch_budgeted(self, product: str, d: dt.date) -> Path | None:
+        rem = self._remaining()
+        if rem <= 2:
+            return None          # budget spent: the next poll retries
+        try:
+            return self._fetch_day(product, d, self.cache_dir,
+                                   read_timeout=min(FETCH_TIMEOUT, rem))
+        except TypeError:        # injected test fakes without the kwarg
+            return self._fetch_day(product, d, self.cache_dir)
 
     def _latest_day(self, product: str) -> dt.date | None:
         import time
@@ -360,7 +403,11 @@ class SstHeroWriter:
         found = None
         d = self._today() - dt.timedelta(days=1)
         for _ in range(LATENCY_TRIES):
-            if self._fetch_day(product, d, self.cache_dir) is not None:
+            if self._remaining() <= 2:
+                # budget spent mid-walk-back: DON'T negative-cache the
+                # probe - the next call re-tries with a fresh budget.
+                return None
+            if self._fetch_budgeted(product, d) is not None:
                 found = d
                 break
             d -= dt.timedelta(days=1)
@@ -377,19 +424,31 @@ class SstHeroWriter:
     def _maybe_render(self, sid: str, storm: dict, basin: str) -> None:
         if not SST_ENABLED or not hasattr(self.sink, "write_png"):
             return
+        import time
         pts = storm.get("points") or []
         last = pts[-1] if pts else {}
         if last.get("lat") is None or last.get("lon") is None:
             return
         clat, clon = float(last["lat"]), float(last["lon"])
-        sst_day = self._latest_day("sst")
+        st = self._state.get(sid)
+        unmoved = (st is not None
+                   and abs(clat - st["lat"]) < MOVE_TRIG_DEG
+                   and abs(((clon - st["lon"] + 180) % 360) - 180)
+                   < MOVE_TRIG_DEG)
+        complete = (st is not None
+                    and len(st.get("layers") or []) == len(LAYERS))
+        # a PARTIAL family (the SSTA-lags-SST case) retries its missing
+        # layer after a cooldown instead of waiting for the storm to
+        # move or the day to roll (adversarial-review find); within the
+        # cooldown, don't even probe upstream.
+        if (unmoved and st is not None and not complete
+                and time.monotonic() - st.get("t", 0) < PARTIAL_RETRY_S):
+            return
+        self._deadline = time.monotonic() + CALL_BUDGET_S
+        sst_day = self._latest_day("sst")   # TTL-cached: cheap when warm
         if sst_day is None:
             return
-        st = self._state.get(sid)
-        if (st is not None and st["date"] == sst_day.isoformat()
-                and abs(clat - st["lat"]) < MOVE_TRIG_DEG
-                and abs(((clon - st["lon"] + 180) % 360) - 180)
-                < MOVE_TRIG_DEG):
+        if unmoved and st["date"] == sst_day.isoformat() and complete:
             return
 
         prune_cache(self.cache_dir, today=self._today())
@@ -400,8 +459,7 @@ class SstHeroWriter:
                        else self._latest_day(layer["product"]))
                 if day is None:
                     continue
-                path = self._fetch_day(layer["product"], day,
-                                       self.cache_dir)
+                path = self._fetch_budgeted(layer["product"], day)
                 if path is None:
                     continue
                 data, lats, lons = self._read_box(
@@ -433,6 +491,8 @@ class SstHeroWriter:
             "layers": written,
         })
         self._state[sid] = {"date": sst_day.isoformat(),
-                            "lat": clat, "lon": clon}
+                            "lat": clat, "lon": clon,
+                            "layers": [x["slug"] for x in written],
+                            "t": time.monotonic()}
         log.info("sst hero %s: %d layer(s) @ %.1f,%.1f (%s)",
                  sid, len(written), clat, clon, sst_day)

@@ -151,11 +151,13 @@ class CycloLabPageWriter:
             st = self._state.get(sid)
             cat = storm.get("current_category") or "TD"
             fix = storm.get("latest_fix_valid_utc")
+            # SST hero layers ride EVERY poll, not just page rewrites:
+            # maybe_render self-gates cheaply (state + TTL'd probe) and
+            # that lets a partial family (SSTA lagging SST) heal between
+            # fixes (adversarial-review find). Best-effort by contract.
+            if self._sst is not None:
+                self._sst.maybe_render(sid, storm, basin)
             if st is None or st["ended"] or st["cat"] != cat or st["fix"] != fix:
-                # SST hero layers FIRST (the freshly baked page + the
-                # hydration poll both read them; best-effort either way).
-                if self._sst is not None:
-                    self._sst.maybe_render(sid, storm, basin)
                 html = render_page(storm, feed_url=feed_url,
                                    adv_url=self._adv_url(sid),
                                    og_image_url=self._og_url(sid),

@@ -785,7 +785,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div class="hafs-stage" id="sat-stage">
           <img id="sat-img" alt="Storm floater satellite frame">
-          <canvas id="sat-canvas" style="display:none"
+          <canvas id="sat-canvas" style="display:none" role="img"
                   aria-label="Storm floater satellite frame"></canvas>
           <div id="sat-status" class="hafs-statusbox">
             <div class="hafs-spinner"></div><span>Loading…</span></div>
@@ -1536,6 +1536,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       advTypeWord = DEV_WORD[adv.points[0].dev_label];
       document.getElementById("storm-type").textContent =
         advTypeWord.toUpperCase();
+      // the hero sub-title rides the same word - sync it now instead
+      // of waiting for the next fix (adversarial-review find).
+      var hs = document.getElementById("sst-hero-sub");
+      if (hs && lastStorm) {
+        hs.textContent = advTypeWord.toUpperCase() + " " +
+          (lastStorm.name || "").toUpperCase();
+      }
     }
     var note = document.getElementById("cone-note");
     if (note && coneRing) {
@@ -1740,24 +1747,6 @@ HTML_TEMPLATE = r"""<!doctype html>
                                     tp[1][1] - tp[0][1]] : lastSeg;
     var fsLen = Math.max(1e-6, Math.hypot(firstSeg[0], firstSeg[1]));
     var ringPx = coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; });
-    function distToTrack(x, y) {
-      var best = Infinity;
-      for (var si = 1; si < tp.length; si++) {
-        var ax = tp[si - 1][0], ay = tp[si - 1][1];
-        var bx2 = tp[si][0], by2 = tp[si][1];
-        var ex = bx2 - ax, ey = by2 - ay;
-        var L2 = ex * ex + ey * ey;
-        var t2 = L2 ? Math.max(0, Math.min(1,
-            ((x - ax) * ex + (y - ay) * ey) / L2)) : 0;
-        var qx = ax + ex * t2, qy = ay + ey * t2;
-        best = Math.min(best, Math.hypot(x - qx, y - qy));
-      }
-      return best;
-    }
-    var halfW = 0;
-    ringPx.forEach(function (q) {
-      halfW = Math.max(halfW, distToTrack(q[0], q[1]));
-    });
     // rear/forward extents: how far the ring reaches BEHIND the first
     // track point / BEYOND the last one (signed projection onto the
     // end-segment directions).
@@ -1783,6 +1772,14 @@ HTML_TEMPLATE = r"""<!doctype html>
                                         tpExt[ci][1] - tpExt[ci - 1][1]));
     }
     var Ltot = cum[cum.length - 1];
+    // DEGENERATE TRACK (adversarial-review find): a fully-stationary
+    // forecast (every point at the same position) collapses the end
+    // segments to [0,0], the extensions to nothing and Ltot to 0 -
+    // halfAt would index samples[NaN] and the swallowed throw left the
+    // cone clipped against an EMPTY path (invisible fill+casing, null
+    // hooks). No growth axis exists, so there is nothing to reveal:
+    // render the finished cone unclipped, no reveal choreography.
+    var revealDegenerate = !(Ltot > 1) || !isFinite(Ltot);
     // forecast-point arc distances in the EXTENDED frame (icons pop
     // when the front tip passes them; index 0 of cum is the rear point)
     var cumIcons = pts.map(function (_, i) { return cum[i + 1]; });
@@ -1845,6 +1842,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                      w: Math.max(CORR_MIN, wMax + CORR_PAD) });
     }
     function halfAt(d) {
+      if (!(sampStep > 0)) return CORR_MIN;  // degenerate-track guard
       d = Math.max(0, Math.min(Ltot, d));
       var j3 = Math.min(SAMP - 2, Math.floor(d / sampStep));
       var f3 = (d - samples[j3].d) / sampStep;
@@ -1952,7 +1950,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<defs>' + gdefs + '<clipPath id="ac-reveal-clip" ' +
       'clipPathUnits="userSpaceOnUse">' +
       '<path class="ac-reveal-path" d=""/></clipPath></defs>');
-    parts.push('<g class="ac-conegrp" clip-path="url(#ac-reveal-clip)">' +
+    // a degenerate track has no growth axis: the group ships UNCLIPPED
+    // (the finished cone IS the only frame).
+    parts.push('<g class="ac-conegrp"' +
+      (revealDegenerate ? '' : ' clip-path="url(#ac-reveal-clip)"') + '>' +
       '<path d="' + dC + '" fill="rgba(205,228,255,0.13)" ' +
       'stroke="#0a1a2e" stroke-width="4.5"/>' +
       '<path d="' + dC + '" fill="none" stroke="#dceaff" ' +
@@ -2063,11 +2064,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       var col = tropical ? (SSHS[cat] || SSHS.TD) : "#ffffff";
       // pops ride the wavefront EXACTLY: the cap tip sits at the
       // front distance, so delay = hold + grow * invease(d_i / L)
-      // (d_i measured in the rear-extended frame - cumIcons).
+      // (d_i measured in the rear-extended frame - cumIcons). A
+      // degenerate track has no wavefront: plain index stagger.
       var delayMs = (i === 0)
         ? 400
-        : Math.round(HOLD_MS + GROW_MS *
-                     invEaseS(Math.max(0.02, cumIcons[i] / Ltot)));
+        : (revealDegenerate
+           ? 600 + i * 150
+           : Math.round(HOLD_MS + GROW_MS *
+                        invEaseS(Math.max(0.02, cumIcons[i] / Ltot))));
       var scale = (i === 0 ? 0.95 : 0.42);   // NOW is the hero (#6)
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
@@ -2208,7 +2212,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     // its immediate-rAF stub would otherwise spin the loop.)
     if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
     var revealPath = svg.querySelector(".ac-reveal-path");
-    if (!reduced && grp.animate) {
+    if (revealDegenerate) {
+      // no growth axis: ships unclipped above; honest static hooks.
+      grp.setAttribute("data-reveal", "final");
+      coneHooks = {
+        seek: function () {
+          return { d: 0, Ltot: 0, degenerate: true, W: W, H: H };
+        },
+        settle: function () {
+          return { Ltot: 0, degenerate: true, W: W, H: H };
+        }
+      };
+    } else if (!reduced && grp.animate) {
       revealPath.setAttribute("d", polyAt(0));
       grp.setAttribute("data-reveal", "animated");
       var t0 = performance.now() + HOLD_MS;
@@ -2234,8 +2249,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     // front at an exact arc fraction, or jump to the settled frame.
     // Pure geometry through the same polyAt the rAF clock drives -
     // the per-frame casing test extracts frames through these instead
-    // of racing wall-clock animation.
-    coneHooks = {
+    // of racing wall-clock animation. (Degenerate tracks installed
+    // their static hooks above.)
+    if (!revealDegenerate) coneHooks = {
       seek: function (f) {
         if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
         var d = Math.max(0, Math.min(1, f)) * Ltot;
@@ -2535,7 +2551,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!f) return null;
     var u = CDN + "/" + f.key;
     var e = sat.bmp[u];
-    if (e) return e.bm;
+    if (e) {
+      // LRU refresh (adversarial-review find): a hit moves the key to
+      // the ring's young end, so steady playback can never evict the
+      // frames the clock is about to present.
+      var ki = sat.bmpKeys.indexOf(u);
+      if (ki >= 0 && ki !== sat.bmpKeys.length - 1) {
+        sat.bmpKeys.splice(ki, 1);
+        sat.bmpKeys.push(u);
+      }
+      return e.bm;
+    }
     e = sat.bmp[u] = { bm: null };
     sat.bmpKeys.push(u);
     fetch(u).then(function (r) { return r.ok ? r.blob() : null; })
@@ -2641,6 +2667,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   function satSelectBand(slug, keepTime) {
     var prevT = (keepTime && sat.frames.length) ? sat.frames[sat.idx].t : null;
     sat.band = slug;
+    sat.gen++;          // invalidate in-flight waitBlits on BOTH paths
     var b = (sat.man && sat.man.bands && sat.man.bands[slug]) || null;
     // STRICTLY CHRONOLOGICAL + DEDUPED within the band (final-gate #4):
     // playback order is a hard guarantee here, not an upstream promise.
@@ -2656,10 +2683,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     satEl("scrub").max = String(Math.max(0, sat.frames.length - 1));
     satEl("band-label").textContent = b ? (b.label || slug) : "";
     // a band key can survive a server-side prune with zero frames left:
-    // honest per-band empty state instead of freezing on the old frame.
+    // honest per-band empty state instead of freezing on the old frame
+    // (canvas path included - the blitted pixels would otherwise stay).
     satEl("empty").style.display = sat.frames.length ? "none" : "block";
     if (!sat.frames.length) {
       satEl("img").removeAttribute("src");
+      var cv0 = satEl("canvas");
+      if (cv0) cv0.style.display = "none";
       satEl("time").textContent = "\u2014";
     }
     var host = satEl("bands");
@@ -2760,11 +2790,15 @@ HTML_TEMPLATE = r"""<!doctype html>
   }];
   function initSatellite() {
     satStatus(true, "Loading\u2026");
+    // PER-SOURCE isolation (adversarial-review find): one source's
+    // throwing resolve() or rejected fetch must neither kill the other
+    // sources nor strand the spinner - each entry settles to null on
+    // failure, and the terminal catch lands on the honest empty state.
     Promise.all(SAT_SOURCES.map(function (src) {
       return fetchJson(src.top).then(function (top) {
         var mu = top && src.resolve(top);
         return mu ? fetchJson(mu) : null;
-      });
+      }).catch(function () { return null; });
     })).then(function (mans) {
       var bands = {}, got = false;
       mans.forEach(function (man) {
@@ -2823,6 +2857,11 @@ HTML_TEMPLATE = r"""<!doctype html>
           satTogglePlay(); e.preventDefault();
         }
       });
+    }).catch(function () {
+      // never strand the spinner: any unexpected throw in the band
+      // build lands on the honest empty state.
+      satStatus(false);
+      satEl("empty").style.display = "block";
     });
   }
 

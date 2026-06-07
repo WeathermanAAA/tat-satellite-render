@@ -1,0 +1,18 @@
+# Dev/test-only dependencies (NOT installed on Railway).
+#
+# The two headline FG-R2 visual contracts - the cone-casing per-frame
+# pixel probe and the satellite presented-frame cadence - run REAL
+# engines and skip cleanly when these are missing (HAVE_RENDERER gate
+# in tests/test_cyclolab_visual.py). That skip is silent by design for
+# the jsdom-only quick loop, so: ANY visual sign-off or deploy gate
+# MUST run with this file installed, plus browsers:
+#
+#   pip install -r requirements-dev.txt
+#   python -m playwright install chromium webkit
+#
+# The jsdom harness additionally needs node + the jsdom package on
+# NODE_PATH (see tests/test_cyclolab_shell.py header).
+pytest>=8
+playwright>=1.49
+Pillow>=11.0
+numpy>=2.1

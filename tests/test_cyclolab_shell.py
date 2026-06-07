@@ -1139,6 +1139,41 @@ class TestConeCorridorContainment(unittest.TestCase):
             f"corridor (first: {outside[:3]}) - the settle frame would "
             f"pop them in")
 
+    def test_stationary_forecast_renders_unclipped_cone(self):
+        # adversarial-review find (reproduced crash): a fully-
+        # stationary forecast (every point identical) collapses the
+        # growth axis to Ltot=0; halfAt used to index samples[NaN] and
+        # the swallowed throw left the cone clipped against an EMPTY
+        # path - invisible fill+casing, null hooks. Now: no growth
+        # axis means nothing to reveal - the finished cone ships
+        # UNCLIPPED with index-staggered pops.
+        pts = [{"tau_h": t, "lat": 15.0, "lon": -135.0,
+                "intensity_kt": 30, "dev_label": "TS", "valid_utc": "x"}
+               for t in (0, 12, 24, 48)]
+        ring = [[-137.0, 13.0], [-133.0, 13.0], [-133.0, 17.0],
+                [-137.0, 17.0], [-137.0, 13.0]]
+        adv = {"sid": "NHC_EP082026", "advisory": 9,
+               "issued_utc": "2026-06-06T21:00:00Z", "source": "nhc",
+               "method": "official-cone", "cone": ring, "points": pts,
+               "text": {"tcp": "X", "tcd": "Y"}}
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": 0.5}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        # the cone RENDERED (fill+casing present, not clipped away)
+        self.assertEqual(a["coneClip"], "none")
+        self.assertEqual(a["coneReveal"], "final")
+        self.assertGreater(len(a["coneOutlineD"]), 40)
+        self.assertEqual(a["coneIcons"], 4)
+        self.assertFalse(a["coneEmptyShown"])
+        # hooks exist and answer honestly (degenerate, no throw)
+        self.assertTrue(a["coneHooks"])
+        self.assertTrue(a["coneSeek"] and a["coneSeek"].get("degenerate"))
+        # pop delays are real numbers (no NaN animation-delay)
+        for d in a["coneIconsDetail"]:
+            self.assertTrue(d["delay"] >= 0.3, d)
+
     def test_partial_seek_clips_strictly_less(self):
         # teeth: the containment test CAN fail - a part-grown corridor
         # must leave forward ring vertices outside.
@@ -1158,6 +1193,36 @@ class TestConeCorridorContainment(unittest.TestCase):
         # seeking re-arms the clip attribute (jsdom boots at 'final')
         self.assertIn("ac-reveal-clip", a["coneClip"])
         self.assertGreater(a["coneRevealPathLen"], 100)
+
+    def test_seek_tip_advances_along_the_track(self):
+        # NOT self-referential (adversarial-review find): the tip must
+        # MOVE between seeks and the clip polygon must actually grow -
+        # checked against the emitted geometry, not seek's own math.
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": self.adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": 0.25},
+                    {"op": "coneSeek", "f": 0.75}]})
+        a25 = recs[-2]["state"]["stage3"]["adv"]
+        a75 = recs[-1]["state"]["stage3"]["adv"]
+        s25, s75 = a25["coneSeek"], a75["coneSeek"]
+        moved = ((s75["tipX"] - s25["tipX"]) ** 2 +
+                 (s75["tipY"] - s25["tipY"]) ** 2) ** 0.5
+        self.assertGreater(moved, 50,
+                           "the front tip barely moved between f=0.25 "
+                           "and f=0.75")
+        # the revealed polygon AREA grows with f (shoelace on the
+        # emitted clip path - independent of the hook's return values)
+        def area(d):
+            pts = _parse_pairs(d, " ")
+            s = 0.0
+            for i in range(len(pts)):
+                x1, y1 = pts[i]
+                x2, y2 = pts[(i + 1) % len(pts)]
+                s += x1 * y2 - x2 * y1
+            return abs(s) / 2
+        self.assertGreater(area(a75["coneRevealD"]),
+                           area(a25["coneRevealD"]) * 1.5)
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
@@ -1180,7 +1245,7 @@ class TestConnectorRule(unittest.TestCase):
             "ops": [{"op": "applyAdvisory", "adv": adv},
                     {"op": "openSec", "name": "advisories"}]})
         a = recs[-1]["state"]["stage3"]["adv"]
-        return a["conePlacards"], a["coneLeaders"]
+        return a["conePlacards"], a["coneLeaders"], a["coneLeaderLines"]
 
     def _assert_rule(self, pls, leaders, label):
         self.assertTrue(pls, f"{label}: no placards")
@@ -1196,8 +1261,22 @@ class TestConnectorRule(unittest.TestCase):
                 f"disagrees with the rule")
 
     def test_rule_holds_on_the_live_official_cone(self):
-        pls, leaders = self._placards(self.live_adv)
+        pls, leaders, lines = self._placards(self.live_adv)
         self._assert_rule(pls, leaders, "live-official")
+        # the gap MEASUREMENT itself (adversarial-review find): a
+        # leader line runs glyph-center -> placard-center, so its
+        # length must equal gap + iconR - an INDEPENDENT check of the
+        # displacement formula, not just rule self-consistency.
+        by_i = {p["i"]: p for p in pls}
+        self.assertTrue(lines, "no leader lines to validate against")
+        for ln in lines:
+            p = by_i[ln["i"]]
+            length = ((ln["x2"] - ln["x1"]) ** 2 +
+                      (ln["y2"] - ln["y1"]) ** 2) ** 0.5
+            self.assertAlmostEqual(
+                length, p["gap"] + p["iconr"], delta=0.5,
+                msg=f"placard {ln['i']}: leader length {length:.1f} != "
+                    f"gap {p['gap']} + iconR {p['iconr']}")
 
     def test_rule_holds_when_bunched_taus_force_displacement(self):
         pts = [
@@ -1210,7 +1289,7 @@ class TestConnectorRule(unittest.TestCase):
                "issued_utc": "2026-06-06T21:00:00Z", "source": "nhc",
                "method": "official-cone", "cone": ring, "points": pts,
                "text": {"tcp": "X", "tcd": "Y"}}
-        pls, leaders = self._placards(adv)
+        pls, leaders, _lines = self._placards(adv)
         self._assert_rule(pls, leaders, "bunched")
         # bunching must actually displace SOME placard past the rule -
         # otherwise this case proves nothing.
@@ -1225,10 +1304,14 @@ class TestMesoSectorSeam(unittest.TestCase):
     Seam only - one source today."""
 
     def test_registry_exists_with_the_floater_entry(self):
+        # STRUCTURAL markers only (a comment reword must not break the
+        # suite): the registry literal, the floater entry, its resolver
+        # hook, and the viewer iterating the registry.
         html = cyclolab_shell.render_page(load_storm(), feed_url=FEED_URL)
         self.assertIn("var SAT_SOURCES = [{", html)
         self.assertIn('id: "floater"', html)
-        self.assertIn("MESOSCALE SECTORS join as a", html)
+        self.assertIn("resolve: function (top)", html)
+        self.assertIn("SAT_SOURCES.map(", html)
 
 
 if __name__ == "__main__":

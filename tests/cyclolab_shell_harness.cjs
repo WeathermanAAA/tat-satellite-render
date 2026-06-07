@@ -308,6 +308,13 @@ const scheduledDelays = [];
       coneLeaders: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll('line[data-role="leader"]'),
         (l) => parseInt(l.getAttribute("data-for"), 10)) : [],
+      coneLeaderLines: coneSvg ? Array.prototype.map.call(
+        coneSvg.querySelectorAll('line[data-role="leader"]'),
+        (l) => ({ i: parseInt(l.getAttribute("data-for"), 10),
+                  x1: parseFloat(l.getAttribute("x1")),
+                  y1: parseFloat(l.getAttribute("y1")),
+                  x2: parseFloat(l.getAttribute("x2")),
+                  y2: parseFloat(l.getAttribute("y2")) })) : [],
       coneLand: coneSvg
         ? coneSvg.querySelectorAll(".ac-land").length : 0,
       coneGraticule: coneSvg
@@ -487,8 +494,11 @@ const scheduledDelays = [];
     out.push({ op: op.op, state: snapshot() });
   }
 
-  process.stdout.write(out.map((o) => JSON.stringify(o)).join("\n") + "\n");
-  process.exit(0);
+  // exit ONLY after stdout flushes - process.exit() truncates large
+  // writes (the cone path snapshots exceed the pipe buffer).
+  process.stdout.write(
+    out.map((o) => JSON.stringify(o)).join("\n") + "\n",
+    () => process.exit(0));
 })().catch((e) => {
   process.stderr.write(String(e && e.stack || e) + "\n");
   process.exit(1);

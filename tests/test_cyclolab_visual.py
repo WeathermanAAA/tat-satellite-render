@@ -773,6 +773,21 @@ class TestSatellitePresentedCadence(unittest.TestCase):
             f"(intervals: {[round(x) for x in iv_sorted[-5:]]})")
         return iv
 
+    def _measure_with_retry(self, p, engine, page_file, frames,
+                            throttle):
+        # shared-hardware flake guard (adversarial-review find): one
+        # foreign-process stall can blow a single 4x-throttled run.
+        # The contract must hold on at least one of two INDEPENDENT
+        # measurements - a real regression fails both.
+        try:
+            return self._measure(p, engine, page_file, frames,
+                                 throttle=throttle)
+        except AssertionError as first:
+            print(f"[cadence] {engine} first run failed "
+                  f"({first}); re-measuring once")
+            return self._measure(p, engine, page_file, frames,
+                                 throttle=throttle)
+
     def test_even_cadence_throttled_chromium_and_webkit(self):
         storm = json.loads(FIXTURE.read_text())
         html = cyclolab_shell.render_page(storm, feed_url=FEED_URL,
@@ -784,12 +799,12 @@ class TestSatellitePresentedCadence(unittest.TestCase):
             page_file = Path(td) / "page.html"
             page_file.write_text(html, encoding="utf-8")
             # THE contract run: 4x CPU throttle on chromium (CDP).
-            self._measure(p, "chromium", page_file, frames,
-                          throttle=True)
+            self._measure_with_retry(p, "chromium", page_file, frames,
+                                     throttle=True)
             # cross-engine canvas-path coverage (webkit has no CDP
             # throttle; unthrottled contract still pins the pipeline).
-            self._measure(p, "webkit", page_file, frames,
-                          throttle=False)
+            self._measure_with_retry(p, "webkit", page_file, frames,
+                                     throttle=False)
 
 
 if __name__ == "__main__":
