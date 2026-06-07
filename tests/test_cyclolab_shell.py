@@ -1534,29 +1534,15 @@ class TestOverviewPlots(unittest.TestCase):
         self.assertIn("mph", ov["trackNote"])
 
     # ---- #8 wind-history swath plot -------------------------------------
-    def test_swath_renders_both_treatments(self):
-        recs = self._ov([
-            {"op": "apply", "storm": self.storm},
-            {"op": "clickSwathTreatment", "treatment": "outlined"},
-            {"op": "clickSwathTreatment", "treatment": "filled"}])
-        applied = recs[0]["state"]["overview"]
-        outlined = recs[1]["state"]["overview"]
-        filled = recs[2]["state"]["overview"]
-        # default treatment is "filled".
-        self.assertEqual(applied["swathTreatment"], "filled")
+    def test_swath_renders_filled(self):
+        # FG-R3 verdict 2: the swath ALWAYS renders filled - the outlined /
+        # hatched variant and its toggle were dropped entirely. Both the
+        # 34-kt field and the 64-kt core render as filled bands.
+        recs = self._ov([{"op": "apply", "storm": self.storm}])
+        applied = recs[-1]["state"]["overview"]
         self.assertTrue(applied["swathRendered"])
         self.assertGreater(applied["swath34"], 0)
         self.assertGreater(applied["swath64"], 0)
-        self.assertEqual(applied["swathHatch"], 0)   # filled has no hatch
-        # OUTLINED treatment: both regions still render, plus hatch patterns.
-        self.assertEqual(outlined["swathTreatment"], "outlined")
-        self.assertGreater(outlined["swath34"], 0)
-        self.assertGreater(outlined["swath64"], 0)
-        self.assertGreater(outlined["swathHatch"], 0)
-        # toggling back to filled re-renders filled, no hatch.
-        self.assertEqual(filled["swathTreatment"], "filled")
-        self.assertEqual(filled["swathHatch"], 0)
-        self.assertGreater(filled["swath34"], 0)
 
     def test_swath_derived_caption_and_method_panel(self):
         st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
@@ -1585,14 +1571,6 @@ class TestOverviewPlots(unittest.TestCase):
         # the derived caption + method panel stay hidden in the empty state.
         self.assertFalse(ov["swathDerivedShown"])
         self.assertFalse(ov["swathMethodShown"])
-
-    def test_swath_seg_control_default_filled(self):
-        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
-        seg = st["overview"]["swathSeg"]
-        self.assertEqual([s["treatment"] for s in seg],
-                         ["filled", "outlined"])
-        active = [s["treatment"] for s in seg if s["active"]]
-        self.assertEqual(active, ["filled"])
 
     # ---- #11 two-column Overview layout ---------------------------------
     def test_overview_two_column_grid(self):

@@ -563,6 +563,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
   .ac-ocean { fill: rgba(202,217,240,0.14); font-size: 17px;
     font-weight: 700; letter-spacing: 4.5px; }
+  /* subtle dark backing so the white head always reads clean over any
+     swath fill / track ring that bleeds into the lockup corner (one canon,
+     both overview plots). Matches the dark-on-ocean read the cone gets. */
+  .ac-title-bg { fill: rgba(8,13,22,0.74); stroke: rgba(44,58,82,0.5);
+    stroke-width: 1; }
   .ac-title .ac-eyebrow { fill: #8fa2bd; font-size: 11.5px;
     font-weight: 700; letter-spacing: 1.6px; }
   .ac-title .ac-head { fill: #ffffff; font-size: 21px;
@@ -625,7 +630,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-variant-numeric: tabular-nums; }
   .tp-field-key-u { fill: #8ea2bd; font-size: 11px; }
   .tp-radii-lab { fill: #aebdd4; font-size: 11px; font-weight: 600; }
-  .sw-seg-host { display: flex; gap: 0; margin: 0 0 11px; }
   .sw-caption-d { display: inline-block; margin: 8px 0 0;
     font-size: 10.5px; font-weight: 700; letter-spacing: 0.8px;
     color: #9fc6f5; text-transform: uppercase; }
@@ -861,8 +865,6 @@ HTML_TEMPLATE = r"""<!doctype html>
                preserveAspectRatio="xMidYMid meet"></svg>
           <div class="note" id="trackplot-note"></div></div>
         <div class="card" id="card-swath">
-          <div class="hafs-seg-group sw-seg-host" id="swath-seg"
-               role="group" aria-label="Swath treatment"></div>
           <svg id="swathplot" viewBox="0 0 1000 620"
                preserveAspectRatio="xMidYMid meet"></svg>
           <div class="sw-empty" id="swath-empty" style="display:none"></div>
@@ -1821,6 +1823,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     return parts;
   }
 
+  // ONE wind-tier palette, used by BOTH overview plots (FG-R3 verdict 1).
+  // These are the canonical SSHS house tokens (== ace_core.SSHS_COLORS /
+  // the inline SSHS var): 34 kt = TS GREEN, 50 kt = C1 GOLD, 64 kt = C3 RED.
+  // The track-plot wind-field rings AND the wind-swath fills both read
+  // through tierRGBA() so the rgba is never hardcoded twice.
+  var WIND_TIER = { "34": [70, 197, 106],     // TS green  #46c56a
+                    "50": [255, 225, 77],     // C1 gold   #ffe14d
+                    "64": [255, 77, 59] };    // C3 red    #ff4d3b
+  function tierRGBA(tier, a) {
+    var c = WIND_TIER[String(tier)] || [255, 255, 255];
+    return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")";
+  }
+  function tierHex(tier) {
+    var c = WIND_TIER[String(tier)] || [255, 255, 255];
+    return "#" + c.map(function (v) {
+      return ("0" + v.toString(16)).slice(-2); }).join("");
+  }
+
   // in-plot title lockup (mirror the cone's ac-title #5) at a top corner.
   function titleLockup(pr, head) {
     var stormName = (document.getElementById("storm-name") || {})
@@ -1829,7 +1849,21 @@ HTML_TEMPLATE = r"""<!doctype html>
       .textContent || (document.getElementById("chip") || {})
       .textContent || "";
     var tx0 = 18, ty0 = 16, TIT_H = 70;
+    // sub line width drives the backing box width (eyebrow + head are
+    // shorter); ~ a char-width estimate at the sub's 13px/700.
+    var subTxt = (typeWord.toUpperCase() + " " + stormName.toUpperCase());
+    var headW = head.length * 13.5 + 4;          // head @ 21px/800
+    var subW = subTxt.length * 8.2 + 4;          // sub  @ 13px/700
+    var bgW = Math.max(headW, subW, 160) + 22;
+    // SUBTLE DARK BACKING (one lockup canon): a faint rounded panel UNDER
+    // the eyebrow/head/sub so the white head always reads clean even when a
+    // swath fill or track ring bleeds into this corner - the same guarantee
+    // the cone gets from collision-placing its lockup over open ocean. The
+    // lockup is always emitted LAST by each renderer, so it is on top.
     return '<g class="ac-title">' +
+      '<rect class="ac-title-bg" x="' + (tx0 - 13) + '" y="' + (ty0 - 4) +
+      '" width="' + bgW.toFixed(0) + '" height="' + (TIT_H + 8) +
+      '" rx="8"/>' +
       '<rect x="' + (tx0 - 9.5) + '" y="' + ty0 +
       '" width="3" height="' + TIT_H +
       '" rx="1.5" fill="var(--cat-accent)"/>' +
@@ -1964,10 +1998,11 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     // current wind-field arcs (drawn BEFORE the track dots / hero marker so
     // the marker sits on top but the arcs fan visibly beyond it). Three
-    // color-tiered rings, ~2px strokes, bright on the dark canvas:
-    //   34 kt = cool/dim blue (outer), 50 kt = mid cyan, 64 kt = warm amber
-    //   (inner, brightest). Each non-empty tier gets an outer-edge label and
-    //   an entry in a tiny inline key.
+    // color-tiered rings, ~2px strokes, bright on the dark canvas, all from
+    // the ONE house wind-tier palette (verdict 1 - same hues the swath uses):
+    //   34 kt = TS green (outer), 50 kt = C1 gold, 64 kt = C3 red (inner).
+    //   Each non-empty tier gets an outer-edge label and an entry in a tiny
+    //   inline key. tiers = [thr, fill, stroke, strokeWidth, labelHex, bearing]
     var hasField = false;
     var fieldKey = [];
     if (lastRad) {
@@ -1975,12 +2010,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       // so the three numbers fan AROUND the ring instead of stacking on one
       // edge: 34 -> NE, 50 -> E, 64 -> N.
       var tiers = [
-        ["34", "rgba(70,150,255,0.10)", "rgba(96,176,255,0.95)", 2,
-          "#7cb4ff", 50],
-        ["50", "rgba(40,220,230,0.12)", "rgba(54,232,238,0.97)", 2,
-          "#46e6ee", 95],
-        ["64", "rgba(255,170,60,0.16)", "rgba(255,196,84,1)", 2.2,
-          "#ffc454", 10]];
+        ["34", tierRGBA("34", 0.12), tierRGBA("34", 0.95), 2,
+          tierHex("34"), 50],
+        ["50", tierRGBA("50", 0.14), tierRGBA("50", 0.97), 2,
+          tierHex("50"), 95],
+        ["64", tierRGBA("64", 0.18), tierRGBA("64", 1), 2.2,
+          tierHex("64"), 10]];
       var coslat = Math.max(0.2, Math.cos(last.lat * Math.PI / 180));
       var ccx = pr.X(last.lon), ccy = pr.Y(last.lat);
       tiers.forEach(function (t) {
@@ -2144,7 +2179,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   // ---------------------------------------------------------------- #8
-  var swathTreatment = "filled";          // default = filled (item 8)
+  // The swath ALWAYS renders FILLED (verdict 2 - the outlined/hatched
+  // variant was dropped; filled won). No treatment toggle.
   function renderSwathPlot(storm) {
     var svg = document.getElementById("swathplot");
     var empty = document.getElementById("swath-empty");
@@ -2253,47 +2289,25 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     var sw34 = sweep("34");
     var sw64 = sweep("64");
-    var hatchDefs = "";
-    if (swathTreatment === "outlined") {
-      hatchDefs =
-        '<defs>' +
-        '<pattern id="sw-hatch34" width="8" height="8" ' +
-        'patternUnits="userSpaceOnUse" patternTransform="rotate(45)">' +
-        '<line x1="0" y1="0" x2="0" y2="8" stroke="rgba(63,164,255,0.5)" ' +
-        'stroke-width="1.4"/></pattern>' +
-        '<pattern id="sw-hatch64" width="6" height="6" ' +
-        'patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">' +
-        '<line x1="0" y1="0" x2="0" y2="6" stroke="rgba(120,255,210,0.85)" ' +
-        'stroke-width="1.4"/></pattern></defs>';
-    }
-    parts.push(hatchDefs);
 
-    function emitSwath(polys, treatment, fillKey) {
+    // The swath ALWAYS renders FILLED (verdict 2). CLEAN SOLID translucent
+    // bands, NO per-polygon stroke: the swept sectors are all wound the same
+    // way so fill-rule="nonzero" unions every overlap into one seam-free
+    // shape. House GREEN for the 34-kt tropical-storm field; a solid RED core
+    // for the 64-kt hurricane wind on top (verdict 1 - the SAME tier palette
+    // the track rings use). The two read at a glance: green field, red core.
+    // (Any stroke here re-draws every sub-polygon edge -> a mesh.)
+    function emitSwath(polys, fillKey) {
       if (!polys.length) return;
       var d = polys.join(" ");
-      if (treatment === "filled") {
-        // CLEAN SOLID translucent band: NO per-polygon stroke. The swept
-        // sectors are all wound the same way so fill-rule="nonzero" unions
-        // every overlap into one seam-free shape. Opaque-enough house blue
-        // for the 34-kt envelope; a brighter solid cyan core for 64 kt on
-        // top. (Any stroke here re-draws every sub-polygon edge -> a mesh.)
-        var fill = fillKey === "34" ? "rgba(63,164,255,0.52)"
-                                    : "rgba(90,238,255,0.66)";
-        parts.push('<path class="sw-' + fillKey + '" d="' + d +
-          '" fill="' + fill +
-          '" fill-rule="nonzero" stroke="none"/>');
-      } else {
-        var hatch = fillKey === "34" ? "url(#sw-hatch34)"
-                                     : "url(#sw-hatch64)";
-        parts.push('<path class="sw-' + fillKey + '" d="' + d +
-          '" fill="' + hatch + '" fill-rule="nonzero" stroke="' +
-          (fillKey === "34" ? "rgba(99,160,235,0.9)"
-                            : "rgba(150,245,255,0.95)") +
-          '" stroke-width="' + (fillKey === "34" ? 1.4 : 1.8) + '"/>');
-      }
+      var fill = fillKey === "34" ? tierRGBA("34", 0.5)
+                                  : tierRGBA("64", 0.66);
+      parts.push('<path class="sw-' + fillKey + '" d="' + d +
+        '" fill="' + fill +
+        '" fill-rule="nonzero" stroke="none"/>');
     }
-    emitSwath(sw34, swathTreatment, "34");
-    emitSwath(sw64, swathTreatment, "64");
+    emitSwath(sw34, "34");
+    emitSwath(sw64, "64");
 
     // a faint center track for context.
     var tp = pts.map(function (p) { return [pr.X(p.lon), pr.Y(p.lat)]; });
@@ -2322,42 +2336,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (note) {
       note.textContent =
         "Cumulative tropical-storm-force (34 " + windUnitLabel() +
-        ") swath" + (sw64.length ? ", with hurricane-force (64 " +
-        windUnitLabel() + ") core overlaid," : "") +
+        ", green) swath" + (sw64.length ? ", with hurricane-force (64 " +
+        windUnitLabel() + ", red) core overlaid," : "") +
         " swept from the analyzed quadrant wind radii along the observed " +
         "track. Derived from best-track deck radii — not an official " +
         "NHC wind-swath product.";
     }
-  }
-
-  function swathSetTreatment(t) {
-    if (t !== "filled" && t !== "outlined") return;
-    swathTreatment = t;
-    var host = document.getElementById("swath-seg");
-    if (host) {
-      for (var i = 0; i < host.children.length; i++) {
-        var b = host.children[i];
-        b.classList.toggle("active",
-          b.getAttribute("data-treatment") === t);
-      }
-    }
-    if (lastStorm) {
-      try { renderSwathPlot(lastStorm); } catch (e) {}
-    }
-  }
-
-  function buildSwathSeg() {
-    var host = document.getElementById("swath-seg");
-    if (!host || host.children.length) return;
-    [["filled", "Filled"], ["outlined", "Outlined"]].forEach(function (o) {
-      var b = document.createElement("button");
-      b.className = "hafs-seg" + (o[0] === swathTreatment ? " active" : "");
-      b.type = "button";
-      b.setAttribute("data-treatment", o[0]);
-      b.textContent = o[1];
-      b.addEventListener("click", function () { swathSetTreatment(o[0]); });
-      host.appendChild(b);
-    });
   }
 
   // ---- hydration (poll + diff-merge: grow state, never reset the user) ----
@@ -2470,7 +2454,6 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   buildVitals();
   buildSettingsUI();
-  buildSwathSeg();              // FG-R3 #8: swath treatment seg control
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   // ENDED pages used to skip the fetch entirely, which left advFull
@@ -4061,9 +4044,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                    renderTrackPlot: function (s) {
                      return renderTrackPlot(s || lastStorm); },
                    renderSwathPlot: function (s) {
-                     return renderSwathPlot(s || lastStorm); },
-                   swathSetTreatment: function (t) { swathSetTreatment(t); },
-                   swathTreatment: function () { return swathTreatment; } };
+                     return renderSwathPlot(s || lastStorm); } };
 })();
 </script>
 </body>
