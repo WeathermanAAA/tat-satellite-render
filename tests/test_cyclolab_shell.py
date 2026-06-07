@@ -730,9 +730,9 @@ class TestStage4Advisories(unittest.TestCase):
         recs = self._run([{"op": "openSec", "name": "advisories"}])
         a = recs[-1]["state"]["stage3"]["adv"]
         # jsdom has no WAAPI -> the final-frame branch engages: the
-        # growth-front mask stroke sits at dashoffset 0 (fully drawn).
+        # cone group's clip is removed (fully revealed).
         self.assertEqual(a["coneReveal"], "final")
-        self.assertEqual(str(a["coneFrontOffset"]), "0")
+        self.assertEqual(a["coneClip"], "none")
         self.assertEqual(a["coneIcons"], 4)       # one per forecast point
         self.assertGreaterEqual(a["coneSpinners"], 4)
         # pops RIDE THE WAVEFRONT: NOW during the hold (~0.4s), then
@@ -808,6 +808,27 @@ class TestStage4Advisories(unittest.TestCase):
                          q["y"] + q["h"] <= p["y"])
                 self.assertTrue(clear,
                                 f"bunched placards {i}/{j} overlap: {p} {q}")
+
+    def test_title_lockup_and_watermark_avoid_everything(self):
+        # S4-AD2 #4/#5: the in-plot title lockup exists with the house
+        # lockup text, and the watermark landed in open water - outside
+        # the cone bbox and clear of every placard.
+        recs = self._run([{"op": "openSec", "name": "advisories"}])
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertIsNotNone(a["coneTitle"])
+        self.assertEqual(a["coneTitle"]["head"], "FORECAST CONE")
+        self.assertIn("TRIPLE-A-TROPICS", a["coneTitle"]["eyebrow"])
+        self.assertIn("CycloLab", a["coneTitle"]["eyebrow"])
+        self.assertTrue(a["coneTitle"]["sub"].endswith("SYNTH"))
+        self.assertTrue(a["coneFramed"])
+        wm = a["coneWatermark"]
+        self.assertIsNotNone(wm)
+        self.assertEqual(wm["text"], "PACIFIC OCEAN")
+        # clear of every placard rect (centre-in-rect check)
+        for p in a["conePlacards"]:
+            inside = (p["x"] <= wm["x"] <= p["x"] + p["w"] and
+                      p["y"] <= wm["y"] <= p["y"] + p["h"])
+            self.assertFalse(inside, "watermark sits on a placard")
 
     def test_official_cone_copy(self):
         recs = self._run([{"op": "openSec", "name": "advisories"}])
@@ -896,8 +917,7 @@ class TestStage4Advisories(unittest.TestCase):
         self.assertEqual(
             recs[-1]["state"]["stage3"]["adv"]["coneReveal"], "final")
         self.assertEqual(
-            str(recs[-1]["state"]["stage3"]["adv"]["coneFrontOffset"]),
-            "0")
+            recs[-1]["state"]["stage3"]["adv"]["coneClip"], "none")
 
 
 if __name__ == "__main__":

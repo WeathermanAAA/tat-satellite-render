@@ -485,11 +485,24 @@ HTML_TEMPLATE = r"""<!doctype html>
      the ONE permitted continuous loop; reduced-motion = final frame. */
   .adv-cone-stage { background: #0a1019; border-radius: 8px;
     overflow: hidden; }
-  .ac-land { fill: #131b28; stroke: #2b3a50; stroke-width: 1.2; }
-  .ac-graticule line { stroke: #16202e; stroke-width: 1; }
-  .ac-graticule text { fill: #33415a; font-size: 12px; }
-  .ac-ocean { fill: rgba(255,255,255,0.05); font-size: 58px;
-    font-weight: 800; letter-spacing: 14px; }
+  /* S4-AD2 #2/#3: the map reads as a SURFACE - ocean lifted one clear
+     step above the panel chrome, hairline inset border, land one step
+     above the ocean, graticule legible-but-subtle. */
+  .ac-ocean-fill { fill: #101a2c; }
+  .ac-frame { fill: none; stroke: #2c3a52; stroke-width: 1.5; }
+  .ac-land { fill: #1b2536; stroke: #384964;
+    stroke-width: 1.2; }
+  .ac-graticule line { stroke: #223048; stroke-width: 1; }
+  .ac-graticule text { fill: #4d5f7d; font-size: 13px;
+    font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+  .ac-ocean { fill: rgba(202,217,240,0.14); font-size: 17px;
+    font-weight: 700; letter-spacing: 4.5px; }
+  .ac-title .ac-eyebrow { fill: #8fa2bd; font-size: 11.5px;
+    font-weight: 700; letter-spacing: 1.6px; }
+  .ac-title .ac-head { fill: #ffffff; font-size: 21px;
+    font-weight: 800; letter-spacing: 0.6px; }
+  .ac-title .ac-sub { fill: #b9c6da; font-size: 13px;
+    font-weight: 700; letter-spacing: 1.1px; }
   #advcone, #intensity { display: block; width: 100%; height: auto; }
   .ac-zoom { animation: ac-pushin calc(var(--motion-med) * 0.85)
     ease-out 1 both; }
@@ -936,6 +949,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     // pause-on-hide: a hidden tab must not keep its playback loop alive
     // (the satellite interval kept swapping img.src at 5 fps display:none,
     // and both viewers' timers could run concurrently).
+    if (name !== "advisories" && acRaf) {
+      cancelAnimationFrame(acRaf); acRaf = null;
+    }
     if (name !== "satellite") satPause();
     if (name !== "models" && hafsViewer && hafsViewer._pause) {
       hafsViewer._pause();
@@ -1296,6 +1312,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   var advFull = null;
+  var acRaf = null;          // the cone reveal's rAF loop handle
   function applyAdvisory(adv) {
     if (!adv) return;
     var changed = adv.advisory !== coneAdv;
@@ -1446,8 +1463,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     function lonAt(x) { return ((x - MARGIN) / S + x0) / (60 * K); }
     function latAt(y) { return -((y - offY) / S + y0) / 60; }
 
-    var parts = ['<rect width="' + W + '" height="' + H +
-                 '" fill="#0a1019"/>'];
+    var parts = ['<rect class="ac-ocean-fill" width="' + W +
+                 '" height="' + H + '"/>'];
 
     // ---- basemap: land, graticule, ocean watermark (S4-AD1 #2) ------
     var lonL = lonAt(0), lonR = lonAt(W);
@@ -1461,15 +1478,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       var glab = gn > 180 ? (360 - gn) + "\u00b0W"
                           : (gn === 0 || gn === 180 ? gn + "\u00b0"
                                                     : gn + "\u00b0E");
-      parts.push('<text x="' + (gx + 5).toFixed(1) + '" y="' + (H - 10) +
-        '">' + glab + "</text>");
+      if (gx > 30 && gx < W - 60) {
+        parts.push('<text x="' + (gx + 6).toFixed(1) + '" y="' +
+          (H - 12) + '">' + glab + "</text>");
+      }
     }
     for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
       var gy = Y(ga);
       parts.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
         '" y2="' + gy.toFixed(1) + '"/>');
-      parts.push('<text x="8" y="' + (gy - 5).toFixed(1) + '">' +
-        Math.abs(ga) + "\u00b0" + (ga >= 0 ? "N" : "S") + "</text>");
+      if (gy > 40 && gy < H - 34) {
+        parts.push('<text x="10" y="' + (gy - 6).toFixed(1) + '">' +
+          Math.abs(ga) + "\u00b0" + (ga >= 0 ? "N" : "S") + "</text>");
+      }
     }
     parts.push("</g>");
     (BASEMAP.land || []).forEach(function (ring) {
@@ -1479,27 +1500,21 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
-    parts.push('<text class="ac-ocean" x="' + (W / 2) + '" y="' +
-      Math.round(H * 0.45) + '" text-anchor="middle">' +
-      (BASEMAP.ocean || "") + "</text>");
 
-    // ---- reveal mask (S4-AD1 #1): a fat round-capped stroke that
-    // FOLLOWS THE TRACK, drawn by dashoffset - the inflating front
-    // extruded from NOW along the track. The cone polygon bounds what
-    // the front uncovers; near NOW the cone is narrow, so the full
-    // local envelope appears as the front passes. ---------------------
+
+    // ---- reveal (S4-AD2 #1): ONE continuous arc-length-parameterized
+    // progress drives a clip-path POLYGON keyframe animation on the
+    // cone group - compositor-friendly (no per-frame mask re-raster;
+    // the round-1 mask-stroke reveal repainted the masked group every
+    // frame and visibly stepped). Constant vertex count across
+    // keyframes; revealed vertices are static, the leading-edge cap
+    // unfolds; a sine ease over GROW_MS=3600 keeps the peak advance
+    // ~1.44% of track length per 30fps frame (spec <= 1.5%).
     var tp = pts.map(function (p) { return [X(p.lon), Y(p.lat)]; });
-    // extend past the last point along the final bearing so the far
-    // cap (which bulges past the last tau) is fully uncovered
     var lastSeg = tp.length > 1 ? [tp[tp.length - 1][0] - tp[tp.length - 2][0],
                                    tp[tp.length - 1][1] - tp[tp.length - 2][1]]
                                 : [1, 0];
     var lsLen = Math.max(1e-6, Math.hypot(lastSeg[0], lastSeg[1]));
-    // the front's stroke must cover the cone PERPENDICULAR to the
-    // track (its half-width), NOT the radial reach from NOW - a
-    // radially-sized cap uncovered most of the canvas the moment the
-    // draw started (render-verified the hard way). Max half-width =
-    // max distance from any cone vertex to the track polyline.
     function distToTrack(x, y) {
       var best = Infinity;
       for (var si = 1; si < tp.length; si++) {
@@ -1518,30 +1533,114 @@ HTML_TEMPLATE = r"""<!doctype html>
     coneRing.forEach(function (c) {
       halfW = Math.max(halfW, distToTrack(X(c[0]), Y(c[1])));
     });
-    var ext = halfW * 0.9 + 50;
+    var ext = halfW + 60;
     var tpExt = tp.concat([[
       tp[tp.length - 1][0] + lastSeg[0] / lsLen * ext,
       tp[tp.length - 1][1] + lastSeg[1] / lsLen * ext]]);
-    var dTrack = tpExt.map(function (q, i) {
-      return (i ? "L" : "M") + q[0].toFixed(1) + "," + q[1].toFixed(1);
-    }).join(" ");
-    // cumulative lengths -> pop timing rides the wavefront
     var cum = [0];
     for (var ci = 1; ci < tpExt.length; ci++) {
       cum.push(cum[ci - 1] + Math.hypot(tpExt[ci][0] - tpExt[ci - 1][0],
                                         tpExt[ci][1] - tpExt[ci - 1][1]));
     }
     var Ltot = cum[cum.length - 1];
-    var HOLD_MS = 1000, GROW_MS = 3300;
-    var frontW0 = 64;                    // apex width at the NOW point
-    var frontW = 2 * halfW + 110;        // enough to clear the far cap
-    parts.push('<defs><mask id="ac-mask">' +
-      '<rect width="' + W + '" height="' + H + '" fill="#000"/>' +
-      '<path class="ac-front" d="' + dTrack + '" fill="none" ' +
-      'stroke="#fff" stroke-width="' + frontW0 + '" ' +
-      'stroke-linecap="round" stroke-linejoin="round" ' +
-      'stroke-dasharray="' + Ltot.toFixed(1) + '" stroke-dashoffset="' +
-      Ltot.toFixed(1) + '"/></mask></defs>');
+    var HOLD_MS = 1000, GROW_MS = 4000;
+    var frontW0 = 64;
+    var frontW = 2 * halfW + 110;
+    function halfAt(d) {
+      return (frontW0 + (frontW - frontW0) * (d / Ltot)) / 2;
+    }
+    // resample the extended track at uniform arc steps
+    var SAMP = 26;
+    function pointAt(d) {
+      d = Math.max(0, Math.min(Ltot, d));
+      for (var k2 = 1; k2 < tpExt.length; k2++) {
+        if (d <= cum[k2] || k2 === tpExt.length - 1) {
+          var f2 = (d - cum[k2 - 1]) /
+                   Math.max(1e-6, cum[k2] - cum[k2 - 1]);
+          var x2 = tpExt[k2 - 1][0] +
+                   (tpExt[k2][0] - tpExt[k2 - 1][0]) * f2;
+          var y2 = tpExt[k2 - 1][1] +
+                   (tpExt[k2][1] - tpExt[k2 - 1][1]) * f2;
+          var ux2 = (tpExt[k2][0] - tpExt[k2 - 1][0]) /
+                    Math.max(1e-6, cum[k2] - cum[k2 - 1]);
+          var uy2 = (tpExt[k2][1] - tpExt[k2 - 1][1]) /
+                    Math.max(1e-6, cum[k2] - cum[k2 - 1]);
+          return { x: x2, y: y2, nx: -uy2, ny: ux2 };
+        }
+      }
+      return { x: tpExt[0][0], y: tpExt[0][1], nx: 0, ny: -1 };
+    }
+    var samples = [];
+    for (var sj = 0; sj < SAMP; sj++) {
+      var sd = Ltot * sj / (SAMP - 1);
+      var sp = pointAt(sd);
+      samples.push({ d: sd, x: sp.x, y: sp.y, nx: sp.nx, ny: sp.ny });
+    }
+    var CAPV = 5;                       // leading-edge cap vertices
+    function polyAt(d) {
+      // corridor polygon: left chain forward, cap arc whose TIP is at
+      // the front distance d, right chain back. Beyond-front samples
+      // collapse onto the cap shoulders so interpolation unfolds them.
+      var w = halfAt(d);
+      var f = pointAt(d);
+      var shL = [f.x + f.nx * w, f.y + f.ny * w];
+      var shR = [f.x - f.nx * w, f.y - f.ny * w];
+      var L = [], R = [];
+      for (var j2 = 0; j2 < SAMP; j2++) {
+        var s2 = samples[j2];
+        if (s2.d <= d) {
+          var wj = halfAt(s2.d);
+          L.push((s2.x + s2.nx * wj).toFixed(1) + " " +
+                 (s2.y + s2.ny * wj).toFixed(1));
+          R.push((s2.x - s2.nx * wj).toFixed(1) + " " +
+                 (s2.y - s2.ny * wj).toFixed(1));
+        } else {
+          L.push(shL[0].toFixed(1) + " " + shL[1].toFixed(1));
+          R.push(shR[0].toFixed(1) + " " + shR[1].toFixed(1));
+        }
+      }
+      var cap = [];
+      for (var cv = 0; cv < CAPV; cv++) {
+        var th = Math.PI * (cv + 1) / (CAPV + 1);
+        // arc from the LEFT shoulder over the tip (at distance d) to
+        // the RIGHT shoulder: tip bulge capped at 0.55w forward
+        var fwd = Math.sin(th) * w * 0.55;
+        var lat2 = Math.cos(th) * w;
+        // forward direction = track tangent at d
+        var tx = f.ny, ty = -f.nx;      // (nx,ny) rotated -90 = tangent
+        cap.push((f.x + f.nx * lat2 + tx * fwd).toFixed(1) + " " +
+                 (f.y + f.ny * lat2 + ty * fwd).toFixed(1));
+      }
+      // an SVG path (M..L..Z), not a CSS polygon: Chromium never
+      // repaints style clip-path mutations on SVG containers (probe:
+      // interpolated computed values, 108 painted px mid-growth) -
+      // updating a real <clipPath><path d> invalidates reliably.
+      return "M" + L.concat(cap, R.reverse()).join(" L ") + " Z";
+    }
+    // TRAPEZOID ease (S4-AD2 #1): quadratic accel/decel over the first
+    // and last 15%, LINEAR plateau between - the sine ease's peak
+    // velocity (1.57x average) measured 1.63%/frame against the 1.5%
+    // smoothness budget once vsync jitter stacked on it; the trapezoid
+    // plateau holds ~0.98%/frame nominal with gentle ends.
+    var EASE_A = 0.15;
+    var EASE_V = 1 / (1 - EASE_A);          // plateau velocity
+    function easeS(t) {
+      t = Math.max(0, Math.min(1, t));
+      if (t < EASE_A) return EASE_V * t * t / (2 * EASE_A);
+      if (t > 1 - EASE_A) {
+        var u = 1 - t;
+        return 1 - EASE_V * u * u / (2 * EASE_A);
+      }
+      return EASE_V * (t - EASE_A / 2);
+    }
+    function invEaseS(f) {
+      f = Math.max(0, Math.min(1, f));
+      var fa = EASE_V * EASE_A / 2;         // progress at the corners
+      if (f < fa) return Math.sqrt(2 * EASE_A * f / EASE_V);
+      if (f > 1 - fa) return 1 - Math.sqrt(2 * EASE_A * (1 - f) / EASE_V);
+      return f / EASE_V + EASE_A / 2;
+    }
+
 
     // ---- the cone (S4-AD1 #8 restyle): crisp navy/white boundary,
     // subtle white-blue interior, NO glow filters -----------------------
@@ -1553,7 +1652,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," +
         Y(p.lat).toFixed(1);
     }).join(" ");
-    parts.push('<g class="ac-conegrp" mask="url(#ac-mask)">' +
+    parts.push('<defs><clipPath id="ac-reveal-clip" ' +
+      'clipPathUnits="userSpaceOnUse">' +
+      '<path class="ac-reveal-path" d=""/></clipPath></defs>');
+    parts.push('<g class="ac-conegrp" clip-path="url(#ac-reveal-clip)">' +
       '<path d="' + dC + '" fill="rgba(205,228,255,0.13)" ' +
       'stroke="#0a1a2e" stroke-width="4.5"/>' +
       '<path d="' + dC + '" fill="none" stroke="#dceaff" ' +
@@ -1565,7 +1667,32 @@ HTML_TEMPLATE = r"""<!doctype html>
     // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
     // collision-aware placard layout: alternate sides of the track,
     // push outward on overlap, leader line when pushed far.
-    var rects = [];      // occupied rects: icons first, then placards
+    var rects = [];      // occupied rects: title, icons, placards
+    // ---- in-plot TITLE LOCKUP (S4-AD2 #5): reserve its corner before
+    // anything else places - the side with less cone overlap wins.
+    var coneXs = coneRing.map(function (c) { return X(c[0]); });
+    var coneYs = coneRing.map(function (c) { return Y(c[1]); });
+    var coneBox = { x: Math.min.apply(null, coneXs),
+                    y: Math.min.apply(null, coneYs),
+                    w: Math.max.apply(null, coneXs) -
+                       Math.min.apply(null, coneXs),
+                    h: Math.max.apply(null, coneYs) -
+                       Math.min.apply(null, coneYs) };
+    var TIT_W = 285, TIT_H = 86, TIT_PAD = 22;
+    function overlapArea(a, b) {
+      var ox = Math.max(0, Math.min(a.x + a.w, b.x + b.w) -
+                           Math.max(a.x, b.x));
+      var oy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) -
+                           Math.max(a.y, b.y));
+      return ox * oy;
+    }
+    var titleLeft = { x: TIT_PAD, y: TIT_PAD, w: TIT_W, h: TIT_H };
+    var titleRight = { x: W - TIT_W - TIT_PAD, y: TIT_PAD,
+                       w: TIT_W, h: TIT_H };
+    var titleRect = (overlapArea(titleLeft, coneBox) <=
+                     overlapArea(titleRight, coneBox))
+      ? titleLeft : titleRight;
+    rects.push(titleRect);
     function overlaps(r) {
       for (var k = 0; k < rects.length; k++) {
         var o = rects[k];
@@ -1632,14 +1759,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (!tropical) anyNonTropical = true;
       var cat = pointCat(p);
       var col = tropical ? (SSHS[cat] || SSHS.TD) : "#ffffff";
-      // the round cap leads the front by width/2; width itself grows
-      // with the draw, so the EDGE reaches distance d when the front
-      // center is at d - w(d)/2.
-      var wAt = frontW0 + (frontW - frontW0) * (cum[i] / Ltot);
-      var fEff = Math.max(0.02, (cum[i] - wAt / 2) / Ltot);
+      // pops ride the wavefront EXACTLY: the cap tip sits at the
+      // front distance, so delay = hold + grow * invease(d_i / L).
       var delayMs = (i === 0)
         ? 400
-        : Math.round(HOLD_MS + GROW_MS * fEff);
+        : Math.round(HOLD_MS + GROW_MS *
+                     invEaseS(Math.max(0.02, cum[i] / Ltot)));
       var scale = (i === 0 ? 0.95 : 0.42);   // NOW is the hero (#6)
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
@@ -1686,22 +1811,115 @@ HTML_TEMPLATE = r"""<!doctype html>
       parts.push("</g>");
     });
 
+    // ---- title lockup markup (#5) -----------------------------------
+    var stormName = (document.getElementById("storm-name") || {})
+      .textContent || "";
+    var typeWord = (document.getElementById("storm-type") || {})
+      .textContent || "";
+    var tx0 = titleRect.x, ty0 = titleRect.y;
+    var anchorRight = titleRect.x > W / 2;
+    var taX = anchorRight ? (titleRect.x + titleRect.w) : tx0;
+    var taA = anchorRight ? "end" : "start";
+    var railX = anchorRight ? (titleRect.x + titleRect.w + 8) : (tx0 - 8);
+    parts.push('<g class="ac-title">' +
+      '<rect x="' + (railX - 1.5) + '" y="' + ty0 +
+      '" width="3" height="' + TIT_H +
+      '" rx="1.5" fill="var(--cat-accent)"/>' +
+      '<text class="ac-eyebrow" x="' + taX + '" y="' + (ty0 + 14) +
+      '" text-anchor="' + taA +
+      '">TRIPLE-A-TROPICS \u00b7 CycloLab</text>' +
+      '<text class="ac-head" x="' + taX + '" y="' + (ty0 + 42) +
+      '" text-anchor="' + taA + '">FORECAST CONE</text>' +
+      '<text class="ac-sub" x="' + taX + '" y="' + (ty0 + 66) +
+      '" text-anchor="' + taA + '">' + typeWord.toUpperCase() +
+      " " + stormName.toUpperCase() + "</text></g>");
+
+    // ---- ocean watermark (#4): small, auto-placed in the EMPTIEST
+    // open water - never behind the cone, placards or the title ------
+    var wmW = ((BASEMAP.ocean || "").length * 13) + 30, wmH = 26;
+    var best = null, bestScore = -1;
+    for (var gy2 = 0.14; gy2 <= 0.9; gy2 += 0.095) {
+      for (var gx2 = 0.08; gx2 <= 0.92; gx2 += 0.105) {
+        var cxw = gx2 * W, cyw = gy2 * H;
+        var r3 = { x: cxw - wmW / 2, y: cyw - wmH / 2, w: wmW, h: wmH };
+        if (r3.x < 8 || r3.x + r3.w > W - 8 ||
+            r3.y < 8 || r3.y + r3.h > H - 30) continue;
+        var bad = overlapArea(r3, coneBox) > 0;
+        if (!bad) {
+          for (var rk = 0; rk < rects.length && !bad; rk++) {
+            if (overlapArea(r3, rects[rk]) > 0) bad = true;
+          }
+        }
+        if (!bad) {                       // open WATER means not on land
+          for (var lk = 0; lk < (BASEMAP.land || []).length && !bad;
+               lk++) {
+            var lr = BASEMAP.land[lk];
+            var lx0 = Infinity, lx1 = -Infinity,
+                ly0 = Infinity, ly1 = -Infinity;
+            for (var lv = 0; lv < lr.length; lv++) {
+              var lpx = X(lr[lv][0]), lpy = Y(lr[lv][1]);
+              lx0 = Math.min(lx0, lpx); lx1 = Math.max(lx1, lpx);
+              ly0 = Math.min(ly0, lpy); ly1 = Math.max(ly1, lpy);
+            }
+            if (overlapArea(r3, { x: lx0, y: ly0, w: lx1 - lx0,
+                                  h: ly1 - ly0 }) > 0) bad = true;
+          }
+        }
+        if (bad) continue;
+        // score: distance from the cone box centre (deep open water)
+        var dxw = cxw - (coneBox.x + coneBox.w / 2);
+        var dyw = cyw - (coneBox.y + coneBox.h / 2);
+        var sc = dxw * dxw + dyw * dyw;
+        if (sc > bestScore) { bestScore = sc; best = { x: cxw, y: cyw }; }
+      }
+    }
+    if (best) {
+      parts.push('<text class="ac-ocean" x="' + best.x.toFixed(0) +
+        '" y="' + best.y.toFixed(0) + '" text-anchor="middle">' +
+        (BASEMAP.ocean || "") + "</text>");
+    }
+
+    // hairline frame: the map has edges (#2)
+    parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
+      (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
+
     svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     svg.innerHTML = parts.join("");
 
     // arm the growth front (WAAPI dashoffset); reduced motion / jsdom
     // jump to the final frame
-    var front = svg.querySelector(".ac-front");
-    if (!reduced && front.animate) {
-      front.animate([{ strokeDashoffset: Ltot, strokeWidth: frontW0 + "px" },
-                     { strokeDashoffset: 0, strokeWidth: frontW + "px" }],
-                    { duration: GROW_MS, delay: HOLD_MS,
-                      easing: "linear", fill: "forwards" });
-      front.setAttribute("data-reveal", "animated");
+    var grp = svg.querySelector(".ac-conegrp");
+    // ONE continuous arc-length-parameterized progress drives the clip
+    // polygon from a rAF loop with INLINE STYLE writes. WAAPI/CSS
+    // animation of a basic-shape clip on an SVG container interpolates
+    // in computed style but Chromium never repaints until it finishes
+    // (probe-verified: computed values moved, pixels snapped at the
+    // end) - manual style mutation forces the recalc+paint every
+    // frame. Polygon rebuild per tick is ~57 vertices: trivial.
+    // (grp.animate doubles as the capability gate: jsdom lacks it and
+    // its immediate-rAF stub would otherwise spin the loop.)
+    if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
+    var revealPath = svg.querySelector(".ac-reveal-path");
+    if (!reduced && grp.animate) {
+      revealPath.setAttribute("d", polyAt(0));
+      grp.setAttribute("data-reveal", "animated");
+      var t0 = performance.now() + HOLD_MS;
+      var tickFn = function () {
+        var tt = (performance.now() - t0) / GROW_MS;
+        if (tt >= 1) {
+          grp.removeAttribute("clip-path");
+          acRaf = null;
+          return;
+        }
+        if (tt > 0) {
+          revealPath.setAttribute("d", polyAt(easeS(tt) * Ltot));
+        }
+        acRaf = requestAnimationFrame(tickFn);
+      };
+      acRaf = requestAnimationFrame(tickFn);
     } else {
-      front.style.strokeDashoffset = "0";
-      front.style.strokeWidth = frontW + "px";
-      front.setAttribute("data-reveal", "final");
+      grp.removeAttribute("clip-path");  // final frame: fully revealed
+      grp.setAttribute("data-reveal", "final");
     }
 
     var official = advFull.method === "official-cone";

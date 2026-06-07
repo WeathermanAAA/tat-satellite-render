@@ -254,14 +254,31 @@ const scheduledDelays = [];
       coneIconDelays: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll(".ac-icon"),
         (g) => (g.getAttribute("style") || "")).slice(0, 3) : [],
-      coneReveal: coneSvg && coneSvg.querySelector(".ac-front")
-        ? coneSvg.querySelector(".ac-front").getAttribute("data-reveal")
+      coneReveal: coneSvg && coneSvg.querySelector(".ac-conegrp")
+        ? coneSvg.querySelector(".ac-conegrp").getAttribute("data-reveal")
         : null,
-      coneFrontOffset: coneSvg && coneSvg.querySelector(".ac-front")
-        ? (coneSvg.querySelector(".ac-front").style.strokeDashoffset
-           || coneSvg.querySelector(".ac-front")
-                .getAttribute("stroke-dashoffset") || "")
+      coneClip: coneSvg && coneSvg.querySelector(".ac-conegrp")
+        ? (coneSvg.querySelector(".ac-conegrp")
+             .getAttribute("clip-path") || "none")
         : "",
+      coneTitle: coneSvg && coneSvg.querySelector(".ac-title")
+        ? {
+            head: (coneSvg.querySelector(".ac-title .ac-head") || {})
+              .textContent || "",
+            eyebrow: (coneSvg.querySelector(".ac-title .ac-eyebrow") ||
+              {}).textContent || "",
+            sub: (coneSvg.querySelector(".ac-title .ac-sub") || {})
+              .textContent || "",
+          } : null,
+      coneWatermark: coneSvg && coneSvg.querySelector(".ac-ocean")
+        ? {
+            x: parseFloat(coneSvg.querySelector(".ac-ocean")
+              .getAttribute("x")),
+            y: parseFloat(coneSvg.querySelector(".ac-ocean")
+              .getAttribute("y")),
+            text: coneSvg.querySelector(".ac-ocean").textContent,
+          } : null,
+      coneFramed: !!(coneSvg && coneSvg.querySelector(".ac-frame")),
       coneViewBox: coneSvg ? (coneSvg.getAttribute("viewBox") || "") : "",
       coneIconsDetail: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll(".ac-icon"), (g) => ({

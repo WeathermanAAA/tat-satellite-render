@@ -102,14 +102,31 @@ def basemap_for(lat: float, lon: float, basin: str, *,
     lo0, lo1 = lon - dlon, lon + dlon
     out = []
     for ring in _land_rings():
+        # CONTIGUOUS unwrap: each vertex shifts by +-360 to stay within
+        # 180 deg of the PREVIOUS one (per-vertex normalization tore
+        # rings straddling the frame boundary - the clipper turned the
+        # torn polylines into spurious full-window land bands), then the
+        # whole ring shifts as one into the window's lon frame.
         norm = []
+        prev = None
         for x, y in ring:
-            while x - lon > 180.0:
-                x -= 360.0
-            while x - lon < -180.0:
-                x += 360.0
-            norm.append((x, y))
-        clipped = _clip_ring(norm, lo0, la0, lo1, la1)
+            if prev is not None:
+                while x - prev > 180.0:
+                    x -= 360.0
+                while x - prev < -180.0:
+                    x += 360.0
+            norm.append([x, y])
+            prev = x
+        mean_x = sum(p[0] for p in norm) / len(norm)
+        shift = 0.0
+        while mean_x + shift - lon > 180.0:
+            shift -= 360.0
+        while mean_x + shift - lon < -180.0:
+            shift += 360.0
+        if shift:
+            for p in norm:
+                p[0] += shift
+        clipped = _clip_ring([tuple(p) for p in norm], lo0, la0, lo1, la1)
         if len(clipped) < 3:
             continue
         xs = [p[0] for p in clipped]

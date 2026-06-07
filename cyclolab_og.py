@@ -83,11 +83,15 @@ def render_intensity_card(adv: dict, entry: dict, *,
     for s in ax.spines.values():
         s.set_color("#232a36")
 
-    fig.text(0.075, 0.92, storm_name.upper(), color="#ffffff",
+    # the in-plot title lockup (S4-AD2 #5) rides the share card too:
+    # tiny eyebrow over the storm name, house casing.
+    fig.text(0.075, 0.945, "TRIPLE-A-TROPICS · CycloLab",
+             color="#8fa2bd", fontsize=9.5, fontweight="bold")
+    fig.text(0.075, 0.895, storm_name.upper(), color="#ffffff",
              fontsize=22, fontweight="bold")
-    fig.text(0.075, 0.875,
-             f"Intensity forecast · advisory {adv.get('advisory')} "
-             f"· TAT CycloLab", color=MUTED, fontsize=11)
+    fig.text(0.075, 0.852,
+             f"Intensity forecast · advisory {adv.get('advisory')}",
+             color=MUTED, fontsize=11)
     fig.text(0.075, 0.045,
              "Derived intensity range — not an official forecast "
              f"product · ±{entry.get('error_type', 'MAE')} "
