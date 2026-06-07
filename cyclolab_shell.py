@@ -509,8 +509,16 @@ HTML_TEMPLATE = r"""<!doctype html>
      client crop math: the storm is always at 50%/50%.
      #2: the hero is a PANEL, not a poster - the overview column caps
      its width so the bug card + hero + W&P chart compose on one
-     comfortable screen. */
-  #sec-overview .wipe { max-width: 780px; }
+     comfortable screen.
+     FG-R3 #11: the Overview is now a TWO-COLUMN composition - LEFT =
+     SST hero + W&P chart, RIGHT = track-history + wind-swath. The wipe
+     widens to host both columns; each PANEL still caps small (widget,
+     not poster). Mobile collapses to one column with an explicit stack
+     order via CSS `order` (hero -> track -> W&P -> swath). */
+  #sec-overview .wipe { max-width: 1180px; display: grid;
+    grid-template-columns: 1fr 1fr; gap: 0 20px; align-items: start; }
+  #sec-overview .ov-col { min-width: 0; }
+  #sec-overview .ov-col .card:last-child { margin-bottom: 0; }
   .sst-hero { position: relative; overflow: hidden; border-radius: 8px;
     aspect-ratio: 16 / 9.2; background: #0a1019;
     border: 1px solid #2c3a52; }
@@ -586,6 +594,43 @@ HTML_TEMPLATE = r"""<!doctype html>
     .ac-zoom, .ac-icon { animation: none !important; }
     .ac-spin { animation: none !important; }
   }
+
+  /* ---- Overview plots (FG-R3 #7 track history + #8 wind swath): two
+     art-directed client-side panels that REUSE the cone's map furniture
+     (.ac-ocean-fill / .ac-land / .ac-graticule / .ac-frame / .ac-title /
+     .ac-ocean) and add panel-specific chrome. Neon must POP on the dark
+     ocean - the track dots are a continuous ramp, not the 7 SSHS hues. */
+  .tp-track { fill: none; stroke: rgba(150,180,220,0.42);
+    stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
+  .tp-dot { stroke: rgba(8,12,20,0.55); stroke-width: 1; }
+  .tp-dot.tp-now { stroke: #ffffff; stroke-width: 1.6;
+    filter: drop-shadow(0 0 6px currentColor); }
+  .tp-cbar-tick { fill: #8ea2bd; font-size: 11px;
+    font-variant-numeric: tabular-nums; }
+  .tp-cbar-frame { fill: none; stroke: #3a4d6e; stroke-width: 1; }
+  .tp-legend-bg { fill: rgba(10,16,25,0.82); stroke: #2c3a52;
+    stroke-width: 1; }
+  .tp-legend-t { fill: #cdd9ea; font-size: 12px;
+    font-variant-numeric: tabular-nums; }
+  .tp-legend-h { fill: #8fa2bd; font-size: 10px; font-weight: 700;
+    letter-spacing: 1px; }
+  .tp-legend-k { fill: #b9c6da; font-size: 10.5px; }
+  .tp-field-lbl { font-size: 11px; font-weight: 700;
+    font-variant-numeric: tabular-nums; paint-order: stroke;
+    stroke: rgba(6,11,20,0.92); stroke-width: 2.6px;
+    stroke-linejoin: round; }
+  .tp-field-key-h { fill: #8fa2bd; font-size: 10px; font-weight: 700;
+    letter-spacing: 1px; }
+  .tp-field-key { font-size: 12px; font-weight: 700;
+    font-variant-numeric: tabular-nums; }
+  .tp-field-key-u { fill: #8ea2bd; font-size: 11px; }
+  .tp-radii-lab { fill: #aebdd4; font-size: 11px; font-weight: 600; }
+  .sw-seg-host { display: flex; gap: 0; margin: 0 0 11px; }
+  .sw-caption-d { display: inline-block; margin: 8px 0 0;
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.8px;
+    color: #9fc6f5; text-transform: uppercase; }
+  .sw-empty { color: var(--muted); font-size: 12.5px; padding: 26px 14px;
+    text-align: center; line-height: 1.6; }
 
   .stub { color: var(--muted); font-size: 14px; padding: 30px 0;
     text-align: center; }
@@ -687,6 +732,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
     .back-map { border-top: 0; padding: 8px 12px; min-height: 0; }
     .stage { padding: 4px 14px 86px; }
+    /* FG-R3 #11: mobile Overview = ONE column, explicit stack order
+       hero -> track -> W&P -> swath (the DOM stays logical: left col =
+       hero+chart, right col = track+swath; CSS `order` interleaves). */
+    #sec-overview .wipe { grid-template-columns: 1fr; gap: 0; }
+    #sec-overview .ov-col { display: contents; }
+    #sec-overview #card-hero  { order: 1; }
+    #sec-overview #card-track { order: 2; }
+    #sec-overview #card-wp    { order: 3; }
+    #sec-overview #card-swath { order: 4; }
     /* FG-R2 review notes (two rounds): the hero lockup must read as a
        small corner signature on a ~366px panel. The eyebrow drops on
        phones - same precedent as the banner's mobile compaction - and
@@ -780,7 +834,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="stage">
     <section class="sec active" id="sec-overview">
       <div class="wipe">
-        <div class="card">
+        <div class="ov-col ov-left">
+        <div class="card" id="card-hero">
           <div class="sst-hero" id="sst-hero">
             <img id="sst-hero-img" alt="Sea-surface temperature around the storm"
                  draggable="false">
@@ -796,9 +851,28 @@ HTML_TEMPLATE = r"""<!doctype html>
             <div class="sst-hero-glyph" id="sst-hero-glyph"></div>
           </div>
           <div class="note" id="sst-hero-note"></div></div>
-        <div class="card"><h3>Wind &amp; pressure</h3>
+        <div class="card" id="card-wp"><h3>Wind &amp; pressure</h3>
           <svg id="chart" viewBox="0 0 1000 320"
                preserveAspectRatio="xMidYMid meet"></svg></div>
+        </div>
+        <div class="ov-col ov-right">
+        <div class="card" id="card-track">
+          <svg id="trackplot" viewBox="0 0 1000 620"
+               preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="note" id="trackplot-note"></div></div>
+        <div class="card" id="card-swath">
+          <div class="hafs-seg-group sw-seg-host" id="swath-seg"
+               role="group" aria-label="Swath treatment"></div>
+          <svg id="swathplot" viewBox="0 0 1000 620"
+               preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="sw-empty" id="swath-empty" style="display:none"></div>
+          <span class="sw-caption-d" id="swath-derived" hidden>Derived
+            product</span>
+          <div class="note" id="swathplot-note"></div>
+          <details class="adv-method" id="swath-method" hidden>
+            <summary>How is this drawn?</summary>
+            <div id="swath-method-body"></div></details></div>
+        </div>
       </div>
     </section>
     <section class="sec" id="sec-satellite"><div class="wipe">
@@ -1074,6 +1148,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     // advisories tab are gated on a NEW fix, so re-render them directly.
     try { if (lastStorm) { apply(lastStorm); renderChart(lastStorm); } }
     catch (e) {}
+    // FG-R3 #7/#8: the two Overview plots carry units-aware colorbar +
+    // legend labels - convert them directly on a unit change (same as the
+    // W&P chart; apply() is gated on a NEW fix so it won't redraw them).
+    try { if (lastStorm) renderTrackPlot(lastStorm); } catch (e3) {}
+    try { if (lastStorm) renderSwathPlot(lastStorm); } catch (e4) {}
     try { if (inited.advisories && advFull) renderAdvTab(); } catch (e2) {}
   }
   function syncSettingsUI() {
@@ -1571,6 +1650,716 @@ HTML_TEMPLATE = r"""<!doctype html>
     chartDrawn = true;
   }
 
+  // ======================================================================
+  // FG-R3 #7/#8: the two Overview art-directed plots - track history +
+  // wind-history swath. Both REUSE the cone's auto-fit projection math
+  // (renderAdvCone ~line 1731) and the cone's map furniture (.ac-ocean-
+  // fill / .ac-land / .ac-graticule / .ac-frame / .ac-title / .ac-ocean),
+  // but fit the projection to the OBSERVED-TRACK + RADII extent (not the
+  // forecast cone). The helper math is COPIED, not shared (no cone state).
+  // ======================================================================
+
+  // continuous VIBRANT NEON ramp (NOT the 7 SSHS hues - item 7): 0 -> 185+
+  // kt, deep indigo -> electric blue -> cyan -> neon green -> chartreuse ->
+  // hot orange -> red -> magenta -> near-white. Stops are [kt, r,g,b].
+  var NEON_RAMP = [
+    [0,   46,  18, 120],   // deep indigo
+    [25,  40,  90, 235],   // electric blue
+    [45,  20, 200, 245],   // cyan
+    [64,  20, 240, 150],   // neon green
+    [83, 170, 255,  40],   // chartreuse
+    [96, 255, 215,  30],   // yellow
+    [113,255, 140,  20],   // hot orange
+    [137,255,  50,  40],   // red
+    [165,255,  40, 200],   // magenta
+    [185,255, 235, 255]    // near-white
+  ];
+  function neonColor(kt) {
+    var v = (kt == null) ? 0 : kt;
+    if (v <= NEON_RAMP[0][0]) {
+      return "rgb(" + NEON_RAMP[0][1] + "," + NEON_RAMP[0][2] + "," +
+             NEON_RAMP[0][3] + ")";
+    }
+    var last = NEON_RAMP[NEON_RAMP.length - 1];
+    if (v >= last[0]) {
+      return "rgb(" + last[1] + "," + last[2] + "," + last[3] + ")";
+    }
+    for (var i = 1; i < NEON_RAMP.length; i++) {
+      var a = NEON_RAMP[i - 1], b = NEON_RAMP[i];
+      if (v <= b[0]) {
+        var f = (v - a[0]) / (b[0] - a[0]);
+        var r = Math.round(a[1] + (b[1] - a[1]) * f);
+        var g = Math.round(a[2] + (b[2] - a[2]) * f);
+        var bl = Math.round(a[3] + (b[3] - a[3]) * f);
+        return "rgb(" + r + "," + g + "," + bl + ")";
+      }
+    }
+    return "rgb(" + last[1] + "," + last[2] + "," + last[3] + ")";
+  }
+
+  // nature -> marker SHAPE: tropical = circle, subtropical = square,
+  // non-tropical = triangle. The deck's nature codes (per-fix p.nature):
+  // tropical TS/TD/HU/TY/ST/DB (or empty); subtropical SS/SD; everything
+  // else (ET/EX/LO/DS/PT/WV/remnant) = non-tropical.
+  var SUBTROP_NAT = { SS: 1, SD: 1 };
+  var TROP_NAT = { TS: 1, TD: 1, HU: 1, TY: 1, ST: 1, DB: 1 };
+  function natureShape(nat) {
+    var n = (nat || "").toUpperCase();
+    if (!n || TROP_NAT[n]) return "circle";
+    if (SUBTROP_NAT[n]) return "square";
+    return "triangle";
+  }
+  function shapeMarker(shape, cx, cy, r, fill, cls) {
+    // emit one marker glyph centered at cx,cy with radius r.
+    var c = 'class="' + cls + '" fill="' + fill + '" style="color:' +
+            fill + '"';
+    if (shape === "square") {
+      var s = r * 1.78;        // visually-matched area
+      return '<rect ' + c + ' x="' + (cx - s / 2).toFixed(1) + '" y="' +
+        (cy - s / 2).toFixed(1) + '" width="' + s.toFixed(1) +
+        '" height="' + s.toFixed(1) + '" rx="1.5"/>';
+    }
+    if (shape === "triangle") {
+      var t = r * 1.28;
+      var p1 = cx + "," + (cy - t).toFixed(1);
+      var p2 = (cx - t * 0.92).toFixed(1) + "," + (cy + t * 0.74).toFixed(1);
+      var p3 = (cx + t * 0.92).toFixed(1) + "," + (cy + t * 0.74).toFixed(1);
+      return '<polygon ' + c + ' points="' + p1 + " " + p2 + " " + p3 +
+        '"/>';
+    }
+    return '<circle ' + c + ' cx="' + cx.toFixed(1) + '" cy="' +
+      cy.toFixed(1) + '" r="' + r.toFixed(1) + '"/>';
+  }
+
+  // shared auto-fit projection (COPIED from renderAdvCone #3) fitted to a
+  // list of {lat,lon} extent points + an optional degree pad (radii reach).
+  // FOLLOW-UP: BASEMAP.land is baked for the FORECAST extent - if the
+  // observed track runs beyond it some edge land may be missing; a
+  // track-extent basemap is a v1.x follow-up.
+  function fitProjection(extent, viewW, hMin, hMax, margin) {
+    var frameLon = (BASEMAP.window[2] + BASEMAP.window[3]) / 2.0;
+    function normLon(lon) {
+      while (lon - frameLon > 180) lon -= 360;
+      while (lon - frameLon < -180) lon += 360;
+      return lon;
+    }
+    var lats = [], lons = [];
+    extent.forEach(function (p) {
+      lats.push(p.lat); lons.push(normLon(p.lon));
+    });
+    var latMid = (Math.min.apply(null, lats) +
+                  Math.max.apply(null, lats)) / 2;
+    var K = Math.max(0.2, Math.cos(latMid * Math.PI / 180));
+    function pxu(lon) { return lon * 60 * K; }
+    function pyu(lat) { return -lat * 60; }
+    var xs = lons.map(pxu), ys = lats.map(pyu);
+    var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+    var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+    var W = viewW, MARGIN = margin;
+    var spanX = Math.max(1e-6, x1 - x0), spanY = Math.max(1e-6, y1 - y0);
+    // FIT-TO-CONTAIN (not width-only): pick the scale that keeps BOTH
+    // the width budget and the height cap, so a tall recurving track
+    // never overflows the panel and pushes the current fix + wind field
+    // off-edge. H follows the content within [hMin, hMax]; both axes are
+    // centered. (The cone fits to width because it grows H to 1500; a
+    // PANEL caps H, so contain is the right discipline here.)
+    var sW = (W - 2 * MARGIN) / spanX;
+    var sH = (hMax - 2 * MARGIN) / spanY;
+    var S = Math.min(sW, sH);
+    var H = Math.max(hMin, Math.min(hMax,
+        Math.round(spanY * S + 2 * MARGIN)));
+    var offX = (W - spanX * S) / 2;
+    var offY = (H - spanY * S) / 2;
+    return {
+      W: W, H: H, K: K, S: S, normLon: normLon,
+      X: function (lon) { return (pxu(normLon(lon)) - x0) * S + offX; },
+      Y: function (lat) { return (pyu(lat) - y0) * S + offY; },
+      lonAt: function (x) { return ((x - offX) / S + x0) / (60 * K); },
+      latAt: function (y) { return -((y - offY) / S + y0) / 60; }
+    };
+  }
+
+  // map furniture (ocean fill + graticule + land + frame) - REUSE the
+  // cone classes so one CSS canon dresses all three maps.
+  function mapFurniture(pr) {
+    var W = pr.W, H = pr.H;
+    var parts = ['<rect class="ac-ocean-fill" width="' + W +
+                 '" height="' + H + '"/>'];
+    var lonL = pr.lonAt(0), lonR = pr.lonAt(W);
+    var latT = pr.latAt(0), latB = pr.latAt(H);
+    parts.push('<g class="ac-graticule">');
+    for (var gl = Math.ceil(lonL / 5) * 5; gl <= lonR; gl += 5) {
+      var gx = pr.X(gl);
+      parts.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' +
+        gx.toFixed(1) + '" y2="' + H + '"/>');
+      var gn = ((gl % 360) + 360) % 360;
+      var glab = gn > 180 ? (360 - gn) + "°W"
+                          : (gn === 0 || gn === 180 ? gn + "°"
+                                                    : gn + "°E");
+      if (gx > 30 && gx < W - 60) {
+        parts.push('<text x="' + (gx + 6).toFixed(1) + '" y="' +
+          (H - 12) + '">' + glab + "</text>");
+      }
+    }
+    for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
+      var gy = pr.Y(ga);
+      parts.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
+        '" y2="' + gy.toFixed(1) + '"/>');
+      if (gy > 40 && gy < H - 34) {
+        parts.push('<text x="10" y="' + (gy - 6).toFixed(1) + '">' +
+          Math.abs(ga) + "°" + (ga >= 0 ? "N" : "S") + "</text>");
+      }
+    }
+    parts.push("</g>");
+    (BASEMAP.land || []).forEach(function (ring) {
+      var d = ring.map(function (c, i) {
+        return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
+          pr.Y(c[1]).toFixed(1);
+      }).join(" ") + " Z";
+      parts.push('<path class="ac-land" d="' + d + '"/>');
+    });
+    return parts;
+  }
+
+  // in-plot title lockup (mirror the cone's ac-title #5) at a top corner.
+  function titleLockup(pr, head) {
+    var stormName = (document.getElementById("storm-name") || {})
+      .textContent || "";
+    var typeWord = (document.getElementById("storm-type") || {})
+      .textContent || (document.getElementById("chip") || {})
+      .textContent || "";
+    var tx0 = 18, ty0 = 16, TIT_H = 70;
+    return '<g class="ac-title">' +
+      '<rect x="' + (tx0 - 9.5) + '" y="' + ty0 +
+      '" width="3" height="' + TIT_H +
+      '" rx="1.5" fill="var(--cat-accent)"/>' +
+      '<text class="ac-eyebrow" x="' + tx0 + '" y="' + (ty0 + 14) +
+      '">TRIPLE-A-TROPICS · CycloLab</text>' +
+      '<text class="ac-head" x="' + tx0 + '" y="' + (ty0 + 42) +
+      '">' + head + '</text>' +
+      '<text class="ac-sub" x="' + tx0 + '" y="' + (ty0 + 66) + '">' +
+      typeWord.toUpperCase() + " " + stormName.toUpperCase() +
+      "</text></g>";
+  }
+
+  // ocean watermark, auto-placed in the emptiest open water that misses
+  // the track box (a light version of the cone's placement sweep).
+  function oceanWatermark(pr, avoidBox) {
+    var wmW = ((BASEMAP.ocean || "").length * 11) + 26, wmH = 24;
+    var W = pr.W, H = pr.H, best = null, bestScore = -1;
+    function landBoxes() {
+      return (BASEMAP.land || []).map(function (lr) {
+        var lx0 = Infinity, lx1 = -Infinity, ly0 = Infinity, ly1 = -Infinity;
+        for (var lv = 0; lv < lr.length; lv++) {
+          var lpx = pr.X(lr[lv][0]), lpy = pr.Y(lr[lv][1]);
+          lx0 = Math.min(lx0, lpx); lx1 = Math.max(lx1, lpx);
+          ly0 = Math.min(ly0, lpy); ly1 = Math.max(ly1, lpy);
+        }
+        return { x: lx0, y: ly0, w: lx1 - lx0, h: ly1 - ly0 };
+      });
+    }
+    function ov(a, b) {
+      var ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      var oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      return ox > 0 && oy > 0;
+    }
+    var lbs = landBoxes();
+    for (var gy2 = 0.16; gy2 <= 0.9; gy2 += 0.1) {
+      for (var gx2 = 0.1; gx2 <= 0.9; gx2 += 0.11) {
+        var cxw = gx2 * W, cyw = gy2 * H;
+        var r3 = { x: cxw - wmW / 2, y: cyw - wmH / 2, w: wmW, h: wmH };
+        if (r3.x < 8 || r3.x + r3.w > W - 8 ||
+            r3.y < 64 || r3.y + r3.h > H - 30) continue;
+        var bad = avoidBox && ov(r3, avoidBox);
+        for (var lk = 0; lk < lbs.length && !bad; lk++) {
+          if (ov(r3, lbs[lk])) bad = true;
+        }
+        if (bad) continue;
+        var dxw = cxw - (avoidBox ? avoidBox.x + avoidBox.w / 2 : W / 2);
+        var dyw = cyw - (avoidBox ? avoidBox.y + avoidBox.h / 2 : H / 2);
+        var sc = dxw * dxw + dyw * dyw;
+        if (sc > bestScore) { bestScore = sc; best = { x: cxw, y: cyw }; }
+      }
+    }
+    if (!best) return "";
+    return '<text class="ac-ocean" x="' + best.x.toFixed(0) + '" y="' +
+      best.y.toFixed(0) + '" text-anchor="middle">' +
+      (BASEMAP.ocean || "") + "</text>";
+  }
+
+  // four-quadrant wind-radii arcs around a center (NE/SE/SW/NW). radii =
+  // [ne,se,sw,nw] in NAUTICAL MILES -> degrees lat = nm/60. Each quadrant
+  // is a 90deg pie sector; a 0/absent quadrant draws nothing. Returns one
+  // <path> string (or "" if every quadrant is 0).
+  function quadrantArcs(pr, lat, lon, radii, attrs) {
+    if (!radii) return "";
+    var cx = pr.X(lon), cy = pr.Y(lat);
+    // quadrant compass spans (from North, clockwise): NE 0-90, SE 90-180,
+    // SW 180-270, NW 270-360.
+    var quads = [[0, 90], [90, 180], [180, 270], [270, 360]];
+    var dseg = [];
+    for (var q = 0; q < 4; q++) {
+      var rn = radii[q];
+      if (!rn || rn <= 0) continue;
+      var rdeg = rn / 60.0;                  // nm -> degrees latitude
+      // sample the arc; project each point (lon scales with cos lat).
+      var a0 = quads[q][0], a1 = quads[q][1];
+      var seg = ['M' + cx.toFixed(1) + "," + cy.toFixed(1)];
+      for (var aa = a0; aa <= a1 + 0.001; aa += 9) {
+        var th = aa * Math.PI / 180;          // compass angle from North
+        var dlat = rdeg * Math.cos(th);
+        var dlon = rdeg * Math.sin(th) /
+                   Math.max(0.2, Math.cos(lat * Math.PI / 180));
+        seg.push("L" + pr.X(lon + dlon).toFixed(1) + "," +
+          pr.Y(lat + dlat).toFixed(1));
+      }
+      seg.push("Z");
+      dseg.push(seg.join(" "));
+    }
+    if (!dseg.length) return "";
+    return '<path d="' + dseg.join(" ") + '" ' + attrs +
+      ' fill-rule="evenodd"/>';
+  }
+
+  function stormHasRadii(storm) {
+    return (storm.points || []).some(function (p) {
+      return p && p.radii && (p.radii["34"] || p.radii["50"] ||
+        p.radii["64"]);
+    });
+  }
+
+  // ---------------------------------------------------------------- #7
+  function renderTrackPlot(storm) {
+    var svg = document.getElementById("trackplot");
+    var note = document.getElementById("trackplot-note");
+    if (!svg) return;
+    var pts = (storm.points || []).filter(function (p) {
+      return p && p.lat != null && p.lon != null; });
+    if (pts.length < 1) { svg.innerHTML = ""; if (note) note.textContent = "";
+      return; }
+    var last = pts[pts.length - 1];
+    // projection extent: every track point + the current wind-field reach.
+    var extent = pts.map(function (p) { return { lat: p.lat, lon: p.lon }; });
+    var lastRad = last.radii || null;
+    var maxNm = 0;
+    if (lastRad) {
+      ["34", "50", "64"].forEach(function (k) {
+        (lastRad[k] || []).forEach(function (v) {
+          if (v && v > maxNm) maxNm = v; });
+      });
+    }
+    if (maxNm > 0) {
+      var pad = maxNm / 60.0 * 1.15;
+      extent = extent.concat([
+        { lat: last.lat + pad, lon: last.lon },
+        { lat: last.lat - pad, lon: last.lon },
+        { lat: last.lat, lon: last.lon + pad /
+          Math.max(0.2, Math.cos(last.lat * Math.PI / 180)) },
+        { lat: last.lat, lon: last.lon - pad /
+          Math.max(0.2, Math.cos(last.lat * Math.PI / 180)) }]);
+    }
+    var pr = fitProjection(extent, 1000, 440, 760, 92);
+    var W = pr.W, H = pr.H;
+    var parts = mapFurniture(pr);
+
+    // current wind-field arcs (drawn BEFORE the track dots / hero marker so
+    // the marker sits on top but the arcs fan visibly beyond it). Three
+    // color-tiered rings, ~2px strokes, bright on the dark canvas:
+    //   34 kt = cool/dim blue (outer), 50 kt = mid cyan, 64 kt = warm amber
+    //   (inner, brightest). Each non-empty tier gets an outer-edge label and
+    //   an entry in a tiny inline key.
+    var hasField = false;
+    var fieldKey = [];
+    if (lastRad) {
+      // each tier carries a distinct outer-edge label bearing (compass deg)
+      // so the three numbers fan AROUND the ring instead of stacking on one
+      // edge: 34 -> NE, 50 -> E, 64 -> N.
+      var tiers = [
+        ["34", "rgba(70,150,255,0.10)", "rgba(96,176,255,0.95)", 2,
+          "#7cb4ff", 50],
+        ["50", "rgba(40,220,230,0.12)", "rgba(54,232,238,0.97)", 2,
+          "#46e6ee", 95],
+        ["64", "rgba(255,170,60,0.16)", "rgba(255,196,84,1)", 2.2,
+          "#ffc454", 10]];
+      var coslat = Math.max(0.2, Math.cos(last.lat * Math.PI / 180));
+      var ccx = pr.X(last.lon), ccy = pr.Y(last.lat);
+      tiers.forEach(function (t) {
+        var arc = quadrantArcs(pr, last.lat, last.lon, lastRad[t[0]],
+          'fill="' + t[1] + '" stroke="' + t[2] + '" stroke-width="' +
+          t[3] + '" stroke-linejoin="round"');
+        if (!arc) return;
+        hasField = true;
+        parts.push(arc);
+        fieldKey.push([t[0], t[4]]);
+        // outer-edge label along this tier's bearing, in the radius of the
+        // quadrant the bearing falls in, nudged a few px past the stroke.
+        var bearing = t[5];
+        var quad = Math.floor((bearing % 360) / 90);   // 0=NE 1=SE 2=SW 3=NW
+        var rr = lastRad[t[0]] || [];
+        var rn = rr[quad] || 0;
+        if (rn > 0) {
+          var th = bearing * Math.PI / 180;
+          var rdeg = rn / 60.0;
+          var lx = pr.X(last.lon + (rdeg * Math.sin(th)) / coslat);
+          var ly = pr.Y(last.lat + rdeg * Math.cos(th));
+          // push ~9px farther out along the same bearing, in screen space.
+          var vx = lx - ccx, vy = ly - ccy;
+          var vlen = Math.max(1, Math.sqrt(vx * vx + vy * vy));
+          var ox = lx + (vx / vlen) * 9, oy = ly + (vy / vlen) * 9;
+          parts.push('<text class="tp-field-lbl" x="' + ox.toFixed(1) +
+            '" y="' + (oy + 4).toFixed(1) + '" fill="' + t[4] +
+            '" text-anchor="middle">' + windDisp(Number(t[0])) + "</text>");
+        }
+      });
+    }
+
+    // faint track polyline.
+    var tp = pts.map(function (p) {
+      return [pr.X(p.lon), pr.Y(p.lat)]; });
+    var dline = tp.map(function (c, i) {
+      return (i ? "L" : "M") + c[0].toFixed(1) + "," + c[1].toFixed(1);
+    }).join(" ");
+    parts.push('<path class="tp-track" d="' + dline + '"/>');
+
+    // per-fix dots: neon ramp by wind_kt, shape by nature, latest = hero.
+    var shapesSeen = {};
+    pts.forEach(function (p, i) {
+      var isNow = (i === pts.length - 1);
+      var col = neonColor(p.wind_kt);
+      var shape = natureShape(p.nature);
+      shapesSeen[shape] = 1;
+      var r = isNow ? 11 : 5.4;
+      var cls = "tp-dot" + (isNow ? " tp-now" : "");
+      parts.push(shapeMarker(shape, tp[i][0], tp[i][1], r, col, cls));
+    });
+
+    // LABELED COLORBAR (gradient bar + ticks, units-aware labels).
+    var cbX = W - 34, cbY = 96, cbW = 16, cbH = H - 200;
+    var gid = "tp-neon-grad";
+    var stops = NEON_RAMP.map(function (s) {
+      var f = s[0] / 185.0;
+      return '<stop offset="' + (Math.min(1, f) * 100).toFixed(1) +
+        '%" stop-color="rgb(' + s[1] + "," + s[2] + "," + s[3] + ')"/>';
+    }).join("");
+    parts.push('<defs><linearGradient id="' + gid +
+      '" x1="0" y1="1" x2="0" y2="0">' + stops + "</linearGradient></defs>");
+    parts.push('<rect x="' + cbX + '" y="' + cbY + '" width="' + cbW +
+      '" height="' + cbH + '" fill="url(#' + gid + ')"/>');
+    parts.push('<rect class="tp-cbar-frame" x="' + cbX + '" y="' + cbY +
+      '" width="' + cbW + '" height="' + cbH + '"/>');
+    [0, 34, 64, 96, 137, 185].forEach(function (kt) {
+      var ty = cbY + cbH - (Math.min(kt, 185) / 185.0) * cbH;
+      parts.push('<line x1="' + (cbX - 4) + '" y1="' + ty.toFixed(1) +
+        '" x2="' + cbX + '" y2="' + ty.toFixed(1) +
+        '" stroke="#3a4d6e" stroke-width="1"/>');
+      parts.push('<text class="tp-cbar-tick" x="' + (cbX - 7) + '" y="' +
+        (ty + 4).toFixed(1) + '" text-anchor="end">' + windDisp(kt) +
+        "</text>");
+    });
+    parts.push('<text class="tp-cbar-tick" x="' + (cbX + cbW / 2) +
+      '" y="' + (cbY - 8) + '" text-anchor="middle">' + windUnitLabel() +
+      "</text>");
+
+    // LEGEND block: Vmax / Pmin / ACE + a tiny shape key.
+    var lgW = 196, lgH = 96, lgX = 14, lgY = H - lgH - 14;
+    var vmaxKt = last.wind_kt;
+    parts.push('<rect class="tp-legend-bg" x="' + lgX + '" y="' + lgY +
+      '" width="' + lgW + '" height="' + lgH + '" rx="7"/>');
+    parts.push('<text class="tp-legend-h" x="' + (lgX + 12) + '" y="' +
+      (lgY + 18) + '">CURRENT</text>');
+    parts.push('<text class="tp-legend-t" x="' + (lgX + 12) + '" y="' +
+      (lgY + 37) + '">Vmax ' +
+      (vmaxKt != null ? windDisp(vmaxKt) + " " + windUnitLabel() : "—") +
+      "</text>");
+    parts.push('<text class="tp-legend-t" x="' + (lgX + 12) + '" y="' +
+      (lgY + 53) + '">Pmin ' +
+      (last.pressure_mb != null ? Math.round(last.pressure_mb) + " mb"
+        : "—") + "</text>");
+    parts.push('<text class="tp-legend-t" x="' + (lgX + 12) + '" y="' +
+      (lgY + 69) + '">ACE ' +
+      (storm.ace != null ? Number(storm.ace).toFixed(2) : "0.00") + "</text>");
+    // shape key row (its own class so the dot-count probe counts only fixes)
+    var kyY = lgY + 86, ksx = lgX + 14;
+    parts.push(shapeMarker("circle", ksx, kyY - 3, 4, "#cdd9ea",
+      "tp-key"));
+    parts.push(shapeMarker("square", ksx + 56, kyY - 3, 4, "#cdd9ea",
+      "tp-key"));
+    parts.push(shapeMarker("triangle", ksx + 116, kyY - 3, 4, "#cdd9ea",
+      "tp-key"));
+    parts.push('<text class="tp-legend-k" x="' + (ksx + 8) + '" y="' +
+      (kyY) + '">trop</text>');
+    parts.push('<text class="tp-legend-k" x="' + (ksx + 64) + '" y="' +
+      (kyY) + '">sub</text>');
+    parts.push('<text class="tp-legend-k" x="' + (ksx + 124) + '" y="' +
+      (kyY) + '">non-trop</text>');
+
+    // tiny inline WIND-FIELD key ("34/50/64 kt"): one swatch per tier that
+    // actually rendered, in the same tier colors as the arcs. Fixed
+    // furniture anchored just under the title lockup so it stays legible.
+    if (fieldKey.length) {
+      var wkX = 20, wkY = 102, wkGap = 40;
+      parts.push('<text class="tp-field-key-h" x="' + wkX + '" y="' + wkY +
+        '">WIND FIELD</text>');
+      var wkRowY = wkY + 16, wkcx = wkX + 6;
+      fieldKey.forEach(function (fk, fi) {
+        parts.push('<circle class="tp-key" cx="' + wkcx + '" cy="' +
+          (wkRowY - 4) + '" r="4.5" fill="none" stroke="' + fk[1] +
+          '" stroke-width="2"/>');
+        parts.push('<text class="tp-field-key" x="' + (wkcx + 9) + '" y="' +
+          wkRowY + '" fill="' + fk[1] + '">' + windDisp(Number(fk[0])) +
+          "</text>");
+        wkcx += wkGap;
+      });
+      parts.push('<text class="tp-field-key-u" x="' + wkcx + '" y="' +
+        wkRowY + '">' + windUnitLabel() + "</text>");
+    }
+
+    // title lockup + watermark + frame.
+    var trackBox = (function () {
+      var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      tp.forEach(function (c) {
+        x0 = Math.min(x0, c[0]); x1 = Math.max(x1, c[0]);
+        y0 = Math.min(y0, c[1]); y1 = Math.max(y1, c[1]);
+      });
+      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    })();
+    parts.push(titleLockup(pr, "TRACK HISTORY"));
+    parts.push(oceanWatermark(pr, trackBox));
+    parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
+      (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
+
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.innerHTML = parts.join("");
+
+    // disclosure caption (cite the radii source).
+    if (note) {
+      var cap = "Observed best-track positions colored by 1-min wind; ";
+      cap += hasField
+        ? "current four-quadrant wind radii from the latest advisory/ATCF " +
+          "best-track deck (34/50/64 " + windUnitLabel() +
+          " thresholds shown)."
+        : "wind radii unavailable for this storm.";
+      note.textContent = cap;
+    }
+  }
+
+  // ---------------------------------------------------------------- #8
+  var swathTreatment = "filled";          // default = filled (item 8)
+  function renderSwathPlot(storm) {
+    var svg = document.getElementById("swathplot");
+    var empty = document.getElementById("swath-empty");
+    var derived = document.getElementById("swath-derived");
+    var method = document.getElementById("swath-method");
+    var mbody = document.getElementById("swath-method-body");
+    var note = document.getElementById("swathplot-note");
+    if (!svg) return;
+    var pts = (storm.points || []).filter(function (p) {
+      return p && p.lat != null && p.lon != null; });
+
+    // honest empty state when there are no analyzed radii at all.
+    if (!stormHasRadii(storm) || pts.length < 1) {
+      svg.innerHTML = ""; svg.style.display = "none";
+      if (empty) {
+        empty.style.display = "block";
+        empty.textContent = "Wind-swath needs analyzed wind radii — " +
+          "not yet available for this storm.";
+      }
+      if (derived) derived.hidden = true;
+      if (method) method.hidden = true;
+      if (note) note.textContent = "";
+      return;
+    }
+    svg.style.display = "block";
+    if (empty) empty.style.display = "none";
+    if (derived) derived.hidden = false;
+    if (method) method.hidden = false;
+    if (mbody) {
+      mbody.textContent =
+        "Per-advisory analyzed four-quadrant wind radii (34 kt and 64 kt) " +
+        "are swept along the storm’s track, linearly interpolating " +
+        "the radii between consecutive fixes (the standard NHC wind-swath " +
+        "construction), and the swept wind-field polygons are accumulated " +
+        "into a single swath. Source = the best-track / advisory radii " +
+        "deck; the inter-fix interpolation is ours. This is a DERIVED " +
+        "product, not an official NHC wind-swath graphic.";
+    }
+
+    // projection extent: track + the maximum radii reach anywhere.
+    var extent = pts.map(function (p) { return { lat: p.lat, lon: p.lon }; });
+    pts.forEach(function (p) {
+      if (!p.radii) return;
+      ["34", "64"].forEach(function (k) {
+        var arr = p.radii[k]; if (!arr) return;
+        var mx = Math.max.apply(null, arr.map(function (v) {
+          return v || 0; }));
+        if (mx > 0) {
+          var pad = mx / 60.0;
+          var kc = Math.max(0.2, Math.cos(p.lat * Math.PI / 180));
+          extent.push({ lat: p.lat + pad, lon: p.lon });
+          extent.push({ lat: p.lat - pad, lon: p.lon });
+          extent.push({ lat: p.lat, lon: p.lon + pad / kc });
+          extent.push({ lat: p.lat, lon: p.lon - pad / kc });
+        }
+      });
+    });
+    var pr = fitProjection(extent, 1000, 440, 760, 92);
+    var W = pr.W, H = pr.H;
+    var parts = mapFurniture(pr);
+
+    // sweep one threshold's wind-field along the track, INTERPOLATING the
+    // 4 quadrant radii between consecutive fixes (NHC swath method). Each
+    // fix + interpolated sub-step emits the four-quadrant polygon; all are
+    // drawn with one fill so overlaps visually UNION.
+    function sweep(thr) {
+      var withR = pts.filter(function (p) {
+        return p.radii && p.radii[thr] &&
+          Math.max.apply(null, p.radii[thr].map(function (v) {
+            return v || 0; })) > 0; });
+      if (withR.length === 0) return [];
+      var polys = [];
+      function emit(lat, lon, radii) {
+        var d = quadrantArcs(pr, lat, lon, radii, "");
+        // strip the wrapper the arc helper adds; we only want the path d.
+        var m = d.match(/d="([^"]+)"/);
+        if (m) polys.push(m[1]);
+      }
+      // build a dense per-fix list (in track order, only ones with radii
+      // for this threshold), interpolating sub-steps between neighbours.
+      var ordered = pts.filter(function (p) {
+        return p.radii && p.radii[thr] &&
+          Math.max.apply(null, p.radii[thr].map(function (v) {
+            return v || 0; })) > 0; });
+      for (var i = 0; i < ordered.length; i++) {
+        var a = ordered[i];
+        emit(a.lat, a.lon, a.radii[thr]);
+        if (i + 1 < ordered.length) {
+          var b = ordered[i + 1];
+          var STEPS = 6;
+          for (var s = 1; s < STEPS; s++) {
+            var f = s / STEPS;
+            var lat = a.lat + (b.lat - a.lat) * f;
+            var lon = a.lon + (b.lon - a.lon) * f;
+            var rr = [0, 0, 0, 0];
+            for (var q = 0; q < 4; q++) {
+              rr[q] = (a.radii[thr][q] || 0) +
+                ((b.radii[thr][q] || 0) - (a.radii[thr][q] || 0)) * f;
+            }
+            emit(lat, lon, rr);
+          }
+        }
+      }
+      return polys;
+    }
+
+    var sw34 = sweep("34");
+    var sw64 = sweep("64");
+    var hatchDefs = "";
+    if (swathTreatment === "outlined") {
+      hatchDefs =
+        '<defs>' +
+        '<pattern id="sw-hatch34" width="8" height="8" ' +
+        'patternUnits="userSpaceOnUse" patternTransform="rotate(45)">' +
+        '<line x1="0" y1="0" x2="0" y2="8" stroke="rgba(63,164,255,0.5)" ' +
+        'stroke-width="1.4"/></pattern>' +
+        '<pattern id="sw-hatch64" width="6" height="6" ' +
+        'patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">' +
+        '<line x1="0" y1="0" x2="0" y2="6" stroke="rgba(120,255,210,0.85)" ' +
+        'stroke-width="1.4"/></pattern></defs>';
+    }
+    parts.push(hatchDefs);
+
+    function emitSwath(polys, treatment, fillKey) {
+      if (!polys.length) return;
+      var d = polys.join(" ");
+      if (treatment === "filled") {
+        // CLEAN SOLID translucent band: NO per-polygon stroke. The swept
+        // sectors are all wound the same way so fill-rule="nonzero" unions
+        // every overlap into one seam-free shape. Opaque-enough house blue
+        // for the 34-kt envelope; a brighter solid cyan core for 64 kt on
+        // top. (Any stroke here re-draws every sub-polygon edge -> a mesh.)
+        var fill = fillKey === "34" ? "rgba(63,164,255,0.52)"
+                                    : "rgba(90,238,255,0.66)";
+        parts.push('<path class="sw-' + fillKey + '" d="' + d +
+          '" fill="' + fill +
+          '" fill-rule="nonzero" stroke="none"/>');
+      } else {
+        var hatch = fillKey === "34" ? "url(#sw-hatch34)"
+                                     : "url(#sw-hatch64)";
+        parts.push('<path class="sw-' + fillKey + '" d="' + d +
+          '" fill="' + hatch + '" fill-rule="nonzero" stroke="' +
+          (fillKey === "34" ? "rgba(99,160,235,0.9)"
+                            : "rgba(150,245,255,0.95)") +
+          '" stroke-width="' + (fillKey === "34" ? 1.4 : 1.8) + '"/>');
+      }
+    }
+    emitSwath(sw34, swathTreatment, "34");
+    emitSwath(sw64, swathTreatment, "64");
+
+    // a faint center track for context.
+    var tp = pts.map(function (p) { return [pr.X(p.lon), pr.Y(p.lat)]; });
+    var dline = tp.map(function (c, i) {
+      return (i ? "L" : "M") + c[0].toFixed(1) + "," + c[1].toFixed(1);
+    }).join(" ");
+    parts.push('<path class="tp-track" d="' + dline +
+      '" stroke="rgba(150,180,220,0.3)"/>');
+
+    var swathBox = (function () {
+      var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      tp.forEach(function (c) {
+        x0 = Math.min(x0, c[0]); x1 = Math.max(x1, c[0]);
+        y0 = Math.min(y0, c[1]); y1 = Math.max(y1, c[1]);
+      });
+      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    })();
+    parts.push(titleLockup(pr, "WIND HISTORY"));
+    parts.push(oceanWatermark(pr, swathBox));
+    parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
+      (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
+
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.innerHTML = parts.join("");
+
+    if (note) {
+      note.textContent =
+        "Cumulative tropical-storm-force (34 " + windUnitLabel() +
+        ") swath" + (sw64.length ? ", with hurricane-force (64 " +
+        windUnitLabel() + ") core overlaid," : "") +
+        " swept from the analyzed quadrant wind radii along the observed " +
+        "track. Derived from best-track deck radii — not an official " +
+        "NHC wind-swath product.";
+    }
+  }
+
+  function swathSetTreatment(t) {
+    if (t !== "filled" && t !== "outlined") return;
+    swathTreatment = t;
+    var host = document.getElementById("swath-seg");
+    if (host) {
+      for (var i = 0; i < host.children.length; i++) {
+        var b = host.children[i];
+        b.classList.toggle("active",
+          b.getAttribute("data-treatment") === t);
+      }
+    }
+    if (lastStorm) {
+      try { renderSwathPlot(lastStorm); } catch (e) {}
+    }
+  }
+
+  function buildSwathSeg() {
+    var host = document.getElementById("swath-seg");
+    if (!host || host.children.length) return;
+    [["filled", "Filled"], ["outlined", "Outlined"]].forEach(function (o) {
+      var b = document.createElement("button");
+      b.className = "hafs-seg" + (o[0] === swathTreatment ? " active" : "");
+      b.type = "button";
+      b.setAttribute("data-treatment", o[0]);
+      b.textContent = o[1];
+      b.addEventListener("click", function () { swathSetTreatment(o[0]); });
+      host.appendChild(b);
+    });
+  }
+
   // ---- hydration (poll + diff-merge: grow state, never reset the user) ----
   var lastFixKey = null;
   var lastStorm = null;
@@ -1602,6 +2391,17 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       try { renderChart(storm); } catch (e) {
         try { console.warn("[cyclolab] chart render failed:", e); }
+        catch (e2) {}
+      }
+      // FG-R3 #7/#8: the two Overview plots render on a NEW fix - each
+      // ISOLATED (one throw must not starve the next), mirroring the
+      // hero/chart wiring exactly.
+      try { renderTrackPlot(storm); } catch (e) {
+        try { console.warn("[cyclolab] track plot failed:", e); }
+        catch (e2) {}
+      }
+      try { renderSwathPlot(storm); } catch (e) {
+        try { console.warn("[cyclolab] swath plot failed:", e); }
         catch (e2) {}
       }
       lastFixKey = fixKey;
@@ -1670,6 +2470,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   buildVitals();
   buildSettingsUI();
+  buildSwathSeg();              // FG-R3 #8: swath treatment seg control
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   // ENDED pages used to skip the fetch entirely, which left advFull
@@ -3255,7 +4056,14 @@ HTML_TEMPLATE = r"""<!doctype html>
                    setWindUnits: function (u) { setWindUnits(u); },
                    windUnits: function () { return settings.windUnits; },
                    windDisp: function (kt) { return windDisp(kt); },
-                   hafsViewer: function () { return hafsViewer; } };
+                   hafsViewer: function () { return hafsViewer; },
+                   // FG-R3 #7/#8 overview-plot hooks (tests + ops)
+                   renderTrackPlot: function (s) {
+                     return renderTrackPlot(s || lastStorm); },
+                   renderSwathPlot: function (s) {
+                     return renderSwathPlot(s || lastStorm); },
+                   swathSetTreatment: function (t) { swathSetTreatment(t); },
+                   swathTreatment: function () { return swathTreatment; } };
 })();
 </script>
 </body>

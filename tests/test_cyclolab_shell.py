@@ -40,7 +40,12 @@ from storm_ids import InvestSidError  # noqa: E402
 
 HARNESS = HERE / "cyclolab_shell_harness.cjs"
 FIXTURE = HERE / "fixtures" / "cyclolab" / "synth_storm.json"
+RADII_FIXTURE = HERE / "fixtures" / "cyclolab" / "synth_storm_radii.json"
 NODE = shutil.which("node")
+
+
+def load_radii_storm() -> dict:
+    return json.loads(RADII_FIXTURE.read_text(encoding="utf-8"))
 
 # The harness needs jsdom on NODE_PATH. Honour an inherited NODE_PATH (the
 # documented invocation) but fall back to the main repo's node_modules so a
@@ -1456,6 +1461,169 @@ class TestMesoSectorSeam(unittest.TestCase):
         self.assertIn('id: "floater"', html)
         self.assertIn("resolve: function (top)", html)
         self.assertIn("SAT_SOURCES.map(", html)
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestOverviewPlots(unittest.TestCase):
+    """FG-R3 #7/#8/#11: the two art-directed Overview plots (track-history
+    + wind-history swath) and the two-column Overview layout. The plots
+    are CLIENT-SIDE renderers driven from the existing per-fix feed (no
+    new fetch) and wired into apply()'s new-fix block + rerenderUnits()."""
+
+    def setUp(self):
+        self.storm = load_radii_storm()          # 14 fixes, radii present
+        self.bare = load_storm()                  # synth_storm.json, NO radii
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL,
+                                               loader="")
+
+    def _ov(self, ops, storm=None):
+        plan = {"feed": {"storms": [storm or self.storm]}, "ops": ops}
+        recs = run_harness(self.html, plan)
+        return recs
+
+    # ---- #7 track-history plot ------------------------------------------
+    def test_trackplot_renders_dots_three_shapes_and_colorbar(self):
+        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        ov = st["overview"]
+        self.assertTrue(ov["trackRendered"])
+        # one dot per fix (14); legend key shapes use a separate class.
+        self.assertEqual(ov["trackDotCount"], len(self.storm["points"]))
+        sh = ov["trackShapes"]
+        # the fixture mixes SS (square) at the start, TS (circle), ET
+        # (triangle) at the end -> all three marker shapes present.
+        self.assertGreater(sh["circle"], 0)
+        self.assertGreater(sh["square"], 0)
+        self.assertGreater(sh["triangle"], 0)
+        # the LABELED colorbar (gradient + ticks).
+        self.assertTrue(ov["trackColorbar"])
+        self.assertGreaterEqual(ov["trackColorbarTicks"], 6)
+        # title lockup + map furniture + legend.
+        self.assertEqual(ov["trackTitle"], "TRACK HISTORY")
+        self.assertTrue(ov["trackLegend"])
+        self.assertGreaterEqual(ov["trackGraticule"], 2)
+
+    def test_trackplot_windfield_present_with_radii(self):
+        # the current fix carries radii -> the four-quadrant arcs render
+        # (one path per non-empty threshold) and the caption cites them.
+        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        ov = st["overview"]
+        self.assertGreater(ov["trackWindField"], 0)
+        self.assertIn("wind radii", ov["trackNote"])
+        self.assertIn("best-track deck", ov["trackNote"])
+
+    def test_trackplot_windfield_absent_is_graceful(self):
+        # a feed with NO radii anywhere: the plot still renders fully from
+        # wind + nature; the wind-field is skipped and the caption says so.
+        st = self._ov([{"op": "apply", "storm": self.bare}],
+                      storm=self.bare)[-1]["state"]
+        ov = st["overview"]
+        self.assertTrue(ov["trackRendered"])
+        self.assertEqual(ov["trackWindField"], 0)
+        self.assertEqual(ov["trackDotCount"], len(self.bare["points"]))
+        self.assertIn("wind radii unavailable", ov["trackNote"])
+
+    def test_trackplot_colorbar_converts_with_units(self):
+        # units-aware colorbar: the underlying ramp GEOMETRY stays in kt,
+        # only the tick labels convert. 185 kt -> 213 mph appears as a tick.
+        recs = self._ov([{"op": "apply", "storm": self.storm},
+                         {"op": "setWindUnits", "unit": "mph"}])
+        # the plot was re-rendered by rerenderUnits with mph labels.
+        ov = recs[-1]["state"]["overview"]
+        self.assertTrue(ov["trackRendered"])
+        # the caption's threshold note now reads "mph", never a bare "kt".
+        self.assertIn("mph", ov["trackNote"])
+
+    # ---- #8 wind-history swath plot -------------------------------------
+    def test_swath_renders_both_treatments(self):
+        recs = self._ov([
+            {"op": "apply", "storm": self.storm},
+            {"op": "clickSwathTreatment", "treatment": "outlined"},
+            {"op": "clickSwathTreatment", "treatment": "filled"}])
+        applied = recs[0]["state"]["overview"]
+        outlined = recs[1]["state"]["overview"]
+        filled = recs[2]["state"]["overview"]
+        # default treatment is "filled".
+        self.assertEqual(applied["swathTreatment"], "filled")
+        self.assertTrue(applied["swathRendered"])
+        self.assertGreater(applied["swath34"], 0)
+        self.assertGreater(applied["swath64"], 0)
+        self.assertEqual(applied["swathHatch"], 0)   # filled has no hatch
+        # OUTLINED treatment: both regions still render, plus hatch patterns.
+        self.assertEqual(outlined["swathTreatment"], "outlined")
+        self.assertGreater(outlined["swath34"], 0)
+        self.assertGreater(outlined["swath64"], 0)
+        self.assertGreater(outlined["swathHatch"], 0)
+        # toggling back to filled re-renders filled, no hatch.
+        self.assertEqual(filled["swathTreatment"], "filled")
+        self.assertEqual(filled["swathHatch"], 0)
+        self.assertGreater(filled["swath34"], 0)
+
+    def test_swath_derived_caption_and_method_panel(self):
+        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        ov = st["overview"]
+        self.assertEqual(ov["swathTitle"], "WIND HISTORY")
+        self.assertTrue(ov["swathDerivedShown"], "derived caption hidden")
+        self.assertTrue(ov["swathMethodShown"], "method <details> hidden")
+        body = ov["swathMethodBody"] or ""
+        self.assertIn("interpolat", body)          # interpolation disclosed
+        self.assertIn("best-track", body)          # source cited
+        self.assertIn("not an official", body)     # honesty
+        self.assertIn("Derived", ov["swathNote"])
+
+    def test_swath_honest_empty_state_without_radii(self):
+        # a storm with no analyzed radii: never a blank/broken panel -
+        # the SVG hides and the honest empty state shows instead.
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.bare]},
+             "ops": [{"op": "apply", "storm": self.bare}]})
+        ov = recs[-1]["state"]["overview"]
+        self.assertFalse(ov["swathRendered"])
+        self.assertEqual(ov["swathDisplay"], "none")
+        self.assertTrue(ov["swathEmptyShown"])
+        self.assertIn("not yet available", ov["swathEmptyText"])
+        # the derived caption + method panel stay hidden in the empty state.
+        self.assertFalse(ov["swathDerivedShown"])
+        self.assertFalse(ov["swathMethodShown"])
+
+    def test_swath_seg_control_default_filled(self):
+        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        seg = st["overview"]["swathSeg"]
+        self.assertEqual([s["treatment"] for s in seg],
+                         ["filled", "outlined"])
+        active = [s["treatment"] for s in seg if s["active"]]
+        self.assertEqual(active, ["filled"])
+
+    # ---- #11 two-column Overview layout ---------------------------------
+    def test_overview_two_column_grid(self):
+        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        ov = st["overview"]
+        # desktop = a real two-column CSS grid on the .wipe, two ov-col
+        # wrappers (left = hero+chart, right = track+swath).
+        self.assertIn("1fr 1fr", ov["ovGridCols"])
+        self.assertEqual(ov["ovCols"], 2)
+        # all four overview cards are present.
+        for c in ov["ovCardOrder"]:
+            self.assertTrue(c["present"], f"missing {c['id']}")
+
+    def test_overview_mobile_stack_order_in_css(self):
+        # the mobile media query defines the explicit stack order
+        # hero -> track -> W&P -> swath via CSS `order` (jsdom does not
+        # apply media queries, so assert the served rule text).
+        h = self.html
+        self.assertIn("grid-template-columns: 1fr;", h)   # single column
+        self.assertIn("#sec-overview #card-hero  { order: 1; }", h)
+        self.assertIn("#sec-overview #card-track { order: 2; }", h)
+        self.assertIn("#sec-overview #card-wp    { order: 3; }", h)
+        self.assertIn("#sec-overview #card-swath { order: 4; }", h)
+
+    def test_plots_render_on_new_fix_via_apply(self):
+        # wiring parity with renderChart: a fresh fix triggers both plots
+        # (and the chart) inside apply()'s new-fix block.
+        st = self._ov([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        self.assertGreater(st["chartChildCount"], 0)
+        self.assertTrue(st["overview"]["trackRendered"])
+        self.assertTrue(st["overview"]["swathRendered"])
 
 
 if __name__ == "__main__":

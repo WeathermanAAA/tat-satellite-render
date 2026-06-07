@@ -377,9 +377,94 @@ const scheduledDelays = [];
     };
   }
 
+  function overviewProbe() {
+    // FG-R3 #7/#8/#11: the two Overview plots + the two-column layout.
+    const tp = document.getElementById("trackplot");
+    const sw = document.getElementById("swathplot");
+    const wipe = document.querySelector("#sec-overview .wipe");
+    let gridCols = "";
+    try {
+      gridCols = wipe ? (window.getComputedStyle(wipe)
+        .getPropertyValue("grid-template-columns") || "") : "";
+    } catch (e) { gridCols = ""; }
+    function shapeCounts(svgEl, cls) {
+      if (!svgEl) return { circle: 0, square: 0, triangle: 0, total: 0 };
+      const circ = svgEl.querySelectorAll("circle." + cls).length;
+      const sq = svgEl.querySelectorAll("rect." + cls).length;
+      const tri = svgEl.querySelectorAll("polygon." + cls).length;
+      return { circle: circ, square: sq, triangle: tri,
+               total: circ + sq + tri };
+    }
+    const tpShapes = shapeCounts(tp, "tp-dot");
+    return {
+      // ---- track-history plot (#7) ----
+      trackRendered: !!(tp && tp.innerHTML.length > 100),
+      trackChildCount: tp ? tp.children.length : 0,
+      trackDotCount: tpShapes.total,
+      trackShapes: tpShapes,
+      trackColorbar: !!(tp && tp.querySelector("linearGradient")),
+      trackColorbarTicks: tp
+        ? tp.querySelectorAll(".tp-cbar-tick").length : 0,
+      trackWindField: tp
+        ? tp.querySelectorAll('path[fill-rule="evenodd"]').length : 0,
+      trackTitle: tp && tp.querySelector(".ac-title .ac-head")
+        ? tp.querySelector(".ac-title .ac-head").textContent : null,
+      trackLegend: !!(tp && tp.querySelector(".tp-legend-bg")),
+      trackNote: text("trackplot-note"),
+      trackLand: tp ? tp.querySelectorAll(".ac-land").length : 0,
+      trackGraticule: tp ? tp.querySelectorAll(".ac-graticule line").length
+        : 0,
+      // ---- wind-history swath plot (#8) ----
+      swathDisplay: sw ? (sw.style.display || "") : "",
+      swathRendered: !!(sw && sw.style.display !== "none" &&
+        sw.innerHTML.length > 100),
+      swath34: sw ? sw.querySelectorAll(".sw-34").length : 0,
+      swath64: sw ? sw.querySelectorAll(".sw-64").length : 0,
+      swathTreatment: (window.__lab && window.__lab.swathTreatment)
+        ? window.__lab.swathTreatment() : null,
+      swathHatch: sw ? sw.querySelectorAll("pattern").length : 0,
+      swathTitle: sw && sw.querySelector(".ac-title .ac-head")
+        ? sw.querySelector(".ac-title .ac-head").textContent : null,
+      swathEmptyShown:
+        ((document.getElementById("swath-empty") || {}).style || {})
+          .display === "block",
+      swathEmptyText: text("swath-empty"),
+      swathDerivedShown: (() => {
+        const d = document.getElementById("swath-derived");
+        return !!(d && !d.hidden);
+      })(),
+      swathMethodShown: (() => {
+        const m = document.getElementById("swath-method");
+        return !!(m && !m.hidden);
+      })(),
+      swathMethodBody: text("swath-method-body"),
+      swathSeg: (() => {
+        const h = document.getElementById("swath-seg");
+        return h ? Array.prototype.map.call(h.children, (b) => ({
+          treatment: b.getAttribute("data-treatment"),
+          active: b.classList.contains("active") })) : [];
+      })(),
+      swathNote: text("swathplot-note"),
+      // ---- two-column layout (#11) ----
+      ovGridCols: gridCols,
+      ovCols: document.querySelectorAll("#sec-overview .ov-col").length,
+      ovCardOrder: (() => {
+        const ids = ["card-hero", "card-track", "card-wp", "card-swath"];
+        return ids.map((id) => {
+          const el = document.getElementById(id);
+          let o = "";
+          try { o = el ? window.getComputedStyle(el).order : ""; }
+          catch (e) { o = ""; }
+          return { id: id, order: o, present: !!el };
+        });
+      })(),
+    };
+  }
+
   function snapshot() {
     return {
       stage3: stage3Probe(),
+      overview: overviewProbe(),
       cat: document.documentElement.getAttribute("data-cat"),
       ended: document.documentElement.hasAttribute("data-ended"),
       chip: text("chip"),
@@ -536,6 +621,19 @@ const scheduledDelays = [];
         host.children, (b) => b.getAttribute("data-slug") === op.slug);
       if (btn) btn.dispatchEvent(
         new dom.window.Event("click", { bubbles: true }));
+    } else if (op.op === "clickSwathTreatment") {
+      // FG-R3 #8: click a swath treatment seg by name (filled/outlined).
+      const host = document.getElementById("swath-seg");
+      const btn = host && Array.prototype.find.call(host.children,
+        (b) => b.getAttribute("data-treatment") === op.treatment);
+      if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
+    } else if (op.op === "renderTrackPlot") {
+      if (window.__lab && window.__lab.renderTrackPlot)
+        window.__lab.renderTrackPlot(op.storm || null);
+    } else if (op.op === "renderSwathPlot") {
+      if (window.__lab && window.__lab.renderSwathPlot)
+        window.__lab.renderSwathPlot(op.storm || null);
     } else if (op.op === "removeBannerClasses") {
       // test helper: clear banner anim classes to detect re-add / churn.
       const b = document.getElementById("banner");
