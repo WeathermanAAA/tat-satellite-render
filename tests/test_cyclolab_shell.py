@@ -1266,12 +1266,10 @@ class TestConeCorridorContainment(unittest.TestCase):
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
-class TestConnectorRule(unittest.TestCase):
-    """final-gate-2 #4: a leader line renders IFF the placard sits more
-    than LEADER_GAP px beyond its glyph's edge. Every displaced placard
-    has one; every adjacent one doesn't."""
-
-    LEADER_GAP = 36.0    # pinned: the rule constant in renderAdvCone
+class TestNoLeaderLines(unittest.TestCase):
+    """final-gate-3 #1: leader lines are GONE. No placard ever draws a
+    connector. Pairing is positional - placards stay collision-free AND
+    hug their glyph tightly enough to read without a line."""
 
     @classmethod
     def setUpClass(cls):
@@ -1280,45 +1278,42 @@ class TestConnectorRule(unittest.TestCase):
         cls.live_adv = json.loads((HERE / "fixtures" / "cyclolab"
                                    / "live_adv_ep17.json").read_text())
 
-    def _placards(self, adv):
+    def _state(self, adv):
         recs = run_harness(self.html, {
             "ops": [{"op": "applyAdvisory", "adv": adv},
                     {"op": "openSec", "name": "advisories"}]})
-        a = recs[-1]["state"]["stage3"]["adv"]
-        return a["conePlacards"], a["coneLeaders"], a["coneLeaderLines"]
+        return recs[-1]["state"]["stage3"]["adv"]
 
-    def _assert_rule(self, pls, leaders, label):
-        self.assertTrue(pls, f"{label}: no placards")
-        for p in pls:
-            want = p["gap"] > self.LEADER_GAP
-            self.assertEqual(
-                p["leader"], want,
-                f"{label}: placard {p['i']} gap {p['gap']:.1f} vs rule "
-                f"{self.LEADER_GAP} - leader={p['leader']}")
-            self.assertEqual(
-                p["i"] in leaders, want,
-                f"{label}: placard {p['i']} leader LINE presence "
-                f"disagrees with the rule")
+    def _no_overlaps(self, pls, label):
+        for i in range(len(pls)):
+            for j in range(i + 1, len(pls)):
+                a, b = pls[i], pls[j]
+                ox = min(a["x"] + a["w"], b["x"] + b["w"]) - \
+                    max(a["x"], b["x"])
+                oy = min(a["y"] + a["h"], b["y"] + b["h"]) - \
+                    max(a["y"], b["y"])
+                self.assertFalse(
+                    ox > 0 and oy > 0,
+                    f"{label}: placards {a['i']} and {b['i']} overlap")
 
-    def test_rule_holds_on_the_live_official_cone(self):
-        pls, leaders, lines = self._placards(self.live_adv)
-        self._assert_rule(pls, leaders, "live-official")
-        # the gap MEASUREMENT itself (adversarial-review find): a
-        # leader line runs glyph-center -> placard-center, so its
-        # length must equal gap + iconR - an INDEPENDENT check of the
-        # displacement formula, not just rule self-consistency.
-        by_i = {p["i"]: p for p in pls}
-        self.assertTrue(lines, "no leader lines to validate against")
-        for ln in lines:
-            p = by_i[ln["i"]]
-            length = ((ln["x2"] - ln["x1"]) ** 2 +
-                      (ln["y2"] - ln["y1"]) ** 2) ** 0.5
-            self.assertAlmostEqual(
-                length, p["gap"] + p["iconr"], delta=0.5,
-                msg=f"placard {ln['i']}: leader length {length:.1f} != "
-                    f"gap {p['gap']} + iconR {p['iconr']}")
+    def test_no_leader_lines_on_the_live_official_cone(self):
+        a = self._state(self.live_adv)
+        self.assertEqual(a["coneLeaders"], [],
+                         "a leader line was rendered - they must be gone")
+        self.assertTrue(a["conePlacards"])
+        self._no_overlaps(a["conePlacards"], "live-official")
+        # pairing without lines: every placard's anchor sits within a
+        # tight band of its glyph edge so the eye pairs them by position.
+        for p in a["conePlacards"]:
+            self.assertLessEqual(
+                p["gap"], 120.0,
+                f"placard {p['i']} gap {p['gap']:.1f} too far to pair "
+                "without a leader line")
 
-    def test_rule_holds_when_bunched_taus_force_displacement(self):
+    def test_bunched_taus_no_lines_no_overlaps_still_pair(self):
+        # The pathological cluster the leader lines used to rescue: six
+        # taus packed tight. Must place collision-free, draw ZERO lines,
+        # and keep every placard close enough to pair by position.
         pts = [
             {"tau_h": t, "lat": 15.0 + 0.05 * i, "lon": -135.0 - 0.07 * i,
              "intensity_kt": 30 + i, "dev_label": "TS", "valid_utc": "x"}
@@ -1329,12 +1324,13 @@ class TestConnectorRule(unittest.TestCase):
                "issued_utc": "2026-06-06T21:00:00Z", "source": "nhc",
                "method": "official-cone", "cone": ring, "points": pts,
                "text": {"tcp": "X", "tcd": "Y"}}
-        pls, leaders, _lines = self._placards(adv)
-        self._assert_rule(pls, leaders, "bunched")
-        # bunching must actually displace SOME placard past the rule -
-        # otherwise this case proves nothing.
-        self.assertTrue(any(p["leader"] for p in pls),
-                        "bunched fixture produced no displaced placard")
+        a = self._state(adv)
+        self.assertEqual(a["coneLeaders"], [], "bunched case drew a line")
+        self._no_overlaps(a["conePlacards"], "bunched")
+        for p in a["conePlacards"]:
+            self.assertLessEqual(
+                p["gap"], 150.0,
+                f"bunched placard {p['i']} gap {p['gap']:.1f} unpairable")
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")

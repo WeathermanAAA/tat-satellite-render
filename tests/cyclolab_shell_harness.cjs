@@ -309,19 +309,13 @@ const scheduledDelays = [];
           w: parseFloat(g.getAttribute("data-w")),
           h: parseFloat(g.getAttribute("data-h")),
           gap: parseFloat(g.getAttribute("data-gap")),
-          leader: g.getAttribute("data-leader") === "1",
           iconr: parseFloat(g.getAttribute("data-iconr")),
         })) : [],
+      // final-gate-3 #1: leader lines are GONE. The probe stays so the
+      // invariant ("zero leader lines ever") is directly assertable.
       coneLeaders: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll('line[data-role="leader"]'),
         (l) => parseInt(l.getAttribute("data-for"), 10)) : [],
-      coneLeaderLines: coneSvg ? Array.prototype.map.call(
-        coneSvg.querySelectorAll('line[data-role="leader"]'),
-        (l) => ({ i: parseInt(l.getAttribute("data-for"), 10),
-                  x1: parseFloat(l.getAttribute("x1")),
-                  y1: parseFloat(l.getAttribute("y1")),
-                  x2: parseFloat(l.getAttribute("x2")),
-                  y2: parseFloat(l.getAttribute("y2")) })) : [],
       coneLand: coneSvg
         ? coneSvg.querySelectorAll(".ac-land").length : 0,
       coneGraticule: coneSvg

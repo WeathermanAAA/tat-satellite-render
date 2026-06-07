@@ -2015,13 +2015,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       rects.push({ x: tp[i][0] - half, y: tp[i][1] - half,
                    w: 2 * half, h: 2 * half });
     });
-    // FINAL-GATE R2 #4 - THE CONNECTOR RULE: a leader line renders if
-    // and only if the placard's anchor sits more than LEADER_GAP px
-    // beyond its glyph's EDGE (center distance minus the icon
-    // half-size, so the hero NOW icon and the small tau icons read the
-    // same adjacency). Which placement slot happened to win is not a
-    // rule; displacement is.
-    var LEADER_GAP = 36;
+    // FINAL-GATE R3 #1 - NO LEADER LINES, EVER. Pairing is carried by
+    // POSITION alone: a placard hugs its glyph just outside the icon
+    // edge and is pushed PERPENDICULAR (straight out from the track)
+    // before it ever slides along-track, so the eye reads "this pill
+    // belongs to the glyph directly inward from it." The candidate
+    // slots are ordered by a cost that penalises along-track nudges
+    // heavily and growth gently, and a side flip is the cheapest escape
+    // - the placard stays as close and as radial as the cluster allows.
     var placards = [];
     pts.forEach(function (p, i) {
       var pw = (i === 0 ? 112 : 86), ph = (i === 0 ? 26 : 22);
@@ -2030,27 +2031,39 @@ HTML_TEMPLATE = r"""<!doctype html>
       var vx = b[0] - a[0], vy = b[1] - a[1];
       var vl = Math.max(1e-6, Math.hypot(vx, vy));
       var nx = -vy / vl, ny = vx / vl;
+      var ux = vx / vl, uy = vy / vl;
       var side = (i % 2 === 0) ? 1 : -1;
       if (i === 0) side = -1;            // NOW placard prefers up-track
-      var placed = null;
-      var offs = [34, 48, 62, 76, 92, 110];
-      var nudges = [0, 30, -30, 60, -60, 90, -90];
-      // preferred side first, then the opposite; outward pushes, then
-      // along-track nudges - placards NEVER overlap (S4-AD1 #7).
-      var sides = [side, -side];
-      for (var si = 0; si < sides.length && !placed; si++) {
-        for (var oi = 0; oi < offs.length && !placed; oi++) {
-          for (var ni = 0; ni < nudges.length && !placed; ni++) {
-            var cx2 = tp[i][0] + nx * sides[si] * offs[oi]
-                      + (vx / vl) * nudges[ni];
-            var cy2 = tp[i][1] + ny * sides[si] * offs[oi]
-                      + (vy / vl) * nudges[ni];
-            var r2 = { x: cx2 - pw / 2, y: cy2 - ph / 2, w: pw, h: ph };
-            r2.x = Math.max(6, Math.min(W - pw - 6, r2.x));
-            r2.y = Math.max(6, Math.min(H - ph - 6, r2.y));
-            if (!overlaps(r2)) placed = r2;
+      // The pill sits just clear of the icon EDGE: base gap scales with
+      // the glyph so the hero NOW and the small taus hug equally tight.
+      var base = iconR[i] + ph / 2 + 6;
+      var offs = [base, base + 14, base + 30, base + 50, base + 74,
+                  base + 102];
+      var nudges = [0, 26, -26, 54, -54];
+      // Cost-ordered candidate sweep: smallest perpendicular offset and
+      // zero along-track nudge first; growing the offset is cheap, a
+      // side flip is cheaper than a big nudge, and along-track sliding
+      // is the last resort. Placards NEVER overlap (S4-AD1 #7).
+      var cands = [];
+      for (var oi = 0; oi < offs.length; oi++) {
+        for (var ni = 0; ni < nudges.length; ni++) {
+          for (var sj = 0; sj < 2; sj++) {
+            var s = (sj === 0) ? side : -side;
+            cands.push({ cost: oi * 2 + ni * 3 + sj, off: offs[oi],
+                         nud: nudges[ni], s: s });
           }
         }
+      }
+      cands.sort(function (c1, c2) { return c1.cost - c2.cost; });
+      var placed = null;
+      for (var ci = 0; ci < cands.length && !placed; ci++) {
+        var c = cands[ci];
+        var cx2 = tp[i][0] + nx * c.s * c.off + ux * c.nud;
+        var cy2 = tp[i][1] + ny * c.s * c.off + uy * c.nud;
+        var r2 = { x: cx2 - pw / 2, y: cy2 - ph / 2, w: pw, h: ph };
+        r2.x = Math.max(6, Math.min(W - pw - 6, r2.x));
+        r2.y = Math.max(6, Math.min(H - ph - 6, r2.y));
+        if (!overlaps(r2)) placed = r2;
       }
       if (!placed) {                     // pathological: park it below
         placed = { x: Math.max(6, Math.min(W - pw - 6,
@@ -2061,7 +2074,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       var gap = Math.hypot(placed.x + pw / 2 - tp[i][0],
                            placed.y + ph / 2 - tp[i][1]) - iconR[i];
       rects.push(placed);
-      placards.push({ rect: placed, leader: gap > LEADER_GAP, gap: gap });
+      placards.push({ rect: placed, gap: gap });
     });
 
     var anyNonTropical = false;
@@ -2097,23 +2110,16 @@ HTML_TEMPLATE = r"""<!doctype html>
             sshsLabel(cat) + "</text>"
           : "") +
         "</g>");
-      // placard (skip none - NOW gets one too), with leader if pushed
+      // placard (skip none - NOW gets one too). NO leader line: pairing
+      // is positional (the pill hugs its glyph; see the placement sweep).
       var pl = placards[i];
       var pillGrad = "url(#pillg-" + (tropical ? cat : "NEUTRAL") + ")";
       var label = (i === 0)
         ? "NOW \u00b7 " + Math.round(p.intensity_kt || 0) + "kt"
         : "+" + tau + "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt";
       var pw2 = pl.rect.w, ph2 = pl.rect.h;
-      if (pl.leader) {
-        parts.push('<line data-role="leader" data-for="' + i +
-          '" x1="' + px2.toFixed(1) + '" y1="' +
-          py2.toFixed(1) + '" x2="' + (pl.rect.x + pw2 / 2).toFixed(1) +
-          '" y2="' + (pl.rect.y + ph2 / 2).toFixed(1) +
-          '" stroke="rgba(255,255,255,0.45)" stroke-width="1.2"/>');
-      }
       parts.push('<g data-role="placard" data-i="' + i +
         '" data-gap="' + pl.gap.toFixed(1) +
-        '" data-leader="' + (pl.leader ? 1 : 0) +
         '" data-iconr="' + iconR[i] + '" data-x="' +
         pl.rect.x.toFixed(1) + '" data-y="' + pl.rect.y.toFixed(1) +
         '" data-w="' + pw2 + '" data-h="' + ph2 +
