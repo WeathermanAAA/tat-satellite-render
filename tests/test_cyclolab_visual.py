@@ -160,9 +160,19 @@ def baseline_verdict(rows):
 
 
 JS_CELLS = """(id) => {
+  // final-gate-3 #2: the value is now PLAIN TEXT (no .digit cells). To
+  // measure per-glyph boxes we wrap each character in a BARE inline
+  // span - tnum digits don't kern, so bare spans render pixel-identical
+  // to the plain text already in the screenshot; the boxes line up.
   const el = document.getElementById(id);
   const em = parseFloat(getComputedStyle(el).fontSize);
   const want = el.getAttribute('data-odo') || el.textContent;
+  el.textContent = '';
+  for (let i = 0; i < want.length; i++) {
+    const s = document.createElement('span');
+    s.textContent = want[i];
+    el.appendChild(s);
+  }
   return [...el.children].map((c, i) => {
     const r = c.getBoundingClientRect();
     return {char: want[i], box: [r.left, r.top, r.right, r.bottom], em};
@@ -178,8 +188,7 @@ JS_TWIN = """(id) => {
   // measured in isolation and compared RELATIVELY (per-glyph offset
   // from each side's own modal flat baseline).
   const el = document.getElementById(id);
-  const ref = el.querySelector('.digit') || el;
-  const cs = getComputedStyle(ref);
+  const cs = getComputedStyle(el);          // .odo is plain text now
   let ov = document.getElementById('twin-overlay');
   if (!ov) {
     ov = document.createElement('div');
@@ -267,17 +276,23 @@ class TestRenderedCard(unittest.TestCase):
                        ref: g('#ref-digits'),
                        glyph: g('.banner .glyph') };
             }""")
+            # final-gate-3 #2: the value is plain text - measure each
+            # .odo element's own box (its rendered value) and the band
+            # just below it.
             cls.rest_cells = pg.evaluate("""() =>
-              [...document.querySelectorAll('.odo .digit:not(.ch)')]
-                .filter(c => !c.closest('.col'))
+              [...document.querySelectorAll('.odo')]
+                .filter(c => (c.textContent || '').trim().length)
                 .map(c => {
                   const r = c.getBoundingClientRect();
                   return {box: [r.left, r.top, r.right, r.bottom],
                           em: parseFloat(getComputedStyle(c).fontSize),
-                          odo: (c.closest('.odo') || {}).id || '?'};
+                          odo: c.id || '?'};
                 })""")
+            # the structural guard the odometer is gone: zero cell/strip
+            # machinery anywhere, ever.
             cls.col_count = pg.evaluate(
-                "document.querySelectorAll('.odo .col').length")
+                "document.querySelectorAll('.odo .col, .odo .strip')"
+                ".length")
             b.close()
         cls.im = Image.open(shot)
 
@@ -481,9 +496,10 @@ class TestVitalsTypography(unittest.TestCase):
                 document.getElementById('odo-mslp'), v)""", val)
             pg.wait_for_timeout(600)
             self.assertEqual(
-                pg.evaluate("document.querySelectorAll('.odo .col').length"),
-                0, f"{engine}/dpr{dpr}: cols still mounted after settle "
-                   f"(value {val})")
+                pg.evaluate("document.querySelectorAll("
+                            "'.odo .col, .odo .strip').length"),
+                0, f"{engine}/dpr{dpr}: cell/strip machinery present "
+                   f"(value {val}) - the odometer must be gone")
             sv = td / f"c_{engine}_{dpr}_{val}.png"
             pg.screenshot(path=str(sv))
             rows = self._scan(pg, Image.open(sv), "odo-mslp", dpr)

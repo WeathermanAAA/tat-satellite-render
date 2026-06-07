@@ -301,50 +301,21 @@ HTML_TEMPLATE = r"""<!doctype html>
   .vrow.due .val { color: var(--cat-accent); font-size: 12.5px;
     letter-spacing: 0.6px; }
 
-  /* odometer (AD R3b rebuild - REST IS PLAIN TEXT).
-     R2 clipped ink at the box edge (sheared bottoms + synthesized
-     baseline). R3 anchored the baseline but kept every digit inside a
-     clipped, translateY'd strip even when settled: the 1.15em cell
-     height is fractional in device pixels, so translateY(-d x 1.15em)
-     rounded differently per digit VALUE (the "9" sat 2px low) - and
-     the rest-state clip sheared the round digits' baseline overshoot
-     flat (0/3/5/6/8/9 are SUPPOSED to dip 1-2px below the baseline;
-     that overshoot is correct typography, not a defect).
-     The contract now:
-       * AT REST a cell is a plain inline span on the row's natural
-         baseline - no box, no clip, no transform. A settled 0 is
-         pixel-identical to a 0 typed as static text, overshoot
-         included. The card spends ~99% of its life here.
-       * DURING A ROLL ONLY, the cell swaps in a .col: in-flow
-         INVISIBLE anchor (keeps layout + true baseline) + an abspos
-         .strip of ten SPACED entries (1.7em pitch, snapped to whole
-         DEVICE pixels for the live DPR - integer geometry, so digit
-         resting offsets can never accumulate per-value fractions)
-         transitioning translateY. On settle the cell snaps back to
-         plain text (timer = transition duration + slack).
-       * the roll-time mask is inset(-0.3em 0): >=0.25em slack beyond
-         the glyph extents on BOTH sides, so overshoot is CONTAINED,
-         never clipped; the mask edges land mid-gap between the spaced
-         strip entries, so neighbor entries stay clear of the window -
-         entry SPACING owns ghost prevention, never clip-shaving.
-     Digits ride fixed 0.62em cells (tnum); LETTER cells (.ch) are
-     auto-width (W in "141.2W" must not clip); white-space:pre keeps
-     space cells real. */
+  /* numeric stats - PLAIN STATIC TEXT (final-gate-3 #2: the odometer
+     is gone). Every value renders as ordinary type on the row's natural
+     baseline at all times: a 9 is pixel-identical to a 9 typed as
+     static text, round-digit baseline overshoot (0/3/5/6/8/9 dip
+     1-2px - correct typography) intact, with NO box, clip, strip, or
+     transform anywhere. A value CHANGE is marked by one subtle
+     fade-in of the new text (reduced motion / no-JS = instant swap).
+     tnum keeps the digits tabular so a changing number never reflows
+     its neighbours; white-space:pre keeps space cells real. The baked
+     no-JS form is the same plain text the live updater writes. */
   .odo { display: inline-block; white-space: pre;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
-  .odo .digit { display: inline-block; width: 0.62em; text-align: center;
-    line-height: 1.15em; }
-  .odo .digit.ch { width: auto; min-width: 0.3em; }
-  .odo .col { position: relative; display: inline-block; width: 0.62em;
-    height: 1.15em; line-height: 1.15em; text-align: center;
-    clip-path: inset(-0.3em 0); }
-  .odo .col .anchor { visibility: hidden; }
-  .odo .col .strip { position: absolute; left: 0; top: 0; width: 100%;
-    display: block;
-    transition: transform calc(var(--motion-slow) * 0.35)
-      cubic-bezier(0.22, 1, 0.36, 1); }
-  .odo .col .strip .digit { display: block; width: 100%;
-    height: var(--odo-eh, 1.7em); line-height: 1.15em; }
+  .odo.odo-swap { animation: odo-swap calc(var(--motion-fast) * 0.5)
+    ease-out 1; }
+  @keyframes odo-swap { from { opacity: 0.3; } to { opacity: 1; } }
 
   /* section nav with the accent rail */
   .nav-secs { display: flex; flex-direction: column; padding: 10px 0;
@@ -693,7 +664,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       animation-duration: 0.001s !important;
       animation-delay: 0s !important; }
     .banner .glyph .spin, .loader .eye .spin { animation: none !important; }
-    .odo .col .strip { transition-duration: 0.001s !important; }
+    .odo.odo-swap { animation: none !important; }
   }
 </style>
 </head>
@@ -1040,104 +1011,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (b) openSec(b.getAttribute("data-sec"));
   });
 
-  // ---- odometer ------------------------------------------------------------
-  // REST IS PLAIN TEXT: a settled cell is a plain span on the row's
-  // natural baseline (pixel-identical to static type, overshoot
-  // intact). A .col (anchor + SPACED strip on a whole-device-pixel
-  // grid) exists ONLY while a digit is actually rolling; on settle
-  // (timer = transition duration + slack) the cell snaps back to
-  // plain text. Mid-roll retargets (the 1s countdown) reuse the live
-  // strip - CSS transitions retarget from the interpolated position.
-  function odoCellChar(cell) {
-    var t = cell.getAttribute("data-ch");
-    return t != null ? t : cell.textContent;
-  }
-  function odoSettle(cell) {
-    if (cell._settleT) { clearTimeout(cell._settleT); cell._settleT = null; }
-    var ch = odoCellChar(cell);
-    cell.className = "digit" + (/^[0-9]$/.test(ch) ? "" : " ch");
-    cell.removeAttribute("data-ch");
-    cell.textContent = ch;
-  }
-  function odoRoll(el, cell, from, to) {
-    var strip, eh;
-    if (!cell.classList.contains("col")) {
-      // build the roll-time col: integer geometry - entry pitch is
-      // 1.7em SNAPPED TO WHOLE DEVICE PIXELS, every resting offset is
-      // -digit x (integer device px) so no per-value fractions.
-      var fs = parseFloat(getComputedStyle(el).fontSize) || 16;
-      var dpr = window.devicePixelRatio || 1;
-      eh = Math.max(1, Math.round(1.7 * fs * dpr)) / dpr;
-      cell.className = "digit col";
-      cell.textContent = "";
-      var anchor = document.createElement("span");
-      anchor.className = "anchor"; anchor.textContent = to;
-      cell.appendChild(anchor);
-      strip = document.createElement("span");
-      strip.className = "strip";
-      strip.style.setProperty("--odo-eh", eh + "px");
-      strip.setAttribute("data-eh", String(eh));
-      for (var d = 0; d <= 9; d++) {
-        var s = document.createElement("span");
-        s.className = "digit"; s.textContent = String(d);
-        strip.appendChild(s);
-      }
-      cell.appendChild(strip);
-      strip.style.transition = "none";
-      strip.style.transform = "translateY(" + (-from * eh) + "px)";
-      void strip.offsetWidth;             // commit the start frame
-      strip.style.transition = "";
-    } else {
-      strip = cell.querySelector(".strip");
-      eh = parseFloat(strip.getAttribute("data-eh")) || 0;
-      cell.querySelector(".anchor").textContent = to;
-    }
-    cell.setAttribute("data-ch", to);
-    strip.style.transform = "translateY(" + (-Number(to) * eh) + "px)";
-    if (cell._settleT) clearTimeout(cell._settleT);
-    var dur = parseFloat(getComputedStyle(strip).transitionDuration) || 0;
-    cell._settleT = setTimeout(function () { odoSettle(cell); },
-                               dur * 1000 + 150);
-  }
+  // ---- numeric stats: PLAIN STATIC TEXT (final-gate-3 #2) -------------------
+  // The odometer is deleted. odoSet just writes the value as plain text
+  // (the element keeps its name for the call sites and the baked no-JS
+  // form). A real CHANGE plays one subtle fade-in of the new text;
+  // first paint and reduced motion swap instantly. No digit cells, no
+  // clip, no strip, no timers - the rest state IS the only state, so
+  // there is nothing left to shear a baseline or ghost a neighbour.
   function odoSet(el, text) {
     var want = String(text);
     if (el.getAttribute("data-odo") === want) return;
+    var first = !el.hasAttribute("data-odo");
     el.setAttribute("data-odo", want);
-    // AT reads the value; the cells are aria-hidden presentation.
     el.setAttribute("aria-label", want);
-    while (el.children.length > want.length) {
-      var last = el.lastChild;
-      if (last._settleT) clearTimeout(last._settleT);
-      el.removeChild(last);
-    }
-    for (var i = 0; i < want.length; i++) {
-      var ch = want[i];
-      var cell = el.children[i];
-      if (!cell) {
-        cell = document.createElement("span");
-        cell.className = "digit" + (/[0-9]/.test(ch) ? "" : " ch");
-        cell.setAttribute("aria-hidden", "true");
-        cell.textContent = ch;
-        el.appendChild(cell);
-        continue;
-      }
-      var cur = odoCellChar(cell);
-      if (cur === ch) {
-        // settled-and-right or already rolling to the right target.
-        if (!cell.classList.contains("col")) {
-          cell.classList.toggle("ch", !/[0-9]/.test(ch));
-        }
-        continue;
-      }
-      if (/^[0-9]$/.test(ch) && /^[0-9]$/.test(cur) && !reduced) {
-        odoRoll(el, cell, Number(cur), ch);
-      } else {
-        // letters, mixed transitions, reduced motion: straight to rest.
-        if (cell._settleT) { clearTimeout(cell._settleT); cell._settleT = null; }
-        cell.className = "digit" + (/[0-9]/.test(ch) ? "" : " ch");
-        cell.removeAttribute("data-ch");
-        cell.textContent = ch;
-      }
+    el.textContent = want;
+    if (!first && !reduced) {
+      el.classList.remove("odo-swap");
+      void el.offsetWidth;                // restart the fade
+      el.classList.add("odo-swap");
     }
   }
 
@@ -2941,15 +2832,11 @@ def _sshs_label(cat: str) -> str:
 
 
 def _odo_static(text) -> str:
-    """Bake an odometer's initial cells (static .digit spans; non-digits
-    carry .ch = auto-width, mirroring odoSet's REST state) so the no-JS
-    render carries real values. The live odoSet() leaves matching cells
-    untouched (rest IS this plain-text form); only a digit that actually
-    changes swaps in a rolling column, then settles back to this."""
-    return "".join(
-        f'<span class="digit{"" if ch.isdigit() else " ch"}"'
-        f' aria-hidden="true">{_esc(ch)}</span>'
-        for ch in str(text))
+    """Bake a stat's initial value as PLAIN TEXT (final-gate-3 #2: the
+    odometer is gone). The live odoSet() writes exactly this same plain
+    text, so the no-JS render and the hydrated render are pixel-identical
+    at rest - there is no cell/strip form to reconcile."""
+    return _esc(str(text))
 
 
 def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,

@@ -257,23 +257,14 @@ class TestIntegratedCard(unittest.TestCase):
             h = cyclolab_shell.render_page(s, feed_url=FEED_URL)
             self.assertRegex(h, r'id="glyph-cat"[^>]*>\s*' + label +
                              r'\s*</text>')
-            # digits bake as fixed cells; letters carry .ch (auto-width);
-            # the container carries the accessible value, cells are
-            # presentation-only.
-            cell_cls = "digit" if label.isdigit() else "digit ch"
-            self.assertIn(f'id="odo-cat" aria-label="{label}">'
-                          f'<span class="{cell_cls}" aria-hidden="true">'
-                          + label, h)
+            # final-gate-3 #2: the Category hero bakes as PLAIN TEXT (no
+            # digit cells), with the accessible value on the container.
+            self.assertIn(f'id="odo-cat" aria-label="{label}">{label}<', h)
 
     def test_heroes_bake_vmax_and_category(self):
-        # fixture last wind 120 -> three baked digit cells + the
-        # accessible value on the container; no-JS render carries real
-        # values.
-        self.assertIn('id="odo-vmax" aria-label="120">'
-                      '<span class="digit" aria-hidden="true">1</span>'
-                      '<span class="digit" aria-hidden="true">2</span>'
-                      '<span class="digit" aria-hidden="true">0</span>',
-                      self.html)
+        # final-gate-3 #2: fixture last wind 120 bakes as plain text
+        # (no digit cells) with the accessible value on the container.
+        self.assertIn('id="odo-vmax" aria-label="120">120<', self.html)
         self.assertIn('class="hero-cap">Max wind<', self.html)
         self.assertIn('class="hero-cap">Category<', self.html)
 
@@ -293,9 +284,7 @@ class TestIntegratedCard(unittest.TestCase):
         s = copy.deepcopy(self.storm)
         s["points"] = [dict(s["points"][-1], wind_kt=None)]
         h = cyclolab_shell.render_page(s, feed_url=FEED_URL)
-        self.assertIn('id="odo-vmax" aria-label="—">'
-                      '<span class="digit ch" aria-hidden="true">—</span>',
-                      h)
+        self.assertIn('id="odo-vmax" aria-label="—">—<', h)
 
     def test_sshs_label_none_and_empty_match_the_js_guard(self):
         # exact JS-parity edge: sshsLabel(null) / sshsLabel("") -> "D".
@@ -331,11 +320,10 @@ class TestIntegratedCardBehavior(unittest.TestCase):
         self.assertEqual(ts["glyphCat"], "S")
         self.assertEqual(ts["odo"]["cat"], "S")
 
-    def test_vmax_hero_still_rides_the_odometer(self):
-        # the promoted hero keeps the odometer state machine (data-odo +
-        # rolling columns) - same id, same discipline - and the
-        # accessible value tracks it (the rolling 0-9 stacks are
-        # aria-hidden presentation).
+    def test_vmax_hero_is_plain_text_with_a11y(self):
+        # final-gate-3 #2: the promoted hero is PLAIN TEXT - the value,
+        # the rendered textContent, and the accessible label all agree,
+        # with no digit cells or rolling columns left.
         s = copy.deepcopy(self.storm)
         s["points"] = [dict(self.storm["points"][-1], wind_kt=140.0)]
         recs = run_harness(
@@ -344,8 +332,7 @@ class TestIntegratedCardBehavior(unittest.TestCase):
              "ops": [{"op": "apply", "storm": s}]})
         st = recs[-1]["state"]
         self.assertEqual(st["odo"]["vmax"], "140")
-        self.assertTrue(all(c.startswith("translateY(")
-                            for c in st["odoColsVmax"]))
+        self.assertEqual(st["odoText"]["vmax"], "140")
         self.assertEqual(st["odoAriaVmax"], "140")
 
     def test_unknown_category_clamps_to_td_everywhere(self):
@@ -489,8 +476,10 @@ class TestSectionNav(unittest.TestCase):
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
-class TestOdometer(unittest.TestCase):
-    """The odometer state machine: data-odo + per-digit column transforms."""
+class TestPlainTextStats(unittest.TestCase):
+    """final-gate-3 #2: stats are PLAIN STATIC TEXT. A value change swaps
+    the text and plays one subtle fade-in; there is NO rolling, no digit
+    cell, no clip machinery anywhere in the DOM."""
 
     def setUp(self):
         self.storm = load_storm()
@@ -501,7 +490,7 @@ class TestOdometer(unittest.TestCase):
         s["points"] = [dict(self.storm["points"][0], wind_kt=wind)]
         return s
 
-    def test_vmax_rolls_from_95_to_110(self):
+    def test_value_change_swaps_plain_text_and_fades(self):
         s95 = self._one_point_storm(95.0)
         s110 = self._one_point_storm(110.0)
         recs = run_harness(
@@ -512,15 +501,25 @@ class TestOdometer(unittest.TestCase):
                  {"op": "apply", "storm": s110},
              ]})
         at95, at110 = (r["state"] for r in recs)
-        # data-odo flips 95 -> 110.
-        self.assertEqual(at95["odo"]["vmax"], "95")
+        # the rendered text IS the value - plain, no cells.
+        self.assertEqual(at95["odoText"]["vmax"], "95")
+        self.assertEqual(at110["odoText"]["vmax"], "110")
         self.assertEqual(at110["odo"]["vmax"], "110")
-        # the digit columns' translateY transforms changed (the roll).
-        cols95 = at95["odoColsVmax"]
-        cols110 = at110["odoColsVmax"]
-        self.assertTrue(all(c.startswith("translateY(") for c in cols95))
-        self.assertTrue(all(c.startswith("translateY(") for c in cols110))
-        self.assertNotEqual(cols95, cols110)
+        # the only motion left: the fade-in class on the CHANGE.
+        self.assertTrue(at110["odoSwapVmax"],
+                        "a value change should play the subtle fade")
+
+    def test_no_rolling_machinery_in_the_template(self):
+        # the structural proof the odometer is gone: no cell/strip/anchor
+        # classes and no clip CSS are ever emitted - there is nothing in
+        # the served template that could shear a baseline or ghost a
+        # neighbour. (The DOM can only contain what the template + the
+        # plain-text odoSet write, and odoSet writes only textContent.)
+        for needle in ('class="digit col"', 'class="strip"',
+                       'class="anchor"', '.odo .col', '.odo .strip',
+                       'odoRoll', 'odoSettle'):
+            self.assertNotIn(needle, self.html,
+                             f"odometer remnant in template: {needle}")
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")

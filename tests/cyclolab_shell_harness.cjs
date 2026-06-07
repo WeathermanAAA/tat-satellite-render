@@ -183,14 +183,15 @@ const scheduledDelays = [];
     return el ? el.getAttribute("data-odo") : null;
   }
 
-  function odoCols(id) {
-    // the per-digit strip transforms (translateY) - proves the roll
-    // moved. (AD R3: the transform rides the abspos .strip inside each
-    // .col; the col itself stays put as the in-flow baseline anchor.)
+  function odoText(id) {
+    // final-gate-3 #2: the RENDERED plain-text value (no cells/strips).
     const el = document.getElementById("odo-" + id);
-    if (!el) return [];
-    return Array.prototype.map.call(el.querySelectorAll(".col .strip"),
-      (c) => c.style.transform || "");
+    return el ? el.textContent : null;
+  }
+  function odoSwapping(id) {
+    // the only animation left: the subtle fade-in class on a CHANGE.
+    const el = document.getElementById("odo-" + id);
+    return !!(el && el.classList.contains("odo-swap"));
   }
 
   function endedStripVisible() {
@@ -392,7 +393,11 @@ const scheduledDelays = [];
         vmax: odo("vmax"), mslp: odo("mslp"), ace: odo("ace"),
         pos: odo("pos"), fix: odo("fix"), cat: odo("cat"),
       },
-      odoColsVmax: odoCols("vmax"),
+      // final-gate-3 #2: the rendered plain text + the fade-on-change flag
+      odoText: {
+        vmax: odoText("vmax"), mslp: odoText("mslp"), cat: odoText("cat"),
+      },
+      odoSwapVmax: odoSwapping("vmax"),
       odoAriaVmax: (function () {
         const el = document.getElementById("odo-vmax");
         return el ? el.getAttribute("aria-label") : null;
