@@ -2219,11 +2219,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       f.t.slice(0, 16).replace("T", " ") + "Z";
   }
   function satPreload() {
-    // newest-backwards, bounded window, ~3 in flight (P3-b loader pattern).
+    // newest-backwards over the ENTIRE band, ~3 in flight. The old
+    // 12-frame window left ~90% of the loop un-cached; playback then
+    // raced the network and the floater sector visibly lurched
+    // (final-gate #4).
     var gen = ++sat.gen;
     var want = [];
-    for (var k = sat.frames.length - 1;
-         k >= 0 && want.length < 12; k--) want.push(sat.frames[k]);
+    for (var k = sat.frames.length - 1; k >= 0; k--) want.push(sat.frames[k]);
     var inflight = 0, qi = 0;
     function next() {
       if (gen !== sat.gen) return;
@@ -2253,7 +2255,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     var prevT = (keepTime && sat.frames.length) ? sat.frames[sat.idx].t : null;
     sat.band = slug;
     var b = (sat.man && sat.man.bands && sat.man.bands[slug]) || null;
-    sat.frames = (b && b.frames) || [];
+    // STRICTLY CHRONOLOGICAL + DEDUPED within the band (final-gate #4):
+    // playback order is a hard guarantee here, not an upstream promise.
+    var raw = ((b && b.frames) || []).slice();
+    raw.sort(function (a, b2) { return a.t < b2.t ? -1 : a.t > b2.t ? 1 : 0; });
+    sat.frames = [];
+    for (var fi = 0; fi < raw.length; fi++) {
+      if (!sat.frames.length ||
+          raw[fi].t !== sat.frames[sat.frames.length - 1].t) {
+        sat.frames.push(raw[fi]);
+      }
+    }
     satEl("scrub").max = String(Math.max(0, sat.frames.length - 1));
     satEl("band-label").textContent = b ? (b.label || slug) : "";
     // a band key can survive a server-side prune with zero frames left:
@@ -2282,8 +2294,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!sat.frames.length) return;
     sat.playing = true;
     satEl("play").innerHTML = "&#10074;&#10074; Pause";
+    sat.holds = 0;
     sat.timer = setInterval(function () {
-      satShow(sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1);
+      var j = sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1;
+      // DECODE GATE: during playback a frame is shown only once its
+      // preload has fully decoded - swapping src to an in-flight URL
+      // races the network and the sector jumps (final-gate #4). A dead
+      // frame is skipped after ~2s so one bad object can't stall the
+      // loop.
+      var im = sat.preloaded[CDN + "/" + sat.frames[j].key];
+      var ready = im && im.complete && im.naturalWidth > 0;
+      if (!ready && sat.holds < 10) { sat.holds++; return; }
+      sat.holds = 0;
+      satShow(j);
     }, 200);
   }
   function initSatellite() {
@@ -2358,6 +2381,10 @@ HTML_TEMPLATE = r"""<!doctype html>
                    satState: function () {
                      return { band: sat.band, idx: sat.idx,
                               frames: sat.frames.length,
+                              frameTimes: sat.frames.map(function (f) {
+                                return f.t; }),
+                              frameKeys: sat.frames.map(function (f) {
+                                return f.key; }),
                               playing: sat.playing };
                    },
                    hafsViewer: function () { return hafsViewer; } };

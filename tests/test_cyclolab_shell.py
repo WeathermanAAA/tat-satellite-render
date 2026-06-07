@@ -682,6 +682,39 @@ class TestOgImageTag(unittest.TestCase):
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
+class TestSatellitePlaybackContract(unittest.TestCase):
+    """Final-gate #4: the storm-scoped viewer GUARANTEES playback
+    order - strictly chronological, deduped, one band per sequence -
+    even against a disordered upstream manifest."""
+
+    def setUp(self):
+        self.html = cyclolab_shell.render_page(load_storm(),
+                                               feed_url=FEED_URL,
+                                               loader="")
+
+    def test_shuffled_manifest_plays_chronologically(self):
+        frames = [{"t": f"2026-06-06T{h:02d}:00:00Z",
+                   "key": f"floaters/ep08/ir/2026{h:02d}.png"}
+                  for h in (7, 2, 9, 4, 2, 11, 4)]   # shuffled + dupes
+        top = TestStage3Mounts._floaters_top()
+        man = {"id": "ep082026", "slug": "ep08", "name": "SYNTH",
+               "basin": "EP",
+               "bands": {"ir": {"label": "Clean IR", "frames": frames}}}
+        recs = run_harness(self.html, {
+            "hafs_stub": True, "floaters": top, "floater_storm": man,
+            "ops": [{"op": "openSec", "name": "satellite"}]})
+        sat = recs[-1]["state"]["stage3"]["sat"]
+        ts = sat["frameTimes"]
+        self.assertEqual(ts, sorted(ts), "frames not chronological")
+        self.assertEqual(len(ts), len(set(ts)), "duplicate frames kept")
+        self.assertEqual(len(ts), 5)
+        # registration sanity: every frame in the sequence comes from
+        # the SAME band path (no zoom/band mixing in one loop)
+        prefixes = {k.rsplit("/", 2)[0] + "/" + k.rsplit("/", 2)[1]
+                    for k in sat["frameKeys"]}
+        self.assertEqual(len(prefixes), 1, f"mixed paths: {prefixes}")
+
+
 class TestStage4Advisories(unittest.TestCase):
     """Stage 4: THE CONE reveal + the intensity cone + advisory text
     panels (CYCLOLAB_DESIGN §7.4/§8). The reveal is structural here
