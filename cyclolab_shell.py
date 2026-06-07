@@ -422,8 +422,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   .hafs-stage { position: relative; background: #0a0d12; min-height: 280px;
     display: flex; align-items: center; justify-content: center;
     border-radius: 8px; overflow: hidden; }
-  .hafs-stage img { display: block; max-width: 100%; max-height: 72vh;
-    width: auto; height: auto; }
+  .hafs-stage img, .hafs-stage canvas { display: block; max-width: 100%;
+    max-height: 72vh; width: auto; height: auto; }
   .hafs-statusbox { position: absolute; inset: 0; display: none;
     align-items: center; justify-content: center; gap: 10px;
     color: var(--muted); background: rgba(10,13,18,0.6); font-size: 13.5px; }
@@ -485,12 +485,29 @@ HTML_TEMPLATE = r"""<!doctype html>
      the ONE permitted continuous loop; reduced-motion = final frame. */
   .adv-cone-stage { background: #0a1019; border-radius: 8px;
     overflow: hidden; }
-  /* Overview hero (final-gate #1): storm-centered SST crop + glyph */
+  /* Overview hero (final-gate-2 #1/#2): a storm-centered SST render
+     from SOURCE data - the per-storm PNGs the poller bakes (storm at
+     the EXACT pixel center, native 5 km CRW detail, house recipe +
+     labeled isotherms) - with the big spinning category glyph and a
+     base-layer picker. The PNG shares the panel's 16/9.2 aspect, so
+     object-fit:cover is a 1:1 mapping and registration needs NO
+     client crop math: the storm is always at 50%/50%.
+     #2: the hero is a PANEL, not a poster - the overview column caps
+     its width so the bug card + hero + W&P chart compose on one
+     comfortable screen. */
+  #sec-overview .wipe { max-width: 780px; }
   .sst-hero { position: relative; overflow: hidden; border-radius: 8px;
     aspect-ratio: 16 / 9.2; background: #0a1019;
     border: 1px solid #2c3a52; }
-  .sst-hero img { position: absolute; left: 0; top: 0;
-    transform-origin: 0 0; user-select: none; pointer-events: none; }
+  .sst-hero img { position: absolute; inset: 0; width: 100%;
+    height: 100%; object-fit: cover; user-select: none;
+    pointer-events: none; }
+  .sst-hero-layers { position: absolute; top: 10px; right: 10px; }
+  .sst-hero-layers .hafs-seg { font-size: 10.5px; font-weight: 700;
+    padding: 4px 10px; background: rgba(10,16,25,0.78);
+    border-color: rgba(255,255,255,0.22); color: #cdd9ea; }
+  .sst-hero-layers .hafs-seg.active { background: var(--cat-accent);
+    color: var(--cat-ink); border-color: var(--cat-accent); }
   .sst-hero-scrim { position: absolute; inset: 0; pointer-events: none;
     background: linear-gradient(155deg, rgba(8,12,20,0.62) 0%,
       rgba(8,12,20,0.18) 30%, transparent 55%); }
@@ -506,7 +523,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     text-shadow: 0 1px 6px rgba(0,0,0,0.5); }
   .sst-hero-title .hero-sub { color: #cdd9ea; font-size: 12.5px;
     font-weight: 700; letter-spacing: 1.1px; margin-top: 2px; }
-  .sst-hero-glyph { position: absolute; width: 120px; height: 120px;
+  .sst-hero-glyph { position: absolute; left: 50%; top: 50%;
+    width: 120px; height: 120px;
     margin: -60px 0 0 -60px; pointer-events: none;
     filter: drop-shadow(0 3px 10px rgba(0,0,0,0.55)); }
   .sst-hero-glyph svg { width: 100%; height: 100%; }
@@ -732,9 +750,11 @@ HTML_TEMPLATE = r"""<!doctype html>
             <div class="sst-hero-title">
               <div class="hero-rail"></div>
               <div class="hero-eyebrow">TRIPLE-A-TROPICS &middot; CycloLab</div>
-              <div class="hero-head">SEA SURFACE TEMPERATURE</div>
+              <div class="hero-head" id="sst-hero-head">SEA SURFACE TEMPERATURE</div>
               <div class="hero-sub" id="sst-hero-sub"></div>
             </div>
+            <div class="hafs-seg-group sst-hero-layers" id="sst-hero-layers"
+                 role="group" aria-label="Base layer"></div>
             <div class="sst-hero-glyph" id="sst-hero-glyph"></div>
           </div>
           <div class="note" id="sst-hero-note"></div></div>
@@ -753,6 +773,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div class="hafs-stage" id="sat-stage">
           <img id="sat-img" alt="Storm floater satellite frame">
+          <canvas id="sat-canvas" style="display:none"
+                  aria-label="Storm floater satellite frame"></canvas>
           <div id="sat-status" class="hafs-statusbox">
             <div class="hafs-spinner"></div><span>Loading…</span></div>
         </div>
@@ -877,6 +899,9 @@ HTML_TEMPLATE = r"""<!doctype html>
   var SID = "__SID__";
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
+  // per-storm SST hero layer base (final-gate-2 #1): meta.json +
+  // {layer}.png live under it, written by the poller's SST hero writer.
+  var SST_BASE = "__SST_BASE__";
   var ENDED = __ENDED__;
   var BASIN = "__BASIN__";
   var HAFS_ID = "__HAFS_ID__";        // storm_ids join: 01e
@@ -1209,78 +1234,105 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   // ---- map + cone (the home view showstopper) -------------------------------
   var coneRing = null, coneAdv = null, conePts = null;
-  // ---- Overview hero (final-gate #1): a storm-centered crop of the
-  // site's EXISTING CRW SST render (5 km CoralTemp 'actual' - the
-  // house SST pipeline; nothing new is rendered) with the big spinning
-  // category glyph at the current position. The crop is EXACT: the
-  // generator's layout is deterministic (figsize x dpi 150,
-  // subplots_adjust 0.05/0.89/0.86/0.08, linear plate carree), so the
-  // geographic data-rect of each region PNG is known to the pixel.
-  var SST_REGIONS = {
-    "east-pacific": { ext: [-140, -80, 5, 35], fig: [11.0, 5.8] },
-    "northeast-pacific": { ext: [-160, -80, 0, 50], fig: [11.0, 7.0] },
-    "central-pacific": { ext: [-180, -140, 0, 35], fig: [8.0, 7.0] },
-    "northwest-pacific": { ext: [100, 180, 0, 60], fig: [10.5, 7.5] },
-    "north-pacific": { ext: [100, 260, 0, 65], fig: [14.5, 6.5] },
-    "tropical-atlantic": { ext: [-90, -10, 0, 30], fig: [11.5, 5.4] },
-    "western-atlantic": { ext: [-100, -55, 8, 42], fig: [8.8, 7.0] },
-    "north-atlantic": { ext: [-100, 0, 0, 65], fig: [10.5, 7.0] },
-    "global-tropics": { ext: [30, 390, -45, 45], fig: [14.5, 5.6] }
-  };
-  var SST_DPI = 150;
-  var SST_AX = { l: 0.05, r: 0.89, t: 0.86, b: 0.08 };
-  var CROP_HW_LON = 12, CROP_HW_LAT = 7.5;
-  var heroMeta = null, heroParams = null;
+  // ---- Overview hero (final-gate-2 #1): the poller renders dedicated
+  // STORM-CENTERED SST products from SOURCE data (cyclolab_sst.py -
+  // the house CRW CoralTemp recipe at native 5 km, labeled isotherms,
+  // the storm at the EXACT pixel center) and writes them beside the
+  // advisory JSON. The shell reads meta.json for the available layers,
+  // builds the base-layer picker (LAZY: only the selected layer's PNG
+  // is ever fetched) and pins the spinning category glyph at 50%/50% -
+  // the render itself is storm-centered, the old client crop math is
+  // gone.
+  var heroMeta = null;        // {layers:[...], valid_date, updated_utc}
+  var heroLayer = null;       // selected layer slug (sticky across polls)
+  var heroFixKey = null;      // meta refetches when the fix advances
   var chartDrawn = false;     // W&P draw-on animation runs once
 
-  function heroRegionFor(lat, lon) {
-    var best = null, bestPpd = 0;
-    Object.keys(SST_REGIONS).forEach(function (slug) {
-      var r = SST_REGIONS[slug];
-      var L = lon;
-      while (L < r.ext[0]) L += 360;
-      while (L > r.ext[1]) L -= 360;
-      if (L < r.ext[0] + 2 || L > r.ext[1] - 2 ||
-          lat < r.ext[2] + 2 || lat > r.ext[3] - 2) return;
-      var ppd = (r.fig[0] * SST_DPI * (SST_AX.r - SST_AX.l)) /
-                (r.ext[1] - r.ext[0]);
-      if (ppd > bestPpd) { bestPpd = ppd; best = { slug: slug, lon: L }; }
-    });
-    return best;
+  function heroNote(msg) {
+    document.getElementById("sst-hero-note").textContent = msg;
   }
-
-  function heroLayout() {
-    // (re)apply the crop transform for the current params - also runs
-    // on resize so the crop tracks the panel width.
-    if (!heroParams) return;
-    var p = heroParams;
-    var panel = document.getElementById("sst-hero");
+  function heroFallback(msg) {
+    // honest fallback: navy panel + centered glyph, no fake field
+    heroMeta = null;
     var img = document.getElementById("sst-hero-img");
-    var pw = panel.clientWidth, ph = panel.clientHeight;
-    if (!pw || !ph) return;
-    var s = pw / p.cropW;
-    if (p.cropH * s < ph) s = ph / p.cropH;   // cover, never letterbox
-    img.style.width = p.natW + "px";
-    img.style.height = p.natH + "px";
-    img.style.transform = "translate(" + (-p.cropX * s).toFixed(1) +
-      "px," + (-p.cropY * s).toFixed(1) + "px) scale(" + s.toFixed(5) + ")";
-    var g = document.getElementById("sst-hero-glyph");
-    g.style.left = ((p.glyphX * p.natScaleX - p.cropX) * s).toFixed(1) + "px";
-    g.style.top = ((p.glyphY * p.natScaleY - p.cropY) * s).toFixed(1) + "px";
+    img.removeAttribute("src");
+    img.removeAttribute("data-url");
+    img.style.display = "none";
+    document.getElementById("sst-hero-layers").innerHTML = "";
+    heroNote(msg);
   }
-  window.addEventListener("resize", heroLayout);
-
+  function heroLayerEntry(slug) {
+    var hit = null;
+    ((heroMeta && heroMeta.layers) || []).forEach(function (l) {
+      if (l.slug === slug) hit = l;
+    });
+    return hit;
+  }
+  function heroCaption() {
+    var L = heroLayerEntry(heroLayer);
+    if (!L) return;
+    // disclosure caption: source \u00b7 field \u00b7 valid date (+ layer note,
+    // e.g. the anomaly baseline disclosure). Layers can carry their
+    // own valid day (the SSTA file can lag the SST file by hours).
+    var vd = L.valid || heroMeta.valid_date;
+    var d = vd ? " \u00b7 valid " + vd : "";
+    heroNote((L.source || "NOAA Coral Reef Watch CoralTemp v3.1 (5 km)") +
+      " \u00b7 " + (L.field || L.label || heroLayer) + d +
+      " \u00b7 storm-centered render" +
+      (L.note ? " \u00b7 " + L.note : "") + ".");
+  }
+  function heroSetLayer(slug) {
+    var L = heroLayerEntry(slug);
+    if (!L) return;
+    heroLayer = slug;
+    var img = document.getElementById("sst-hero-img");
+    img.style.display = "";
+    var url = SST_BASE + "/" + L.file + "?v=" +
+      encodeURIComponent(heroMeta.updated_utc || "");
+    if (img.getAttribute("data-url") !== url) {
+      img.setAttribute("data-url", url);
+      img.onerror = function () {
+        heroFallback(
+          "SST base layer unavailable \u00b7 NOAA Coral Reef Watch.");
+      };
+      img.src = url;            // lazy: fetched on selection only
+    }
+    var host = document.getElementById("sst-hero-layers");
+    for (var i = 0; i < host.children.length; i++) {
+      var b = host.children[i];
+      b.classList.toggle("active", b.getAttribute("data-slug") === slug);
+    }
+    var head = document.getElementById("sst-hero-head");
+    if (head) {
+      head.textContent =
+        (L.title || L.label || "Sea surface temperature").toUpperCase();
+    }
+    heroCaption();
+  }
+  function heroBuildPicker() {
+    var host = document.getElementById("sst-hero-layers");
+    host.innerHTML = "";
+    ((heroMeta && heroMeta.layers) || []).forEach(function (l) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "hafs-seg";
+      b.setAttribute("data-slug", l.slug);
+      b.textContent = l.label || l.slug;
+      b.addEventListener("click", function () {
+        heroSetLayer(this.getAttribute("data-slug"));
+      });
+      host.appendChild(b);
+    });
+  }
   function renderHero(storm) {
     var pts = storm.points || [];
     var last = pts[pts.length - 1];
     if (!last || last.lat == null) return;
-    var sel = heroRegionFor(last.lat, last.lon);
-    var img = document.getElementById("sst-hero-img");
-    var note = document.getElementById("sst-hero-note");
     document.getElementById("sst-hero-sub").textContent =
       ((document.getElementById("storm-type") || {}).textContent || "")
         .toUpperCase() + " " + (storm.name || "").toUpperCase();
-    // glyph: the cone-hero treatment - spinning path, stationary label
+    // glyph: the cone-hero treatment - spinning path, stationary label;
+    // ALWAYS at the panel center (the render is storm-centered).
     var cat = storm.current_category || "TD";
     document.getElementById("sst-hero-glyph").innerHTML =
       '<svg viewBox="-62 -62 124 124">' +
@@ -1290,66 +1342,27 @@ HTML_TEMPLATE = r"""<!doctype html>
       '<text class="ac-cat" y="12" text-anchor="middle" font-size="34" ' +
       'font-weight="800" fill="#ffffff" stroke="rgba(0,0,0,0.45)" ' +
       'stroke-width="1">' + sshsLabel(cat) + "</text></svg>";
-    if (!sel) {
-      // honest fallback: navy panel + glyph centered, no fake field
-      heroParams = null;
-      img.removeAttribute("src");
-      img.style.display = "none";
-      var g0 = document.getElementById("sst-hero-glyph");
-      g0.style.left = "50%"; g0.style.top = "50%";
-      note.textContent = "No regional SST panel covers this position.";
-      return;
-    }
-    var r = SST_REGIONS[sel.slug];
-    var natW = Math.round(r.fig[0] * SST_DPI);
-    var natH = Math.round(r.fig[1] * SST_DPI);
-    var ax = { x0: SST_AX.l * natW, x1: SST_AX.r * natW,
-               y0: (1 - SST_AX.t) * natH, y1: (1 - SST_AX.b) * natH };
-    var ppdX = (ax.x1 - ax.x0) / (r.ext[1] - r.ext[0]);
-    var ppdY = (ax.y1 - ax.y0) / (r.ext[3] - r.ext[2]);
-    // crop window: storm-centered, clamped inside the region extent
-    var c0 = Math.max(r.ext[0],
-        Math.min(sel.lon - CROP_HW_LON, r.ext[1] - 2 * CROP_HW_LON));
-    var la1 = Math.min(r.ext[3],
-        Math.max(last.lat + CROP_HW_LAT, r.ext[2] + 2 * CROP_HW_LAT));
-    heroParams = {
-      natW: natW, natH: natH, natScaleX: 1, natScaleY: 1,
-      cropX: ax.x0 + (c0 - r.ext[0]) * ppdX,
-      cropY: ax.y0 + (r.ext[3] - la1) * ppdY,
-      cropW: 2 * CROP_HW_LON * ppdX,
-      cropH: 2 * CROP_HW_LAT * ppdY,
-      glyphX: ax.x0 + (sel.lon - r.ext[0]) * ppdX,
-      glyphY: ax.y0 + (r.ext[3] - last.lat) * ppdY
-    };
-    img.style.display = "";
-    var url = CDN + "/sst/crw_" + sel.slug + "_actual.png";
-    if (img.getAttribute("data-url") !== url) {
-      img.setAttribute("data-url", url);
-      img.onload = heroLayout;
-      img.onerror = function () {
-        heroParams = null;
-        img.style.display = "none";
-        note.textContent =
-          "SST base layer unavailable \u00b7 NOAA Coral Reef Watch.";
+    var fixKey = (last.t || "") + "|" + cat;
+    if (heroMeta && heroFixKey === fixKey) { heroCaption(); return; }
+    fetchJson(SST_BASE + "/meta.json").then(function (m) {
+      if (!m || !m.layers || !m.layers.length) {
+        if (!heroMeta) {
+          heroFallback("No storm-centered SST render available yet " +
+            "\u00b7 NOAA Coral Reef Watch.");
+        }
+        return;
+      }
+      heroFixKey = fixKey;
+      var slugs = function (mm) {
+        return ((mm && mm.layers) || []).map(function (l) {
+          return l.slug; }).join(",");
       };
-      img.src = url;
-    } else {
-      heroLayout();
-    }
-    // disclosure caption: field name + valid time + source
-    function caption() {
-      var d = heroMeta && heroMeta.date ? " \u00b7 valid " + heroMeta.date : "";
-      note.textContent =
-        "NOAA Coral Reef Watch CoralTemp v3.1 (5 km) \u00b7 sea-surface " +
-        "temperature" + d + " \u00b7 cropped from the house " +
-        sel.slug.replace(/-/g, " ") + " SST panel.";
-    }
-    caption();
-    if (!heroMeta) {
-      fetchJson(SITE_BASE + "/sst/crw_meta.json").then(function (m) {
-        if (m && m.date) { heroMeta = m; caption(); }
-      });
-    }
+      var rebuild = !heroMeta || slugs(heroMeta) !== slugs(m);
+      heroMeta = m;
+      if (rebuild) heroBuildPicker();
+      heroSetLayer(heroLayerEntry(heroLayer) ? heroLayer
+                                             : m.layers[0].slug);
+    });
   }
 
   function renderChart(storm) {
@@ -1480,14 +1493,23 @@ HTML_TEMPLATE = r"""<!doctype html>
     odoSet(document.getElementById("odo-fix"),
            fixKey ? fixKey.slice(5, 16).replace("T", " ") : "—");
     if (fixKey !== lastFixKey) {
-      renderHero(storm);
-      renderChart(storm);
+      // ISOLATED (the final-gate #3 lesson): one renderer's throw must
+      // never starve the next.
+      try { renderHero(storm); } catch (e) {
+        try { console.warn("[cyclolab] hero render failed:", e); }
+        catch (e2) {}
+      }
+      try { renderChart(storm); } catch (e) {
+        try { console.warn("[cyclolab] chart render failed:", e); }
+        catch (e2) {}
+      }
       lastFixKey = fixKey;
     }
   }
 
   var advFull = null;
   var acRaf = null;          // the cone reveal's rAF loop handle
+  var coneHooks = null;      // per-render seek/settle (test + ops hooks)
   function applyAdvisory(adv) {
     if (!adv) return;
     var changed = adv.advisory !== coneAdv;
@@ -1516,6 +1538,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   function fetchJson(url) {
+    if (typeof fetch !== "function") return Promise.resolve(null);
     return fetch(url + (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now(),
                  { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -1684,11 +1707,27 @@ HTML_TEMPLATE = r"""<!doctype html>
     // keyframes; revealed vertices are static, the leading-edge cap
     // unfolds; a sine ease over GROW_MS=3600 keeps the peak advance
     // ~1.44% of track length per 30fps frame (spec <= 1.5%).
+    //
+    // FINAL-GATE R2 #3: the corridor must CONTAIN the cone laterally at
+    // every revealed arc position. The old linear half-width estimate
+    // ran NARROWER than the real cone wherever it bulged, so the
+    // lateral edge of the revealed region was a raw clip cut - the
+    // cone's own cased edges stayed hidden and "filled in" only when
+    // the clip dropped at settle. Now the corridor's per-sample width
+    // comes from the RING GEOMETRY itself (perpendicular-line
+    // intersection + margin), and the track is extended BEHIND NOW by
+    // the ring's rear extent, so at every frame the revealed region's
+    // lateral + rear boundary is the finished cone: fill and casing
+    // appear together, only the advancing cap is a raw front.
     var tp = pts.map(function (p) { return [X(p.lon), Y(p.lat)]; });
     var lastSeg = tp.length > 1 ? [tp[tp.length - 1][0] - tp[tp.length - 2][0],
                                    tp[tp.length - 1][1] - tp[tp.length - 2][1]]
                                 : [1, 0];
     var lsLen = Math.max(1e-6, Math.hypot(lastSeg[0], lastSeg[1]));
+    var firstSeg = tp.length > 1 ? [tp[1][0] - tp[0][0],
+                                    tp[1][1] - tp[0][1]] : lastSeg;
+    var fsLen = Math.max(1e-6, Math.hypot(firstSeg[0], firstSeg[1]));
+    var ringPx = coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; });
     function distToTrack(x, y) {
       var best = Infinity;
       for (var si = 1; si < tp.length; si++) {
@@ -1704,27 +1743,58 @@ HTML_TEMPLATE = r"""<!doctype html>
       return best;
     }
     var halfW = 0;
-    coneRing.forEach(function (c) {
-      halfW = Math.max(halfW, distToTrack(X(c[0]), Y(c[1])));
+    ringPx.forEach(function (q) {
+      halfW = Math.max(halfW, distToTrack(q[0], q[1]));
     });
-    var ext = halfW + 60;
-    var tpExt = tp.concat([[
-      tp[tp.length - 1][0] + lastSeg[0] / lsLen * ext,
-      tp[tp.length - 1][1] + lastSeg[1] / lsLen * ext]]);
+    // rear/forward extents: how far the ring reaches BEHIND the first
+    // track point / BEYOND the last one (signed projection onto the
+    // end-segment directions).
+    var rearNeed = 0, fwdNeed = 0;
+    ringPx.forEach(function (q) {
+      rearNeed = Math.max(rearNeed,
+          -((q[0] - tp[0][0]) * firstSeg[0] +
+            (q[1] - tp[0][1]) * firstSeg[1]) / fsLen);
+      fwdNeed = Math.max(fwdNeed,
+          ((q[0] - tp[tp.length - 1][0]) * lastSeg[0] +
+           (q[1] - tp[tp.length - 1][1]) * lastSeg[1]) / lsLen);
+    });
+    var rearExt = Math.max(24, rearNeed + 40);
+    var fwdExt = Math.max(60, fwdNeed + 60);
+    var tpExt = [[tp[0][0] - firstSeg[0] / fsLen * rearExt,
+                  tp[0][1] - firstSeg[1] / fsLen * rearExt]]
+      .concat(tp)
+      .concat([[tp[tp.length - 1][0] + lastSeg[0] / lsLen * fwdExt,
+                tp[tp.length - 1][1] + lastSeg[1] / lsLen * fwdExt]]);
     var cum = [0];
     for (var ci = 1; ci < tpExt.length; ci++) {
       cum.push(cum[ci - 1] + Math.hypot(tpExt[ci][0] - tpExt[ci - 1][0],
                                         tpExt[ci][1] - tpExt[ci - 1][1]));
     }
     var Ltot = cum[cum.length - 1];
+    // forecast-point arc distances in the EXTENDED frame (icons pop
+    // when the front tip passes them; index 0 of cum is the rear point)
+    var cumIcons = pts.map(function (_, i) { return cum[i + 1]; });
     var HOLD_MS = 1000, GROW_MS = 4000;
-    var frontW0 = 64;
-    var frontW = 2 * halfW + 110;
-    function halfAt(d) {
-      return (frontW0 + (frontW - frontW0) * (d / Ltot)) / 2;
+    // exact local cone half-width at a canvas point P with normal n:
+    // max |t| over intersections of the perpendicular line P + t*n
+    // with the ring's edges.
+    function ringHalfAt(px3, py3, nx3, ny3) {
+      var w = 0;
+      for (var ri = 0; ri < ringPx.length; ri++) {
+        var a = ringPx[ri];
+        var b = ringPx[(ri + 1) % ringPx.length];
+        var ex2 = b[0] - a[0], ey2 = b[1] - a[1];
+        var det = ex2 * ny3 - ey2 * nx3;
+        if (Math.abs(det) < 1e-9) continue;
+        var rx = a[0] - px3, ry = a[1] - py3;
+        var t3 = (ex2 * ry - ey2 * rx) / det;
+        var s3 = (nx3 * ry - ny3 * rx) / det;
+        if (s3 >= 0 && s3 <= 1) w = Math.max(w, Math.abs(t3));
+      }
+      return w;
     }
     // resample the extended track at uniform arc steps
-    var SAMP = 26;
+    var SAMP = 34;
     function pointAt(d) {
       d = Math.max(0, Math.min(Ltot, d));
       for (var k2 = 1; k2 < tpExt.length; k2++) {
@@ -1744,11 +1814,29 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       return { x: tpExt[0][0], y: tpExt[0][1], nx: 0, ny: -1 };
     }
+    // per-sample corridor half-width = the cone's REAL local width
+    // (probed at the sample and half a step either side - the ring can
+    // bulge between samples) + margin, so the clip edge always rides
+    // OUTSIDE the casing where the cone has been revealed.
+    var CORR_PAD = 16, CORR_MIN = 32;
     var samples = [];
+    var sampStep = Ltot / (SAMP - 1);
     for (var sj = 0; sj < SAMP; sj++) {
       var sd = Ltot * sj / (SAMP - 1);
       var sp = pointAt(sd);
-      samples.push({ d: sd, x: sp.x, y: sp.y, nx: sp.nx, ny: sp.ny });
+      var wMax = 0;
+      [-0.5, 0, 0.5].forEach(function (frac) {
+        var q = pointAt(sd + frac * sampStep);
+        wMax = Math.max(wMax, ringHalfAt(q.x, q.y, q.nx, q.ny));
+      });
+      samples.push({ d: sd, x: sp.x, y: sp.y, nx: sp.nx, ny: sp.ny,
+                     w: Math.max(CORR_MIN, wMax + CORR_PAD) });
+    }
+    function halfAt(d) {
+      d = Math.max(0, Math.min(Ltot, d));
+      var j3 = Math.min(SAMP - 2, Math.floor(d / sampStep));
+      var f3 = (d - samples[j3].d) / sampStep;
+      return samples[j3].w + (samples[j3 + 1].w - samples[j3].w) * f3;
     }
     var CAPV = 5;                       // leading-edge cap vertices
     function polyAt(d) {
@@ -1770,7 +1858,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       for (var j2 = 0; j2 < SAMP; j2++) {
         var s2 = samples[j2];
         if (s2.d <= d) {
-          var wj = halfAt(s2.d);
+          var wj = s2.w;
           L.push((s2.x + s2.nx * wj).toFixed(1) + " " +
                  (s2.y + s2.ny * wj).toFixed(1));
           R.push((s2.x - s2.nx * wj).toFixed(1) + " " +
@@ -1905,6 +1993,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       rects.push({ x: tp[i][0] - half, y: tp[i][1] - half,
                    w: 2 * half, h: 2 * half });
     });
+    // FINAL-GATE R2 #4 - THE CONNECTOR RULE: a leader line renders if
+    // and only if the placard's anchor sits more than LEADER_GAP px
+    // beyond its glyph's EDGE (center distance minus the icon
+    // half-size, so the hero NOW icon and the small tau icons read the
+    // same adjacency). Which placement slot happened to win is not a
+    // rule; displacement is.
+    var LEADER_GAP = 36;
     var placards = [];
     pts.forEach(function (p, i) {
       var pw = (i === 0 ? 112 : 86), ph = (i === 0 ? 26 : 22);
@@ -1915,7 +2010,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       var nx = -vy / vl, ny = vx / vl;
       var side = (i % 2 === 0) ? 1 : -1;
       if (i === 0) side = -1;            // NOW placard prefers up-track
-      var placed = null, leader = false;
+      var placed = null;
       var offs = [34, 48, 62, 76, 92, 110];
       var nudges = [0, 30, -30, 60, -60, 90, -90];
       // preferred side first, then the opposite; outward pushes, then
@@ -1931,10 +2026,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             var r2 = { x: cx2 - pw / 2, y: cy2 - ph / 2, w: pw, h: ph };
             r2.x = Math.max(6, Math.min(W - pw - 6, r2.x));
             r2.y = Math.max(6, Math.min(H - ph - 6, r2.y));
-            if (!overlaps(r2)) {
-              placed = r2;
-              leader = offs[oi] > 48 || Math.abs(nudges[ni]) > 30;
-            }
+            if (!overlaps(r2)) placed = r2;
           }
         }
       }
@@ -1943,10 +2035,11 @@ HTML_TEMPLATE = r"""<!doctype html>
                        tp[i][0] - pw / 2)),
                    y: Math.min(H - ph - 6, 6 + i * (ph + 4)),
                    w: pw, h: ph };
-        leader = true;
       }
+      var gap = Math.hypot(placed.x + pw / 2 - tp[i][0],
+                           placed.y + ph / 2 - tp[i][1]) - iconR[i];
       rects.push(placed);
-      placards.push({ rect: placed, leader: leader });
+      placards.push({ rect: placed, leader: gap > LEADER_GAP, gap: gap });
     });
 
     var anyNonTropical = false;
@@ -1957,11 +2050,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       var cat = pointCat(p);
       var col = tropical ? (SSHS[cat] || SSHS.TD) : "#ffffff";
       // pops ride the wavefront EXACTLY: the cap tip sits at the
-      // front distance, so delay = hold + grow * invease(d_i / L).
+      // front distance, so delay = hold + grow * invease(d_i / L)
+      // (d_i measured in the rear-extended frame - cumIcons).
       var delayMs = (i === 0)
         ? 400
         : Math.round(HOLD_MS + GROW_MS *
-                     invEaseS(Math.max(0.02, cum[i] / Ltot)));
+                     invEaseS(Math.max(0.02, cumIcons[i] / Ltot)));
       var scale = (i === 0 ? 0.95 : 0.42);   // NOW is the hero (#6)
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
@@ -1986,12 +2080,16 @@ HTML_TEMPLATE = r"""<!doctype html>
         : "+" + tau + "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt";
       var pw2 = pl.rect.w, ph2 = pl.rect.h;
       if (pl.leader) {
-        parts.push('<line x1="' + px2.toFixed(1) + '" y1="' +
+        parts.push('<line data-role="leader" data-for="' + i +
+          '" x1="' + px2.toFixed(1) + '" y1="' +
           py2.toFixed(1) + '" x2="' + (pl.rect.x + pw2 / 2).toFixed(1) +
           '" y2="' + (pl.rect.y + ph2 / 2).toFixed(1) +
           '" stroke="rgba(255,255,255,0.45)" stroke-width="1.2"/>');
       }
-      parts.push('<g data-role="placard" data-x="' +
+      parts.push('<g data-role="placard" data-i="' + i +
+        '" data-gap="' + pl.gap.toFixed(1) +
+        '" data-leader="' + (pl.leader ? 1 : 0) +
+        '" data-iconr="' + iconR[i] + '" data-x="' +
         pl.rect.x.toFixed(1) + '" data-y="' + pl.rect.y.toFixed(1) +
         '" data-w="' + pw2 + '" data-h="' + ph2 +
         '" transform="translate(' + pl.rect.x.toFixed(1) +
@@ -2119,6 +2217,29 @@ HTML_TEMPLATE = r"""<!doctype html>
       grp.removeAttribute("clip-path");  // final frame: fully revealed
       grp.setAttribute("data-reveal", "final");
     }
+
+    // deterministic reveal hooks (final-gate-2 #3): place the growth
+    // front at an exact arc fraction, or jump to the settled frame.
+    // Pure geometry through the same polyAt the rAF clock drives -
+    // the per-frame casing test extracts frames through these instead
+    // of racing wall-clock animation.
+    coneHooks = {
+      seek: function (f) {
+        if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
+        var d = Math.max(0, Math.min(1, f)) * Ltot;
+        grp.setAttribute("clip-path", "url(#ac-reveal-clip)");
+        revealPath.setAttribute("d", polyAt(d));
+        var p = pointAt(d);
+        return { d: d, Ltot: Ltot, tipX: p.x, tipY: p.y,
+                 w: halfAt(d), W: W, H: H };
+      },
+      settle: function () {
+        if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
+        grp.removeAttribute("clip-path");
+        grp.setAttribute("data-reveal", "final");
+        return { Ltot: Ltot, W: W, H: H };
+      }
+    };
 
     var official = advFull.method === "official-cone";
     note.textContent = (official
@@ -2361,13 +2482,86 @@ HTML_TEMPLATE = r"""<!doctype html>
   // small bounded backward preload window; band switches keep the MOMENT
   // (nearest frame in the new band's availability - the hour-grid idiom on
   // a time axis).
+  //
+  // FINAL-GATE R2 #5 - THE PRESENTATION PATH: swapping img.src forces a
+  // main-thread decode + raster per frame even when the bytes are
+  // cached, and playback still stuttered on real (throttled) hardware.
+  // Playback now pre-DECODES frames into ImageBitmaps (fetch ->
+  // createImageBitmap, a bounded look-ahead ring) and PRESENTS by
+  // drawImage onto a canvas from a rAF clock - the only per-frame
+  // main-thread work is one GPU-friendly blit. Presented-frame
+  // timestamps are recorded so cadence is MEASURABLE
+  // (satState().presented); the contract - no interval > 2x the median
+  // over a full loop at 4x CPU throttle - is pinned in tests. Engines
+  // without canvas/createImageBitmap (jsdom) keep the img.src path
+  // with the decode gate.
   var sat = { man: null, band: null, frames: [], idx: 0, playing: false,
-              timer: null, gen: 0, preloaded: {} };
+              timer: null, gen: 0, preloaded: {},
+              mode: null, bmp: {}, bmpKeys: [], raf: null, lastT: 0,
+              holdT0: 0, presented: [] };
+  var SAT_FRAME_MS = 200, SAT_AHEAD = 12, SAT_BMP_MAX = 28;
   function satEl(id) { return document.getElementById("sat-" + id); }
   function satStatus(show, msg) {
     var box = satEl("status");
     box.style.display = show ? "flex" : "none";
     if (msg != null) box.querySelector("span").textContent = msg;
+  }
+  function satCanvasOk() {
+    if (sat.mode !== null) return sat.mode === "canvas";
+    var ok = false;
+    try {
+      var cv = satEl("canvas");
+      ok = !!(window.createImageBitmap && cv && cv.getContext &&
+              cv.getContext("2d"));
+    } catch (e) { ok = false; }
+    sat.mode = ok ? "canvas" : "img";
+    return ok;
+  }
+  function satBitmapFor(i) {
+    // decoded ImageBitmap for frame i, or null (decode kicked off).
+    var f = sat.frames[i];
+    if (!f) return null;
+    var u = CDN + "/" + f.key;
+    var e = sat.bmp[u];
+    if (e) return e.bm;
+    e = sat.bmp[u] = { bm: null };
+    sat.bmpKeys.push(u);
+    fetch(u).then(function (r) { return r.ok ? r.blob() : null; })
+      .then(function (bl) { return bl ? createImageBitmap(bl) : null; })
+      .then(function (bm) { e.bm = bm; })
+      .catch(function () {});
+    // bounded decode ring: evict (and close) the oldest entries.
+    while (sat.bmpKeys.length > SAT_BMP_MAX) {
+      var old = sat.bmpKeys.shift();
+      var oe = sat.bmp[old];
+      delete sat.bmp[old];
+      if (oe && oe.bm && oe.bm.close) {
+        try { oe.bm.close(); } catch (e2) {}
+      }
+    }
+    return null;
+  }
+  function satAhead(i) {
+    // decode-ahead window so the presentation clock never waits on the
+    // network mid-loop.
+    var n = sat.frames.length;
+    if (!n) return;
+    for (var k = 1; k <= Math.min(SAT_AHEAD, n - 1); k++) {
+      satBitmapFor((i + k) % n);
+    }
+  }
+  function satBlit(bm) {
+    var cv = satEl("canvas");
+    if (cv.width !== bm.width || cv.height !== bm.height) {
+      cv.width = bm.width; cv.height = bm.height;
+    }
+    cv.getContext("2d").drawImage(bm, 0, 0);
+  }
+  function satReadout(i) {
+    var f = sat.frames[i];
+    satEl("scrub").value = String(i);
+    satEl("time").textContent =
+      f.t.slice(0, 16).replace("T", " ") + "Z";
   }
   function satShow(i) {
     var n = sat.frames.length;
@@ -2376,10 +2570,28 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (i >= n) i = n - 1;
     sat.idx = i;
     var f = sat.frames[i];
-    satEl("img").src = CDN + "/" + f.key;
-    satEl("scrub").value = String(i);
-    satEl("time").textContent =
-      f.t.slice(0, 16).replace("T", " ") + "Z";
+    if (satCanvasOk()) {
+      satEl("img").style.display = "none";
+      satEl("canvas").style.display = "";
+      var bm = satBitmapFor(i);
+      if (bm) {
+        satBlit(bm);
+      } else {
+        // decode in flight: blit when ready if the user is still on
+        // this frame; give up quietly on a dead object (~2.5 s).
+        var gen = sat.gen, want = i, tries = 0;
+        (function waitBlit() {
+          if (gen !== sat.gen || sat.idx !== want || tries++ > 60) return;
+          var b2 = satBitmapFor(want);
+          if (b2) { satBlit(b2); return; }
+          setTimeout(waitBlit, 40);
+        })();
+      }
+      satAhead(i);
+    } else {
+      satEl("img").src = CDN + "/" + f.key;
+    }
+    satReadout(i);
   }
   function satPreload() {
     // newest-backwards over the ENTIRE band, ~3 in flight. The old
@@ -2444,27 +2656,68 @@ HTML_TEMPLATE = r"""<!doctype html>
       btn.classList.toggle("active", btn.getAttribute("data-slug") === slug);
     }
     satShow(prevT != null ? satNearest(prevT) : sat.frames.length - 1);
-    satPreload();
+    // canvas mode decodes ahead of the playhead; the Image-object
+    // warmer only serves the img fallback path.
+    if (satCanvasOk()) satAhead(sat.idx); else satPreload();
   }
   function satStep(d) { satPause(); satShow(sat.idx + d); }
   function satPause() {
     sat.playing = false;
     if (sat.timer) { clearInterval(sat.timer); sat.timer = null; }
+    if (sat.raf) { cancelAnimationFrame(sat.raf); sat.raf = null; }
     satEl("play").innerHTML = "&#9654; Play";
+  }
+  function satRafTick(ts) {
+    if (!sat.playing) { sat.raf = null; return; }
+    sat.raf = requestAnimationFrame(satRafTick);
+    if (ts - sat.lastT < SAT_FRAME_MS - 1) return;
+    var j = sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1;
+    var bm = satBitmapFor(j);
+    if (!bm) {
+      // hold the clock for an in-flight decode; skip a dead frame
+      // after ~2 s so one bad object can't stall the loop.
+      if (!sat.holdT0) sat.holdT0 = ts;
+      if (ts - sat.holdT0 > 2000) {
+        sat.holdT0 = 0;
+        sat.idx = j; satReadout(j); satAhead(j);
+        sat.lastT = ts;
+      }
+      return;
+    }
+    sat.holdT0 = 0;
+    sat.idx = j;
+    satBlit(bm);
+    satReadout(j);
+    satAhead(j);
+    // drift-resistant cadence: lock to the frame grid, resync only if
+    // the main thread fell more than a frame behind.
+    sat.lastT = (ts - sat.lastT > 2 * SAT_FRAME_MS) ? ts
+                : sat.lastT + SAT_FRAME_MS;
+    // PRESENTED-frame log (final-gate-2 #5): the cadence contract is
+    // asserted on these, not on swap counts.
+    sat.presented.push(ts);
+    if (sat.presented.length > 600) sat.presented.shift();
   }
   function satTogglePlay() {
     if (sat.playing) { satPause(); return; }
     if (!sat.frames.length) return;
     sat.playing = true;
     satEl("play").innerHTML = "&#10074;&#10074; Pause";
+    if (satCanvasOk()) {
+      sat.lastT = 0;
+      sat.holdT0 = 0;
+      satAhead(sat.idx);
+      sat.raf = requestAnimationFrame(satRafTick);
+      return;
+    }
     sat.holds = 0;
     sat.timer = setInterval(function () {
       var j = sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1;
-      // DECODE GATE: during playback a frame is shown only once its
-      // preload has fully decoded - swapping src to an in-flight URL
-      // races the network and the sector jumps (final-gate #4). A dead
-      // frame is skipped after ~2s so one bad object can't stall the
-      // loop.
+      // DECODE GATE (img fallback path): during playback a frame is
+      // shown only once its preload has fully decoded - swapping src
+      // to an in-flight URL races the network and the sector jumps
+      // (final-gate #4). A dead frame is skipped after ~2s so one bad
+      // object can't stall the loop.
       var im = sat.preloaded[CDN + "/" + sat.frames[j].key];
       var ready = im && im.complete && im.naturalWidth > 0;
       if (!ready && sat.holds < 10) { sat.holds++; return; }
@@ -2472,24 +2725,50 @@ HTML_TEMPLATE = r"""<!doctype html>
       satShow(j);
     }, 200);
   }
-  function initSatellite() {
-    satStatus(true, "Loading\u2026");
-    fetchJson(CDN + "/floaters/manifest.json").then(function (top) {
-      var entry = null;
+  // SECTOR-SOURCE REGISTRY (final-gate-2 #6, a seam - no second source
+  // is built this round): the Satellite tab discovers per-storm sector
+  // manifests through this table, so MESOSCALE SECTORS join as a
+  // second entry when the meso pipeline exists (satellite roadmap
+  // phase) - a registry entry, not a viewer rewrite. Band slugs merge
+  // across sources (first registered source wins a collision). Today:
+  // the GOES floater pipeline only.
+  var SAT_SOURCES = [{
+    id: "floater",
+    top: CDN + "/floaters/manifest.json",
+    resolve: function (top) {
       var storms = (top && top.storms) || [];
       for (var i = 0; i < storms.length; i++) {
-        if (String(storms[i].id).toLowerCase() === FLOATER_ID) {
-          entry = storms[i]; break;
+        if (String(storms[i].id).toLowerCase() === FLOATER_ID &&
+            storms[i].manifest) {
+          return CDN + "/" + storms[i].manifest;
         }
       }
-      if (!entry || !entry.manifest) return null;
-      return fetchJson(CDN + "/" + entry.manifest);
-    }).then(function (man) {
-      if (!man || !man.bands) {
+      return null;
+    }
+  }];
+  function initSatellite() {
+    satStatus(true, "Loading\u2026");
+    Promise.all(SAT_SOURCES.map(function (src) {
+      return fetchJson(src.top).then(function (top) {
+        var mu = top && src.resolve(top);
+        return mu ? fetchJson(mu) : null;
+      });
+    })).then(function (mans) {
+      var bands = {}, got = false;
+      mans.forEach(function (man) {
+        if (!man || !man.bands) return;
+        for (var bs in man.bands) {
+          if (!man.bands.hasOwnProperty(bs) || bands[bs]) continue;
+          bands[bs] = man.bands[bs];
+          got = true;
+        }
+      });
+      if (!got) {
         satStatus(false);
         satEl("empty").style.display = "block";
         return;
       }
+      var man = { bands: bands };
       sat.man = man;
       satStatus(false);
       var host = satEl("bands");
@@ -2541,6 +2820,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                    // Stage-3 deterministic hooks (tests + ops)
                    renderAdvTab: renderAdvTab,
                    intensityRows: intensityRows,
+                   cone: function () { return coneHooks; },
                    satState: function () {
                      return { band: sat.band, idx: sat.idx,
                               frames: sat.frames.length,
@@ -2548,7 +2828,9 @@ HTML_TEMPLATE = r"""<!doctype html>
                                 return f.t; }),
                               frameKeys: sat.frames.map(function (f) {
                                 return f.key; }),
-                              playing: sat.playing };
+                              playing: sat.playing,
+                              mode: sat.mode,
+                              presented: sat.presented.slice() };
                    },
                    hafsViewer: function () { return hafsViewer; } };
 })();
@@ -2596,10 +2878,13 @@ def _odo_static(text) -> str:
 
 def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                 ended: bool = False, loader: str = "b",
-                og_image_url: str | None = None) -> str:
+                og_image_url: str | None = None,
+                sst_base: str | None = None) -> str:
     """Render one storm's shell. ``loader`` selects the loading screen:
     "b" (eye opens - THE CHOSEN loader, AD R3 default) or the other
-    prototypes "a"/"c"/"d"; "" = plain wipe."""
+    prototypes "a"/"c"/"d"; "" = plain wipe. ``sst_base`` is the URL
+    base of the per-storm SST hero layers (final-gate-2 #1); default =
+    the live Worker path."""
     ids = parse_sid(storm["sid"])
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
@@ -2666,6 +2951,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                                 separators=(",", ":")))
             .replace("__ATCF_LONG__", _esc(ids.atcf_long))
             .replace("__ADV_URL__", _esc(adv_url or adv_key(storm["sid"])))
+            .replace("__SST_BASE__", _esc(
+                (sst_base or f"/cyclolab/{ids.sid}/sst").rstrip("/")))
             .replace("__BASIN__", ids.basin)
             .replace("__LOADER__", _esc(loader))
             .replace("__SSHS_JSON__", json.dumps(SSHS_COLORS))

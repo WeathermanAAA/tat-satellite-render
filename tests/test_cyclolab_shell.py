@@ -48,6 +48,31 @@ NODE = shutil.which("node")
 _DEFAULT_NODE_PATH = "/workspaces/Triple-A-Tropics/node_modules"
 FEED_URL = "https://cdn.triple-a-tropics.com/feeds/ep_tracks_data.json"
 
+# final-gate-2 #1: the per-storm SST hero meta the poller's
+# SstHeroWriter writes (cyclolab_sst.py) - the plan fixture the harness
+# serves at SST_BASE/meta.json.
+SST_META = {
+    "sid": "NHC_EP082026",
+    "center": {"lat": 20.4, "lon": -141.2},
+    "box": {"hw_lon": 9.0, "hw_lat": 5.175},
+    "px": [1200, 690],
+    "valid_date": "2026-06-05",
+    "updated_utc": "2026-06-06T12:00:00Z",
+    "layers": [
+        {"slug": "actual", "label": "SST",
+         "title": "Sea surface temperature",
+         "field": "sea-surface temperature (°C)", "file": "actual.png",
+         "source": "NOAA Coral Reef Watch CoralTemp v3.1 (5 km)",
+         "valid": "2026-06-05"},
+        {"slug": "anomaly", "label": "Anomaly", "title": "SST anomaly",
+         "field": "SST anomaly (°C)", "file": "anomaly.png",
+         "source": "NOAA Coral Reef Watch v3.1 (5 km)",
+         "note": ("anomaly vs the official CRW climatology, not the "
+                  "site-wide 1991–2020 baseline"),
+         "valid": "2026-06-05"},
+    ],
+}
+
 
 def load_storm() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -353,6 +378,7 @@ class TestHydration(unittest.TestCase):
         recs = run_harness(
             self.html,
             {"feed": {"storms": [self.storm]},
+             "sst_meta": SST_META,
              "ops": [{"op": "apply", "storm": self.storm}]})
         st = recs[-1]["state"]
         # last fix: wind 120 kt, mslp 925 mb; ace 4.821 -> "4.82".
@@ -362,15 +388,20 @@ class TestHydration(unittest.TestCase):
         # position + last-fix odometers populated (not the em-dash placeholder).
         self.assertEqual(st["odo"]["pos"], "20.4N 141.2W")
         self.assertTrue(st["odo"]["fix"] and st["odo"]["fix"] != "—")
-        # the hero rendered: SST crop URL chosen from the house CRW
-        # panels, the spinning glyph carries the category label, and
-        # the caption discloses field + source (final-gate #1).
+        # the hero rendered from the PER-STORM render family
+        # (final-gate-2 #1): the img points at the baked SST base, the
+        # spinning glyph carries the category label, and the caption
+        # discloses source + field + valid date.
         hero = st["hero"]
-        self.assertIn("/sst/crw_", hero["imgUrl"])
-        self.assertIn("_actual.png", hero["imgUrl"])
+        self.assertIn("/sst/actual.png", hero["imgUrl"])
+        self.assertTrue(hero["imgShown"])
+        self.assertEqual(hero["layers"], ["actual", "anomaly"])
+        self.assertEqual(hero["activeLayer"], "actual")
         self.assertGreater(hero["glyphHtml"], 50)
         self.assertEqual(hero["glyphLabel"], "4")   # C4 synth fixture
         self.assertIn("Coral Reef Watch", hero["caption"])
+        self.assertIn("valid 2026-06-05", hero["caption"])
+        self.assertIn("storm-centered", hero["caption"])
         self.assertTrue(hero["sub"].endswith("SYNTH"))
         self.assertGreater(st["chartChildCount"], 0)
 
@@ -989,6 +1020,215 @@ class TestStage4Advisories(unittest.TestCase):
             recs[-1]["state"]["stage3"]["adv"]["coneReveal"], "final")
         self.assertEqual(
             recs[-1]["state"]["stage3"]["adv"]["coneClip"], "none")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestHeroLayers(unittest.TestCase):
+    """final-gate-2 #1 - the storm-centered SST hero layer picker:
+    meta-driven, LAZY per selection, disclosure caption, honest
+    fallback."""
+
+    def setUp(self):
+        self.storm = load_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+
+    def _run(self, ops, meta=SST_META):
+        plan = {"feed": {"storms": [self.storm]}, "ops": ops}
+        if meta is not None:
+            plan["sst_meta"] = meta
+        return run_harness(self.html, plan)
+
+    def test_sst_base_is_baked(self):
+        # the live default rides the Worker path for THIS sid
+        self.assertIn('var SST_BASE = "/cyclolab/NHC_EP082026/sst"',
+                      self.html)
+        html2 = cyclolab_shell.render_page(
+            self.storm, feed_url=FEED_URL,
+            sst_base="https://cdn.example.com/shadow/cyclolab/X/sst")
+        self.assertIn(
+            'var SST_BASE = "https://cdn.example.com/shadow/cyclolab/X/sst"',
+            html2)
+
+    def test_picker_builds_and_defaults_to_first_layer(self):
+        recs = self._run([{"op": "apply", "storm": self.storm}])
+        hero = recs[-1]["state"]["hero"]
+        self.assertEqual(hero["layers"], ["actual", "anomaly"])
+        self.assertEqual(hero["activeLayer"], "actual")
+        self.assertIn("/sst/actual.png?v=2026-06-06T12", hero["imgUrl"])
+        self.assertEqual(hero["head"], "SEA SURFACE TEMPERATURE")
+
+    def test_layer_click_is_lazy_and_discloses_baseline(self):
+        recs = self._run([{"op": "apply", "storm": self.storm},
+                          {"op": "clickHeroLayer", "slug": "anomaly"}])
+        before = recs[0]["state"]["hero"]
+        after = recs[-1]["state"]["hero"]
+        # lazy: the anomaly PNG was not referenced until picked
+        self.assertNotIn("anomaly.png", before["imgUrl"])
+        self.assertIn("/sst/anomaly.png?v=", after["imgUrl"])
+        self.assertEqual(after["activeLayer"], "anomaly")
+        self.assertEqual(after["head"], "SST ANOMALY")
+        # the caption carries the per-layer disclosure note + valid day
+        self.assertIn("official CRW climatology", after["caption"])
+        self.assertIn("valid 2026-06-05", after["caption"])
+
+    def test_missing_meta_is_an_honest_fallback(self):
+        recs = self._run([{"op": "apply", "storm": self.storm}],
+                         meta=None)
+        hero = recs[-1]["state"]["hero"]
+        self.assertFalse(hero["imgShown"])
+        self.assertEqual(hero["layers"], [])
+        self.assertIn("No storm-centered SST render", hero["caption"])
+        # the glyph still renders (centered by CSS - no client math)
+        self.assertGreater(hero["glyphHtml"], 50)
+
+
+def _parse_pairs(d: str, sep: str) -> list[tuple[float, float]]:
+    """Parse 'x{sep}y' coordinate pairs out of an SVG path string."""
+    import re
+    pat = (r"([-\d.]+)\s+([-\d.]+)" if sep == " "
+           else r"([-\d.]+),([-\d.]+)")
+    return [(float(a), float(b)) for a, b in re.findall(pat, d)]
+
+
+def _inside(poly: list[tuple[float, float]], x: float, y: float) -> bool:
+    n, j, c = len(poly), len(poly) - 1, False
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and \
+           (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            c = not c
+        j = i
+    return c
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestConeCorridorContainment(unittest.TestCase):
+    """final-gate-2 #3, the geometry half (the pixel half lives in
+    test_cyclolab_visual.py): the reveal corridor must CONTAIN the cone
+    at full extent - rear bulge behind NOW and lateral bulges included
+    - so clip removal at settle is a visual no-op and the revealed
+    lateral boundary is always the cone's own casing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.storm = load_storm()
+        cls.html = cyclolab_shell.render_page(cls.storm, feed_url=FEED_URL)
+        cls.adv = json.loads((HERE / "fixtures" / "cyclolab"
+                              / "live_adv_ep17.json").read_text())
+
+    def _seek(self, f):
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": self.adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": f}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        clip = _parse_pairs(a["coneRevealD"], " ")
+        ring = _parse_pairs(a["coneOutlineD"], ",")
+        return a, clip, ring
+
+    def test_full_extent_corridor_contains_every_ring_vertex(self):
+        a, clip, ring = self._seek(1.0)
+        self.assertTrue(a["coneHooks"])
+        self.assertGreater(len(clip), 40)
+        self.assertGreater(len(ring), 100)
+        outside = [(x, y) for x, y in ring if not _inside(clip, x, y)]
+        self.assertEqual(
+            len(outside), 0,
+            f"{len(outside)}/{len(ring)} ring verts OUTSIDE the full "
+            f"corridor (first: {outside[:3]}) - the settle frame would "
+            f"pop them in")
+
+    def test_partial_seek_clips_strictly_less(self):
+        # teeth: the containment test CAN fail - a part-grown corridor
+        # must leave forward ring vertices outside.
+        _, clip, ring = self._seek(0.35)
+        outside = [p for p in ring if not _inside(clip, p[0], p[1])]
+        self.assertGreater(len(outside), 10,
+                           "a 35% corridor should not contain the "
+                           "whole cone - the probe has no teeth")
+
+    def test_seek_hook_reports_geometry_and_rearms_clip(self):
+        a, clip, _ = self._seek(0.5)
+        s = a["coneSeek"]
+        self.assertIsNotNone(s)
+        self.assertGreater(s["Ltot"], 100)
+        self.assertAlmostEqual(s["d"], s["Ltot"] * 0.5, places=3)
+        self.assertGreater(s["w"], 0)
+        # seeking re-arms the clip attribute (jsdom boots at 'final')
+        self.assertIn("ac-reveal-clip", a["coneClip"])
+        self.assertGreater(a["coneRevealPathLen"], 100)
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestConnectorRule(unittest.TestCase):
+    """final-gate-2 #4: a leader line renders IFF the placard sits more
+    than LEADER_GAP px beyond its glyph's edge. Every displaced placard
+    has one; every adjacent one doesn't."""
+
+    LEADER_GAP = 36.0    # pinned: the rule constant in renderAdvCone
+
+    @classmethod
+    def setUpClass(cls):
+        cls.storm = load_storm()
+        cls.html = cyclolab_shell.render_page(cls.storm, feed_url=FEED_URL)
+        cls.live_adv = json.loads((HERE / "fixtures" / "cyclolab"
+                                   / "live_adv_ep17.json").read_text())
+
+    def _placards(self, adv):
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        return a["conePlacards"], a["coneLeaders"]
+
+    def _assert_rule(self, pls, leaders, label):
+        self.assertTrue(pls, f"{label}: no placards")
+        for p in pls:
+            want = p["gap"] > self.LEADER_GAP
+            self.assertEqual(
+                p["leader"], want,
+                f"{label}: placard {p['i']} gap {p['gap']:.1f} vs rule "
+                f"{self.LEADER_GAP} - leader={p['leader']}")
+            self.assertEqual(
+                p["i"] in leaders, want,
+                f"{label}: placard {p['i']} leader LINE presence "
+                f"disagrees with the rule")
+
+    def test_rule_holds_on_the_live_official_cone(self):
+        pls, leaders = self._placards(self.live_adv)
+        self._assert_rule(pls, leaders, "live-official")
+
+    def test_rule_holds_when_bunched_taus_force_displacement(self):
+        pts = [
+            {"tau_h": t, "lat": 15.0 + 0.05 * i, "lon": -135.0 - 0.07 * i,
+             "intensity_kt": 30 + i, "dev_label": "TS", "valid_utc": "x"}
+            for i, t in enumerate((0, 12, 24, 36, 48, 60))]
+        ring = [[-140.0, 13.0], [-134.0, 13.0], [-133.5, 18.0],
+                [-140.5, 18.5], [-140.0, 13.0]]
+        adv = {"sid": "NHC_EP082026", "advisory": 21,
+               "issued_utc": "2026-06-06T21:00:00Z", "source": "nhc",
+               "method": "official-cone", "cone": ring, "points": pts,
+               "text": {"tcp": "X", "tcd": "Y"}}
+        pls, leaders = self._placards(adv)
+        self._assert_rule(pls, leaders, "bunched")
+        # bunching must actually displace SOME placard past the rule -
+        # otherwise this case proves nothing.
+        self.assertTrue(any(p["leader"] for p in pls),
+                        "bunched fixture produced no displaced placard")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestMesoSectorSeam(unittest.TestCase):
+    """final-gate-2 #6: the Satellite tab reads sectors through a
+    SOURCE REGISTRY so mesoscale sectors are an entry, not a rewrite.
+    Seam only - one source today."""
+
+    def test_registry_exists_with_the_floater_entry(self):
+        html = cyclolab_shell.render_page(load_storm(), feed_url=FEED_URL)
+        self.assertIn("var SAT_SOURCES = [{", html)
+        self.assertIn('id: "floater"', html)
+        self.assertIn("MESOSCALE SECTORS join as a", html)
 
 
 if __name__ == "__main__":

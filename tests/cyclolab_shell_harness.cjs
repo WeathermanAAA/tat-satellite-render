@@ -92,6 +92,9 @@ const scheduledDelays = [];
       const FLOATERS = Array.isArray(PLAN) ? null : (PLAN.floaters || null);
       const FLOATER_STORM = Array.isArray(PLAN) ? null
         : (PLAN.floater_storm || null);
+      // final-gate-2 #1: the per-storm SST hero meta (plan.sst_meta);
+      // absent -> !ok response -> the shell's honest fallback panel.
+      const SST_META = Array.isArray(PLAN) ? null : (PLAN.sst_meta || null);
       window.__fetched = [];
       function jsonResponse(body) {
         if (body == null) {
@@ -124,6 +127,9 @@ const scheduledDelays = [];
         }
         if (/floaters\/[^/]+\/manifest\.json/.test(url)) {
           return jsonResponse(FLOATER_STORM);
+        }
+        if (/\/sst\/meta\.json/.test(url)) {
+          return jsonResponse(SST_META);
         }
         if (FEED == null) {
           return Promise.resolve({
@@ -290,11 +296,18 @@ const scheduledDelays = [];
         })) : [],
       conePlacards: coneSvg ? Array.prototype.map.call(
         coneSvg.querySelectorAll('[data-role="placard"]'), (g) => ({
+          i: parseInt(g.getAttribute("data-i"), 10),
           x: parseFloat(g.getAttribute("data-x")),
           y: parseFloat(g.getAttribute("data-y")),
           w: parseFloat(g.getAttribute("data-w")),
           h: parseFloat(g.getAttribute("data-h")),
+          gap: parseFloat(g.getAttribute("data-gap")),
+          leader: g.getAttribute("data-leader") === "1",
+          iconr: parseFloat(g.getAttribute("data-iconr")),
         })) : [],
+      coneLeaders: coneSvg ? Array.prototype.map.call(
+        coneSvg.querySelectorAll('line[data-role="leader"]'),
+        (l) => parseInt(l.getAttribute("data-for"), 10)) : [],
       coneLand: coneSvg
         ? coneSvg.querySelectorAll(".ac-land").length : 0,
       coneGraticule: coneSvg
@@ -304,6 +317,24 @@ const scheduledDelays = [];
         ? coneSvg.querySelectorAll(".ac-spin").length : 0,
       coneNote: text("advcone-note"),
       coneMethodBody: text("advcone-method-body"),
+      coneHooks: !!(win.__lab && win.__lab.cone && win.__lab.cone()),
+      coneSeek: win.__coneSeek || null,
+      coneRevealPathLen: (() => {
+        const p = coneSvg && coneSvg.querySelector(".ac-reveal-path");
+        return p ? (p.getAttribute("d") || "").length : 0;
+      })(),
+      // raw path data for python-side geometry assertions (final-gate-2
+      // #3: the corridor must CONTAIN the cone; point-in-polygon over
+      // the outline vertices proves it without pixels).
+      coneRevealD: (() => {
+        const p = coneSvg && coneSvg.querySelector(".ac-reveal-path");
+        return p ? (p.getAttribute("d") || "") : "";
+      })(),
+      coneOutlineD: (() => {
+        const g = coneSvg && coneSvg.querySelector(".ac-conegrp");
+        return g && g.children[1]
+          ? (g.children[1].getAttribute("d") || "") : "";
+      })(),
       coneEmptyShown:
         ((win.document.getElementById("advcone-empty") || {}).style || {})
           .display === "block",
@@ -371,8 +402,22 @@ const scheduledDelays = [];
         const g = document.getElementById("sst-hero-glyph");
         const note = document.getElementById("sst-hero-note");
         if (!img) return null;
+        const host = document.getElementById("sst-hero-layers");
+        const layers = host
+          ? Array.prototype.map.call(host.children,
+              (b) => b.getAttribute("data-slug")) : [];
+        const active = host
+          ? Array.prototype.filter.call(host.children,
+              (b) => b.classList.contains("active"))
+              .map((b) => b.getAttribute("data-slug")) : [];
         return {
           imgUrl: img.getAttribute("data-url") || "",
+          imgShown: img.style.display !== "none" &&
+            !!img.getAttribute("data-url"),
+          layers: layers,
+          activeLayer: active.length === 1 ? active[0] : null,
+          head: (document.getElementById("sst-hero-head") || {})
+            .textContent || "",
           glyphHtml: g ? g.innerHTML.length : 0,
           glyphLabel: g && g.querySelector("text.ac-cat")
             ? g.querySelector("text.ac-cat").textContent : "",
@@ -412,6 +457,20 @@ const scheduledDelays = [];
     } else if (op.op === "clickSatBand") {
       // Stage-3 satellite: click a band toggle by slug.
       const host = document.getElementById("sat-bands");
+      const btn = host && Array.prototype.find.call(
+        host.children, (b) => b.getAttribute("data-slug") === op.slug);
+      if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
+    } else if (op.op === "coneSeek") {
+      // final-gate-2 #3: place the growth front deterministically.
+      const h = window.__lab.cone && window.__lab.cone();
+      window.__coneSeek = h ? h.seek(op.f) : null;
+    } else if (op.op === "coneSettle") {
+      const h2 = window.__lab.cone && window.__lab.cone();
+      window.__coneSettle = h2 ? h2.settle() : null;
+    } else if (op.op === "clickHeroLayer") {
+      // final-gate-2 #1: pick an SST hero base layer by slug.
+      const host = document.getElementById("sst-hero-layers");
       const btn = host && Array.prototype.find.call(
         host.children, (b) => b.getAttribute("data-slug") === op.slug);
       if (btn) btn.dispatchEvent(

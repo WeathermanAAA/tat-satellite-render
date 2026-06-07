@@ -505,5 +505,284 @@ class TestVitalsTypography(unittest.TestCase):
         pg.close()
 
 
+# ---------------------------------------------------------------------------
+# FINAL-GATE R2 #3 - per-frame casing coverage (the PIXEL half; the
+# geometry half is TestConeCorridorContainment in test_cyclolab_shell).
+#
+# THE POSITIVE CONTRACT: frame-extract the reveal at >=10 arc fractions
+# (through the deterministic __lab.cone().seek hook - no wall-clock
+# racing). In EVERY frame, walk the revealed region's pixel boundary:
+# every sample outside the advancing-front cap zone must have white
+# casing ink within N px - the revealed region looks FINISHED at every
+# frame, fill + its boundary together. The settle frame is checked with
+# NO exclusion zone: one complete closed loop.
+#
+# Negative controls: (a) in-suite PROBE-TEETH - hiding the boundary
+# stroke must collapse the measured coverage (the probe can fail);
+# (b) dev-time - the probe run against the pre-fix build (linear
+# corridor narrower than the cone) fails mid-frames + settle, evidence
+# JSON in the review packet.
+# ---------------------------------------------------------------------------
+
+ADV_FIXTURE = HERE / "fixtures" / "cyclolab" / "live_adv_ep17.json"
+OCEAN_RGB = (0x10, 0x1a, 0x2c)
+
+HIDE_FURNITURE_JS = """() => {
+  // display:none, NOT opacity - the ac-pop/ac-spin CSS animations
+  // (fill: both) override inline opacity, but nothing overrides
+  // display.
+  const svg = document.getElementById('advcone');
+  for (const sel of ['.ac-icon', '.ac-title', '.ac-ocean',
+                     '.ac-graticule', '.ac-land', '.ac-frame',
+                     'line[data-role="leader"]']) {
+    svg.querySelectorAll(sel).forEach(el => {
+      el.style.display = 'none';
+    });
+  }
+}"""
+
+
+def casing_coverage(im, *, exclude=None, n_px=9, sample_step=3):
+    """Fraction of revealed-boundary samples with white casing ink
+    within n_px, + the sample count. exclude = (cx, cy, r) image-px
+    circle around the advancing front tip."""
+    import numpy as np
+    px = np.asarray(im.convert("RGB"), dtype=np.int16)
+    ocean = np.array(OCEAN_RGB, dtype=np.int16)
+    # tolerance 18: the cone fill blend sits 24+ off the ocean, while
+    # the card-panel bg (#11161f, max-channel diff 13) that can bleed
+    # into the clip box at element edges stays below it.
+    revealed = np.abs(px - ocean).max(axis=2) > 18
+    ink = ((px[:, :, 0] > 165) & (px[:, :, 1] > 185)
+           & (px[:, :, 2] > 205))
+    # the stage's rounded corners + element-edge AA leak the panel bg
+    # into the screenshot border; the cone sits 200+px inside the
+    # auto-fit margins, so a 32px frame drop costs nothing.
+    revealed[:32, :] = False
+    revealed[-32:, :] = False
+    revealed[:, :32] = False
+    revealed[:, -32:] = False
+    er = revealed.copy()
+    for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
+        er &= np.roll(revealed, sh, axis=ax)
+    boundary = revealed & ~er
+    cov = ink.copy()
+    for _ in range(n_px):
+        cov |= (np.roll(cov, 1, 0) | np.roll(cov, -1, 0)
+                | np.roll(cov, 1, 1) | np.roll(cov, -1, 1))
+    ys, xs = np.nonzero(boundary)
+    if exclude is not None:
+        cx, cy, r = exclude
+        keep = (xs - cx) ** 2 + (ys - cy) ** 2 > r * r
+        ys, xs = ys[keep], xs[keep]
+    ys, xs = ys[::sample_step], xs[::sample_step]
+    if ys.size == 0:
+        return 1.0, 0
+    return float(cov[ys, xs].mean()), int(ys.size)
+
+
+@unittest.skipUnless(HAVE_RENDERER, "playwright/Pillow unavailable")
+class TestConeCasingRidesTheFront(unittest.TestCase):
+    ENGINES = ("chromium", "webkit")
+    FRACS = (0.08, 0.17, 0.26, 0.35, 0.44, 0.53, 0.62, 0.71, 0.84, 0.92)
+    MIN_COV = 0.985
+
+    def test_casing_coverage_per_frame_and_settled_loop(self):
+        storm = json.loads(FIXTURE.read_text())
+        adv = json.loads(ADV_FIXTURE.read_text())
+        html = cyclolab_shell.render_page(storm, feed_url=FEED_URL,
+                                          loader="")
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p, \
+                tempfile.TemporaryDirectory() as td:
+            page_file = Path(td) / "page.html"
+            page_file.write_text(html, encoding="utf-8")
+            for engine in self.ENGINES:
+                browser = getattr(p, engine).launch()
+                try:
+                    self._run_engine(browser, engine, page_file, adv, td)
+                finally:
+                    browser.close()
+
+    def _shot(self, pg, box, path):
+        pg.screenshot(path=str(path), clip=box)
+        return Image.open(path)
+
+    def _run_engine(self, browser, engine, page_file, adv, td):
+        pg = browser.new_page(viewport={"width": 1280, "height": 900},
+                              device_scale_factor=2)
+        pg.goto(f"file://{page_file}")
+        pg.wait_for_timeout(1200)
+        pg.evaluate("a => window.__lab.applyAdvisory(a)", adv)
+        pg.evaluate("window.__lab.openSec('advisories')")
+        pg.wait_for_timeout(400)
+        pg.evaluate(HIDE_FURNITURE_JS)
+        box = pg.evaluate("""() => {
+          const r = document.getElementById('advcone')
+            .getBoundingClientRect();
+          return {x: r.x, y: r.y, width: r.width, height: r.height};
+        }""")
+        shot = Path(td) / f"casing_{engine}.png"
+        for f in self.FRACS:
+            seek = pg.evaluate(
+                "f => window.__lab.cone().seek(f)", f)
+            pg.wait_for_timeout(80)         # commit the paint
+            im = self._shot(pg, box, shot)
+            scale = im.size[0] / seek["W"]
+            tip = (seek["tipX"] * scale, seek["tipY"] * scale,
+                   (seek["w"] * 1.6 + 24) * scale)
+            cov, n = casing_coverage(im, exclude=tip)
+            if n < 60:
+                continue        # barely-grown frames: nothing to walk
+            self.assertGreaterEqual(
+                cov, self.MIN_COV,
+                f"{engine} f={f}: only {cov:.1%} of {n} revealed-"
+                f"boundary samples have casing ink within 9px - the "
+                f"revealed region does not look finished")
+        # the settle frame: one complete closed loop, no exclusions
+        pg.evaluate("window.__lab.cone().settle()")
+        pg.wait_for_timeout(80)
+        im = self._shot(pg, box, shot)
+        cov, n = casing_coverage(im, exclude=None)
+        self.assertGreater(n, 200, f"{engine}: settled cone too small")
+        self.assertGreaterEqual(
+            cov, self.MIN_COV,
+            f"{engine} settle: casing loop incomplete ({cov:.1%})")
+        # PROBE TEETH (in-suite negative control): hiding the boundary
+        # stroke must collapse coverage - the probe can fail.
+        pg.evaluate("""() => {
+          document.querySelector('.ac-conegrp').children[1]
+            .style.opacity = '0';
+        }""")
+        pg.wait_for_timeout(80)
+        im = self._shot(pg, box, shot)
+        cov_teeth, _ = casing_coverage(im, exclude=None)
+        self.assertLess(
+            cov_teeth, 0.6,
+            f"{engine}: probe kept reporting {cov_teeth:.1%} with the "
+            f"casing hidden - it has no teeth")
+        pg.close()
+
+
+# ---------------------------------------------------------------------------
+# FINAL-GATE R2 #5 - the satellite PRESENTED-frame cadence contract:
+# canvas + ImageBitmap presentation on a rAF clock, measured on a 4x
+# CPU-throttled chromium (CDP Emulation.setCPUThrottlingRate) plus an
+# unthrottled webkit cross-engine pass. Contract: over a full loop
+# (after a one-loop warmup) no presented interval exceeds 2x the
+# median, and the median holds the 200 ms frame grid.
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(HAVE_RENDERER, "playwright/Pillow unavailable")
+class TestSatellitePresentedCadence(unittest.TestCase):
+    N_FRAMES = 20
+    FRAME_MS = 200
+
+    @classmethod
+    def _frame_pngs(cls):
+        import io as _io
+
+        import numpy as np
+        rng = np.random.default_rng(11)
+        out = []
+        for _ in range(cls.N_FRAMES):
+            arr = rng.integers(0, 255, (640, 640, 3), dtype=np.uint8)
+            buf = _io.BytesIO()
+            Image.fromarray(arr, "RGB").save(buf, "PNG")
+            out.append(buf.getvalue())
+        return out
+
+    def _route(self, pg, frames):
+        man = {"bands": {"ir": {"label": "IR", "frames": [
+            {"t": f"2026-06-06T{i // 60:02d}:{i % 60:02d}:00Z",
+             "key": f"floaters/ep082026/ir/f{i:03d}.png"}
+            for i in range(self.N_FRAMES)]}}}
+        top = {"storms": [{"id": "ep082026",
+                           "manifest": "floaters/ep082026/manifest.json"}]}
+
+        def handler(route):
+            # strip the cache-bust query before matching
+            path = route.request.url.split("?")[0]
+            hdrs = {"Access-Control-Allow-Origin": "*"}
+            if path.endswith("floaters/manifest.json"):
+                route.fulfill(json=top, headers=hdrs)
+            elif path.endswith("/manifest.json"):
+                route.fulfill(json=man, headers=hdrs)
+            elif path.endswith(".png"):
+                i = int(path.rsplit("/f", 1)[1][:3])
+                route.fulfill(body=frames[i], headers=hdrs,
+                              content_type="image/png")
+            else:
+                route.abort()
+
+        pg.route("https://cdn.triple-a-tropics.com/floaters/**", handler)
+
+    def _measure(self, p, engine, page_file, frames, throttle):
+        browser = getattr(p, engine).launch()
+        try:
+            pg = browser.new_page(
+                viewport={"width": 1100, "height": 760})
+            self._route(pg, frames)
+            pg.goto(f"file://{page_file}")
+            pg.wait_for_timeout(1200)
+            pg.evaluate("window.__lab.openSec('satellite')")
+            pg.wait_for_timeout(1500)        # mount + initial decode
+            st0 = pg.evaluate("window.__lab.satState()")
+            self.assertEqual(st0["frames"], self.N_FRAMES, engine)
+            self.assertEqual(st0["mode"], "canvas",
+                             f"{engine}: presentation path is not the "
+                             f"canvas/ImageBitmap pipeline")
+            if throttle:
+                cdp = pg.context.new_cdp_session(pg)
+                cdp.send("Emulation.setCPUThrottlingRate", {"rate": 4})
+            pg.evaluate(
+                "document.getElementById('sat-play').click()")
+            pg.wait_for_timeout(
+                int(self.N_FRAMES * self.FRAME_MS * 2.6) + 1200)
+            st = pg.evaluate("window.__lab.satState()")
+            pg.close()
+        finally:
+            browser.close()
+        pres = st["presented"]
+        self.assertGreaterEqual(
+            len(pres), self.N_FRAMES * 2,
+            f"{engine}{' @4x' if throttle else ''}: only {len(pres)} "
+            f"presented frames - playback starved")
+        # drop the first loop (decode warmup), measure the steady loop
+        iv = [b - a for a, b in zip(pres[self.N_FRAMES:],
+                                    pres[self.N_FRAMES + 1:])]
+        self.assertGreaterEqual(len(iv), self.N_FRAMES - 2)
+        iv_sorted = sorted(iv)
+        med = iv_sorted[len(iv_sorted) // 2]
+        label = f"{engine}{' @4x' if throttle else ''}"
+        self.assertLess(abs(med - self.FRAME_MS), self.FRAME_MS * 0.5,
+                        f"{label}: median interval {med:.0f}ms is off "
+                        f"the {self.FRAME_MS}ms grid")
+        self.assertLessEqual(
+            max(iv), 2 * med,
+            f"{label}: worst presented interval {max(iv):.0f}ms > 2x "
+            f"median {med:.0f}ms - cadence contract broken "
+            f"(intervals: {[round(x) for x in iv_sorted[-5:]]})")
+        return iv
+
+    def test_even_cadence_throttled_chromium_and_webkit(self):
+        storm = json.loads(FIXTURE.read_text())
+        html = cyclolab_shell.render_page(storm, feed_url=FEED_URL,
+                                          loader="")
+        frames = self._frame_pngs()
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p, \
+                tempfile.TemporaryDirectory() as td:
+            page_file = Path(td) / "page.html"
+            page_file.write_text(html, encoding="utf-8")
+            # THE contract run: 4x CPU throttle on chromium (CDP).
+            self._measure(p, "chromium", page_file, frames,
+                          throttle=True)
+            # cross-engine canvas-path coverage (webkit has no CDP
+            # throttle; unthrottled contract still pins the pipeline).
+            self._measure(p, "webkit", page_file, frames,
+                          throttle=False)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
