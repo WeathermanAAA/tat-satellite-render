@@ -30,11 +30,19 @@ def _clock():
     return dt.datetime(2026, 6, 6, 1, 0, 0)
 
 
-TCP_SHTML = (FIX / "tcp_amanda_current.shtml").read_text()
+# The CAPTURED fixture pair is itself out of sync: the TCP page had
+# rolled to advisory 14 while CurrentStorms/cone were still at 13 - the
+# exact rolling-URL hazard the §7.4 verification now rejects. The
+# matched adv-13 variant drives the happy paths; the captured original
+# drives the rolled-ahead rejection test.
+TCP_SHTML_14 = (FIX / "tcp_amanda_current.shtml").read_text()
+TCP_SHTML = (FIX / "tcp_amanda_adv13.shtml").read_text()
+TCD_BODY = ("<pre>Tropical Storm Amanda Discussion Number  13\n\n"
+            "TCD DISCUSSION BODY</pre>")
 
 
 def make_engine(sink, *, current_text=CURRENT, kmz=None, tcp_text=TCP_SHTML,
-                tcd_text="<pre>TCD DISCUSSION BODY</pre>", text_raises=None):
+                tcd_text=TCD_BODY, text_raises=None):
     kmz = kmz or {"CONE": CONE, "TRACK": TRACK}
 
     def fetch_text(url):
@@ -100,7 +108,8 @@ class TestAdvisoriesSource(unittest.TestCase):
         self.assertIn("BULLETIN", p["text"]["tcp"])
         self.assertNotIn("<pre", p["text"]["tcp"])
         self.assertNotIn("<html", p["text"]["tcp"].lower())
-        self.assertEqual(p["text"]["tcd"], "TCD DISCUSSION BODY")
+        self.assertIn("TCD DISCUSSION BODY", p["text"]["tcd"])
+        self.assertIn("Discussion Number", p["text"]["tcd"])
         self.assertTrue(p["text"]["tcp_url"])  # urls still ride along
 
     def test_tcd_failure_never_blocks_tcp_cone_or_countdown(self):
@@ -121,7 +130,8 @@ class TestAdvisoriesSource(unittest.TestCase):
         if isinstance(p, str):
             p = json.loads(p)
         self.assertNotIn("tcp", p["text"])
-        self.assertEqual(p["text"]["tcd"], "TCD DISCUSSION BODY")
+        self.assertIn("TCD DISCUSSION BODY", p["text"]["tcd"])
+        self.assertIn("Discussion Number", p["text"]["tcd"])
         self.assertGreaterEqual(len(p["cone"]), 1000)
         self.assertNotIn("next_advisory_utc", p)  # countdown source gone
 
@@ -215,6 +225,130 @@ class TestAdvisoriesSource(unittest.TestCase):
         self.assertNotIn("cyclolab-adv", [s.name for s in eng_off.sources])
         eng_on = ip.build_engine(sink, session=mock.Mock(), cyclolab=True)
         self.assertIn("cyclolab-adv", [s.name for s in eng_on.sources])
+
+
+class TestTextHealAndVerification(unittest.TestCase):
+    """Final-gate-3 #4 (the third strike): text products that fail or
+    lag at advisory-processing time must HEAL on later polls instead of
+    staying blank for the whole 3-6 h advisory cycle, and a rolling
+    .shtml page serving the WRONG advisory's text must never attach."""
+
+    def _engine_with_window(self, sink):
+        """Engine whose text products 503 until the window 'opens' -
+        the exact at-issuance mid-roll / transient-failure shape."""
+        avail = {"on": False}
+
+        def fetch_text(url):
+            if "MIATC" in url:
+                if not avail["on"]:
+                    raise RuntimeError("503 mid-roll " + url)
+                return TCP_SHTML if "TCP" in url else TCD_BODY
+            return CURRENT
+
+        def fetch_bytes(url):
+            return CONE if "CONE" in url else (
+                TRACK if "TRACK" in url else None)
+
+        src = ca.make_advisories_source(
+            session=None, sink=sink, prefix="shadow/cyclolab",
+            current_storms_url="fixture://CurrentStorms.json",
+            policy=pf.FetchPolicy(), fetch_text=fetch_text,
+            fetch_bytes=fetch_bytes, clock=_clock)
+        eng = pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
+                              stale_after_s=60, clock=_clock)
+        return eng, avail
+
+    def _payload(self, sink):
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        return json.loads(p) if isinstance(p, str) else p
+
+    def test_text_lag_heals_on_a_later_poll(self):
+        sink = pf.DictSink()
+        eng, avail = self._engine_with_window(sink)
+        eng.poll_once()                       # adv ships text-less...
+        p = self._payload(sink)
+        self.assertNotIn("tcp", p["text"])
+        self.assertNotIn("tcd", p["text"])
+        self.assertGreaterEqual(len(p["cone"]), 1000)  # cone never blocked
+        avail["on"] = True                    # window over: pages posted
+        eng.poll_once()                       # ...and HEALS in place
+        p = self._payload(sink)
+        self.assertIn("BULLETIN", p["text"]["tcp"])
+        self.assertIn("TCD DISCUSSION BODY", p["text"]["tcd"])
+        self.assertEqual(p["provenance"]["text_healed_utc"],
+                         "2026-06-06T01:00:00Z")
+        # countdown healed along with the TCP
+        self.assertIn("next_advisory_utc", p)
+
+    def test_heal_settles_no_rewrites_after_complete(self):
+        sink = pf.DictSink()
+        eng, avail = self._engine_with_window(sink)
+        writes = []
+        orig = sink.write
+        sink.write = lambda k, v: (writes.append(k), orig(k, v))
+        eng.poll_once()
+        avail["on"] = True
+        eng.poll_once()    # heal write
+        eng.poll_once()    # settled: gate is back, no further writes
+        eng.poll_once()
+        adv_writes = [k for k in writes if "/adv/" in k]
+        self.assertEqual(len(adv_writes), 2)   # initial + one heal
+
+    def test_rolled_ahead_text_never_attached(self):
+        # The CAPTURED real pair: TCP page already at advisory 14 while
+        # CurrentStorms/cone are at 13. Wrong-advisory text must never
+        # ship; the panel placeholder is the honest state.
+        sink = pf.DictSink()
+        make_engine(sink, tcp_text=TCP_SHTML_14).poll_once()
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        if isinstance(p, str):
+            p = json.loads(p)
+        self.assertNotIn("tcp", p["text"])     # rejected, not mis-attached
+        self.assertIn("TCD DISCUSSION BODY", p["text"]["tcd"])
+
+    def test_unverifiable_text_never_attached(self):
+        # An outage interstitial / maintenance page has no Number line:
+        # unverifiable text must never be attached as advisory text.
+        sink = pf.DictSink()
+        make_engine(sink,
+                    tcp_text="<pre>scheduled maintenance</pre>").poll_once()
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        if isinstance(p, str):
+            p = json.loads(p)
+        self.assertNotIn("tcp", p["text"])
+
+    def test_intermediate_letter_passes_verification(self):
+        # Intermediate public advisories ("Advisory Number 13A") belong
+        # to the same advisory family - they verify against adv 13.
+        sink = pf.DictSink()
+        make_engine(sink, tcp_text=TCP_SHTML.replace(
+            "Advisory Number  13", "Intermediate Advisory Number  13A"
+        )).poll_once()
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        if isinstance(p, str):
+            p = json.loads(p)
+        self.assertIn("BULLETIN", p["text"]["tcp"])
+
+    def test_storm_leaving_index_closes_the_heal(self):
+        # A storm that dissipates with text still owed can never heal -
+        # the pulse must close so the source settles (no busy-looping
+        # process calls forever).
+        sink = pf.DictSink()
+        eng, avail = self._engine_with_window(sink)
+        eng.poll_once()                       # text-less, heal pending
+        empty = json.dumps({"activeStorms": []})
+
+        # swap the index to empty (storm gone) - reach into the source
+        src = eng.sources[0]
+        eng2, _ = self._engine_with_window(sink)  # unused; keep API shape
+        writes = []
+        orig = sink.write
+        sink.write = lambda k, v: (writes.append(k), orig(k, v))
+        with mock.patch.object(
+                ca, "_storm_entries", return_value=[]):
+            eng.poll_once()                   # storm left: debt closed
+            eng.poll_once()                   # settled - no process churn
+        self.assertEqual([k for k in writes if "/adv/" in k], [])
 
 
 if __name__ == "__main__":

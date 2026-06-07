@@ -95,6 +95,10 @@ const scheduledDelays = [];
       // final-gate-2 #1: the per-storm SST hero meta (plan.sst_meta);
       // absent -> !ok response -> the shell's honest fallback panel.
       const SST_META = Array.isArray(PLAN) ? null : (PLAN.sst_meta || null);
+      // final-gate-3 #4: the advisory JSON (plan.adv) - the page's own
+      // poll/single-ENDED-fetch hydrates the Advisories tab from this.
+      // Absent -> a clean fetch failure (the pre-first-advisory window).
+      const ADV = Array.isArray(PLAN) ? null : (PLAN.adv || null);
       window.__fetched = [];
       function jsonResponse(body) {
         if (body == null) {
@@ -130,6 +134,9 @@ const scheduledDelays = [];
         }
         if (/\/sst\/meta\.json/.test(url)) {
           return jsonResponse(SST_META);
+        }
+        if (/\/adv\/[^/]+\.json/.test(url)) {
+          return jsonResponse(ADV);
         }
         if (FEED == null) {
           return Promise.resolve({

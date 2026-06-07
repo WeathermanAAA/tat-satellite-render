@@ -32,6 +32,7 @@ import datetime as dt
 import hashlib
 import logging
 import os
+import re
 from typing import Callable, Optional
 
 import requests
@@ -59,6 +60,41 @@ CYCLOLAB_ENABLED = (_env("CYCLOLAB_ADVISORIES", "1") or "1").lower() \
 CYCLOLAB_PREFIX = (_env("CYCLOLAB_PREFIX", "shadow/cyclolab") or "").rstrip("/")
 
 _NHC_BASINS = {"AL", "EP", "CP"}
+
+# §7.4 TEXT VERIFICATION (final-gate-3 #4, the third-strike fix): the
+# TCP/TCD URLs are ROLLING pages (MIATCPEP1.shtml serves whatever
+# advisory is current AT FETCH TIME). At advisory-issuance the index
+# and the text pages roll at slightly different instants, so a fetch
+# can return the PREVIOUS advisory's product - the repo's own captured
+# fixtures show a real adv-14 TCP under an adv-13 CurrentStorms. Every
+# product is therefore verified against the advisory being cached via
+# its own "Advisory/Discussion Number" line before it is attached;
+# intermediate letters (4A) belong to the same advisory family and
+# pass. Unverifiable text (no Number line: error pages, outage
+# interstitials) is NEVER attached - a placeholder panel beats wrong
+# text. Mismatch/missing -> the product stays PENDING and the
+# text-heal path retries it every poll (see process()).
+_PRODUCT_NUM_RE = {
+    "tcp": re.compile(r"Advisory\s+Number\s+(\d+)\s*[A-Za-z]?", re.I),
+    "tcd": re.compile(r"Discussion\s+Number\s+(\d+)", re.I),
+}
+
+
+def _verified_product(kind: str, raw: str, adv: int) -> str:
+    """Strip the .shtml wrapper and return the product body iff its own
+    advisory number matches ``adv``; raise AdvisoryParseError otherwise."""
+    body = product_text(raw)
+    m = _PRODUCT_NUM_RE[kind].search(body or "")
+    if not m:
+        raise AdvisoryParseError(
+            f"{kind.upper()} has no Advisory/Discussion Number line - "
+            "unverifiable, not attached")
+    got = int(m.group(1))
+    if got != adv:
+        raise AdvisoryParseError(
+            f"{kind.upper()} page is at advisory {got}, caching advisory "
+            f"{adv} - rolling URL out of sync, not attached")
+    return body
 
 
 def _iso_z(t: dt.datetime) -> str:
@@ -133,31 +169,130 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
     get_bytes = fetch_bytes or (
         lambda url: _default_fetch_bytes(session, url, policy))
 
-    # Per-storm ledger: {nhc_sid: {"adv": int, "issued": iso}}. In-memory;
-    # a restart simply re-fetches the current advisory and overwrites the
-    # SAME content at the SAME key - idempotent by construction.
+    # Per-storm ledger: {nhc_sid: {"adv": int, "issued": iso,
+    # "text_done": bool, "payload": dict}}. In-memory; a restart simply
+    # re-fetches the current advisory and overwrites the SAME content at
+    # the SAME key - idempotent by construction. ``payload`` is retained
+    # (~25 KB/storm) so the TEXT-HEAL path can merge late products and
+    # rewrite WITHOUT refetching the KMZs; ``text_done`` records whether
+    # every text product with a URL was attached VERIFIED.
     ledger: dict[str, dict] = {}
+    poll_seq = {"n": 0}
 
     def fetch():
         import json as _json
         text = get_text(current_storms_url)
         if not text:
             raise pf.TransientFetchError("CurrentStorms.json unavailable")
+        poll_seq["n"] += 1
         return {"storms": _storm_entries(_json.loads(text))}
 
     def change_key(data):
-        return tuple(sorted((e["sid"], e["adv"]) for e in data["storms"]))
+        base = tuple(sorted((e["sid"], e["adv"]) for e in data["storms"]))
+        # TEXT-HEAL PULSE (final-gate-3 #4): the engine only runs
+        # process() on a change_key change, so a storm whose advisory
+        # shipped text-less (mid-roll page / transient failure / outage
+        # restart) would otherwise stay blank for the WHOLE 3-6 h
+        # advisory cycle - the user's third-strike blank. While any
+        # ledgered storm still owes verified text, every poll gets a
+        # distinct key so process() runs and retries JUST the text
+        # (two cheap .shtml GETs - no KMZ work). Settles back to the
+        # plain advisory-set key once everything is attached.
+        live = {e["sid"] for e in data["storms"]}
+        if any(not k.get("text_done") for s, k in ledger.items()
+               if s in live):
+            return (base, poll_seq["n"])
+        return (base,)
 
     def valid_time(data):
         return None   # freshness is the advisory issuance, stamped per write
 
+    def _attach_text(entry: dict, adv: int, payload: dict) -> bool:
+        """§7.4 ADVISORY TEXT PANELS: fetch + VERIFY + attach the TCP/TCD
+        product text alongside the URLs - the browser cannot fetch
+        nhc.gov cross-origin. Best-effort PER PRODUCT: missing text never
+        blocks the cone, the countdown, or the other product. Idempotent:
+        already-attached products are never refetched, so the heal path
+        retries ONLY what is still owed. Returns True iff every product
+        that has a URL is attached (vacuously True when no URLs - e.g. a
+        basin with no NHC text products)."""
+        sid = entry["sid"]
+        urls = entry.get("text") or {}
+        # Defensive: build_advisory_json always ships the URL dict, but a
+        # malformed payload must degrade to "pending", never crash the
+        # storm out of its cone.
+        if not isinstance(payload.get("text"), dict):
+            payload["text"] = {"tcp_url": urls.get("tcp_url"),
+                               "tcd_url": urls.get("tcd_url")}
+        complete = True
+        tcp_raw = None
+        for kind in ("tcp", "tcd"):
+            url = urls.get(kind + "_url")
+            if not url or payload["text"].get(kind):
+                continue
+            try:
+                raw = get_text(url)
+                if not raw:
+                    raise AdvisoryParseError("product page missing/empty")
+                payload["text"][kind] = _verified_product(kind, raw, adv)
+                if kind == "tcp":
+                    tcp_raw = raw
+            except Exception as tx:  # noqa: BLE001
+                complete = False
+                log.warning("%s adv %d: %s text pending: %s",
+                            sid, adv, kind.upper(), tx)
+        # NEXT-ADVISORY countdown source (the advisory's OWN stated
+        # time - never wall-clock cadence). Rides a successful TCP
+        # attach; best-effort: a parse failure leaves the fields absent
+        # and the shell simply shows no countdown this cycle.
+        try:
+            if tcp_raw:
+                nxt = parse_next_advisory(tcp_raw, payload["issued_utc"])
+                payload["next_advisory_utc"] = nxt["next_advisory_utc"]
+                payload["next_advisory_kind"] = nxt["kind"]
+                payload["next_complete_utc"] = nxt["next_complete_utc"]
+                payload["next_advisory_stated"] = nxt["stated"]
+        except Exception as nx:  # noqa: BLE001
+            log.warning("%s adv %d: next-advisory parse skipped: %s",
+                        sid, adv, nx)
+        return complete
+
+    def _heal_text(entry: dict, known: dict) -> None:
+        """TEXT-HEAL (final-gate-3 #4): same advisory, text still owed -
+        retry the missing products and rewrite the JSON if anything
+        landed. Cheap (text GETs only; the retained payload spares the
+        KMZ refetch) and best-effort: a failed heal never flags the
+        source, the next poll simply tries again."""
+        sid, adv = entry["sid"], known["adv"]
+        payload = known["payload"]
+        before = (payload["text"].get("tcp"), payload["text"].get("tcd"))
+        known["text_done"] = _attach_text(entry, adv, payload)
+        after = (payload["text"].get("tcp"), payload["text"].get("tcd"))
+        if after != before:
+            payload["provenance"]["text_healed_utc"] = _iso_z(clock())
+            sink.write(f"{prefix}/adv/{sid}.json", payload)
+            log.info("cyclolab adv text healed: %s adv %d (tcp=%d ch, "
+                     "tcd=%d ch)", sid, adv,
+                     len(payload["text"].get("tcp") or ""),
+                     len(payload["text"].get("tcd") or ""))
+
     def process(ctx: pf.ProcessContext):
         errors = []
+        live = set()
         for e in ctx.data["storms"]:
             sid, adv = e["sid"], e["adv"]
+            live.add(sid)
             known = ledger.get(sid)
             if known and known["adv"] >= adv:
-                continue   # adv-gate: nothing new for this storm
+                # adv-gate: nothing NEW for this storm - but late text
+                # products still heal in place (the third-strike fix).
+                if known["adv"] == adv and not known.get("text_done"):
+                    try:
+                        _heal_text(e, known)
+                    except Exception as hx:  # noqa: BLE001
+                        log.warning("%s adv %d: text heal failed: %s",
+                                    sid, adv, hx)
+                continue
             try:
                 cone_b = get_bytes(e["cone_url"])
                 track_b = get_bytes(e["track_url"])
@@ -167,43 +302,7 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                         f"(cone={bool(cone_b)}, track={bool(track_b)})")
                 payload = build_advisory_json(sid, cone_b, track_b,
                                               text_urls=e["text"])
-                # §7.4 ADVISORY TEXT PANELS: ship the parsed product
-                # text (TCP + TCD) alongside the URLs - the browser
-                # cannot fetch nhc.gov cross-origin. Best-effort PER
-                # PRODUCT: missing text never blocks the cone, the
-                # countdown, or the other product.
-                tcp_txt = None
-                try:
-                    tcp_url = (e["text"] or {}).get("tcp_url")
-                    tcp_txt = get_text(tcp_url) if tcp_url else None
-                    if tcp_txt:
-                        payload["text"]["tcp"] = product_text(tcp_txt)
-                except Exception as tx:  # noqa: BLE001
-                    log.warning("%s adv %d: TCP text skipped: %s",
-                                sid, adv, tx)
-                try:
-                    tcd_url = (e["text"] or {}).get("tcd_url")
-                    tcd_txt = get_text(tcd_url) if tcd_url else None
-                    if tcd_txt:
-                        payload["text"]["tcd"] = product_text(tcd_txt)
-                except Exception as tx:  # noqa: BLE001
-                    log.warning("%s adv %d: TCD text skipped: %s",
-                                sid, adv, tx)
-                # NEXT-ADVISORY countdown source (the advisory's OWN
-                # stated time - never wall-clock cadence). Best-effort:
-                # a TCP fetch/parse failure leaves the fields absent and
-                # the shell simply shows no countdown this cycle.
-                try:
-                    if tcp_txt:
-                        nxt = parse_next_advisory(tcp_txt,
-                                                  payload["issued_utc"])
-                        payload["next_advisory_utc"] = nxt["next_advisory_utc"]
-                        payload["next_advisory_kind"] = nxt["kind"]
-                        payload["next_complete_utc"] = nxt["next_complete_utc"]
-                        payload["next_advisory_stated"] = nxt["stated"]
-                except Exception as nx:  # noqa: BLE001
-                    log.warning("%s adv %d: next-advisory parse skipped: %s",
-                                sid, adv, nx)
+                text_done = _attach_text(e, adv, payload)
                 # ISSUANCE-REGRESSION GUARD: never replace cached state
                 # with an OLDER advisory (stale mirror / CDN echo).
                 if known and payload["issued_utc"] < known["issued"]:
@@ -227,12 +326,21 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                 except Exception as og:  # noqa: BLE001
                     log.warning("%s adv %d: OG card skipped: %s",
                                 sid, adv, og)
-                ledger[sid] = {"adv": adv, "issued": payload["issued_utc"]}
+                ledger[sid] = {"adv": adv, "issued": payload["issued_utc"],
+                               "text_done": text_done, "payload": payload}
                 log.info("cyclolab adv cached: %s adv %d (%d cone vtx, "
-                         "%d points)", sid, adv, len(payload["cone"]),
-                         len(payload["points"]))
+                         "%d points, text %s)", sid, adv,
+                         len(payload["cone"]), len(payload["points"]),
+                         "complete" if text_done else "PENDING-HEAL")
             except Exception as ex:  # noqa: BLE001 - isolate per storm
                 errors.append(f"{sid} adv {adv}: {type(ex).__name__}: {ex}")
+        # A storm that left CurrentStorms (dissipated/post-storm) can
+        # never heal - close its text debt so the heal pulse stops.
+        for sid, k in ledger.items():
+            if sid not in live and not k.get("text_done"):
+                k["text_done"] = True
+                log.info("%s: storm left the index with text pending - "
+                         "heal closed", sid)
         if errors:
             # Raise AFTER the successful storms persisted - the engine
             # holds the change signature and retries only the failures

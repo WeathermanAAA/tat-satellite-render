@@ -535,7 +535,8 @@ class TestEndedPage(unittest.TestCase):
                                           ended=True)
         # Drive the stubbed fetch (a feed IS provided) so any poll() that DID
         # run would resolve and try to re-arm the 60s timer - the ended page
-        # must not, since `if (!ENDED) poll()` never starts it.
+        # must not: it does ONE advisory fetch (final-gate-3 #4) with no
+        # re-arm and no feed re-apply.
         recs = run_harness(html,
                            {"feed": {"storms": [self.storm]},
                             "ops": [{"op": "snapshot"}]})
@@ -545,6 +546,36 @@ class TestEndedPage(unittest.TestCase):
         self.assertNotIn(60000, st["scheduledDelays"])
         # baked snapshot still hydrated the page before freezing.
         self.assertEqual(st["odo"]["vmax"], "120")
+
+    def test_ended_page_single_fetches_the_frozen_advisory(self):
+        # final-gate-3 #4, the LATENT variant of the user's blank: ENDED
+        # pages used to skip the fetch entirely, so advFull stayed null
+        # FOREVER - no cone, no intensity chart, and permanently blank
+        # advisory panels on every dead-storm page. Now: ONE fetch of the
+        # frozen R2 advisory JSON (no re-arm), both products RENDER, and
+        # the countdown stays suppressed (a dead storm has no NEXT
+        # advisory even though the frozen JSON still carries the field).
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL,
+                                          ended=True)
+        adv = json.loads(
+            (FIXTURE.parent / "live_adv_ep17.json").read_text())
+        self.assertTrue(adv.get("next_advisory_utc"))   # field present...
+        recs = run_harness(html, {
+            "feed": {"storms": [self.storm]}, "adv": adv,
+            "ops": [{"op": "openSec", "name": "advisories"},
+                    {"op": "clickAdvTextTab", "prod": "tcd"}]})
+        # The default-tab render shows TCP, the tcd click shows TCD.
+        tcp_text = recs[-2]["state"]["stage3"]["adv"]["advText"]
+        tcd_text = recs[-1]["state"]["stage3"]["adv"]["advText"]
+        adv_fetches = [u for u in recs[-1]["state"]["stage3"]["fetched"]
+                       if "/adv/" in u]
+        self.assertEqual(len(adv_fetches), 1)            # exactly once
+        self.assertNotIn(60000, recs[-1]["state"]["scheduledDelays"])
+        self.assertIn("BULLETIN", tcp_text)             # TCP product
+        self.assertIn("Discussion", tcd_text)           # TCD product
+        for body in (tcp_text, tcd_text):
+            self.assertNotIn("(advisory text", body)
+            self.assertNotIn("(loading", body)
 
     def test_live_page_does_schedule_the_60s_poll(self):
         # The contrast: on the live page the poll resolves (stubbed fetch) and
@@ -995,10 +1026,19 @@ class TestStage4Advisories(unittest.TestCase):
         self.assertIn("TEST PUBLIC ADVISORY BODY", states[2])
 
     def test_missing_text_products_show_placeholder(self):
+        # Honest placeholder states (final-gate-3 #4): URL present but
+        # text not yet attached = the posting-lag window the poller's
+        # text-heal closes - say so; no URLs at all = the agency
+        # publishes no product - say THAT.
         adv = self._adv(text={"tcp_url": "u1", "tcd_url": "u2"})
         recs = self._run([{"op": "openSec", "name": "advisories"}], adv=adv)
-        self.assertIn("not available",
+        self.assertIn("hasn’t posted yet",
                       recs[-1]["state"]["stage3"]["adv"]["advText"])
+        adv2 = self._adv(text={})
+        recs2 = self._run([{"op": "openSec", "name": "advisories"}],
+                          adv=adv2)
+        self.assertIn("no advisory text product",
+                      recs2[-1]["state"]["stage3"]["adv"]["advText"])
 
     def test_no_advisory_shows_cone_empty_state(self):
         plan = {"ops": [{"op": "openSec", "name": "advisories"}]}

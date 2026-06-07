@@ -899,7 +899,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <button type="button" class="hafs-seg"
                   data-prod="tcd">Discussion</button>
         </div>
-        <pre id="advtext" class="advtext">(advisory text loads with the next data poll)</pre>
+        <pre id="advtext" class="advtext">(loading advisory data…)</pre>
       </div>
     </div></section>
   </main>
@@ -1529,7 +1529,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     coneAdv = adv.advisory;
     coneRing = adv.cone || null;
     conePts = adv.points || null;
-    nextAdvUtc = adv.next_advisory_utc || null;
+    // ENDED pages hydrate the advisory tab too (single fetch below),
+    // but a dead storm has no NEXT advisory - never show a countdown.
+    nextAdvUtc = ENDED ? null : (adv.next_advisory_utc || null);
     tickCountdown();
     if (adv.points && adv.points.length &&
         DEV_WORD[adv.points[0].dev_label]) {
@@ -1580,7 +1582,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   buildVitals();
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
-  if (!ENDED) poll();
+  // ENDED pages used to skip the fetch entirely, which left advFull
+  // null FOREVER - no cone, no intensity chart, blank advisory text on
+  // every dead-storm page (final-gate-3 #4, the latent variant of the
+  // user's blank). The frozen R2 advisory JSON is the storm's final
+  // state: fetch it ONCE (no re-arm, no feed re-apply - the page's
+  // vitals stay frozen as baked).
+  if (ENDED) { fetchJson(ADV_URL).then(applyAdvisory); }
+  else { poll(); }
 
   // ---- Stage 4: THE CONE reveal + intensity cone + advisory text ----------
   // (§8.1/8.2) The showpiece cone: same projection + brand-blue/white
@@ -2425,14 +2434,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.getElementById("intensity-method-body").textContent = body;
   }
 
-  // (§7.4) advisory text panels - monospace, never tinted
+  // (§7.4) advisory text panels - monospace, never tinted. Placeholder
+  // states are HONEST (final-gate-3 #4): a product whose URL exists but
+  // whose text hasn't attached yet is "posting" (the poller's text-heal
+  // rewrites the advisory JSON within a poll or two and the page poll
+  // picks it up - it WILL load); no URL at all means the agency
+  // publishes no such product for this storm.
   var advTextProd = "tcp";
   function renderAdvText() {
     var pre = document.getElementById("advtext");
     var t = (advFull && advFull.text) || {};
     var body = advTextProd === "tcp" ? t.tcp : t.tcd;
-    pre.textContent = body ||
-      "(advisory text not available for this advisory)";
+    var hasUrl = !!(advTextProd === "tcp" ? t.tcp_url : t.tcd_url);
+    pre.textContent = body || (!advFull
+      ? "(loading advisory data…)"
+      : hasUrl
+        ? "(advisory text hasn’t posted yet — it loads " +
+          "automatically within a few minutes)"
+        : "(no advisory text product is published for this storm)");
     var host = document.getElementById("advtext-tabs");
     for (var i = 0; i < host.children.length; i++) {
       var b = host.children[i];
