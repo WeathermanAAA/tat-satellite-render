@@ -71,6 +71,18 @@ SST_ENABLED = (os.environ.get("CYCLOLAB_SST") or "1").lower() \
 # ---------------------------------------------------------------------------
 CRW_BASE = ("https://www.star.nesdis.noaa.gov/pub/sod/mecb/crw/data/5km/"
             "v3.1_op/nc/v1.0/daily")
+# Site CDN: the house 1991-2020 day-of-year SST climatology (final-gate-3
+# #6a, ONE CANON). 366 grids baked by build_crw_doy_climatology.py to
+# R2 sst/climo/, native CRW grid + -180..180 lon (so the box-read math
+# below is unchanged), int16 packed -> netCDF4 auto-unpacks to degC.
+# The manifest is the GATE: present only when all 366 grids exist, so a
+# partial bake can never serve a wrong-baseline anomaly.
+CDN_BASE = "https://cdn.triple-a-tropics.com"
+CLIMO_BASE = f"{CDN_BASE}/sst/climo"
+CLIMO_MANIFEST_URL = f"{CLIMO_BASE}/manifest.json"
+CLIMO_FILE = "crw_doy_climo_1991_2020_{doy:03d}.nc"
+CLIMO_VAR = "sst_climo"
+CLIMO_PROBE_TTL_S = 3600          # re-check the bake-complete gate hourly
 FETCH_CONNECT_TIMEOUT = 8
 FETCH_TIMEOUT = 45
 LATENCY_TRIES = 7
@@ -144,13 +156,18 @@ LAYERS = [
         "slug": "anomaly",
         "label": "Anomaly",
         "title": "SST anomaly",
-        "field": "SST anomaly (°C)",
+        "field": "SST anomaly vs the site-wide 1991–2020 baseline (°C)",
         "file": "anomaly.png",
-        "product": "ssta",
-        "var": "sea_surface_temperature_anomaly",
-        "source": "NOAA Coral Reef Watch v3.1 (5 km)",
-        "note": ("anomaly vs the official CRW climatology, not the "
-                 "site-wide 1991–2020 baseline"),
+        # final-gate-3 #6a, ONE CANON: today's CoralTemp SST MINUS the
+        # site's own 1991-2020 day-of-year climatology (the same baseline
+        # /sst/ uses). Computed in the writer from the SST file + the
+        # house climo grid - no official-SSTA product, no divergence note.
+        "compute": "house_anomaly",
+        "product": "sst",
+        "var": "analysed_sst",
+        "source": ("NOAA Coral Reef Watch CoralTemp v3.1 (5 km) minus the "
+                   "Triple-A-Tropics 1991–2020 day-of-year "
+                   "climatology"),
     },
 ]
 
@@ -182,6 +199,42 @@ def fetch_crw_day(product: str, d: dt.date, cache_dir: Path,
                                       max(5.0, read_timeout)))
     except Exception as e:  # noqa: BLE001
         log.warning("CRW %s %s fetch error: %s", product, d, e)
+        return None
+    if r.status_code != 200 or len(r.content) < 100_000:
+        return None
+    tmp = cp.with_suffix(".part")
+    tmp.write_bytes(r.content)
+    tmp.replace(cp)
+    return cp
+
+
+def climo_doy(d: dt.date) -> int:
+    """Day-of-year index for the house climo bake (final-gate-3 #6a).
+    EXACTLY the bake's contract: a leap-keyed (month, day) -> 1..366 map
+    so Feb-29 has its own slot and every other day is stable across
+    years. Pinned to build_crw_doy_climatology._doy_of."""
+    return dt.date(2000, d.month, d.day).timetuple().tm_yday
+
+
+def fetch_climo_doy(d: dt.date, cache_dir: Path, session=None,
+                    read_timeout: float = FETCH_TIMEOUT) -> Path | None:
+    """Download the house 1991-2020 climatology grid for ``d``'s
+    day-of-year from R2, disk-cached. Same validity/404/timeout contract
+    as fetch_crw_day; returns None on any miss so the anomaly layer
+    degrades cleanly to 'not shown'."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    doy = climo_doy(d)
+    cp = cache_dir / f"crw_doy_climo.{doy:03d}.nc"
+    if cp.exists() and cp.stat().st_size > 100_000:
+        return cp
+    if session is None:
+        import requests as session  # noqa: PLC0415
+    url = f"{CLIMO_BASE}/{CLIMO_FILE.format(doy=doy)}"
+    try:
+        r = session.get(url, timeout=(FETCH_CONNECT_TIMEOUT,
+                                      max(5.0, read_timeout)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("climo DOY %03d fetch error: %s", doy, e)
         return None
     if r.status_code != 200 or len(r.content) < 100_000:
         return None
@@ -366,6 +419,7 @@ class SstHeroWriter:
 
     def __init__(self, sink, *, prefix: str, cache_dir: Path | None = None,
                  fetch_day=fetch_crw_day, read_box=read_crw_box,
+                 fetch_climo=fetch_climo_doy, climo_ready=None,
                  today=None):
         self.sink = sink
         self.prefix = prefix.rstrip("/")
@@ -373,6 +427,10 @@ class SstHeroWriter:
             Path(tempfile.gettempdir()) / "cyclolab-crw-cache")
         self._fetch_day = fetch_day
         self._read_box = read_box
+        # final-gate-3 #6a injection points (tests drive these offline):
+        # the house-climo fetch and the bake-complete gate override.
+        self._fetch_climo = fetch_climo
+        self._climo_ready_override = climo_ready
         self._today = today or (lambda: dt.datetime.now(dt.UTC).date())
         # sid -> {"date": iso, "lat": f, "lon": f,
         #         "layers": [slugs], "t": monotonic}
@@ -394,6 +452,52 @@ class SstHeroWriter:
                                    read_timeout=min(FETCH_TIMEOUT, rem))
         except TypeError:        # injected test fakes without the kwarg
             return self._fetch_day(product, d, self.cache_dir)
+
+    def _climo_ready(self) -> bool:
+        """The house-climo bake-complete GATE (final-gate-3 #6a): the
+        manifest exists only when all 366 grids are on R2. Hourly-cached
+        + best-effort - until the bake lands, the anomaly layer is simply
+        not written (hidden, never a wrong-baseline render)."""
+        if self._climo_ready_override is not None:
+            return bool(self._climo_ready_override)
+        import time
+        hit = getattr(self, "_climo_gate", None)
+        if hit and time.monotonic() - hit[0] < CLIMO_PROBE_TTL_S:
+            return hit[1]
+        ok = False
+        try:
+            import requests
+            r = requests.get(CLIMO_MANIFEST_URL,
+                             timeout=(FETCH_CONNECT_TIMEOUT, 15))
+            ok = (r.status_code == 200
+                  and int((r.json() or {}).get("doy_count", 0)) >= 366)
+        except Exception as e:  # noqa: BLE001
+            log.debug("climo manifest probe failed: %s", e)
+        self._climo_gate = (time.monotonic(), ok)
+        return ok
+
+    def _house_anomaly_box(self, sst_path, sst_day, clat, clon):
+        """today's SST box minus the house DOY-climo box, on the SAME
+        native CRW grid (both -180..180, 0.05deg). Returns (anom, lats,
+        lons) or None when the climo grid is unavailable / off-belt /
+        misaligned - the caller then omits the layer."""
+        try:
+            climo_path = self._fetch_climo(sst_day, self.cache_dir)
+        except TypeError:        # injected fakes without the kwargs
+            climo_path = self._fetch_climo(sst_day)
+        if climo_path is None:
+            return None
+        sst, lats, lons = self._read_box(sst_path, "analysed_sst",
+                                         clat, clon)
+        cli, clats, clons = self._read_box(climo_path, CLIMO_VAR,
+                                           clat, clon)
+        if (sst.shape != cli.shape
+                or not np.allclose(lats, clats, atol=1e-4)
+                or not np.allclose(lons, clons, atol=1e-4)):
+            log.warning("house anomaly: SST/climo grids misaligned "
+                        "(%s vs %s) - layer skipped", sst.shape, cli.shape)
+            return None
+        return np.asarray(sst) - np.asarray(cli), lats, lons
 
     def _latest_day(self, product: str) -> dt.date | None:
         import time
@@ -462,8 +566,19 @@ class SstHeroWriter:
                 path = self._fetch_budgeted(layer["product"], day)
                 if path is None:
                     continue
-                data, lats, lons = self._read_box(
-                    path, layer["var"], clat, clon)
+                if layer.get("compute") == "house_anomaly":
+                    # ONE CANON: SST - house DOY climo. Gated on the
+                    # bake-complete manifest; off-belt / pre-bake / grid
+                    # mismatch -> the layer is simply not advertised.
+                    if not self._climo_ready():
+                        continue
+                    res = self._house_anomaly_box(path, day, clat, clon)
+                    if res is None:
+                        continue
+                    data, lats, lons = res
+                else:
+                    data, lats, lons = self._read_box(
+                        path, layer["var"], clat, clon)
                 png = render_hero_layer(layer, data, lats, lons,
                                         basin=basin, clat=clat, clon=clon)
                 self.sink.write_png(

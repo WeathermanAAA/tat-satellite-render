@@ -65,10 +65,11 @@ SST_META = {
          "source": "NOAA Coral Reef Watch CoralTemp v3.1 (5 km)",
          "valid": "2026-06-05"},
         {"slug": "anomaly", "label": "Anomaly", "title": "SST anomaly",
-         "field": "SST anomaly (°C)", "file": "anomaly.png",
-         "source": "NOAA Coral Reef Watch v3.1 (5 km)",
-         "note": ("anomaly vs the official CRW climatology, not the "
-                  "site-wide 1991–2020 baseline"),
+         "field": "SST anomaly vs the site-wide 1991–2020 baseline (°C)",
+         "file": "anomaly.png",
+         "source": ("NOAA Coral Reef Watch CoralTemp v3.1 (5 km) minus "
+                    "the Triple-A-Tropics 1991–2020 day-of-year "
+                    "climatology"),
          "valid": "2026-06-05"},
     ],
 }
@@ -1106,8 +1107,10 @@ class TestHeroLayers(unittest.TestCase):
         self.assertIn("/sst/anomaly.png?v=", after["imgUrl"])
         self.assertEqual(after["activeLayer"], "anomaly")
         self.assertEqual(after["head"], "SST ANOMALY")
-        # the caption carries the per-layer disclosure note + valid day
-        self.assertIn("official CRW climatology", after["caption"])
+        # final-gate-3 #6a, ONE CANON: the caption discloses the
+        # SITE-WIDE 1991-2020 baseline (no divergence note) + valid day
+        self.assertIn("1991", after["caption"])
+        self.assertNotIn("official CRW climatology", after["caption"])
         self.assertIn("valid 2026-06-05", after["caption"])
 
     def test_missing_meta_is_an_honest_fallback(self):

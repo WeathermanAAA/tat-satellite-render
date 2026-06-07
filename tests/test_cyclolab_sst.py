@@ -171,22 +171,33 @@ class _JsonOnlySink:
         self.json[key] = payload
 
 
-def _fake_io(available=("sst", "ssta")):
-    """(fetch_day, read_box) fakes - no network, no netCDF."""
-    def fetch_day(product, d, cache_dir, session=None):
+def _fake_io(available=("sst",), climo=True):
+    """(fetch_day, read_box, fetch_climo) fakes - no network, no netCDF.
+
+    final-gate-3 #6a: the anomaly layer now reads the SST file + the
+    house DOY-climo grid (no official-SSTA product). The climo box must
+    share the SST box's lat/lon vectors so the subtraction lands.
+    """
+    def fetch_day(product, d, cache_dir, session=None, read_timeout=None):
         if product in available and d == dt.date(2026, 6, 5):
             return Path(f"/fake/crw_{product}.nc")
         return None
 
+    def fetch_climo(d, cache_dir=None, session=None, read_timeout=None):
+        return Path("/fake/crw_doy_climo.nc") if climo else None
+
     def read_box(path, var, clat, clon, hw_lat=cs.HW_LAT,
                  hw_lon=cs.HW_LON):
         lats, lons = _grid(clat, clon, step=0.5)
-        rng = np.random.default_rng(3)
-        data = rng.normal(27.0 if "sst" in str(path) else 0.5, 0.4,
+        # SST ~27 C, climo ~26.4 C -> anomaly ~+0.6 C; same grid so the
+        # writer's alignment guard passes.
+        base = 26.4 if "climo" in str(path) else 27.0
+        rng = np.random.default_rng(3 if "climo" in str(path) else 4)
+        data = rng.normal(base, 0.3,
                           (lats.size, lons.size)).astype(np.float32)
         return data, lats, lons
 
-    return fetch_day, read_box
+    return fetch_day, read_box, fetch_climo
 
 
 def _storm(lat=12.1, lon=-134.9):
@@ -202,12 +213,13 @@ class TestWriterLifecycle(unittest.TestCase):
         self._td = tempfile.TemporaryDirectory()
         self.addCleanup(self._td.cleanup)
 
-    def _writer(self, sink, available=("sst", "ssta")):
-        fetch_day, read_box = _fake_io(available)
+    def _writer(self, sink, available=("sst",), climo=True,
+                climo_ready=True):
+        fetch_day, read_box, fetch_climo = _fake_io(available, climo)
         return cs.SstHeroWriter(
             sink, prefix="shadow/cyclolab", cache_dir=Path(self._td.name),
-            fetch_day=fetch_day, read_box=read_box,
-            today=lambda: dt.date(2026, 6, 6))
+            fetch_day=fetch_day, read_box=read_box, fetch_climo=fetch_climo,
+            climo_ready=climo_ready, today=lambda: dt.date(2026, 6, 6))
 
     def test_writes_layers_then_meta_in_order(self):
         sink = _PngSink()
@@ -227,10 +239,33 @@ class TestWriterLifecycle(unittest.TestCase):
                          ["actual", "anomaly"])
         self.assertEqual(meta["valid_date"], "2026-06-05")
         self.assertEqual(meta["layers"][0]["valid"], "2026-06-05")
-        self.assertIn("official CRW climatology",
-                      meta["layers"][1]["note"])
+        # final-gate-3 #6a, ONE CANON: the anomaly layer carries the
+        # site-wide baseline in its caption and NO divergence note.
+        anom = meta["layers"][1]
+        self.assertNotIn("note", anom)
+        self.assertIn("1991", anom["field"])
+        self.assertIn("1991", anom["source"])
+        self.assertNotIn("official CRW climatology", anom["source"])
         self.assertEqual(meta["center"], {"lat": 12.1, "lon": -134.9})
         self.assertEqual(meta["px"], [1200, 690])
+
+    def test_anomaly_hidden_until_the_bake_lands(self):
+        # the bake-complete GATE: no manifest -> the anomaly layer is
+        # simply not written (hidden, never a wrong-baseline render).
+        sink = _PngSink()
+        w = self._writer(sink, climo_ready=False)
+        w.maybe_render("NHC_EP012026", _storm(), "EP")
+        meta = sink.json["shadow/cyclolab/NHC_EP012026/sst/meta.json"]
+        self.assertEqual([x["slug"] for x in meta["layers"]], ["actual"])
+
+    def test_anomaly_hidden_when_climo_grid_missing(self):
+        # gate is open but the DOY grid 404s (off-belt / not yet on R2):
+        # still hidden, never broken.
+        sink = _PngSink()
+        w = self._writer(sink, climo=False, climo_ready=True)
+        w.maybe_render("NHC_EP012026", _storm(), "EP")
+        meta = sink.json["shadow/cyclolab/NHC_EP012026/sst/meta.json"]
+        self.assertEqual([x["slug"] for x in meta["layers"]], ["actual"])
 
     def test_unmoved_same_day_skips_then_move_rerenders(self):
         sink = _PngSink()
@@ -242,12 +277,14 @@ class TestWriterLifecycle(unittest.TestCase):
         w.maybe_render("NHC_EP012026", _storm(lat=12.6), "EP")
         self.assertGreater(len(sink.log), n, "0.5 deg IS a move")
 
-    def test_missing_anomaly_file_meta_lists_only_actual(self):
+    def test_missing_sst_file_writes_nothing(self):
+        # the SST file is the source of BOTH layers now - absent -> no
+        # family at all (replaces the old ssta-missing case, which is
+        # covered by the two climo-gate tests above).
         sink = _PngSink()
-        w = self._writer(sink, available=("sst",))
+        w = self._writer(sink, available=())
         w.maybe_render("NHC_EP012026", _storm(), "EP")
-        meta = sink.json["shadow/cyclolab/NHC_EP012026/sst/meta.json"]
-        self.assertEqual([x["slug"] for x in meta["layers"]], ["actual"])
+        self.assertEqual(sink.json, {})
 
     def test_json_only_sink_writes_nothing(self):
         sink = _JsonOnlySink()
@@ -280,11 +317,12 @@ class TestShellFixtureMirrorsWriter(unittest.TestCase):
     def test_fixture_layers_match_writer_meta(self):
         from test_cyclolab_shell import SST_META
         sink = _PngSink()
-        fetch_day, read_box = _fake_io()
+        fetch_day, read_box, fetch_climo = _fake_io()
         with tempfile.TemporaryDirectory() as td:
             w = cs.SstHeroWriter(
                 sink, prefix="shadow/cyclolab", cache_dir=Path(td),
                 fetch_day=fetch_day, read_box=read_box,
+                fetch_climo=fetch_climo, climo_ready=True,
                 today=lambda: dt.date(2026, 6, 6))
             w.maybe_render("NHC_EP012026", _storm(), "EP")
         meta = sink.json["shadow/cyclolab/NHC_EP012026/sst/meta.json"]
