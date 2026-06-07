@@ -485,6 +485,31 @@ HTML_TEMPLATE = r"""<!doctype html>
      the ONE permitted continuous loop; reduced-motion = final frame. */
   .adv-cone-stage { background: #0a1019; border-radius: 8px;
     overflow: hidden; }
+  /* Overview hero (final-gate #1): storm-centered SST crop + glyph */
+  .sst-hero { position: relative; overflow: hidden; border-radius: 8px;
+    aspect-ratio: 16 / 9.2; background: #0a1019;
+    border: 1px solid #2c3a52; }
+  .sst-hero img { position: absolute; left: 0; top: 0;
+    transform-origin: 0 0; user-select: none; pointer-events: none; }
+  .sst-hero-scrim { position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(155deg, rgba(8,12,20,0.62) 0%,
+      rgba(8,12,20,0.18) 30%, transparent 55%); }
+  .sst-hero-title { position: absolute; top: 14px; left: 16px;
+    padding-left: 11px; }
+  .sst-hero-title .hero-rail { position: absolute; left: 0; top: 2px;
+    bottom: 2px; width: 3px; border-radius: 1.5px;
+    background: var(--cat-accent); }
+  .sst-hero-title .hero-eyebrow { color: #aebdd4; font-size: 11px;
+    font-weight: 700; letter-spacing: 1.6px; }
+  .sst-hero-title .hero-head { color: #ffffff; font-size: 19px;
+    font-weight: 800; letter-spacing: 0.6px; margin-top: 2px;
+    text-shadow: 0 1px 6px rgba(0,0,0,0.5); }
+  .sst-hero-title .hero-sub { color: #cdd9ea; font-size: 12.5px;
+    font-weight: 700; letter-spacing: 1.1px; margin-top: 2px; }
+  .sst-hero-glyph { position: absolute; width: 120px; height: 120px;
+    margin: -60px 0 0 -60px; pointer-events: none;
+    filter: drop-shadow(0 3px 10px rgba(0,0,0,0.55)); }
+  .sst-hero-glyph svg { width: 100%; height: 100%; }
   /* S4-AD2 #2/#3: the map reads as a SURFACE - ocean lifted one clear
      step above the panel chrome, hairline inset border, land one step
      above the ocean, graticule legible-but-subtle. */
@@ -699,10 +724,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="stage">
     <section class="sec active" id="sec-overview">
       <div class="wipe">
-        <div class="card"><h3>Track &amp; forecast cone</h3>
-          <svg id="trackmap" viewBox="0 0 1000 620"
-               preserveAspectRatio="xMidYMid meet"></svg>
-          <div class="note" id="cone-note" hidden></div></div>
+        <div class="card">
+          <div class="sst-hero" id="sst-hero">
+            <img id="sst-hero-img" alt="Sea-surface temperature around the storm"
+                 draggable="false">
+            <div class="sst-hero-scrim"></div>
+            <div class="sst-hero-title">
+              <div class="hero-rail"></div>
+              <div class="hero-eyebrow">TRIPLE-A-TROPICS &middot; CycloLab</div>
+              <div class="hero-head">SEA SURFACE TEMPERATURE</div>
+              <div class="hero-sub" id="sst-hero-sub"></div>
+            </div>
+            <div class="sst-hero-glyph" id="sst-hero-glyph"></div>
+          </div>
+          <div class="note" id="sst-hero-note"></div></div>
         <div class="card"><h3>Wind &amp; pressure</h3>
           <svg id="chart" viewBox="0 0 1000 320"
                preserveAspectRatio="xMidYMid meet"></svg></div>
@@ -1174,109 +1209,245 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   // ---- map + cone (the home view showstopper) -------------------------------
   var coneRing = null, coneAdv = null, conePts = null;
-  function renderTrack(storm) {
-    var svg = document.getElementById("trackmap");
-    var pts = storm.points || [];
-    if (!pts.length && !coneRing) { svg.innerHTML = ""; return; }
-    var lats = [], lons = [];
-    pts.forEach(function (p) { lats.push(p.lat); lons.push(p.lon); });
-    (coneRing || []).forEach(function (c) { lons.push(c[0]); lats.push(c[1]); });
-    var pad = 1.8;
-    var la0 = Math.min.apply(null, lats) - pad, la1 = Math.max.apply(null, lats) + pad;
-    var lo0 = Math.min.apply(null, lons) - pad, lo1 = Math.max.apply(null, lons) + pad;
-    var W = 1000, H = 620;
-    function X(lon) { return (lon - lo0) / (lo1 - lo0) * W; }
-    function Y(lat) { return H - (lat - la0) / (la1 - la0) * H; }
-    var parts = ['<rect width="' + W + '" height="' + H + '" fill="#0a1019"/>'];
-    // CONE: brand blue/white, never category-colored (uncertainty area).
-    if (coneRing && coneRing.length > 3) {
-      var dC = coneRing.map(function (c, i) {
-        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
-      }).join(" ") + " Z";
-      parts.push('<defs><filter id="cone-soft" x="-20%" y="-20%" ' +
-        'width="140%" height="140%"><feGaussianBlur stdDeviation="5"/>' +
-        "</filter></defs>");
-      parts.push('<path d="' + dC + '" fill="none" stroke="#8cc8ff" ' +
-        'stroke-width="9" stroke-opacity="0.35" filter="url(#cone-soft)"/>');
-      parts.push('<path d="' + dC + '" fill="rgba(255,255,255,0.12)" ' +
-        'stroke="#0a1a2e" stroke-width="2"/>');
-      if (conePts && conePts.length > 1) {
-        var dF = conePts.map(function (p, i) {
-          return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
-        }).join(" ");
-        parts.push('<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
-          'stroke-width="1.6" stroke-dasharray="2 5" stroke-opacity="0.7"/>');
-      }
-    }
-    if (pts.length) {
-      var d = pts.map(function (p, i) {
-        return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," + Y(p.lat).toFixed(1);
-      }).join(" ");
-      parts.push('<path d="' + d + '" fill="none" stroke="var(--cat-accent)" ' +
-        'stroke-width="2.5" stroke-opacity="0.85" stroke-linejoin="round" ' +
-        'stroke-linecap="round"/>');
-      pts.forEach(function (p) {
-        parts.push('<circle cx="' + X(p.lon).toFixed(1) + '" cy="' +
-          Y(p.lat).toFixed(1) + '" r="4.5" fill="' +
-          (SSHS[p.cls] || SSHS.TD) + '" stroke="#fff" stroke-width="1"/>');
-      });
-      var last = pts[pts.length - 1];
-      parts.push('<circle cx="' + X(last.lon).toFixed(1) + '" cy="' +
-        Y(last.lat).toFixed(1) + '" r="10" fill="none" ' +
-        'stroke="var(--cat-accent)" stroke-width="3"/>');
-    }
-    svg.innerHTML = parts.join("");
+  // ---- Overview hero (final-gate #1): a storm-centered crop of the
+  // site's EXISTING CRW SST render (5 km CoralTemp 'actual' - the
+  // house SST pipeline; nothing new is rendered) with the big spinning
+  // category glyph at the current position. The crop is EXACT: the
+  // generator's layout is deterministic (figsize x dpi 150,
+  // subplots_adjust 0.05/0.89/0.86/0.08, linear plate carree), so the
+  // geographic data-rect of each region PNG is known to the pixel.
+  var SST_REGIONS = {
+    "east-pacific": { ext: [-140, -80, 5, 35], fig: [11.0, 5.8] },
+    "northeast-pacific": { ext: [-160, -80, 0, 50], fig: [11.0, 7.0] },
+    "central-pacific": { ext: [-180, -140, 0, 35], fig: [8.0, 7.0] },
+    "northwest-pacific": { ext: [100, 180, 0, 60], fig: [10.5, 7.5] },
+    "north-pacific": { ext: [100, 260, 0, 65], fig: [14.5, 6.5] },
+    "tropical-atlantic": { ext: [-90, -10, 0, 30], fig: [11.5, 5.4] },
+    "western-atlantic": { ext: [-100, -55, 8, 42], fig: [8.8, 7.0] },
+    "north-atlantic": { ext: [-100, 0, 0, 65], fig: [10.5, 7.0] },
+    "global-tropics": { ext: [30, 390, -45, 45], fig: [14.5, 5.6] }
+  };
+  var SST_DPI = 150;
+  var SST_AX = { l: 0.05, r: 0.89, t: 0.86, b: 0.08 };
+  var CROP_HW_LON = 12, CROP_HW_LAT = 7.5;
+  var heroMeta = null, heroParams = null;
+  var chartDrawn = false;     // W&P draw-on animation runs once
+
+  function heroRegionFor(lat, lon) {
+    var best = null, bestPpd = 0;
+    Object.keys(SST_REGIONS).forEach(function (slug) {
+      var r = SST_REGIONS[slug];
+      var L = lon;
+      while (L < r.ext[0]) L += 360;
+      while (L > r.ext[1]) L -= 360;
+      if (L < r.ext[0] + 2 || L > r.ext[1] - 2 ||
+          lat < r.ext[2] + 2 || lat > r.ext[3] - 2) return;
+      var ppd = (r.fig[0] * SST_DPI * (SST_AX.r - SST_AX.l)) /
+                (r.ext[1] - r.ext[0]);
+      if (ppd > bestPpd) { bestPpd = ppd; best = { slug: slug, lon: L }; }
+    });
+    return best;
   }
 
-  var chartDrawn = false;
+  function heroLayout() {
+    // (re)apply the crop transform for the current params - also runs
+    // on resize so the crop tracks the panel width.
+    if (!heroParams) return;
+    var p = heroParams;
+    var panel = document.getElementById("sst-hero");
+    var img = document.getElementById("sst-hero-img");
+    var pw = panel.clientWidth, ph = panel.clientHeight;
+    if (!pw || !ph) return;
+    var s = pw / p.cropW;
+    if (p.cropH * s < ph) s = ph / p.cropH;   // cover, never letterbox
+    img.style.width = p.natW + "px";
+    img.style.height = p.natH + "px";
+    img.style.transform = "translate(" + (-p.cropX * s).toFixed(1) +
+      "px," + (-p.cropY * s).toFixed(1) + "px) scale(" + s.toFixed(5) + ")";
+    var g = document.getElementById("sst-hero-glyph");
+    g.style.left = ((p.glyphX * p.natScaleX - p.cropX) * s).toFixed(1) + "px";
+    g.style.top = ((p.glyphY * p.natScaleY - p.cropY) * s).toFixed(1) + "px";
+  }
+  window.addEventListener("resize", heroLayout);
+
+  function renderHero(storm) {
+    var pts = storm.points || [];
+    var last = pts[pts.length - 1];
+    if (!last || last.lat == null) return;
+    var sel = heroRegionFor(last.lat, last.lon);
+    var img = document.getElementById("sst-hero-img");
+    var note = document.getElementById("sst-hero-note");
+    document.getElementById("sst-hero-sub").textContent =
+      ((document.getElementById("storm-type") || {}).textContent || "")
+        .toUpperCase() + " " + (storm.name || "").toUpperCase();
+    // glyph: the cone-hero treatment - spinning path, stationary label
+    var cat = storm.current_category || "TD";
+    document.getElementById("sst-hero-glyph").innerHTML =
+      '<svg viewBox="-62 -62 124 124">' +
+      '<g class="ac-spin"><path d="__HPATH__" fill="' +
+      (SSHS[cat] || SSHS.TD) +
+      '" stroke="rgba(0,0,0,0.35)" stroke-width="2"/></g>' +
+      '<text class="ac-cat" y="12" text-anchor="middle" font-size="34" ' +
+      'font-weight="800" fill="#ffffff" stroke="rgba(0,0,0,0.45)" ' +
+      'stroke-width="1">' + sshsLabel(cat) + "</text></svg>";
+    if (!sel) {
+      // honest fallback: navy panel + glyph centered, no fake field
+      heroParams = null;
+      img.removeAttribute("src");
+      img.style.display = "none";
+      var g0 = document.getElementById("sst-hero-glyph");
+      g0.style.left = "50%"; g0.style.top = "50%";
+      note.textContent = "No regional SST panel covers this position.";
+      return;
+    }
+    var r = SST_REGIONS[sel.slug];
+    var natW = Math.round(r.fig[0] * SST_DPI);
+    var natH = Math.round(r.fig[1] * SST_DPI);
+    var ax = { x0: SST_AX.l * natW, x1: SST_AX.r * natW,
+               y0: (1 - SST_AX.t) * natH, y1: (1 - SST_AX.b) * natH };
+    var ppdX = (ax.x1 - ax.x0) / (r.ext[1] - r.ext[0]);
+    var ppdY = (ax.y1 - ax.y0) / (r.ext[3] - r.ext[2]);
+    // crop window: storm-centered, clamped inside the region extent
+    var c0 = Math.max(r.ext[0],
+        Math.min(sel.lon - CROP_HW_LON, r.ext[1] - 2 * CROP_HW_LON));
+    var la1 = Math.min(r.ext[3],
+        Math.max(last.lat + CROP_HW_LAT, r.ext[2] + 2 * CROP_HW_LAT));
+    heroParams = {
+      natW: natW, natH: natH, natScaleX: 1, natScaleY: 1,
+      cropX: ax.x0 + (c0 - r.ext[0]) * ppdX,
+      cropY: ax.y0 + (r.ext[3] - la1) * ppdY,
+      cropW: 2 * CROP_HW_LON * ppdX,
+      cropH: 2 * CROP_HW_LAT * ppdY,
+      glyphX: ax.x0 + (sel.lon - r.ext[0]) * ppdX,
+      glyphY: ax.y0 + (r.ext[3] - last.lat) * ppdY
+    };
+    img.style.display = "";
+    var url = CDN + "/sst/crw_" + sel.slug + "_actual.png";
+    if (img.getAttribute("data-url") !== url) {
+      img.setAttribute("data-url", url);
+      img.onload = heroLayout;
+      img.onerror = function () {
+        heroParams = null;
+        img.style.display = "none";
+        note.textContent =
+          "SST base layer unavailable \u00b7 NOAA Coral Reef Watch.";
+      };
+      img.src = url;
+    } else {
+      heroLayout();
+    }
+    // disclosure caption: field name + valid time + source
+    function caption() {
+      var d = heroMeta && heroMeta.date ? " \u00b7 valid " + heroMeta.date : "";
+      note.textContent =
+        "NOAA Coral Reef Watch CoralTemp v3.1 (5 km) \u00b7 sea-surface " +
+        "temperature" + d + " \u00b7 cropped from the house " +
+        sel.slug.replace(/-/g, " ") + " SST panel.";
+    }
+    caption();
+    if (!heroMeta) {
+      fetchJson(SITE_BASE + "/sst/crw_meta.json").then(function (m) {
+        if (m && m.date) { heroMeta = m; caption(); }
+      });
+    }
+  }
+
   function renderChart(storm) {
+    // ONE CANON (final-gate #1): this chart mirrors the site's
+    // existing wind-history graphic (renderWindChart in the basin
+    // pages) - SSHS bands at 0.38, white series line, dark dots with
+    // white stroke, threshold y-ticks - scaled to this panel, with
+    // the dashed pressure series + its mb axis on the right (the
+    // pressure-axis backlog item, closed here since it rode along).
     var svg = document.getElementById("chart");
     var pts = (storm.points || []).filter(function (p) {
       return p.wind_kt != null; });
     if (pts.length < 2) { svg.innerHTML = ""; return; }
-    var W = 1000, H = 320, padL = 56, padR = 56, padT = 16, padB = 28;
-    var wMax = Math.max(140, Math.max.apply(null, pts.map(function (p) {
+    var W = 1000, H = 320, padL = 56, padR = 56, padT = 16, padB = 30;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var wMax = Math.max(160, Math.max.apply(null, pts.map(function (p) {
       return p.wind_kt; })) + 10);
+    var times = pts.map(function (p) { return new Date(p.t).getTime(); });
+    var tMin = Math.min.apply(null, times);
+    var tMax = Math.max.apply(null, times);
+    function Xt(t) {
+      if (tMax === tMin) return padL + plotW / 2;
+      return padL + (t - tMin) / (tMax - tMin) * plotW;
+    }
+    function Yw(w) { return padT + plotH - (w / wMax) * plotH; }
     var prs = pts.map(function (p) { return p.pressure_mb; })
       .filter(function (v) { return v != null; });
     var p0 = Math.min.apply(null, prs.concat([1000])) - 6;
     var p1 = Math.max.apply(null, prs.concat([1014])) + 6;
-    function Xi(i) { return padL + i / (pts.length - 1) * (W - padL - padR); }
-    function Yw(w) { return H - padB - (w / wMax) * (H - padT - padB); }
-    function Yp(p) { return H - padB - ((p - p0) / (p1 - p0)) * (H - padT - padB); }
-    var parts = ['<rect width="' + W + '" height="' + H + '" fill="#0a1019"/>'];
-    [[34, "TS"], [64, "C1"], [83, "C2"], [96, "C3"], [113, "C4"], [137, "C5"]]
+    function Yp(p) { return padT + plotH - ((p - p0) / (p1 - p0)) * plotH; }
+    var parts = ['<rect width="' + W + '" height="' + H +
+                 '" fill="#0a1019"/>'];
+    // canon SSHS bands
+    [[0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"], [83, 96, "C2"],
+     [96, 113, "C3"], [113, 137, "C4"], [137, wMax, "C5"]]
       .forEach(function (b) {
-        parts.push('<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' +
-          Yw(b[0]).toFixed(1) + '" y2="' + Yw(b[0]).toFixed(1) +
-          '" stroke="' + SSHS[b[1]] + '" stroke-opacity="0.25" ' +
-          'stroke-dasharray="3 5"/>');
-        parts.push('<text x="' + (W - padR + 6) + '" y="' +
-          (Yw(b[0]) + 4).toFixed(1) + '" fill="' + SSHS[b[1]] +
-          '" font-size="11" opacity="0.8">' + b[1] + "</text>");
+        var y1 = Yw(Math.min(b[1], wMax)), y2 = Yw(b[0]);
+        parts.push('<rect x="' + padL + '" y="' + y1.toFixed(1) +
+          '" width="' + plotW + '" height="' + (y2 - y1).toFixed(1) +
+          '" fill="' + SSHS[b[2]] + '" fill-opacity="0.38"/>');
       });
-    var dWind = pts.map(function (p, i) {
-      return (i ? "L" : "M") + Xi(i).toFixed(1) + "," + Yw(p.wind_kt).toFixed(1);
-    }).join(" ");
-    var area = dWind + " L" + Xi(pts.length - 1).toFixed(1) + "," + (H - padB) +
-      " L" + padL + "," + (H - padB) + " Z";
-    parts.push('<path class="fill" d="' + area +
-      '" fill="var(--cat-accent)" fill-opacity="0.13"/>');
-    parts.push('<path class="series" d="' + dWind +
-      '" fill="none" stroke="var(--cat-accent)" stroke-width="3" ' +
-      'stroke-linejoin="round" stroke-linecap="round"/>');
+    // canon threshold y-axis
+    [0, 35, 65, 85, 100, 115, 140, 160].forEach(function (v) {
+      if (v > wMax) return;
+      var y = Yw(v);
+      parts.push('<line x1="' + (padL - 5) + '" y1="' + y.toFixed(1) +
+        '" x2="' + padL + '" y2="' + y.toFixed(1) +
+        '" stroke="#3a4d6e" stroke-width="1"/>');
+      parts.push('<text x="' + (padL - 9) + '" y="' + (y + 4).toFixed(1) +
+        '" text-anchor="end" font-size="12" fill="#8ea2bd">' + v +
+        "</text>");
+    });
+    // x labels (canon: 3 calendar ticks)
+    var MN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+              "Sep", "Oct", "Nov", "Dec"];
+    for (var xi = 0; xi < 3; xi++) {
+      var tt = tMin + xi * (tMax - tMin) / 2;
+      var d2 = new Date(tt);
+      parts.push('<text x="' + Xt(tt).toFixed(1) + '" y="' + (H - 8) +
+        '" text-anchor="middle" font-size="12" fill="#8ea2bd">' +
+        MN[d2.getUTCMonth()] + " " + d2.getUTCDate() + "</text>");
+    }
+    // pressure series + right mb axis
     var pp = pts.filter(function (p) { return p.pressure_mb != null; });
     if (pp.length >= 2) {
       var dPres = pp.map(function (p, i) {
-        var gi = pts.indexOf(p);
-        return (i ? "L" : "M") + Xi(gi).toFixed(1) + "," +
-          Yp(p.pressure_mb).toFixed(1);
+        return (i ? "L" : "M") + Xt(new Date(p.t).getTime()).toFixed(1) +
+          "," + Yp(p.pressure_mb).toFixed(1);
       }).join(" ");
       parts.push('<path d="' + dPres + '" fill="none" stroke="#8ea2bd" ' +
         'stroke-width="2" stroke-dasharray="5 4" stroke-opacity="0.9"/>');
+      [p0 + 6, (p0 + p1) / 2, p1 - 6].forEach(function (v) {
+        var y = Yp(v);
+        parts.push('<line x1="' + (W - padR) + '" y1="' + y.toFixed(1) +
+          '" x2="' + (W - padR + 5) + '" y2="' + y.toFixed(1) +
+          '" stroke="#3a4d6e" stroke-width="1"/>');
+        parts.push('<text x="' + (W - padR + 9) + '" y="' +
+          (y + 4).toFixed(1) + '" font-size="12" fill="#8ea2bd">' +
+          Math.round(v) + "</text>");
+      });
     }
-    parts.push('<text x="' + padL + '" y="13" fill="#8ea2bd" font-size="11">' +
-      'wind kt (solid) · pressure mb (dashed)</text>');
+    // canon wind series: white line + dark dots, white stroke
+    var dWind = pts.map(function (p, i) {
+      return (i ? "L" : "M") + Xt(new Date(p.t).getTime()).toFixed(1) +
+        "," + Yw(p.wind_kt).toFixed(1);
+    }).join(" ");
+    parts.push('<path class="series" d="' + dWind +
+      '" fill="none" stroke="#ffffff" stroke-width="2.8" ' +
+      'stroke-linejoin="round" stroke-linecap="round"/>');
+    pts.forEach(function (p) {
+      parts.push('<circle cx="' +
+        Xt(new Date(p.t).getTime()).toFixed(1) + '" cy="' +
+        Yw(p.wind_kt).toFixed(1) +
+        '" r="4" fill="#0a1324" stroke="#ffffff" stroke-width="1.6"/>');
+    });
+    parts.push('<text x="' + padL + '" y="13" fill="#8ea2bd" ' +
+      'font-size="11">wind kt (solid) \u00b7 pressure mb (dashed, ' +
+      'right axis)</text>');
     svg.innerHTML = parts.join("");
     if (!chartDrawn && !reduced) {
       var series = svg.querySelector("path.series");
@@ -1309,7 +1480,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     odoSet(document.getElementById("odo-fix"),
            fixKey ? fixKey.slice(5, 16).replace("T", " ") : "—");
     if (fixKey !== lastFixKey) {
-      renderTrack(storm);
+      renderHero(storm);
       renderChart(storm);
       lastFixKey = fixKey;
     }
@@ -1340,14 +1511,6 @@ HTML_TEMPLATE = r"""<!doctype html>
         : "Derived uncertainty envelope (advisory " + coneAdv +
           ") — not an official JTWC product. Method: " +
           (adv.method || "derived") + ".";
-    }
-    // isolated like renderAdvTab (final-gate #3): a bad cone payload
-    // in one renderer never blocks the other surfaces
-    if (changed && lastStorm) {
-      try { renderTrack(lastStorm); } catch (e) {
-        try { console.warn("[cyclolab] track render failed:", e); }
-        catch (e2) {}
-      }
     }
     if (changed && inited.advisories) renderAdvTab();
   }

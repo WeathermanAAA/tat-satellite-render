@@ -362,8 +362,16 @@ class TestHydration(unittest.TestCase):
         # position + last-fix odometers populated (not the em-dash placeholder).
         self.assertEqual(st["odo"]["pos"], "20.4N 141.2W")
         self.assertTrue(st["odo"]["fix"] and st["odo"]["fix"] != "—")
-        # both Overview SVGs have rendered children.
-        self.assertGreater(st["trackmapChildCount"], 0)
+        # the hero rendered: SST crop URL chosen from the house CRW
+        # panels, the spinning glyph carries the category label, and
+        # the caption discloses field + source (final-gate #1).
+        hero = st["hero"]
+        self.assertIn("/sst/crw_", hero["imgUrl"])
+        self.assertIn("_actual.png", hero["imgUrl"])
+        self.assertGreater(hero["glyphHtml"], 50)
+        self.assertEqual(hero["glyphLabel"], "4")   # C4 synth fixture
+        self.assertIn("Coral Reef Watch", hero["caption"])
+        self.assertTrue(hero["sub"].endswith("SYNTH"))
         self.assertGreater(st["chartChildCount"], 0)
 
 

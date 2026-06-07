@@ -366,8 +366,21 @@ const scheduledDelays = [];
         return el ? el.textContent : null;
       })(),
       bannerClasses: bannerClasses(),
-      trackmapChildCount: (document.getElementById("trackmap") || { children: [] })
-        .children.length,
+      hero: (() => {
+        const img = document.getElementById("sst-hero-img");
+        const g = document.getElementById("sst-hero-glyph");
+        const note = document.getElementById("sst-hero-note");
+        if (!img) return null;
+        return {
+          imgUrl: img.getAttribute("data-url") || "",
+          glyphHtml: g ? g.innerHTML.length : 0,
+          glyphLabel: g && g.querySelector("text.ac-cat")
+            ? g.querySelector("text.ac-cat").textContent : "",
+          caption: note ? note.textContent : "",
+          sub: (document.getElementById("sst-hero-sub") || {})
+            .textContent || "",
+        };
+      })(),
       chartChildCount: (document.getElementById("chart") || { children: [] })
         .children.length,
       endedStripVisible: endedStripVisible(),
