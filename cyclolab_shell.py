@@ -672,17 +672,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
     .back-map { border-top: 0; padding: 8px 12px; min-height: 0; }
     .stage { padding: 4px 14px 86px; }
-    /* FG-R2 review note: the hero lockup read far too big on a
-       ~366px panel (the 19px head wrapped to two dominating lines) -
-       scale the whole title block down for phones. */
-    .sst-hero-title { top: 10px; left: 12px; padding-left: 8px; }
-    .sst-hero-title .hero-eyebrow { font-size: 8.5px;
-      letter-spacing: 1.1px; }
-    .sst-hero-title .hero-head { font-size: 13px;
-      letter-spacing: 0.4px; }
-    .sst-hero-title .hero-sub { font-size: 10px;
-      letter-spacing: 0.8px; }
-    .sst-hero-layers .hafs-seg { font-size: 9.5px; padding: 3px 8px; }
+    /* FG-R2 review notes (two rounds): the hero lockup must read as a
+       small corner signature on a ~366px panel. The eyebrow drops on
+       phones - same precedent as the banner's mobile compaction - and
+       head/sub shrink to caption scale. */
+    .sst-hero-title { top: 9px; left: 11px; padding-left: 7px; }
+    .sst-hero-title .hero-eyebrow { display: none; }
+    .sst-hero-title .hero-head { font-size: 10.5px;
+      letter-spacing: 0.5px; margin-top: 0; }
+    .sst-hero-title .hero-sub { font-size: 8.5px;
+      letter-spacing: 0.6px; margin-top: 1px; }
+    .sst-hero-title .hero-rail { width: 2px; }
+    .sst-hero-layers .hafs-seg { font-size: 9px; padding: 2px 7px; }
   }
 
   @media (prefers-reduced-motion: reduce) {
