@@ -93,6 +93,14 @@ class CycloLabPageWriter:
         # sid -> {"cat": str, "fix": str|None, "missing": int,
         #         "ended": bool, "last": dict (snapshot)}
         self._state: dict[str, dict] = {}
+        # final-gate-2 #1: the storm-centered SST hero layers ride the
+        # same per-fix cadence (best-effort; its own kill switch).
+        try:
+            from cyclolab_sst import SstHeroWriter
+            self._sst = SstHeroWriter(sink, prefix=self.prefix)
+        except Exception as e:  # noqa: BLE001 - never block pages
+            _log.warning("sst hero writer unavailable: %s", e)
+            self._sst = None
 
     def _adv_url(self, sid: str) -> str:
         # Live prefix -> same-origin relative path through the Worker;
@@ -100,6 +108,13 @@ class CycloLabPageWriter:
         if self.prefix == LIVE_PREFIX:
             return f"/cyclolab/adv/{sid}.json"
         return f"{self.cdn_base}/{adv_key(sid, prefix=self.prefix)}"
+
+    def _sst_base(self, sid: str) -> str:
+        # Same live/shadow convention as _adv_url (the Worker serves any
+        # file-ish key under cyclolab/; shadow keys go absolute-CDN).
+        if self.prefix == LIVE_PREFIX:
+            return f"/cyclolab/{sid}/sst"
+        return f"{self.cdn_base}/{self.prefix}/{sid}/sst"
 
     def _og_url(self, sid: str) -> str | None:
         """The intensity OG card URL - only when the storm's basin has a
@@ -137,9 +152,14 @@ class CycloLabPageWriter:
             cat = storm.get("current_category") or "TD"
             fix = storm.get("latest_fix_valid_utc")
             if st is None or st["ended"] or st["cat"] != cat or st["fix"] != fix:
+                # SST hero layers FIRST (the freshly baked page + the
+                # hydration poll both read them; best-effort either way).
+                if self._sst is not None:
+                    self._sst.maybe_render(sid, storm, basin)
                 html = render_page(storm, feed_url=feed_url,
                                    adv_url=self._adv_url(sid),
-                                   og_image_url=self._og_url(sid))
+                                   og_image_url=self._og_url(sid),
+                                   sst_base=self._sst_base(sid))
                 self.sink.write_html(page_key(sid, prefix=self.prefix), html)
                 _log.info("cyclolab page %s: %s (%s, fix %s)",
                           "BIRTH" if st is None else "refresh", sid, cat, fix)
@@ -158,7 +178,8 @@ class CycloLabPageWriter:
             if st["missing"] >= ENDED_DEBOUNCE_POLLS:
                 from cyclolab_shell import render_page as _rp
                 html = _rp(st["last"], feed_url=feed_url,
-                           adv_url=self._adv_url(sid), ended=True)
+                           adv_url=self._adv_url(sid), ended=True,
+                           sst_base=self._sst_base(sid))
                 self.sink.write_html(page_key(sid, prefix=self.prefix), html)
                 st["ended"] = True
                 _log.info("cyclolab page ENDED (frozen): %s", sid)
