@@ -469,8 +469,15 @@ class TestGlobalGeojson(unittest.TestCase):
     def test_composer_mirrors_cron_composition_exactly(self):
         # Same storms through (a) the pure composer and (b) a hand-rolled
         # replica of the cron's global-mode loop -> identical features bytes.
+        # TWOE: a freshly-designated TD (peak < 34 kt) - the case the
+        # v0.5.1 stage rule flipped from the retired td_circle ring to
+        # the standard glyph.
+        fresh_td = {**self._storm("TWOE", -100.0),
+                    "peak_wind_kt": 30.0, "max_category": "TD",
+                    "current_category": "TD"}
         by_basin = {"al": [self._storm("ALPHA", -60.0)],
                     "ep": [self._storm("AMANDA", -120.0),
+                           fresh_td,
                            self._storm("90E", -110.0, invest=True)],
                     "wp": [self._storm("JANGMI", 140.0)]}
         feed = fr.build_global_geojson_feed(
@@ -489,11 +496,17 @@ class TestGlobalGeojson(unittest.TestCase):
         self.assertEqual(feed["latest_fix_valid_utc"], "2026-04-11T00:00:00Z")
         self.assertEqual(feed["staleness_minutes"], 60)
         # Invest is on the map; inputs not mutated by the basin stamp.
-        # ace-core-v0.4.0: EVERY invest is invest_x (the red NHC X) -
-        # active state no longer splits the icon ('L' retired).
+        # ace-core-v0.4.0+: EVERY invest is invest_x (the red NHC X) -
+        # active state no longer splits the icon ('L' retired). Since
+        # v0.5.1 every active designated storm is "hurricane" (the
+        # peak-keyed td_circle ring is retired).
         kinds = {(f["properties"]["kind"], f["properties"].get("marker_type"))
                  for f in feed["features"]}
         self.assertIn(("active_marker", "invest_x"), kinds)  # active invest
+        # Stage rule (v0.5.1): the fresh TD wears the glyph, and the
+        # retired ring never appears.
+        self.assertIn(("active_marker", "hurricane"), kinds)
+        self.assertNotIn(("active_marker", "td_circle"), kinds)
         self.assertNotIn("basin", by_basin["ep"][0])
 
     def test_engine_writes_shadow_geojson_after_all_basins(self):

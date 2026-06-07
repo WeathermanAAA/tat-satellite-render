@@ -17,8 +17,9 @@ compute_header_stats (tracks). Nothing is reimplemented here.
 The poller owns ONLY the fresh slice. The historical archive (curves, climo,
 past storms, ranking backbone) comes straight from the base; this never rebuilds
 it, never touches climo or /historical, and never alters ACE methodology
-(ace_core is pinned at ace-core-v0.4.0: invest guard by construction +
-unified invest_x marker).
+(ace_core is pinned at ace-core-v0.5.1: invest guard by construction +
+unified invest_x marker + stage-rule hurricane marker for every active
+designated storm + NaN-safe NATURE).
 """
 from __future__ import annotations
 

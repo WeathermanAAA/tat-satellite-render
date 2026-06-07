@@ -25,9 +25,13 @@ the main-repo WRITE_LIVE_FEEDS flag and stays reversible.
 Anti-freeze (inherited from poller_framework): per-source isolation (one basin's
 b-deck fetch failing never freezes or stales the others; each keeps its own
 last-known-good), resilient_fetch (timeout + backoff retries), always-on health
-heartbeat. ace_core is pinned at ace-core-v0.4.0 (invest guard by
+heartbeat. ace_core is pinned at ace-core-v0.5.1 (invest guard by
 construction: ATCF 90-99 can never accrue ACE or count as named; unified
-invest marker: every invest is invest_x regardless of active state) - this
+invest marker: every invest is invest_x regardless of active state; stage
+rule: every active designated storm is marker_type "hurricane" - the
+peak-keyed td_circle ring is retired, current_category picks the glyph
+letter; NaN-safe NATURE so a blank b-deck NATURE column can never crash
+the feed build) - this
 never alters ACE methodology, never rebuilds the archive, never touches
 climo or /historical.
 """

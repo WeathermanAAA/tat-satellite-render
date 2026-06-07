@@ -44,5 +44,5 @@ requests>=2.31
 # v0.4.0: invest marker unification - every invest is marker_type invest_x
 # (the red NHC invest-area X) regardless of active state; the 'L' type is
 # retired. Presentation-only: ACE math identical to v0.3.0.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.4.0#subdirectory=ace_core
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.5.1#subdirectory=ace_core
 pandas>=2.0
