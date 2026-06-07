@@ -698,6 +698,35 @@ class TestStage3Mounts(unittest.TestCase):
                          "band switch must keep the moment (nearest frame)")
         self.assertIn("floaters/ep08/x/1012.png", st["satImgSrc"])
 
+    def test_satellite_speed_presets_default_1x_and_switch(self):
+        # final-gate-3 #5: four presets, default 1x; a click changes the
+        # speed multiplier (which scales the playback cadence uniformly,
+        # so the no-stutter contract holds at every speed).
+        # the harness snapshots after EVERY op, so index off the ops.
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "openSec", "name": "satellite"},
+                    {"op": "clickSatSpeed", "speed": 4},
+                    {"op": "clickSatSpeed", "speed": 0.5}]})
+        speeds = [r["state"]["stage3"]["sat"]["speed"] for r in recs]
+        self.assertEqual(speeds, [1, 4, 0.5])
+
+    def test_satellite_gif_button_and_hooks_exist(self):
+        # the export button mounts and the encoder hook is exposed (the
+        # encoder itself is round-trip-validated against the browser's
+        # GIF decoder in validate_gif.py - jsdom has no real decoder).
+        recs = run_harness(self.html, {
+            "floaters": self._floaters_top(),
+            "floater_storm": self._floater_storm(),
+            "ops": [{"op": "openSec", "name": "satellite"},
+                    {"op": "snapshot"}]})
+        st = recs[-1]["state"]["stage3"]["sat"]
+        self.assertFalse(st["gifBusy"])
+        self.assertIn('id="sat-gif"', self.html)
+        self.assertIn("function gifEncode", self.html)
+        self.assertIn("function gifLzw", self.html)
+
     def test_satellite_absent_storm_shows_empty_state(self):
         recs = run_harness(self.html, {
             "floaters": self._floaters_top(include=False),

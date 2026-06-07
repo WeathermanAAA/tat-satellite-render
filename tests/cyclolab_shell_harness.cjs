@@ -474,6 +474,14 @@ const scheduledDelays = [];
         host.children, (b) => b.getAttribute("data-slug") === op.slug);
       if (btn) btn.dispatchEvent(
         new dom.window.Event("click", { bubbles: true }));
+    } else if (op.op === "clickSatSpeed") {
+      // final-gate-3 #5: click a speed preset by multiplier.
+      const host = document.getElementById("sat-speed");
+      const btn = host && Array.prototype.find.call(
+        host.children,
+        (b) => parseFloat(b.getAttribute("data-speed")) === op.speed);
+      if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
     } else if (op.op === "coneSeek") {
       // final-gate-2 #3: place the growth front deterministically.
       const h = window.__lab.cone && window.__lab.cone();

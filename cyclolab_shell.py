@@ -414,6 +414,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     white-space: nowrap; }
   .hafs-btn:hover { border-color: var(--cat-accent); color: var(--cat-accent); }
   .hafs-play { min-width: 86px; }
+  /* satellite speed + GIF export tools (final-gate-3 #5) */
+  .sat-tools { align-items: flex-end; padding-top: 2px; }
+  .sat-gif { align-self: flex-end; }
+  .sat-gif[disabled] { opacity: 0.5; cursor: progress; }
+  .sat-gif-prog { display: flex; align-items: center; gap: 8px;
+    flex: 1 1 160px; font-size: 11.5px; color: var(--muted);
+    font-variant-numeric: tabular-nums; }
+  .sat-gif-prog[hidden] { display: none; }
+  .sat-gif-bar { flex: 1 1 auto; height: 6px; border-radius: 3px;
+    background: var(--bg); border: 1px solid var(--border);
+    overflow: hidden; }
+  .sat-gif-bar i { display: block; height: 100%; width: 0;
+    background: var(--cat-accent); transition: width 0.15s linear; }
   .hafs-readout { display: flex; flex-direction: column; gap: 2px;
     min-width: 150px; flex: 1 1 auto;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
@@ -772,6 +785,18 @@ HTML_TEMPLATE = r"""<!doctype html>
                  step="1" aria-label="Frame time">
           <div class="hafs-readout"><span id="sat-time">&#8212;</span>
             <span id="sat-band-label"></span></div>
+        </div>
+        <div class="hafs-controls sat-tools">
+          <div class="hafs-group"><label>Speed</label>
+            <div id="sat-speed" class="hafs-seg-group" role="group"
+                 aria-label="Playback speed"></div></div>
+          <button id="sat-gif" class="hafs-btn sat-gif" type="button"
+                  title="Export the loaded frames as a GIF">
+            &#8681; GIF</button>
+          <div id="sat-gif-prog" class="sat-gif-prog" hidden
+               role="status" aria-live="polite">
+            <div class="sat-gif-bar"><i></i></div>
+            <span class="sat-gif-pct">0%</span></div>
         </div>
         <div id="sat-empty" class="stub" style="display:none">No floater
           imagery for this storm right now.</div>
@@ -2442,8 +2467,13 @@ HTML_TEMPLATE = r"""<!doctype html>
   var sat = { man: null, band: null, frames: [], idx: 0, playing: false,
               timer: null, gen: 0, preloaded: {},
               mode: null, bmp: {}, bmpKeys: [], raf: null, lastT: 0,
-              holdT0: 0, presented: [] };
+              holdT0: 0, presented: [], speed: 1 };
   var SAT_FRAME_MS = 200, SAT_AHEAD = 12, SAT_BMP_MAX = 28;
+  // final-gate-3 #5: playback speed presets. The cadence CONTRACT (no
+  // interval > 2x the median over a loop) holds at every speed because
+  // the target interval scales uniformly - the median scales with it.
+  var SAT_SPEEDS = [0.5, 1, 2, 4];
+  function satFrameMs() { return SAT_FRAME_MS / sat.speed; }
   function satEl(id) { return document.getElementById("sat-" + id); }
   function satStatus(show, msg) {
     var box = satEl("status");
@@ -2628,7 +2658,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   function satRafTick(ts) {
     if (!sat.playing) { sat.raf = null; return; }
     sat.raf = requestAnimationFrame(satRafTick);
-    if (ts - sat.lastT < SAT_FRAME_MS - 1) return;
+    var fm = satFrameMs();
+    if (ts - sat.lastT < fm - 1) return;
     var j = sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1;
     var bm = satBitmapFor(j);
     if (!bm) {
@@ -2647,10 +2678,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     satBlit(bm);
     satReadout(j);
     satAhead(j);
-    // drift-resistant cadence: lock to the frame grid, resync only if
-    // the main thread fell more than a frame behind.
-    sat.lastT = (ts - sat.lastT > 2 * SAT_FRAME_MS) ? ts
-                : sat.lastT + SAT_FRAME_MS;
+    // drift-resistant cadence: lock to the (speed-scaled) frame grid,
+    // resync only if the main thread fell more than a frame behind.
+    sat.lastT = (ts - sat.lastT > 2 * fm) ? ts : sat.lastT + fm;
     // PRESENTED-frame log (final-gate-2 #5): the cadence contract is
     // asserted on these, not on swap counts.
     sat.presented.push(ts);
@@ -2669,6 +2699,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     sat.holds = 0;
+    satArmFallbackTimer();
+  }
+  function satArmFallbackTimer() {
+    if (sat.timer) clearInterval(sat.timer);
     sat.timer = setInterval(function () {
       var j = sat.idx >= sat.frames.length - 1 ? 0 : sat.idx + 1;
       // DECODE GATE (img fallback path): during playback a frame is
@@ -2681,7 +2715,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (!ready && sat.holds < 10) { sat.holds++; return; }
       sat.holds = 0;
       satShow(j);
-    }, 200);
+    }, satFrameMs());
   }
   // SECTOR-SOURCE REGISTRY (final-gate-2 #6, a seam - no second source
   // is built this round): the Satellite tab discovers per-storm sector
@@ -2704,6 +2738,234 @@ HTML_TEMPLATE = r"""<!doctype html>
       return null;
     }
   }];
+  // ---- speed presets (final-gate-3 #5) ------------------------------------
+  function satSetSpeed(mult) {
+    sat.speed = mult;
+    var host = satEl("speed");
+    if (host) {
+      for (var i = 0; i < host.children.length; i++) {
+        var b = host.children[i];
+        b.classList.toggle("active",
+          parseFloat(b.getAttribute("data-speed")) === mult);
+      }
+    }
+    // re-arm the running clock at the new cadence (rAF reads satFrameMs
+    // live; the img-fallback interval must be rebuilt).
+    if (sat.playing && sat.timer) satArmFallbackTimer();
+  }
+  function satBuildSpeed() {
+    var host = satEl("speed");
+    if (!host) return;
+    host.innerHTML = "";
+    SAT_SPEEDS.forEach(function (mult) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "hafs-seg";
+      b.setAttribute("data-speed", String(mult));
+      b.textContent = (mult === 1 ? "1" :
+        (mult < 1 ? "0.5" : String(mult))) + "\u00d7";
+      b.addEventListener("click", function () {
+        satSetSpeed(parseFloat(this.getAttribute("data-speed")));
+      });
+      host.appendChild(b);
+    });
+    satSetSpeed(1);
+  }
+  function satNudgeSpeed(dir) {
+    var i = SAT_SPEEDS.indexOf(sat.speed);
+    if (i < 0) i = 1;
+    satSetSpeed(SAT_SPEEDS[Math.max(0,
+      Math.min(SAT_SPEEDS.length - 1, i + dir))]);
+  }
+
+  // ---- client-side GIF export (final-gate-3 #5) ---------------------------
+  // Self-contained GIF89a encoder (no CDN): a fixed 3-3-2 RGB palette so
+  // the index is computed per pixel (no quantizer search), standard LZW,
+  // looping. Frames come from the ALREADY-LOADED imagery (ImageBitmaps in
+  // canvas mode, decoded <img>s in the fallback), so export adds no new
+  // fetches. Export is capped + downscaled to keep the file sane on
+  // desktop and mobile.
+  var SAT_GIF_MAX_FRAMES = 48;     // cap (oldest-trimmed) - sane size
+  var SAT_GIF_MAX_PX = 480;        // longest side after downscale
+  function gifColorIndex(r, g, b) {
+    return ((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6);  // 3-3-2
+  }
+  function gifGlobalPalette() {
+    var pal = new Uint8Array(256 * 3);
+    for (var i = 0; i < 256; i++) {
+      var r3 = (i >> 5) & 7, g3 = (i >> 2) & 7, b2 = i & 3;
+      pal[i * 3] = Math.round(r3 * 255 / 7);
+      pal[i * 3 + 1] = Math.round(g3 * 255 / 7);
+      pal[i * 3 + 2] = Math.round(b2 * 255 / 3);
+    }
+    return pal;
+  }
+  function gifLzw(indices, minCode, out) {
+    // GIF variable-width LZW (faithful port of omggif's proven encoder).
+    var clear = 1 << minCode, eoi = clear + 1;
+    var next = eoi + 1, width = minCode + 1;
+    var dict = new Map();
+    var cur = 0, shift = 0;
+    var block = [];
+    function flushBits() {
+      while (shift >= 8) {
+        block.push(cur & 255); cur >>= 8; shift -= 8;
+        if (block.length === 255) {
+          out.push(255);
+          for (var k = 0; k < 255; k++) out.push(block[k]);
+          block = [];
+        }
+      }
+    }
+    function emit(code) { cur |= code << shift; shift += width; flushBits(); }
+    emit(clear);
+    var ib = indices[0];
+    for (var i = 1; i < indices.length; i++) {
+      var k = indices[i];
+      var key = (ib << 8) | k;
+      var code = dict.get(key);
+      if (code !== undefined) { ib = code; continue; }
+      emit(ib);
+      if (next === 4096) {            // table full: reset
+        emit(clear);
+        dict.clear(); next = eoi + 1; width = minCode + 1;
+      } else {
+        if (next >= (1 << width)) width++;
+        dict.set(key, next++);
+      }
+      ib = k;
+    }
+    emit(ib);
+    emit(eoi);
+    if (shift > 0) { block.push(cur & 255); }
+    if (block.length) {
+      out.push(block.length);
+      for (var k2 = 0; k2 < block.length; k2++) out.push(block[k2]);
+    }
+    out.push(0);   // block terminator
+  }
+  function gifEncode(frames, w, h, delayCs) {
+    // frames: array of Uint8ClampedArray RGBA (w*h*4). Returns Blob.
+    var pal = gifGlobalPalette();
+    var b = [];
+    function str(s) { for (var i = 0; i < s.length; i++) b.push(s.charCodeAt(i)); }
+    function u16(v) { b.push(v & 255, (v >> 8) & 255); }
+    str("GIF89a");
+    u16(w); u16(h);
+    b.push(0xF7, 0, 0);                       // global table, 256 colors
+    for (var i = 0; i < pal.length; i++) b.push(pal[i]);
+    // NETSCAPE loop extension
+    b.push(0x21, 0xFF, 0x0B);
+    str("NETSCAPE2.0");
+    b.push(0x03, 0x01, 0, 0, 0x00);
+    frames.forEach(function (rgba) {
+      // graphic control extension (delay, no transparency)
+      b.push(0x21, 0xF9, 0x04, 0x00);
+      u16(delayCs);
+      b.push(0x00, 0x00);
+      // image descriptor
+      b.push(0x2C); u16(0); u16(0); u16(w); u16(h); b.push(0x00);
+      var n = w * h, idx = new Uint8Array(n);
+      for (var p = 0; p < n; p++) {
+        idx[p] = gifColorIndex(rgba[p * 4], rgba[p * 4 + 1],
+                               rgba[p * 4 + 2]);
+      }
+      b.push(8);                              // LZW minimum code size
+      gifLzw(idx, 8, b);
+    });
+    b.push(0x3B);                             // trailer
+    return new Blob([new Uint8Array(b)], { type: "image/gif" });
+  }
+  var satGifBusy = false;
+  function satGifProgress(frac) {
+    var box = satEl("gif-prog");
+    if (!box) return;
+    box.hidden = frac == null;
+    if (frac == null) return;
+    box.querySelector(".sat-gif-bar i").style.width =
+      Math.round(frac * 100) + "%";
+    box.querySelector(".sat-gif-pct").textContent =
+      Math.round(frac * 100) + "%";
+  }
+  function satFrameToCanvas(i, cw, ch) {
+    var cnv = document.createElement("canvas");
+    cnv.width = cw; cnv.height = ch;
+    var ctx = cnv.getContext("2d");
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cw, ch);
+    var src = sat.bmp[CDN + "/" + sat.frames[i].key];
+    src = src && src.bm;
+    if (!src) src = sat.preloaded[CDN + "/" + sat.frames[i].key];
+    if (src && (src.width || src.naturalWidth)) {
+      try { ctx.drawImage(src, 0, 0, cw, ch); } catch (e) { return null; }
+      return ctx.getImageData(0, 0, cw, ch).data;
+    }
+    return null;
+  }
+  function satExportGif() {
+    if (satGifBusy || !sat.frames.length) return;
+    var btn = satEl("gif");
+    var first = sat.bmp[CDN + "/" + sat.frames[0].key];
+    first = (first && first.bm) ||
+            sat.preloaded[CDN + "/" + sat.frames[0].key];
+    var sw = (first && (first.width || first.naturalWidth)) || 480;
+    var sh = (first && (first.height || first.naturalHeight)) || 480;
+    var scale = Math.min(1, SAT_GIF_MAX_PX / Math.max(sw, sh));
+    var cw = Math.max(2, Math.round(sw * scale));
+    var ch = Math.max(2, Math.round(sh * scale));
+    // chronological subset, capped (evenly sampled if over the cap)
+    var n = sat.frames.length;
+    var order = [];
+    for (var i = 0; i < n; i++) order.push(i);
+    if (n > SAT_GIF_MAX_FRAMES) {
+      var pick = [];
+      for (var k = 0; k < SAT_GIF_MAX_FRAMES; k++) {
+        pick.push(order[Math.round(k * (n - 1) /
+          (SAT_GIF_MAX_FRAMES - 1))]);
+      }
+      order = pick;
+    }
+    var wasPlaying = sat.playing;
+    satPause();
+    satGifBusy = true;
+    btn.disabled = true;
+    satGifProgress(0);
+    var rgbaFrames = [];
+    var idx = 0;
+    var delayCs = Math.max(2, Math.round(satFrameMs() / 10));
+    function step() {
+      if (idx >= order.length) { finish(); return; }
+      var data = satFrameToCanvas(order[idx], cw, ch);
+      if (data) rgbaFrames.push(data);
+      idx++;
+      satGifProgress(idx / order.length * 0.85);
+      (window.requestAnimationFrame || setTimeout)(step);
+    }
+    function finish() {
+      try {
+        var blob = gifEncode(rgbaFrames, cw, ch, delayCs);
+        satGifProgress(1);
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        var stamp = (sat.frames[sat.idx] &&
+          sat.frames[sat.idx].t || "").replace(/[^0-9]/g, "").slice(0, 12);
+        a.href = url;
+        a.download = "cyclolab_" + (SID || "storm") + "_" +
+          (sat.band || "sat") + "_" + (stamp || "loop") + ".gif";
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      } catch (e) {
+        try { console.warn("[cyclolab] GIF export failed:", e); }
+        catch (e2) {}
+      }
+      satGifBusy = false;
+      btn.disabled = false;
+      setTimeout(function () { satGifProgress(null); }, 1200);
+      if (wasPlaying) satTogglePlay();
+    }
+    step();
+  }
+
   function initSatellite() {
     satStatus(true, "Loading\u2026");
     // PER-SOURCE isolation (adversarial-review find): one source's
@@ -2755,9 +3017,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         return;
       }
       satSelectBand(slugs.indexOf("ir") >= 0 ? "ir" : slugs[0], false);
+      satBuildSpeed();
       satEl("step-back").addEventListener("click", function () { satStep(-1); });
       satEl("step-fwd").addEventListener("click", function () { satStep(1); });
       satEl("play").addEventListener("click", satTogglePlay);
+      satEl("gif").addEventListener("click", satExportGif);
       satEl("scrub").addEventListener("input", function () {
         satPause(); satShow(Number(this.value));
       });
@@ -2771,6 +3035,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         else if (e.key === "ArrowRight") { satStep(1); e.preventDefault(); }
         else if (e.key === " " || e.key === "Spacebar") {
           satTogglePlay(); e.preventDefault();
+        } else if (e.key === "+" || e.key === "=") {
+          satNudgeSpeed(1); e.preventDefault();
+        } else if (e.key === "-" || e.key === "_") {
+          satNudgeSpeed(-1); e.preventDefault();
         }
       });
     }).catch(function () {
@@ -2797,8 +3065,13 @@ HTML_TEMPLATE = r"""<!doctype html>
                                 return f.key; }),
                               playing: sat.playing,
                               mode: sat.mode,
+                              speed: sat.speed,
+                              gifBusy: satGifBusy,
                               presented: sat.presented.slice() };
                    },
+                   satSetSpeed: function (m) { satSetSpeed(m); },
+                   satExportGif: function () { return satExportGif(); },
+                   gifEncode: gifEncode,
                    hafsViewer: function () { return hafsViewer; } };
 })();
 </script>
