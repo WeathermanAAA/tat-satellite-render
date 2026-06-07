@@ -623,6 +623,7 @@ class TestConeCasingRidesTheFront(unittest.TestCase):
           return {x: r.x, y: r.y, width: r.width, height: r.height};
         }""")
         shot = Path(td) / f"casing_{engine}.png"
+        checked = 0
         for f in self.FRACS:
             seek = pg.evaluate(
                 "f => window.__lab.cone().seek(f)", f)
@@ -634,11 +635,18 @@ class TestConeCasingRidesTheFront(unittest.TestCase):
             cov, n = casing_coverage(im, exclude=tip)
             if n < 60:
                 continue        # barely-grown frames: nothing to walk
+            checked += 1
             self.assertGreaterEqual(
                 cov, self.MIN_COV,
                 f"{engine} f={f}: only {cov:.1%} of {n} revealed-"
                 f"boundary samples have casing ink within 9px - the "
                 f"revealed region does not look finished")
+        # the skip guard must not have eaten the test: most frames
+        # carry a walkable boundary on a real cone.
+        self.assertGreaterEqual(
+            checked, 7,
+            f"{engine}: only {checked}/10 frames had a walkable "
+            f"boundary - the probe is not seeing the reveal")
         # the settle frame: one complete closed loop, no exclusions
         pg.evaluate("window.__lab.cone().settle()")
         pg.wait_for_timeout(80)
