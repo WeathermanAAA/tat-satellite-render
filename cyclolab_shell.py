@@ -830,7 +830,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <button type="button" class="hafs-seg"
                   data-prod="tcd">Discussion</button>
         </div>
-        <pre id="advtext" class="advtext"></pre>
+        <pre id="advtext" class="advtext">(advisory text loads with the next data poll)</pre>
       </div>
     </div></section>
   </main>
@@ -1337,7 +1337,14 @@ HTML_TEMPLATE = r"""<!doctype html>
           ") — not an official JTWC product. Method: " +
           (adv.method || "derived") + ".";
     }
-    if (changed && lastStorm) renderTrack(lastStorm);
+    // isolated like renderAdvTab (final-gate #3): a bad cone payload
+    // in one renderer never blocks the other surfaces
+    if (changed && lastStorm) {
+      try { renderTrack(lastStorm); } catch (e) {
+        try { console.warn("[cyclolab] track render failed:", e); }
+        catch (e2) {}
+      }
+    }
     if (changed && inited.advisories) renderAdvTab();
   }
 
@@ -1578,11 +1585,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     var CAPV = 5;                       // leading-edge cap vertices
     function polyAt(d) {
-      // corridor polygon: left chain forward, cap arc whose TIP is at
-      // the front distance d, right chain back. Beyond-front samples
-      // collapse onto the cap shoulders so interpolation unfolds them.
+      // corridor polygon: left chain forward, leading-edge cap, right
+      // chain back. THE CAP'S MAXIMUM FORWARD EXTENT IS EXACTLY d -
+      // shoulders sit BEHIND at d - 0.45w and the arc rises to the tip
+      // at d. (The first cut bulged the tip 0.55w BEYOND d; the
+      // high-contrast 1.8px boundary line painting inside that bulge
+      // read as an outline ghosting ahead of the pops - the final-gate
+      // bug. Now ink and pops share one front.) Beyond-front samples
+      // collapse onto the shoulders so interpolation unfolds them.
       var w = halfAt(d);
-      var f = pointAt(d);
+      var back = 0.45 * w;
+      var f = pointAt(Math.max(0, d - back));   // shoulder base
+      var ft = pointAt(d);                       // the tip - AT d
       var shL = [f.x + f.nx * w, f.y + f.ny * w];
       var shR = [f.x - f.nx * w, f.y - f.ny * w];
       var L = [], R = [];
@@ -1602,11 +1616,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       var cap = [];
       for (var cv = 0; cv < CAPV; cv++) {
         var th = Math.PI * (cv + 1) / (CAPV + 1);
-        // arc from the LEFT shoulder over the tip (at distance d) to
-        // the RIGHT shoulder: tip bulge capped at 0.55w forward
-        var fwd = Math.sin(th) * w * 0.55;
+        // ellipse arc from the LEFT shoulder rising to the TIP AT d,
+        // back down to the RIGHT shoulder - never past d
+        var fwd = Math.sin(th) * back;
         var lat2 = Math.cos(th) * w;
-        // forward direction = track tangent at d
         var tx = f.ny, ty = -f.nx;      // (nx,ny) rotated -90 = tangent
         cap.push((f.x + f.nx * lat2 + tx * fwd).toFixed(1) + " " +
                  (f.y + f.ny * lat2 + ty * fwd).toFixed(1));
@@ -2101,9 +2114,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderAdvText();
     });
   function renderAdvTab() {
-    renderAdvCone();
-    renderIntensity();
-    renderAdvText();
+    // ISOLATED (final-gate #3): a throw in any one renderer must never
+    // starve the others - the user-visible failure was the advisory
+    // text staying blank because renderAdvCone ran first in this chain.
+    var fns = [renderAdvCone, renderIntensity, renderAdvText];
+    for (var i = 0; i < fns.length; i++) {
+      try { fns[i](); } catch (e) {
+        try { console.warn("[cyclolab] adv renderer failed:", e); }
+        catch (e2) {}
+      }
+    }
   }
 
   // ---- Stage 3: Models mount (componentized /models/ HafsViewer) ----------

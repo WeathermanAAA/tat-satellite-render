@@ -830,6 +830,36 @@ class TestStage4Advisories(unittest.TestCase):
                       p["y"] <= wm["y"] <= p["y"] + p["h"])
             self.assertFalse(inside, "watermark sits on a placard")
 
+    def test_live_payload_renders_nonempty_text_both_products(self):
+        # FINAL-GATE #3: against the FROZEN LIVE payload (Amanda adv 17
+        # exactly as served from R2), both advisory-text products must
+        # render non-empty.
+        import json as _json
+        from pathlib import Path as _P
+        live = _json.loads((_P(__file__).parent / "fixtures" / "cyclolab"
+                            / "live_adv_ep17.json").read_text())
+        recs = self._run([{"op": "openSec", "name": "advisories"},
+                          {"op": "clickAdvTextTab", "prod": "tcd"}],
+                         adv=live)
+        mid = recs[-2]["state"]["stage3"]["adv"]["advText"]
+        end = recs[-1]["state"]["stage3"]["adv"]["advText"]
+        self.assertGreater(len(mid), 500, "tcp rendered empty")
+        self.assertIn("BULLETIN", mid)
+        self.assertGreater(len(end), 500, "tcd rendered empty")
+        self.assertNotEqual(mid, end, "tcd chip did not switch products")
+
+    def test_cone_failure_never_starves_the_text_panel(self):
+        # FINAL-GATE #3 isolation: a poisoned cone ring makes
+        # renderAdvCone throw - the advisory text must STILL render.
+        # (Negative-controlled: pre-fix, renderAdvTab chained the three
+        # renderers unguarded and this assertion fails.)
+        adv = self._adv()
+        adv["cone"] = adv["cone"][:3] + [None] + adv["cone"][4:]
+        recs = self._run([{"op": "openSec", "name": "advisories"}], adv=adv)
+        txt = recs[-1]["state"]["stage3"]["adv"]["advText"]
+        self.assertGreater(len(txt), 10,
+                           "text starved by the cone renderer's throw")
+
     def test_official_cone_copy(self):
         recs = self._run([{"op": "openSec", "name": "advisories"}])
         a = recs[-1]["state"]["stage3"]["adv"]
