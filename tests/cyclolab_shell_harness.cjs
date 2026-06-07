@@ -311,6 +311,7 @@ const scheduledDelays = [];
           h: parseFloat(g.getAttribute("data-h")),
           gap: parseFloat(g.getAttribute("data-gap")),
           iconr: parseFloat(g.getAttribute("data-iconr")),
+          label: (g.querySelector("text") || {}).textContent || "",
         })) : [],
       // final-gate-3 #1: leader lines are GONE. The probe stays so the
       // invariant ("zero leader lines ever") is directly assertable.
@@ -409,6 +410,31 @@ const scheduledDelays = [];
         const el = document.getElementById("odo-cat");
         return el ? el.textContent : null;
       })(),
+      // final-gate-3 #3: wind-unit display surfaces
+      windUnits: (window.__lab && window.__lab.windUnits)
+        ? window.__lab.windUnits() : null,
+      vmaxText: text("odo-vmax"),
+      vmaxUnit: text("vmax-unit"),
+      moveText: text("odo-move"),
+      chartLabel: (function () {
+        const c = document.getElementById("chart");
+        if (!c) return "";
+        const t = Array.prototype.find.call(
+          c.querySelectorAll("text"),
+          (x) => /wind/.test(x.textContent || ""));
+        return t ? t.textContent : "";
+      })(),
+      settingsUnits: (function () {
+        const h = document.getElementById("settings-units");
+        if (!h) return null;
+        return Array.prototype.map.call(h.children, function (b) {
+          return { unit: b.getAttribute("data-unit"),
+                   checked: b.getAttribute("aria-checked") === "true" }; });
+      })(),
+      settingsOpen: (function () {
+        const p = document.getElementById("settings-pop");
+        return !!(p && !p.hidden);
+      })(),
       bannerClasses: bannerClasses(),
       hero: (() => {
         const img = document.getElementById("sst-hero-img");
@@ -473,6 +499,20 @@ const scheduledDelays = [];
       const btn = host && Array.prototype.find.call(
         host.children, (b) => b.getAttribute("data-slug") === op.slug);
       if (btn) btn.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
+    } else if (op.op === "setWindUnits") {
+      // final-gate-3 #3: change the display wind unit.
+      if (window.__lab && window.__lab.setWindUnits)
+        window.__lab.setWindUnits(op.unit);
+    } else if (op.op === "openSettings") {
+      var sb = document.getElementById("settings-btn");
+      if (sb) sb.dispatchEvent(
+        new dom.window.Event("click", { bubbles: true }));
+    } else if (op.op === "clickSettingsUnit") {
+      var sh = document.getElementById("settings-units");
+      var ub = sh && Array.prototype.find.call(sh.children,
+        function (b) { return b.getAttribute("data-unit") === op.unit; });
+      if (ub) ub.dispatchEvent(
         new dom.window.Event("click", { bubbles: true }));
     } else if (op.op === "clickSatSpeed") {
       // final-gate-3 #5: click a speed preset by multiplier.

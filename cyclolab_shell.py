@@ -414,6 +414,37 @@ HTML_TEMPLATE = r"""<!doctype html>
     white-space: nowrap; }
   .hafs-btn:hover { border-color: var(--cat-accent); color: var(--cat-accent); }
   .hafs-play { min-width: 86px; }
+  /* in-app settings (final-gate-3 #3) */
+  .settings-btn { position: absolute; top: 12px; right: 12px;
+    width: 32px; height: 32px; display: flex; align-items: center;
+    justify-content: center; border-radius: 8px; cursor: pointer;
+    background: rgba(0,0,0,0.22); color: #fff; border: 0;
+    transition: background 0.15s; }
+  .settings-btn:hover { background: rgba(0,0,0,0.40); }
+  .settings-pop { position: fixed; inset: 0; z-index: 60;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 12vh; background: rgba(4,8,14,0.55); }
+  .settings-pop[hidden] { display: none; }
+  .settings-card { width: min(360px, calc(100vw - 32px));
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px 20px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.5); }
+  .settings-head { font-size: 12px; font-weight: 800; letter-spacing: 1.4px;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 14px; }
+  .settings-row { display: flex; flex-direction: column; gap: 8px; }
+  .settings-lbl { font-size: 13px; font-weight: 700; color: var(--fg); }
+  .seg-units { display: flex; gap: 0; }
+  .seg-units button { flex: 1 1 0; background: var(--bg); color: var(--muted);
+    border: 1px solid var(--border); padding: 9px 0; font: inherit;
+    font-size: 13px; font-weight: 700; cursor: pointer; }
+  .seg-units button:first-child { border-radius: 8px 0 0 8px; }
+  .seg-units button:last-child { border-radius: 0 8px 8px 0;
+    border-left: 0; }
+  .seg-units button:not(:first-child):not(:last-child) { border-left: 0; }
+  .seg-units button[aria-checked="true"] { background: var(--cat-accent);
+    color: var(--cat-ink); border-color: var(--cat-accent); }
+  .settings-note { margin: 14px 0 0; font-size: 11.5px; line-height: 1.5;
+    color: var(--muted); }
   /* satellite speed + GIF export tools (final-gate-3 #5) */
   .sat-tools { align-items: flex-end; padding-top: 2px; }
   .sat-gif { align-self: flex-end; }
@@ -709,11 +740,22 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="storm-name" id="storm-name">__NAME__</div>
         <span class="chip" id="chip"__CHIP_STYLE__>__CHIP__</span>
       </div>
+      <button type="button" id="settings-btn" class="settings-btn"
+              title="Settings" aria-label="Settings"
+              aria-haspopup="dialog" aria-expanded="false">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8zm0
+            2a2 2 0 110 4 2 2 0 010-4zm8.4 2c0-.5 0-1-.1-1.5l2-1.6-2-3.4-2.4
+            1a7.6 7.6 0 00-1.3-.8l-.4-2.6H9.8l-.4 2.6c-.5.2-.9.5-1.3.8l-2.4-1-2
+            3.4 2 1.6c-.1.5-.1 1-.1 1.5s0 1 .1 1.5l-2 1.6 2 3.4 2.4-1c.4.3.8.6
+            1.3.8l.4 2.6h4.4l.4-2.6c.5-.2.9-.5 1.3-.8l2.4 1 2-3.4-2-1.6c.1-.5.1-1
+            .1-1.5z"/></svg>
+      </button>
     </div>
     <div class="bug-body">
       <div class="heroes">
         <div class="hero">
-          <span class="hero-val"><span class="odo" id="odo-vmax" aria-label="__VMAX_A11Y__">__VMAX_ODO__</span><span class="unit">kt</span></span>
+          <span class="hero-val"><span class="odo" id="odo-vmax" aria-label="__VMAX_A11Y__">__VMAX_ODO__</span><span class="unit" id="vmax-unit">kt</span></span>
           <span class="hero-cap">Max wind</span>
         </div>
         <div class="hero-div"></div>
@@ -901,6 +943,22 @@ HTML_TEMPLATE = r"""<!doctype html>
   </main>
 </div>
 
+<!-- in-app settings (final-gate-3 #3): reopen the wind-unit choice from
+     the gear; an extensible dialog, units are its first control. -->
+<div class="settings-pop" id="settings-pop" hidden role="dialog"
+     aria-label="CycloLab settings" aria-modal="false">
+  <div class="settings-card">
+    <div class="settings-head">Settings</div>
+    <div class="settings-row">
+      <div class="settings-lbl">Wind units</div>
+      <div class="seg-units" id="settings-units" role="radiogroup"
+           aria-label="Wind units"></div>
+    </div>
+    <p class="settings-note">Display only. Agency forecasts are issued in
+      knots; other units are converted here.</p>
+  </div>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -952,6 +1010,117 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   var reduced = window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---- display settings (final-gate-3 #3): WIND UNITS ---------------------
+  // DISPLAY-ONLY conversion - the canonical feeds stay in knots; agency
+  // forecasts ARE issued in knots (the methodology panels say so). The
+  // setting is read on boot from ?units= (the launch dialog's hand-off)
+  // or localStorage, persisted, and changeable from the in-app gear.
+  // Extensible: the framework is a settings object, units are its first
+  // member.
+  var WIND_UNITS = {
+    kt:  { label: "kt",   conv: function (kt) { return kt; } },
+    mph: { label: "mph",  conv: function (kt) { return kt * 1.1507794; } },
+    kmh: { label: "km/h", conv: function (kt) { return kt * 1.852; } }
+  };
+  var SETTINGS_KEY = "cyclolab:settings";
+  var settings = { windUnits: "kt" };
+  function loadSettings() {
+    var s = {};
+    try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {}; }
+    catch (e) { s = {}; }
+    // a ?units= launch param (from the pre-launch dialog) wins for THIS
+    // load and is then persisted as the remembered choice.
+    var q = null;
+    try { q = new URLSearchParams(location.search).get("units"); }
+    catch (e2) { q = null; }
+    var u = (q && WIND_UNITS[q]) ? q
+          : (WIND_UNITS[s.windUnits] ? s.windUnits : "kt");
+    settings.windUnits = u;
+    if (q) saveSettings();
+  }
+  function saveSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
+    catch (e) {}
+  }
+  function windUnitLabel() { return WIND_UNITS[settings.windUnits].label; }
+  function unitsSourceNote() {
+    // methodology honesty (final-gate-3 #3): agency forecasts ARE in
+    // knots; when the user views another unit, say the conversion is
+    // ours and display-only.
+    if (settings.windUnits === "kt") return "";
+    return " Agency forecasts are issued in knots; the " +
+      windUnitLabel() + " values shown here are a display-only " +
+      "conversion.";
+  }
+  function windNum(kt) {
+    if (kt == null || isNaN(kt)) return null;
+    return WIND_UNITS[settings.windUnits].conv(+kt);
+  }
+  function windDisp(kt) {            // rounded display number (string)
+    var v = windNum(kt);
+    return v == null ? "—" : String(Math.round(v));
+  }
+  function setWindUnits(u) {
+    if (!WIND_UNITS[u] || u === settings.windUnits) return;
+    settings.windUnits = u;
+    saveSettings();
+    rerenderUnits();
+    syncSettingsUI();
+  }
+  function rerenderUnits() {
+    // DISPLAY-ONLY: re-render every wind surface from the retained data.
+    // apply() refreshes the hero + vitals; the W&P chart and the
+    // advisories tab are gated on a NEW fix, so re-render them directly.
+    try { if (lastStorm) { apply(lastStorm); renderChart(lastStorm); } }
+    catch (e) {}
+    try { if (inited.advisories && advFull) renderAdvTab(); } catch (e2) {}
+  }
+  function syncSettingsUI() {
+    var host = document.getElementById("settings-units");
+    if (!host) return;
+    for (var i = 0; i < host.children.length; i++) {
+      var b = host.children[i];
+      b.setAttribute("aria-checked",
+        b.getAttribute("data-unit") === settings.windUnits
+          ? "true" : "false");
+    }
+  }
+  function buildSettingsUI() {
+    var host = document.getElementById("settings-units");
+    if (!host) return;
+    host.innerHTML = "";
+    ["kt", "mph", "kmh"].forEach(function (u) {
+      var b = document.createElement("button");
+      b.type = "button"; b.className = "seg-unit";
+      b.setAttribute("role", "radio");
+      b.setAttribute("data-unit", u);
+      b.textContent = WIND_UNITS[u].label;
+      b.addEventListener("click", function () {
+        setWindUnits(this.getAttribute("data-unit"));
+      });
+      host.appendChild(b);
+    });
+    syncSettingsUI();
+    var pop = document.getElementById("settings-pop");
+    var btn = document.getElementById("settings-btn");
+    function openSettings() {
+      pop.hidden = false; btn.setAttribute("aria-expanded", "true");
+    }
+    function closeSettings() {
+      pop.hidden = true; btn.setAttribute("aria-expanded", "false");
+    }
+    if (btn) btn.addEventListener("click", function () {
+      pop.hidden ? openSettings() : closeSettings();
+    });
+    if (pop) pop.addEventListener("click", function (e) {
+      if (e.target === pop) closeSettings();   // backdrop dismiss
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !pop.hidden) closeSettings();
+    });
+  }
+  loadSettings();
 
   // ---- loader -------------------------------------------------------------
   var loader = document.getElementById("loader");
@@ -1095,8 +1264,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       var dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
                   "S","SSW","SW","WSW","W","WNW","NW","NNW"];
       var brg = (Math.atan2(lonm, latm) * 180 / Math.PI + 360) % 360;
+      // forward speed rides the SAME display unit as wind (NHC TCPs give
+      // movement in mph; one unit choice everywhere).
       return dirs[Math.round(brg / 22.5) % 16] + " " +
-        Math.round(dist / dtH) + " kt";
+        windDisp(dist / dtH) + " " + windUnitLabel();
     }
     return "—";
   }
@@ -1332,7 +1503,8 @@ HTML_TEMPLATE = r"""<!doctype html>
           '" width="' + plotW + '" height="' + (y2 - y1).toFixed(1) +
           '" fill="' + SSHS[b[2]] + '" fill-opacity="0.38"/>');
       });
-    // canon threshold y-axis
+    // canon threshold y-axis (tick GEOMETRY stays in kt; the LABELS
+    // display in the chosen wind unit - final-gate-3 #3)
     [0, 35, 65, 85, 100, 115, 140, 160].forEach(function (v) {
       if (v > wMax) return;
       var y = Yw(v);
@@ -1340,8 +1512,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" x2="' + padL + '" y2="' + y.toFixed(1) +
         '" stroke="#3a4d6e" stroke-width="1"/>');
       parts.push('<text x="' + (padL - 9) + '" y="' + (y + 4).toFixed(1) +
-        '" text-anchor="end" font-size="12" fill="#8ea2bd">' + v +
-        "</text>");
+        '" text-anchor="end" font-size="12" fill="#8ea2bd">' +
+        windDisp(v) + "</text>");
     });
     // x labels (canon: 3 calendar ticks)
     var MN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
@@ -1387,8 +1559,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" r="4" fill="#0a1324" stroke="#ffffff" stroke-width="1.6"/>');
     });
     parts.push('<text x="' + padL + '" y="13" fill="#8ea2bd" ' +
-      'font-size="11">wind kt (solid) \u00b7 pressure mb (dashed, ' +
-      'right axis)</text>');
+      'font-size="11">wind ' + windUnitLabel() +
+      ' (solid) \u00b7 pressure mb (dashed, right axis)</text>');
     svg.innerHTML = parts.join("");
     if (!chartDrawn && !reduced) {
       var series = svg.querySelector("path.series");
@@ -1410,8 +1582,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     var pts = storm.points || [];
     var last = pts[pts.length - 1] || {};
     var fixKey = last.t || null;
-    odoSet(document.getElementById("odo-vmax"),
-           last.wind_kt != null ? String(Math.round(last.wind_kt)) : "—");
+    odoSet(document.getElementById("odo-vmax"), windDisp(last.wind_kt));
+    var vu = document.getElementById("vmax-unit");
+    if (vu) vu.textContent = windUnitLabel();
     odoSet(document.getElementById("odo-mslp"),
            last.pressure_mb != null ? String(Math.round(last.pressure_mb)) : "—");
     odoSet(document.getElementById("odo-ace"),
@@ -1496,6 +1669,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   buildVitals();
+  buildSettingsUI();
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   // ENDED pages used to skip the fetch entirely, which left advFull
@@ -2031,8 +2205,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       var pl = placards[i];
       var pillGrad = "url(#pillg-" + (tropical ? cat : "NEUTRAL") + ")";
       var label = (i === 0)
-        ? "NOW \u00b7 " + Math.round(p.intensity_kt || 0) + "kt"
-        : "+" + tau + "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt";
+        ? "NOW \u00b7 " + windDisp(p.intensity_kt || 0) + windUnitLabel()
+        : "+" + tau + "h \u00b7 " + windDisp(p.intensity_kt || 0) +
+          windUnitLabel();
       var pw2 = pl.rect.w, ph2 = pl.rect.h;
       parts.push('<g data-role="placard" data-i="' + i +
         '" data-gap="' + pl.gap.toFixed(1) +
@@ -2209,7 +2384,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         (advFull.method || "derived") + ".") +
       (anyNonTropical ? " White icons = forecast non-tropical." : "");
     document.getElementById("advcone-method-body").textContent =
-      official ? NHC_METHOD_COPY : WP_METHOD_COPY;
+      (official ? NHC_METHOD_COPY : WP_METHOD_COPY) + unitsSourceNote();
   }
 
   // (§8.6) THE INTENSITY CONE: forecast-VMAX center line + published-
@@ -2305,12 +2480,16 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" text-anchor="middle" font-size="11.5" fill="#8b95a5">+' +
         Math.round(r.tau) + "h</text>");
     });
+    // y-axis: tick GEOMETRY in kt, LABELS in the chosen unit (#3)
     [0, 25, 50, 75, 100, 125, 150].forEach(function (k) {
       if (k > kMax) return;
       parts.push('<text x="' + (padL - 8) + '" y="' +
         (Yk(k) + 4).toFixed(1) + '" text-anchor="end" font-size="11" ' +
-        'fill="#8b95a5">' + k + "</text>");
+        'fill="#8b95a5">' + windDisp(k) + "</text>");
     });
+    parts.push('<text x="' + (padL - 8) + '" y="' + (padT + 2) +
+      '" text-anchor="end" font-size="10.5" fill="#5b6677">' +
+      windUnitLabel() + "</text>");
     // envelope (brand-toned translucent, never category-colored)
     var up = rows.map(function (r, i) {
       return (i ? "L" : "M") + Xt(r.tau).toFixed(1) + "," +
@@ -2352,7 +2531,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       "official advisory text." +
       (INTENSITY_ERR.staleness_note ? " " + INTENSITY_ERR.staleness_note
                                     : "") +
-      (INTENSITY_ERR.vintage_note ? " " + INTENSITY_ERR.vintage_note : "");
+      (INTENSITY_ERR.vintage_note ? " " + INTENSITY_ERR.vintage_note : "") +
+      unitsSourceNote();
     document.getElementById("intensity-method-body").textContent = body;
   }
 
@@ -3072,6 +3252,9 @@ HTML_TEMPLATE = r"""<!doctype html>
                    satSetSpeed: function (m) { satSetSpeed(m); },
                    satExportGif: function () { return satExportGif(); },
                    gifEncode: gifEncode,
+                   setWindUnits: function (u) { setWindUnits(u); },
+                   windUnits: function () { return settings.windUnits; },
+                   windDisp: function (kt) { return windDisp(kt); },
                    hafsViewer: function () { return hafsViewer; } };
 })();
 </script>

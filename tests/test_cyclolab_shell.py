@@ -524,6 +524,83 @@ class TestPlainTextStats(unittest.TestCase):
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
+class TestWindUnits(unittest.TestCase):
+    """final-gate-3 #3: DISPLAY-ONLY wind-unit conversion, applied
+    EVERYWHERE (hero, vitals movement, W&P axis label, cone placards),
+    persisted + reopenable; the canonical feed value stays in knots."""
+
+    def setUp(self):
+        self.storm = load_storm()          # synth vmax 120 kt
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.adv = json.loads(
+            (FIXTURE.parent / "live_adv_ep17.json").read_text())
+
+    def _run(self, ops):
+        return run_harness(self.html,
+                           {"feed": {"storms": [self.storm]},
+                            "adv": self.adv, "ops": ops})
+
+    def test_default_is_kt_and_hero_shows_knots(self):
+        st = self._run([{"op": "apply", "storm": self.storm}])[-1]["state"]
+        self.assertEqual(st["windUnits"], "kt")
+        self.assertEqual(st["vmaxText"], "120")
+        self.assertEqual(st["vmaxUnit"], "kt")
+        self.assertIn("wind kt", st["chartLabel"])
+
+    def test_switch_to_mph_converts_every_surface(self):
+        recs = self._run([{"op": "apply", "storm": self.storm},
+                          {"op": "openSec", "name": "advisories"},
+                          {"op": "setWindUnits", "unit": "mph"}])
+        st = recs[-1]["state"]
+        self.assertEqual(st["windUnits"], "mph")
+        # 120 kt -> 138 mph (1.15078)
+        self.assertEqual(st["vmaxText"], "138")
+        self.assertEqual(st["vmaxUnit"], "mph")
+        self.assertIn("wind mph", st["chartLabel"])
+        # cone placards carry the converted unit, never a bare "kt"
+        labels = [p["label"] for p in st["stage3"]["adv"]["conePlacards"]]
+        self.assertTrue(labels)
+        self.assertTrue(all("mph" in s for s in labels), labels)
+        self.assertFalse(any("kt" in s for s in labels), labels)
+
+    def test_kmh_conversion_is_correct(self):
+        recs = self._run([{"op": "apply", "storm": self._mk(100)},
+                          {"op": "setWindUnits", "unit": "kmh"}])
+        st = recs[-1]["state"]
+        # 100 kt -> 185 km/h (1.852)
+        self.assertEqual(st["vmaxText"], "185")
+        self.assertEqual(st["vmaxUnit"], "km/h")
+
+    def _mk(self, wind):
+        s = copy.deepcopy(self.storm)
+        s["points"] = [dict(self.storm["points"][-1], wind_kt=wind)]
+        return s
+
+    def test_settings_dialog_opens_and_switches(self):
+        recs = self._run([{"op": "apply", "storm": self.storm},
+                          {"op": "openSettings"},
+                          {"op": "clickSettingsUnit", "unit": "kmh"}])
+        opened = recs[-2]["state"]
+        switched = recs[-1]["state"]
+        self.assertTrue(opened["settingsOpen"])
+        self.assertEqual(switched["windUnits"], "kmh")
+        checked = [u["unit"] for u in switched["settingsUnits"]
+                   if u["checked"]]
+        self.assertEqual(checked, ["kmh"])
+
+    def test_feed_value_unchanged_display_only(self):
+        # the storm dict the page holds is never mutated by a unit switch
+        # - conversion is presentation. (vmax baked from the kt feed; a
+        # switch only changes what's DISPLAYED.)
+        recs = self._run([{"op": "apply", "storm": self.storm},
+                          {"op": "setWindUnits", "unit": "mph"},
+                          {"op": "setWindUnits", "unit": "kt"}])
+        st = recs[-1]["state"]
+        self.assertEqual(st["vmaxText"], "120")   # back to the kt value
+        self.assertEqual(st["vmaxUnit"], "kt")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
 class TestEndedPage(unittest.TestCase):
     """The frozen ENDED page: visible strip, baked data, and NO poll timer."""
 
