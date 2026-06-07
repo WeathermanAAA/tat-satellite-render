@@ -854,6 +854,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   // Storm-window basemap (S4-AD1 #2): vendored Natural Earth land,
   // clipped + antimeridian-normalized at bake time. No runtime fetch.
   var BASEMAP = __BASEMAP__;
+  // Python-derived category ramp tokens (THE approved gloss recipe -
+  // same edge/mid/accent stops as the banner ramps and LIVE STATUS
+  // chrome; one canon, baked not re-derived).
+  var CAT_TOKENS = __CAT_TOKENS__;
   var SITE_BASE = "https://triple-a-tropics.com";
   var POLL_MS = 60000;
   var SSHS = __SSHS_JSON__;
@@ -1665,7 +1669,24 @@ HTML_TEMPLATE = r"""<!doctype html>
       return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," +
         Y(p.lat).toFixed(1);
     }).join(" ");
-    parts.push('<defs><clipPath id="ac-reveal-clip" ' +
+    // pill ramp gradients (final-gate #5): THE banner/LIVE-STATUS
+    // chrome recipe (edge 0/mid 22/accent 50/mid 78/edge 100) as SVG
+    // gradients - the pill is ONE rounded rect FILLED by the ramp, so
+    // the sheen is clipped to the pill geometry by construction (the
+    // old half-height overlay rect bulged past the corner radius).
+    var gdefs = "";
+    Object.keys(CAT_TOKENS).forEach(function (k) {
+      var c = CAT_TOKENS[k];
+      gdefs += '<linearGradient id="pillg-' + k +
+        '" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="' + c.edge + '"/>' +
+        '<stop offset="22%" stop-color="' + c.mid + '"/>' +
+        '<stop offset="50%" stop-color="' + c.accent + '"/>' +
+        '<stop offset="78%" stop-color="' + c.mid + '"/>' +
+        '<stop offset="100%" stop-color="' + c.edge + '"/>' +
+        "</linearGradient>";
+    });
+    parts.push('<defs>' + gdefs + '<clipPath id="ac-reveal-clip" ' +
       'clipPathUnits="userSpaceOnUse">' +
       '<path class="ac-reveal-path" d=""/></clipPath></defs>');
     parts.push('<g class="ac-conegrp" clip-path="url(#ac-reveal-clip)">' +
@@ -1796,7 +1817,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         "</g>");
       // placard (skip none - NOW gets one too), with leader if pushed
       var pl = placards[i];
-      var chipFill = tropical ? col : "#8b95a5";
+      var pillGrad = "url(#pillg-" + (tropical ? cat : "NEUTRAL") + ")";
       var label = (i === 0)
         ? "NOW \u00b7 " + Math.round(p.intensity_kt || 0) + "kt"
         : "+" + tau + "h \u00b7 " + Math.round(p.intensity_kt || 0) + "kt";
@@ -1813,14 +1834,15 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" transform="translate(' + pl.rect.x.toFixed(1) +
         " " + pl.rect.y.toFixed(1) + ')">' +
         '<rect width="' + pw2 + '" height="' + ph2 + '" rx="' +
-        (ph2 / 2) + '" fill="' + chipFill +
-        '" fill-opacity="0.92" stroke="rgba(0,0,0,0.3)"/>' +
-        '<rect width="' + pw2 + '" height="' + (ph2 / 2) + '" rx="' +
-        (ph2 / 2) + '" fill="#ffffff" fill-opacity="0.18"/>' +
+        (ph2 / 2) + '" fill="' + pillGrad +
+        '" stroke="rgba(0,0,0,0.3)"/>' +
         '<text x="' + (pw2 / 2) + '" y="' + (ph2 - 7) +
         '" text-anchor="middle" font-size="' + (i === 0 ? 13.5 : 12.5) +
         '" font-weight="' + (i === 0 ? 800 : 700) +
-        '" fill="#0b0e13">' + label + "</text></g>");
+        // canon ink rule: ALWAYS light on the category ramps (same
+        // stroke treatment as the icon SS labels)
+        '" fill="#ffffff" stroke="rgba(0,0,0,0.4)" stroke-width="0.8" ' +
+        'paint-order="stroke">' + label + "</text></g>");
       parts.push("</g>");
     });
 
@@ -2437,6 +2459,13 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__OG_IMAGE__",
                      ('\n<meta property="og:image" content="' +
                       _esc(og_image_url) + '">') if og_image_url else "")
+            .replace("__CAT_TOKENS__", json.dumps(
+                {**{k: {kk: v[kk] for kk in ("edge", "mid", "accent")}
+                    for k, v in CAT_TOKENS.items()},
+                 "NEUTRAL": {"edge": _shade("#8b95a5", 0.30),
+                             "mid": _shade("#8b95a5", 0.62),
+                             "accent": "#8b95a5"}},
+                separators=(",", ":")))
             .replace("__BASEMAP__",
                      json.dumps(basemap_for(
                          float(last.get("lat") or 15.0),
