@@ -678,19 +678,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   .ac-graticule .grat-lab { fill: #e7eef9; font-size: 12.5px;
     font-variant-numeric: tabular-nums; paint-order: stroke;
     stroke: rgba(8,14,26,0.82); stroke-width: 2.6; stroke-linejoin: round; }
-  .ac-ocean { fill: rgba(202,217,240,0.14); font-size: 17px;
-    font-weight: 700; letter-spacing: 4.5px; }
-  /* subtle dark backing so the white head always reads clean over any
-     swath fill / track ring that bleeds into the lockup corner (one canon,
-     both overview plots). Matches the dark-on-ocean read the cone gets. */
-  .ac-title-bg { fill: rgba(8,13,22,0.74); stroke: rgba(44,58,82,0.5);
-    stroke-width: 1; }
-  .ac-title .ac-eyebrow { fill: #8fa2bd; font-size: 11.5px;
-    font-weight: 700; letter-spacing: 1.6px; }
-  .ac-title .ac-head { fill: #ffffff; font-size: 21px;
-    font-weight: 800; letter-spacing: 0.6px; }
-  .ac-title .ac-sub { fill: #b9c6da; font-size: 13px;
-    font-weight: 700; letter-spacing: 1.1px; }
+  /* (.ac-ocean watermark + .ac-title SVG lockup retired R2/R5 - the cone +
+     track/swath titles are HTML overlays: .adv-lockup / .map-lockup.) */
   /* maps-pass R4 #1: the cone SVG COVERS its definite-height stage (slice),
      full-bleed; the intensity chart keeps its natural aspect (meet). */
   #advcone { display: block; width: 100%; height: 100%; }
@@ -723,8 +712,8 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   /* ---- Overview plots (FG-R3 #7 track history + #8 wind swath): two
      art-directed client-side panels that REUSE the cone's map furniture
-     (.ac-ocean-fill / .ac-land / .ac-graticule / .ac-frame / .ac-title /
-     .ac-ocean) and add panel-specific chrome. Neon must POP on the dark
+     (.ac-ocean-fill / .ac-land / .ac-graticule / .ac-coast / .ac-border /
+     .ac-frame) and add panel-specific chrome. Neon must POP on the dark
      ocean - the track dots are a continuous ramp, not the 7 SSHS hues. */
   .tp-track { fill: none; stroke: rgba(150,180,220,0.42);
     stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
@@ -734,22 +723,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   .tp-cbar-tick { fill: #8ea2bd; font-size: 11px;
     font-variant-numeric: tabular-nums; }
   .tp-cbar-frame { fill: none; stroke: #3a4d6e; stroke-width: 1; }
-  .tp-legend-bg { fill: rgba(10,16,25,0.82); stroke: #2c3a52;
-    stroke-width: 1; }
-  .tp-legend-t { fill: #cdd9ea; font-size: 12px;
-    font-variant-numeric: tabular-nums; }
-  .tp-legend-h { fill: #8fa2bd; font-size: 10px; font-weight: 700;
-    letter-spacing: 1px; }
-  .tp-legend-k { fill: #b9c6da; font-size: 10.5px; }
   .tp-field-lbl { font-size: 11px; font-weight: 700;
     font-variant-numeric: tabular-nums; paint-order: stroke;
     stroke: rgba(6,11,20,0.92); stroke-width: 2.6px;
     stroke-linejoin: round; }
-  .tp-field-key-h { fill: #8fa2bd; font-size: 10px; font-weight: 700;
-    letter-spacing: 1px; }
-  .tp-field-key { font-size: 12px; font-weight: 700;
-    font-variant-numeric: tabular-nums; }
-  .tp-field-key-u { fill: #8ea2bd; font-size: 11px; }
   .tp-radii-lab { fill: #aebdd4; font-size: 11px; font-weight: 600; }
   .sw-caption-d { display: inline-block; margin: 8px 0 0;
     font-size: 10.5px; font-weight: 700; letter-spacing: 0.8px;
@@ -1838,7 +1815,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   // FG-R3 #7/#8: the two Overview art-directed plots - track history +
   // wind-history swath. Both REUSE the cone's auto-fit projection math
   // (renderAdvCone ~line 1731) and the cone's map furniture (.ac-ocean-
-  // fill / .ac-land / .ac-graticule / .ac-frame / .ac-title / .ac-ocean),
+  // fill / .ac-land / .ac-graticule / .ac-coast / .ac-border),
   // but fit the projection to the OBSERVED-TRACK + RADII extent (not the
   // forecast cone). The helper math is COPIED, not shared (no cone state).
   // ======================================================================
@@ -2182,70 +2159,6 @@ HTML_TEMPLATE = r"""<!doctype html>
   // produced (FG-R3 #1: "the yellow halo is part of the problem").
   function tierGlow() { return tierHex("64"); }
 
-  // in-plot title lockup (mirror the cone's ac-title #5) at a top corner.
-  function titleLockup(pr, head) {
-    var stormName = (document.getElementById("storm-name") || {})
-      .textContent || "";
-    var typeWord = (document.getElementById("storm-type") || {})
-      .textContent || (document.getElementById("chip") || {})
-      .textContent || "";
-    var tx0 = 18, ty0 = 16, TIT_H = 70;
-    // the backing panel sizes to the WIDEST line of the lockup - EYEBROW
-    // INCLUDED (FG-R3 #3b: the eyebrow used to hang past the panel's right
-    // edge). These are char-width estimates; fitLockup() corrects the panel
-    // to the EXACT rendered width once it is in the DOM (the estimate is the
-    // jsdom/no-layout fallback, which never reaches a user).
-    var ebTxt = "TRIPLE-A-TROPICS · CycloLab";   // the eyebrow line
-    var subTxt = (typeWord.toUpperCase() + " " + stormName.toUpperCase());
-    var headW = head.length * 13.5 + 4;          // head    @ 21px/800
-    var subW = subTxt.length * 8.2 + 4;          // sub     @ 13px/700
-    var ebW = ebTxt.length * 8.9 + 4;            // eyebrow @ 11.5px/700 +ls
-    var bgW = Math.max(headW, subW, ebW, 160) + 22;
-    // SUBTLE DARK BACKING (one lockup canon): a faint rounded panel UNDER
-    // the eyebrow/head/sub so the white head always reads clean even when a
-    // swath fill or track ring bleeds into this corner - the same guarantee
-    // the cone gets from collision-placing its lockup over open ocean. The
-    // lockup is always emitted LAST by each renderer, so it is on top.
-    return '<g class="ac-title">' +
-      '<rect class="ac-title-bg" x="' + (tx0 - 13) + '" y="' + (ty0 - 4) +
-      '" width="' + bgW.toFixed(0) + '" height="' + (TIT_H + 8) +
-      '" rx="8"/>' +
-      '<rect x="' + (tx0 - 9.5) + '" y="' + ty0 +
-      '" width="3" height="' + TIT_H +
-      '" rx="1.5" fill="var(--ac-rail)"/>' +
-      '<text class="ac-eyebrow" x="' + tx0 + '" y="' + (ty0 + 14) +
-      '">' + ebTxt + '</text>' +
-      '<text class="ac-head" x="' + tx0 + '" y="' + (ty0 + 42) +
-      '">' + head + '</text>' +
-      '<text class="ac-sub" x="' + tx0 + '" y="' + (ty0 + 66) + '">' +
-      typeWord.toUpperCase() + " " + stormName.toUpperCase() +
-      "</text></g>";
-  }
-
-  // measure-and-fit (FG-R3 #3b): after the SVG is in the DOM, grow the
-  // lockup's backing panel so it CONTAINS every lockup line (eyebrow / head /
-  // sub) plus padding - exact rendered widths, not estimates. jsdom has no
-  // layout engine (getBBox throws), so the char-width estimate stands there;
-  // that path never reaches a user. Only ever grows the panel, never shrinks.
-  function fitLockup(svg) {
-    try {
-      var g = svg.querySelector(".ac-title");
-      if (!g) return;
-      var bg = g.querySelector(".ac-title-bg");
-      var texts = g.querySelectorAll("text");
-      if (!bg || !texts.length) return;
-      var bx = parseFloat(bg.getAttribute("x"));
-      var maxRight = 0;
-      for (var i = 0; i < texts.length; i++) {
-        var bb = texts[i].getBBox();         // throws under jsdom -> caught
-        maxRight = Math.max(maxRight, bb.x + bb.width);
-      }
-      var PAD = 13;
-      var needW = (maxRight + PAD) - bx;
-      var curW = parseFloat(bg.getAttribute("width")) || 0;
-      if (needW > curW) bg.setAttribute("width", needW.toFixed(0));
-    } catch (e) { /* no layout engine: the width estimate stands */ }
-  }
 
   // maps-pass R5: populate a track/swath HTML title overlay (the cone's
   // contained-box lockup treatment): eyebrow + panel head + storm-name sub,
@@ -2319,50 +2232,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     box.hidden = false;
   }
 
-  // ocean watermark, auto-placed in the emptiest open water that misses
-  // the track box (a light version of the cone's placement sweep).
-  function oceanWatermark(pr, avoidBox) {
-    var wmW = ((BASEMAP.ocean || "").length * 11) + 26, wmH = 24;
-    var W = pr.W, H = pr.H, best = null, bestScore = -1;
-    function landBoxes() {
-      return (BASEMAP.land || []).map(function (lr) {
-        var lx0 = Infinity, lx1 = -Infinity, ly0 = Infinity, ly1 = -Infinity;
-        for (var lv = 0; lv < lr.length; lv++) {
-          var lpx = pr.X(lr[lv][0]), lpy = pr.Y(lr[lv][1]);
-          lx0 = Math.min(lx0, lpx); lx1 = Math.max(lx1, lpx);
-          ly0 = Math.min(ly0, lpy); ly1 = Math.max(ly1, lpy);
-        }
-        return { x: lx0, y: ly0, w: lx1 - lx0, h: ly1 - ly0 };
-      });
-    }
-    function ov(a, b) {
-      var ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-      var oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
-      return ox > 0 && oy > 0;
-    }
-    var lbs = landBoxes();
-    for (var gy2 = 0.16; gy2 <= 0.9; gy2 += 0.1) {
-      for (var gx2 = 0.1; gx2 <= 0.9; gx2 += 0.11) {
-        var cxw = gx2 * W, cyw = gy2 * H;
-        var r3 = { x: cxw - wmW / 2, y: cyw - wmH / 2, w: wmW, h: wmH };
-        if (r3.x < 8 || r3.x + r3.w > W - 8 ||
-            r3.y < 64 || r3.y + r3.h > H - 30) continue;
-        var bad = avoidBox && ov(r3, avoidBox);
-        for (var lk = 0; lk < lbs.length && !bad; lk++) {
-          if (ov(r3, lbs[lk])) bad = true;
-        }
-        if (bad) continue;
-        var dxw = cxw - (avoidBox ? avoidBox.x + avoidBox.w / 2 : W / 2);
-        var dyw = cyw - (avoidBox ? avoidBox.y + avoidBox.h / 2 : H / 2);
-        var sc = dxw * dxw + dyw * dyw;
-        if (sc > bestScore) { bestScore = sc; best = { x: cxw, y: cyw }; }
-      }
-    }
-    if (!best) return "";
-    return '<text class="ac-ocean" x="' + best.x.toFixed(0) + '" y="' +
-      best.y.toFixed(0) + '" text-anchor="middle">' +
-      (BASEMAP.ocean || "") + "</text>";
-  }
 
   // four-quadrant wind-radii arcs around a center (NE/SE/SW/NW). radii =
   // [ne,se,sw,nw] in NAUTICAL MILES -> degrees lat = nm/60. Each quadrant
@@ -3564,11 +3433,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
     }
 
-    // ---- ocean watermark: RETIRED on the cone (maps-pass R2 #6). A
-    // panel-filling cone leaves no clean open water, and the coastlines +
-    // graticule already orient the viewer, so "PACIFIC OCEAN" gracefully
-    // drops here. (The track + swath plots keep their best-effort
-    // watermark via oceanWatermark - they show much more open water.)
+    // ---- ocean watermark: RETIRED (maps-pass R2 #6 on the cone, R5 on the
+    // track + swath). A panel-filling map leaves no clean open water, and the
+    // coastlines + graticule already orient the viewer, so "PACIFIC OCEAN"
+    // is dropped everywhere; the auto-placement sweep (oceanWatermark) is gone.
 
     // hairline frame: the map has edges (#2)
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
