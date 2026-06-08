@@ -1074,3 +1074,161 @@ class TestSettingsControlPlacement(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Satellite AUTO-REFRESH (the manifest re-poll): a new manifest frame must
+# appear within one poll WITHOUT a reload; scrub/pause state survives the
+# append; follow-live advances on newest; the inactive note shows on a stale
+# floater; an ENDED archive page never polls.
+# ---------------------------------------------------------------------------
+@unittest.skipUnless(HAVE_RENDERER, "playwright/Pillow unavailable")
+class TestSatelliteAutoRefresh(unittest.TestCase):
+    @classmethod
+    def _pngs(cls, n):
+        import io as _io
+
+        import numpy as np
+        rng = np.random.default_rng(7)
+        out = []
+        for _ in range(n):
+            arr = rng.integers(0, 255, (256, 256, 3), dtype=np.uint8)
+            buf = _io.BytesIO()
+            Image.fromarray(arr, "RGB").save(buf, "PNG")
+            out.append(buf.getvalue())
+        return out
+
+    @staticmethod
+    def _times(n, newest_age_min):
+        import datetime as dt
+        newest = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+            minutes=newest_age_min)
+        return [(newest - dt.timedelta(minutes=15 * (n - 1 - i)))
+                .strftime("%Y-%m-%dT%H:%M:%SZ") for i in range(n)]
+
+    def _route(self, pg, state, frames):
+        def handler(route):
+            path = route.request.url.split("?")[0]
+            hdrs = {"Access-Control-Allow-Origin": "*"}
+            n = state["n"]
+            times = state["times"]
+            if path.endswith("floaters/manifest.json"):
+                route.fulfill(json={"storms": [{"id": "ep082026",
+                              "manifest": "floaters/ep082026/manifest.json"}]},
+                              headers=hdrs)
+            elif path.endswith("/manifest.json"):
+                man = {"bands": {"ir": {"label": "IR", "frames": [
+                    {"t": times[i], "key": f"floaters/ep082026/ir/f{i:03d}.png"}
+                    for i in range(n)]}}}
+                route.fulfill(json=man, headers=hdrs)
+            elif path.endswith(".png"):
+                i = int(path.rsplit("/f", 1)[1][:3])
+                route.fulfill(body=frames[min(i, len(frames) - 1)],
+                              headers=hdrs, content_type="image/png")
+            else:
+                route.abort()
+        pg.route("https://cdn.triple-a-tropics.com/floaters/**", handler)
+
+    def _boot(self, p, total, shown, newest_age_min=2, ended=False):
+        """render + open the Satellite tab showing `shown` of `total` frames;
+        returns (browser, pg, state, frames)."""
+        storm = json.loads(FIXTURE.read_text())
+        html = cyclolab_shell.render_page(storm, feed_url=FEED_URL,
+                                          loader="", ended=ended)
+        frames = self._pngs(total)
+        state = {"n": shown, "times": self._times(total, newest_age_min)}
+        browser = p.chromium.launch()
+        td = tempfile.mkdtemp()
+        page_file = Path(td) / "page.html"
+        page_file.write_text(html, encoding="utf-8")
+        pg = browser.new_page(viewport={"width": 1100, "height": 760})
+        self._route(pg, state, frames)
+        pg.goto(f"file://{page_file}")
+        pg.wait_for_timeout(900)
+        pg.evaluate("window.__lab.openSec('satellite')")
+        pg.wait_for_timeout(1400)
+        return browser, pg, state, frames
+
+    def test_new_frame_appears_within_one_poll_no_reload(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b, pg, state, _ = self._boot(p, total=12, shown=8)
+            try:
+                st0 = pg.evaluate("window.__lab.satState()")
+                self.assertEqual(st0["frames"], 8)
+                # a new frame lands on the CDN; one poll picks it up.
+                state["n"] = 9
+                pg.evaluate("window.__lab.satPollNow()")
+                pg.wait_for_timeout(300)
+                st1 = pg.evaluate("window.__lab.satState()")
+                self.assertEqual(st1["frames"], 9,
+                                 "new manifest frame did not append on poll")
+                self.assertEqual(len(st1["frameKeys"]), 9)
+            finally:
+                b.close()
+
+    def test_follow_live_advances_when_on_newest(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b, pg, state, _ = self._boot(p, total=12, shown=8)
+            try:
+                # land on newest (default) + paused; a new frame -> advance.
+                st0 = pg.evaluate("window.__lab.satState()")
+                self.assertEqual(st0["idx"], 7)
+                state["n"] = 9
+                pg.evaluate("window.__lab.satPollNow()")
+                pg.wait_for_timeout(300)
+                st1 = pg.evaluate("window.__lab.satState()")
+                self.assertEqual(st1["frames"], 9)
+                self.assertEqual(st1["idx"], 8, "did not follow-live to newest")
+            finally:
+                b.close()
+
+    def test_scrub_state_survives_append(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b, pg, state, _ = self._boot(p, total=12, shown=8)
+            try:
+                # scrub back to an OLDER frame (paused); append must NOT jump.
+                pg.evaluate("window.__lab.satState && "
+                            "document.getElementById('sat-scrub')")
+                pg.eval_on_selector("#sat-scrub", "el => { el.value = '3'; "
+                                    "el.dispatchEvent(new Event('input')); }")
+                pg.wait_for_timeout(150)
+                self.assertEqual(pg.evaluate("window.__lab.satState()")["idx"], 3)
+                state["n"] = 10
+                pg.evaluate("window.__lab.satPollNow()")
+                pg.wait_for_timeout(300)
+                st = pg.evaluate("window.__lab.satState()")
+                self.assertEqual(st["frames"], 10, "frames did not extend")
+                self.assertEqual(st["idx"], 3,
+                                 "scrub position jumped on append")
+            finally:
+                b.close()
+
+    def test_inactive_note_when_floater_is_stale(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # newest frame is 3 h old -> floater inactive.
+            b, pg, _, _ = self._boot(p, total=8, shown=8, newest_age_min=180)
+            try:
+                st = pg.evaluate("window.__lab.satState()")
+                self.assertTrue(st["inactive"], "stale floater not flagged")
+                note = pg.eval_on_selector(
+                    "#sat-inactive", "el => ({hidden: el.hidden, "
+                    "text: el.textContent})")
+                self.assertFalse(note["hidden"])
+                self.assertIn("Floater inactive", note["text"])
+            finally:
+                b.close()
+
+    def test_ended_archive_never_polls(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b, pg, _, _ = self._boot(p, total=8, shown=8, ended=True)
+            try:
+                st = pg.evaluate("window.__lab.satState()")
+                self.assertFalse(st["polling"],
+                                 "ENDED archive page armed a manifest poll")
+            finally:
+                b.close()

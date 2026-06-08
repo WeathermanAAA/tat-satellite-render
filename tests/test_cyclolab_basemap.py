@@ -22,11 +22,37 @@ CASES = [("near-land", 11.2, -87.5, "EP"),
 
 
 class TestBasemapBake(unittest.TestCase):
-    def test_emits_coast_key(self):
+    def test_emits_coast_land_borders_keys(self):
         bm = cb.basemap_for(11.2, -87.5, "EP")
-        self.assertIn("coast", bm)
-        self.assertIn("land", bm)          # land STILL emitted (watermark)
-        self.assertIsInstance(bm["coast"], list)
+        for k in ("land", "coast", "borders"):
+            self.assertIn(k, bm)
+            self.assertIsInstance(bm[k], list)
+
+    def test_coast_vertices_are_a_subset_of_land(self):
+        # round-2 #2: the coast is DERIVED from the land-fill rings (minus the
+        # window-edge segments), so every coast vertex is a land vertex - the
+        # thick white coast can NEVER misalign with the fill into a sliver.
+        for nm, lat, lon, basin in CASES:
+            bm = cb.basemap_for(lat, lon, basin)
+            land = {tuple(p) for r in bm["land"] for p in r}
+            coast = {tuple(p) for r in bm["coast"] for p in r}
+            self.assertTrue(coast <= land,
+                            f"{nm}: {len(coast - land)} coast pts not in land")
+
+    def test_no_sliver_islands(self):
+        # round-2 #2: after the post-DP bbox/thin/area filters, no kept land
+        # ring is a near-collinear sliver (a white dash on the ocean).
+        bm = cb.basemap_for(11.2, -87.5, "EP")
+        for r in bm["land"]:
+            xs = [p[0] for p in r]
+            ys = [p[1] for p in r]
+            self.assertGreaterEqual(min(max(xs) - min(xs), max(ys) - min(ys)),
+                                    cb.THIN_DEG - 1e-9, "thin sliver kept")
+            area = abs(sum(r[k][0] * r[(k + 1) % len(r)][1] -
+                           r[(k + 1) % len(r)][0] * r[k][1]
+                           for k in range(len(r)))) * 0.5
+            self.assertGreaterEqual(area, cb.AREA_MIN - 1e-9,
+                                    "near-collinear sliver kept")
 
     def test_coast_lines_have_at_least_two_points(self):
         # coastlines are drawn as open polylines (M..L.., no trailing Z).
@@ -149,8 +175,29 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         self.assertIn('<path class="tp-track" d="\' + dline +\n', self.html)
 
     def test_now_icon_is_enlarged(self):
-        # the NOW glyph scale was 0.95; the maps-pass hero is 1.42.
-        self.assertIn("var scale = (i === 0 ? 1.42 : 0.42)", self.html)
+        # round-2 legibility: the NOW glyph DOMINATES the origin.
+        self.assertIn("var scale = (i === 0 ? 1.9 : 0.66)", self.html)
+
+    def test_country_borders_drawn_in_both_furniture_sites(self):
+        # round-2 #3: thin white internal borders (ne_10m boundary_lines),
+        # drawn in BOTH mapFurniture (track+swath) and the cone inline.
+        self.assertEqual(self.html.count('<path class="ac-border" d="'), 2)
+        self.assertIn(".ac-border { fill: none; stroke: rgba(255,255,255,0.72)",
+                      self.html)
+
+    def test_lockup_drops_redundant_forecast_cone_line(self):
+        # round-2 #5: the in-SVG lockup carries the storm name, NOT a second
+        # "FORECAST CONE" head (the panel <h3> is the canonical header), and
+        # it sits on a dark backing (.ac-title-bg) so it is never faint.
+        self.assertNotIn('">FORECAST CONE</text>', self.html)
+        self.assertIn("<h3>Forecast cone</h3>", self.html)
+        self.assertIn("var nameLine", self.html)
+
+    def test_reveal_is_arc_length_smoothed(self):
+        # round-2 #7: a Catmull-Rom spline densifies the track before the
+        # growth clip, so the front glides smoothly through curves.
+        self.assertIn("function catmullRom(", self.html)
+        self.assertIn("tpExt = catmullRom(tpExt, PER_SEG)", self.html)
 
 
 if __name__ == "__main__":

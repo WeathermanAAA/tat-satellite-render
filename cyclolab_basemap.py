@@ -23,15 +23,22 @@ import math
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# ne_10m maps-pass: country polygons -> land FILL (outer rings); the
-# separate coastline file -> WHITE coast stroke. Two layers so the land
-# fill can be stroke-free (no interior country borders) while the coast
-# is a clean true-coast white line.
+# ne_10m maps-pass (round 2): THREE consistent layers.
+#  * LAND = ne_10m_land, the PHYSICAL land-mass polygons -> light-gray fill.
+#    The coastline is derived from this same land, so fill + coast MATCH
+#    exactly (no dark unfilled islands with spiky outlines - the round-1 bug
+#    came from filling political admin_0, which drops/differs on small islands
+#    the physical coastline still drew).
+#  * COAST is DERIVED from the land rings (their boundary minus the window-
+#    edge clip segments) -> THICK white coast stroke that shares EXACT
+#    vertices with the fill (no separate-file misalignment slivers).
+#  * BORDER = ne_10m_admin_0_boundary_lines_land -> THIN white internal
+#    country borders (no coast duplication - boundary_lines exclude coast).
 LAND_PATH = HERE / "cyclolab_ne_10m_land.geojson"
-COAST_PATH = HERE / "cyclolab_ne_10m_coastline.geojson"
+BORDER_PATH = HERE / "cyclolab_ne_10m_borders.geojson"
 
 _LAND = None
-_COAST = None
+_BORDER = None
 
 OCEAN_NAMES = {"AL": "ATLANTIC OCEAN", "EP": "PACIFIC OCEAN",
                "CP": "PACIFIC OCEAN", "WP": "PACIFIC OCEAN"}
@@ -54,13 +61,14 @@ def _land_rings() -> list[list[list[float]]]:
     return _LAND
 
 
-def _coast_lines() -> list[list[list[float]]]:
-    """All coastline polylines as [[lon, lat], ...] OPEN lines (the
-    ne_10m_coastline features are LineString / MultiLineString - the
-    coords ARE the line, never indexed [0] like a polygon ring)."""
-    global _COAST
-    if _COAST is None:
-        gj = json.loads(COAST_PATH.read_text(encoding="utf-8"))
+def _border_lines() -> list[list[list[float]]]:
+    """Internal country border polylines (ne_10m_admin_0_boundary_lines_land,
+    coast EXCLUDED) as open [[lon, lat], ...] lines, drawn as a THIN white
+    stroke. (The COAST is derived from the land-fill rings - see _ring_coast -
+    so it always aligns with the fill; there is no separate coastline file.)"""
+    global _BORDER
+    if _BORDER is None:
+        gj = json.loads(BORDER_PATH.read_text(encoding="utf-8"))
         lines = []
         for f in gj["features"]:
             g = f["geometry"]
@@ -70,8 +78,8 @@ def _coast_lines() -> list[list[list[float]]]:
                 lines.append(g["coordinates"])
             elif g["type"] == "MultiLineString":
                 lines.extend(g["coordinates"])
-        _COAST = lines
-    return _COAST
+        _BORDER = lines
+    return _BORDER
 
 
 def _clip_ring(ring, lo0, la0, lo1, la1):
@@ -173,6 +181,44 @@ def _clip_polyline(line, lo0, la0, lo1, la1):
     return runs
 
 
+def _ring_coast(ring, lo0, la0, lo1, la1):
+    """Derive coast polylines from a CLIPPED land-fill ring, EXCLUDING the
+    segments that lie on the window box edge (those are the clip box, not
+    real coast). Coast and fill therefore share EXACT vertices, so the thick
+    white coast can never misalign with the light-gray fill into a sliver
+    (round-2 #2 - the round-1 separate-coastline-file approach drifted). The
+    ring is treated as closed (the last vertex wraps to the first)."""
+    eps = 0.02                       # > 2dp rounding; window edges are at 2dp
+
+    def on_edge(a, b):
+        return ((abs(a[0] - lo0) < eps and abs(b[0] - lo0) < eps) or
+                (abs(a[0] - lo1) < eps and abs(b[0] - lo1) < eps) or
+                (abs(a[1] - la0) < eps and abs(b[1] - la0) < eps) or
+                (abs(a[1] - la1) < eps and abs(b[1] - la1) < eps))
+
+    n = len(ring)
+    runs = []
+    cur = []
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        if a == b:
+            continue
+        if on_edge(a, b):
+            if len(cur) >= 2:
+                runs.append(cur)
+            cur = []
+        elif cur and cur[-1] == a:
+            cur.append(b)
+        else:
+            if len(cur) >= 2:
+                runs.append(cur)
+            cur = [a, b]
+    if len(cur) >= 2:
+        runs.append(cur)
+    return runs
+
+
 def _thin(pts, min_step=0.06):
     out = [pts[0]]
     for p in pts[1:]:
@@ -200,8 +246,17 @@ SIMPLIFY_TOL = 0.01
 # and coarsen toward the edges (TOL_FAR) where geometry is rarely shown
 # and, when it is, the cone is large so the zoom is loose. Cuts a near-
 # land bake roughly in half vs uniform-fine with no visible center loss.
-TOL_NEAR = 0.015      # deg ~ 1.7 km: crisp to ~2 px at a 130 px/deg zoom
-TOL_FAR = 0.10        # deg ~ 11 km: periphery, usually off-canvas
+TOL_NEAR = 0.022      # deg ~ 2.4 km: ~3 px at a 140 px/deg cone zoom (crisp)
+TOL_FAR = 0.10        # deg ~ 11 km: rarely-shown window edge
+# Island floors (deg). Tiny / thin near-shore islands, stroked with the
+# THICK white coast, read as spiky white slivers, NOT land - so drop an
+# island whose bbox is smaller than SPECK_DEG in its long axis OR thinner
+# than THIN_DEG in its short axis. Checked AFTER simplification too, because
+# the coarse periphery DP can COLLAPSE a small island into a sliver (round-2
+# #2 - "check the simplification isn't creating spurs"). Real islands stay.
+SPECK_DEG = 0.11
+THIN_DEG = 0.06
+AREA_MIN = 0.004      # deg^2 (~0.063x0.063): kills near-collinear slivers
 
 
 def _simplify(pts, tol=None):
@@ -265,10 +320,13 @@ def basemap_for(lat: float, lon: float, basin: str, *,
     # grazes the cone region stays crisp even if most of it is far). lon
     # deltas are cos-scaled to the storm latitude.
     cosl = max(0.3, math.cos(math.radians(lat)))
+    coast_out = []
 
     def _adaptive_tol(pts):
         d = min(math.hypot((p[0] - lon) * cosl, p[1] - lat) for p in pts)
-        f = min(1.0, d / dlon)
+        # crisp within ~10 deg of the storm (the cone region, shown at high
+        # zoom); only coarsen toward the rarely-shown +/-30 window edge.
+        f = max(0.0, min(1.0, (d - 10.0) / max(1.0, dlon - 10.0)))
         return TOL_NEAR + (TOL_FAR - TOL_NEAR) * f
 
     out = []
@@ -302,60 +360,95 @@ def basemap_for(lat: float, lon: float, basin: str, *,
             continue
         xs = [p[0] for p in clipped]
         ys = [p[1] for p in clipped]
-        if max(xs) - min(xs) < 0.4 and max(ys) - min(ys) < 0.4:
-            continue                      # speck islands: invisible here
+        # pre-DP skip (cheap): obvious tiny/thin rings.
+        if max(max(xs) - min(xs), max(ys) - min(ys)) < SPECK_DEG or \
+                min(max(xs) - min(xs), max(ys) - min(ys)) < THIN_DEG:
+            continue
         thin = _simplify(clipped, _adaptive_tol(clipped))
-        if len(thin) >= 3:
-            out.append([[round(x, 2), round(y, 2)] for x, y in thin])
-    # COAST: same contiguous-unwrap + shift-into-frame, then OPEN-polyline
-    # clip (may split one coastline into several in-window runs). Drawn as
-    # a white stroke ON TOP of the light-gray land fill.
-    coast_out = []
-    for line in _coast_lines():
-        norm = []
-        prev = None
-        for x, y in line:
-            if prev is not None:
-                while x - prev > 180.0:
-                    x -= 360.0
-                while x - prev < -180.0:
-                    x += 360.0
-            norm.append([x, y])
-            prev = x
-        mean_x = sum(p[0] for p in norm) / len(norm)
-        shift = 0.0
-        while mean_x + shift - lon > 180.0:
-            shift -= 360.0
-        while mean_x + shift - lon < -180.0:
-            shift += 360.0
-        if shift:
-            for p in norm:
-                p[0] += shift
-        for run in _clip_polyline([tuple(p) for p in norm],
-                                  lo0, la0, lo1, la1):
-            thin = _simplify(run, _adaptive_tol(run))
-            if len(thin) < 2:
-                continue
-            rd = [[round(x, 2), round(y, 2)] for x, y in thin]
-            # 2dp rounding can collapse a short run to repeated points; dedup
-            # and then DROP zero/sub-pixel-extent runs - a [[x,y],[x,y]] line
-            # renders as a ~1px white DOT on open water (round linecap). The
-            # land loop drops specks too; the coast keeps real short segments.
-            ded = [rd[0]]
-            for p in rd[1:]:
-                if p != ded[-1]:
-                    ded.append(p)
-            if len(ded) < 2:
-                continue
-            xs = [p[0] for p in ded]
-            ys = [p[1] for p in ded]
-            if (max(xs) - min(xs)) < 0.02 and (max(ys) - min(ys)) < 0.02:
-                continue
-            coast_out.append(ded)
+        if len(thin) < 3:
+            continue
+        rounded = [[round(x, 2), round(y, 2)] for x, y in thin]
+        ded = [rounded[0]]
+        for p in rounded[1:]:
+            if p != ded[-1]:
+                ded.append(p)
+        if len(ded) < 3:
+            continue
+        # POST-DP filter: the coarse periphery DP can collapse a small island
+        # into a sliver the pre-DP bbox check could not see. Drop by bbox
+        # (too small / too thin) AND by shoelace AREA - a near-collinear
+        # 3-point sliver has a "fat" bbox but ~0 area, so the bbox test alone
+        # misses it; the area floor is what kills the last white dashes.
+        oxs = [p[0] for p in ded]
+        oys = [p[1] for p in ded]
+        if max(max(oxs) - min(oxs), max(oys) - min(oys)) < SPECK_DEG or \
+                min(max(oxs) - min(oxs), max(oys) - min(oys)) < THIN_DEG:
+            continue
+        area = 0.0
+        for k in range(len(ded)):
+            x1, y1 = ded[k]
+            x2, y2 = ded[(k + 1) % len(ded)]
+            area += x1 * y2 - x2 * y1
+        if abs(area) * 0.5 < AREA_MIN:
+            continue
+        out.append(ded)
+        # COAST = this land ring's boundary MINUS the window-edge segments,
+        # so the thick white coast shares EXACT vertices with the fill.
+        coast_out.extend(_ring_coast(ded, lo0, la0, lo1, la1))
+    # BORDERS are OPEN polylines processed independently (boundary_lines):
+    # contiguous-unwrap -> shift-into-frame -> open-polyline clip into the
+    # in-window runs -> adaptive DP -> 2dp round -> dedup. `speck` drops a
+    # run that collapsed to a sub-pixel dot (coast only; a border segment is
+    # never a speck). Drawn as white strokes ON TOP of the land fill.
+    def _proc_lines(lines, speck):
+        res = []
+        for line in lines:
+            norm = []
+            prev = None
+            for x, y in line:
+                if prev is not None:
+                    while x - prev > 180.0:
+                        x -= 360.0
+                    while x - prev < -180.0:
+                        x += 360.0
+                norm.append([x, y])
+                prev = x
+            mean_x = sum(p[0] for p in norm) / len(norm)
+            shift = 0.0
+            while mean_x + shift - lon > 180.0:
+                shift -= 360.0
+            while mean_x + shift - lon < -180.0:
+                shift += 360.0
+            if shift:
+                for p in norm:
+                    p[0] += shift
+            for run in _clip_polyline([tuple(p) for p in norm],
+                                      lo0, la0, lo1, la1):
+                thin = _simplify(run, _adaptive_tol(run))
+                if len(thin) < 2:
+                    continue
+                rd = [[round(x, 2), round(y, 2)] for x, y in thin]
+                ded = [rd[0]]
+                for p in rd[1:]:
+                    if p != ded[-1]:
+                        ded.append(p)
+                if len(ded) < 2:
+                    continue
+                if speck > 0:
+                    xs2 = [p[0] for p in ded]
+                    ys2 = [p[1] for p in ded]
+                    if (max(xs2) - min(xs2)) < speck and \
+                            (max(ys2) - min(ys2)) < speck:
+                        continue
+                res.append(ded)
+        return res
+
+    border_out = _proc_lines(_border_lines(), 0.0)
     return {
         "window": [round(la0, 2), round(la1, 2),
                    round(lo0, 2), round(lo1, 2)],
         "land": out,
         "coast": coast_out,
+        "borders": border_out,
         "ocean": OCEAN_NAMES.get((basin or "").upper(), "OCEAN"),
     }

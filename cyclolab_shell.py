@@ -592,9 +592,16 @@ HTML_TEMPLATE = r"""<!doctype html>
      ne_10m coastline polylines. Land paints OVER the graticule, so the
      graticule only shows on open water. */
   .ac-land { fill: #a7b2c4; stroke: none; }
-  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 1.1;
+  /* maps-pass R2: THICK white coast (was a too-thin 1.1) + a slightly
+     thinner white internal-border stroke (drawn UNDER the coast). */
+  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 2.6;
     stroke-linejoin: round; stroke-linecap: round; }
-  .ac-graticule line { stroke: #223048; stroke-width: 1; }
+  .ac-border { fill: none; stroke: rgba(255,255,255,0.72);
+    stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+  /* maps-pass R2: drawn ON TOP of the basemap (full extent), so a mid-tone
+     semi-transparent stroke reads subtly on BOTH the light land and the
+     dark ocean (a flat dark line would dominate the light land). */
+  .ac-graticule line { stroke: rgba(120,140,170,0.38); stroke-width: 1; }
   .ac-graticule text { fill: #4d5f7d; font-size: 13px;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
   .ac-ocean { fill: rgba(202,217,240,0.14); font-size: 17px;
@@ -1841,38 +1848,46 @@ HTML_TEMPLATE = r"""<!doctype html>
     };
   }
 
-  // map furniture (ocean fill + graticule + land + frame) - REUSE the
-  // cone classes so one CSS canon dresses all three maps.
-  function mapFurniture(pr) {
+  // 5-deg graticule, drawn ON TOP of the basemap so the lines span the FULL
+  // panel extent (over land too) instead of being clipped where the land
+  // fill begins (maps-pass R2 #4: they used to "just end" at the coast).
+  // Degree labels ride the bottom (lon) / left (lat) edges.
+  function graticule(pr) {
     var W = pr.W, H = pr.H;
-    var parts = ['<rect class="ac-ocean-fill" width="' + W +
-                 '" height="' + H + '"/>'];
     var lonL = pr.lonAt(0), lonR = pr.lonAt(W);
     var latT = pr.latAt(0), latB = pr.latAt(H);
-    parts.push('<g class="ac-graticule">');
+    var g = ['<g class="ac-graticule">'];
     for (var gl = Math.ceil(lonL / 5) * 5; gl <= lonR; gl += 5) {
       var gx = pr.X(gl);
-      parts.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' +
+      g.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' +
         gx.toFixed(1) + '" y2="' + H + '"/>');
       var gn = ((gl % 360) + 360) % 360;
       var glab = gn > 180 ? (360 - gn) + "°W"
-                          : (gn === 0 || gn === 180 ? gn + "°"
-                                                    : gn + "°E");
+                          : (gn === 0 || gn === 180 ? gn + "°" : gn + "°E");
       if (gx > 30 && gx < W - 60) {
-        parts.push('<text x="' + (gx + 6).toFixed(1) + '" y="' +
+        g.push('<text x="' + (gx + 6).toFixed(1) + '" y="' +
           (H - 12) + '">' + glab + "</text>");
       }
     }
     for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
       var gy = pr.Y(ga);
-      parts.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
+      g.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
         '" y2="' + gy.toFixed(1) + '"/>');
       if (gy > 40 && gy < H - 34) {
-        parts.push('<text x="10" y="' + (gy - 6).toFixed(1) + '">' +
+        g.push('<text x="10" y="' + (gy - 6).toFixed(1) + '">' +
           Math.abs(ga) + "°" + (ga >= 0 ? "N" : "S") + "</text>");
       }
     }
-    parts.push("</g>");
+    g.push("</g>");
+    return g.join("");
+  }
+
+  // basemap furniture (ocean -> land -> borders -> coast -> graticule-on-top)
+  // - REUSE the cone classes so one CSS canon dresses all three maps.
+  function mapFurniture(pr) {
+    var W = pr.W, H = pr.H;
+    var parts = ['<rect class="ac-ocean-fill" width="' + W +
+                 '" height="' + H + '"/>'];
     (BASEMAP.land || []).forEach(function (ring) {
       var d = ring.map(function (c, i) {
         return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
@@ -1880,8 +1895,15 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
-    // maps-pass: WHITE coastline from the ne_10m coastline polylines,
-    // drawn OVER the light-gray land fill (open lines - no trailing Z).
+    // maps-pass R2: thin white country borders UNDER the thick white coast
+    // (both open ne_10m polylines, no trailing Z), over the land fill.
+    (BASEMAP.borders || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
+          pr.Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-border" d="' + d + '"/>');
+    });
     (BASEMAP.coast || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
@@ -1889,6 +1911,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
+    parts.push(graticule(pr));
     return parts;
   }
 
@@ -2763,33 +2786,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     var parts = ['<rect class="ac-ocean-fill" width="' + W +
                  '" height="' + H + '"/>'];
 
-    // ---- basemap: land, graticule, ocean watermark (S4-AD1 #2) ------
-    var lonL = lonAt(0), lonR = lonAt(W);
-    var latT = latAt(0), latB = latAt(H);
-    parts.push('<g class="ac-graticule">');
-    for (var gl = Math.ceil(lonL / 5) * 5; gl <= lonR; gl += 5) {
-      var gx = X(gl);
-      parts.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' +
-        gx.toFixed(1) + '" y2="' + H + '"/>');
-      var gn = ((gl % 360) + 360) % 360;
-      var glab = gn > 180 ? (360 - gn) + "\u00b0W"
-                          : (gn === 0 || gn === 180 ? gn + "\u00b0"
-                                                    : gn + "\u00b0E");
-      if (gx > 30 && gx < W - 60) {
-        parts.push('<text x="' + (gx + 6).toFixed(1) + '" y="' +
-          (H - 12) + '">' + glab + "</text>");
-      }
-    }
-    for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
-      var gy = Y(ga);
-      parts.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
-        '" y2="' + gy.toFixed(1) + '"/>');
-      if (gy > 40 && gy < H - 34) {
-        parts.push('<text x="10" y="' + (gy - 6).toFixed(1) + '">' +
-          Math.abs(ga) + "\u00b0" + (ga >= 0 ? "N" : "S") + "</text>");
-      }
-    }
-    parts.push("</g>");
+    // ---- basemap: land -> borders -> coast -> graticule ON TOP (S4-AD1 #2;
+    // maps-pass R2 #4: graticule LAST so it spans the full extent over land,
+    // via the shared graticule() helper + a local-projection adapter) ------
     (BASEMAP.land || []).forEach(function (ring) {
       var d = ring.map(function (c, i) {
         return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
@@ -2797,9 +2796,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
-    // maps-pass: WHITE coastline (ne_10m polylines, open - no Z). The cone
-    // inlines its own furniture, so this mirrors mapFurniture's coast loop
-    // using the cone's local X()/Y().
+    (BASEMAP.borders || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+          Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-border" d="' + d + '"/>');
+    });
     (BASEMAP.coast || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
@@ -2807,6 +2810,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
+    parts.push(graticule({ W: W, H: H, X: X, Y: Y,
+                           lonAt: lonAt, latAt: latAt }));
 
 
     // ---- reveal (S4-AD2 #1): ONE continuous arc-length-parameterized
@@ -2857,6 +2862,39 @@ HTML_TEMPLATE = r"""<!doctype html>
       .concat(tp)
       .concat([[tp[tp.length - 1][0] + lastSeg[0] / lsLen * fwdExt,
                 tp[tp.length - 1][1] + lastSeg[1] / lsLen * fwdExt]]);
+    // maps-pass R2 #7: ARC-LENGTH-SMOOTH reveal. The corridor centerline was
+    // the COARSE forecast-point polyline, so the growth front's tangent
+    // FLIPPED at each vertex - a hitch through curves / the recurve. Fit a
+    // Catmull-Rom spline THROUGH the forecast points and densify to a smooth
+    // polyline; the single continuous arc-length progress (trapezoid-ease)
+    // then advances the front by a smooth small increment each frame
+    // regardless of curvature. The spline passes THROUGH every control point,
+    // so forecast point fc_i lands at dense index (i+1)*PER_SEG and the
+    // icon-pop arc distances still map cleanly. High-curvature segments get
+    // more arc-length -> more uniform-arc samples downstream (natural adapt).
+    var PER_SEG = 14;
+    function catmullRom(poly, perSeg) {
+      var n = poly.length;
+      if (n < 3) return poly.slice();
+      var out = [poly[0].slice()];
+      for (var i = 0; i < n - 1; i++) {
+        var p0 = poly[i > 0 ? i - 1 : 0], p1 = poly[i], p2 = poly[i + 1];
+        var p3 = poly[i + 2 < n ? i + 2 : n - 1];
+        for (var s = 1; s <= perSeg; s++) {
+          var t = s / perSeg, t2 = t * t, t3 = t2 * t;
+          out.push([
+            0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t +
+              (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+              (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+            0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t +
+              (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+              (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+          ]);
+        }
+      }
+      return out;
+    }
+    tpExt = catmullRom(tpExt, PER_SEG);
     var cum = [0];
     for (var ci = 1; ci < tpExt.length; ci++) {
       cum.push(cum[ci - 1] + Math.hypot(tpExt[ci][0] - tpExt[ci - 1][0],
@@ -2873,7 +2911,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var revealDegenerate = !(Ltot > 1) || !isFinite(Ltot);
     // forecast-point arc distances in the EXTENDED frame (icons pop
     // when the front tip passes them; index 0 of cum is the rear point)
-    var cumIcons = pts.map(function (_, i) { return cum[i + 1]; });
+    var cumIcons = pts.map(function (_, i) { return cum[(i + 1) * PER_SEG]; });
     var HOLD_MS = 1000, GROW_MS = 4000;
     // exact local cone half-width at a canvas point P with normal n:
     // max |t| over intersections of the perpendicular line P + t*n
@@ -2893,8 +2931,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       return w;
     }
-    // resample the extended track at uniform arc steps
-    var SAMP = 34;
+    // resample the (now arc-smooth) extended track at uniform arc steps -
+    // more samples than the coarse era so the corridor chains hug the
+    // recurve smoothly.
+    var SAMP = 48;
     function pointAt(d) {
       d = Math.max(0, Math.min(Ltot, d));
       for (var k2 = 1; k2 < tpExt.length; k2++) {
@@ -3086,7 +3126,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                        Math.min.apply(null, coneXs),
                     h: Math.max.apply(null, coneYs) -
                        Math.min.apply(null, coneYs) };
-    var TIT_W = 285, TIT_H = 86, TIT_PAD = 22;
+    var TIT_W = 312, TIT_H = 58, TIT_PAD = 22;
     function overlapArea(a, b) {
       var ox = Math.max(0, Math.min(a.x + a.w, b.x + b.w) -
                            Math.max(a.x, b.x));
@@ -3111,11 +3151,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     var iconR = [];      // per-point icon half-size (canvas units)
     pts.forEach(function (p, i) {
-      // maps-pass: the NOW marker is ENLARGED (was 42) so it is bigger than
-      // both the forecast glyphs AND the cone's blunt rear cap - the cone
-      // visually emerges from under it (a "pinched" origin without altering
-      // NHC's official polygon).
-      var half = (i === 0 ? 60 : 20);
+      // maps-pass R2 (legibility): the NOW marker DOMINATES the origin and
+      // the forecast glyphs are enlarged so every label reads at a glance.
+      var half = (i === 0 ? 80 : 32);
       iconR.push(half);
       rects.push({ x: tp[i][0] - half, y: tp[i][1] - half,
                    w: 2 * half, h: 2 * half });
@@ -3130,7 +3168,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     // - the placard stays as close and as radial as the cluster allows.
     var placards = [];
     pts.forEach(function (p, i) {
-      var pw = (i === 0 ? 112 : 86), ph = (i === 0 ? 26 : 22);
+      var pw = (i === 0 ? 158 : 118), ph = (i === 0 ? 38 : 30);
       // local track direction -> perpendicular placement sides
       var a = tp[Math.max(0, i - 1)], b = tp[Math.min(tp.length - 1, i + 1)];
       var vx = b[0] - a[0], vy = b[1] - a[1];
@@ -3199,7 +3237,7 @@ HTML_TEMPLATE = r"""<!doctype html>
            ? 600 + i * 150
            : Math.round(HOLD_MS + GROW_MS *
                         invEaseS(Math.max(0.02, cumIcons[i] / Ltot))));
-      var scale = (i === 0 ? 1.42 : 0.42);   // NOW is the enlarged hero
+      var scale = (i === 0 ? 1.9 : 0.66);    // NOW dominates; forecast bigger
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
         '" data-tropical="' + (tropical ? 1 : 0) +
@@ -3234,8 +3272,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         '<rect width="' + pw2 + '" height="' + ph2 + '" rx="' +
         (ph2 / 2) + '" fill="' + pillGrad +
         '" stroke="rgba(0,0,0,0.3)"/>' +
-        '<text x="' + (pw2 / 2) + '" y="' + (ph2 - 7) +
-        '" text-anchor="middle" font-size="' + (i === 0 ? 13.5 : 12.5) +
+        '<text x="' + (pw2 / 2) + '" y="' + (ph2 / 2) +
+        '" text-anchor="middle" dominant-baseline="central" font-size="' +
+        (i === 0 ? 19 : 16) +
         '" font-weight="' + (i === 0 ? 800 : 700) +
         // canon ink rule: ALWAYS light on the category ramps (same
         // stroke treatment as the icon SS labels)
@@ -3244,93 +3283,36 @@ HTML_TEMPLATE = r"""<!doctype html>
       parts.push("</g>");
     });
 
-    // ---- title lockup markup (#5) -----------------------------------
+    // ---- title lockup markup (#5) -- maps-pass R2: the STORM IDENTITY on a
+    // DARK BACKING (legible over the cone / land / graticule, never faint).
+    // The redundant "FORECAST CONE" line is DROPPED - the panel's own <h3>
+    // is the canonical "Forecast cone" header; this lockup carries only the
+    // eyebrow + storm name, left-aligned in a corner clamped on-panel.
     var stormName = (document.getElementById("storm-name") || {})
       .textContent || "";
     var typeWord = (document.getElementById("storm-type") || {})
       .textContent || "";
-    var tx0 = titleRect.x, ty0 = titleRect.y;
-    var anchorRight = titleRect.x > W / 2;
-    var taX = anchorRight ? (titleRect.x + titleRect.w) : tx0;
-    var taA = anchorRight ? "end" : "start";
-    var railX = anchorRight ? (titleRect.x + titleRect.w + 8) : (tx0 - 8);
+    var nameLine = (typeWord.toUpperCase() + " " +
+                    stormName.toUpperCase()).trim();
+    var ebLine = "TRIPLE-A-TROPICS \u00b7 CycloLab";
+    var bgW = Math.max(nameLine.length * 11.2, ebLine.length * 7.0) + 30;
+    var bgX = Math.max(TIT_PAD, Math.min(titleRect.x, W - bgW - TIT_PAD));
+    var ty0 = titleRect.y, textX = bgX + 16;
     parts.push('<g class="ac-title">' +
-      '<rect x="' + (railX - 1.5) + '" y="' + ty0 +
-      '" width="3" height="' + TIT_H +
-      '" rx="1.5" fill="var(--ac-rail)"/>' +
-      '<text class="ac-eyebrow" x="' + taX + '" y="' + (ty0 + 14) +
-      '" text-anchor="' + taA +
-      '">TRIPLE-A-TROPICS \u00b7 CycloLab</text>' +
-      '<text class="ac-head" x="' + taX + '" y="' + (ty0 + 42) +
-      '" text-anchor="' + taA + '">FORECAST CONE</text>' +
-      '<text class="ac-sub" x="' + taX + '" y="' + (ty0 + 66) +
-      '" text-anchor="' + taA + '">' + typeWord.toUpperCase() +
-      " " + stormName.toUpperCase() + "</text></g>");
+      '<rect class="ac-title-bg" x="' + bgX.toFixed(1) + '" y="' +
+      (ty0 - 5) + '" width="' + bgW.toFixed(0) + '" height="50" rx="8"/>' +
+      '<rect x="' + (bgX + 5) + '" y="' + (ty0 - 1) +
+      '" width="3" height="42" rx="1.5" fill="var(--ac-rail)"/>' +
+      '<text class="ac-eyebrow" x="' + textX + '" y="' + (ty0 + 12) +
+      '">' + ebLine + '</text>' +
+      '<text class="ac-head" x="' + textX + '" y="' + (ty0 + 35) +
+      '">' + nameLine + '</text></g>');
 
-    // ---- ocean watermark (#4): small, auto-placed in the EMPTIEST
-    // open water - never behind the cone, placards or the title ------
-    var wmW = ((BASEMAP.ocean || "").length * 13) + 30, wmH = 26;
-    // maps-pass: avoid the cone POLYGON, not its axis-aligned bbox. The
-    // tighter panel-filling cone's bbox claims the open diagonal corners
-    // (bottom-left / top-right are OUTSIDE the cone but inside its bbox), so
-    // the old bbox test found no open water. Ray-cast the label box corners
-    // against the real ring instead, keeping the genuinely-open corners.
-    function ptInCone(px, py) {
-      var inside = false;
-      for (var pi = 0, pj = coneXs.length - 1; pi < coneXs.length;
-           pj = pi++) {
-        var xi = coneXs[pi], yi = coneYs[pi], xj = coneXs[pj], yj = coneYs[pj];
-        if (((yi > py) !== (yj > py)) &&
-            (px < (xj - xi) * (py - yi) / ((yj - yi) || 1e-9) + xi)) {
-          inside = !inside;
-        }
-      }
-      return inside;
-    }
-    var best = null, bestScore = -1;
-    for (var gy2 = 0.14; gy2 <= 0.9; gy2 += 0.095) {
-      for (var gx2 = 0.08; gx2 <= 0.92; gx2 += 0.105) {
-        var cxw = gx2 * W, cyw = gy2 * H;
-        var r3 = { x: cxw - wmW / 2, y: cyw - wmH / 2, w: wmW, h: wmH };
-        if (r3.x < 8 || r3.x + r3.w > W - 8 ||
-            r3.y < 8 || r3.y + r3.h > H - 30) continue;
-        var bad = ptInCone(cxw, cyw) ||
-          ptInCone(r3.x, r3.y) || ptInCone(r3.x + r3.w, r3.y) ||
-          ptInCone(r3.x, r3.y + r3.h) ||
-          ptInCone(r3.x + r3.w, r3.y + r3.h);
-        if (!bad) {
-          for (var rk = 0; rk < rects.length && !bad; rk++) {
-            if (overlapArea(r3, rects[rk]) > 0) bad = true;
-          }
-        }
-        if (!bad) {                       // open WATER means not on land
-          for (var lk = 0; lk < (BASEMAP.land || []).length && !bad;
-               lk++) {
-            var lr = BASEMAP.land[lk];
-            var lx0 = Infinity, lx1 = -Infinity,
-                ly0 = Infinity, ly1 = -Infinity;
-            for (var lv = 0; lv < lr.length; lv++) {
-              var lpx = X(lr[lv][0]), lpy = Y(lr[lv][1]);
-              lx0 = Math.min(lx0, lpx); lx1 = Math.max(lx1, lpx);
-              ly0 = Math.min(ly0, lpy); ly1 = Math.max(ly1, lpy);
-            }
-            if (overlapArea(r3, { x: lx0, y: ly0, w: lx1 - lx0,
-                                  h: ly1 - ly0 }) > 0) bad = true;
-          }
-        }
-        if (bad) continue;
-        // score: distance from the cone box centre (deep open water)
-        var dxw = cxw - (coneBox.x + coneBox.w / 2);
-        var dyw = cyw - (coneBox.y + coneBox.h / 2);
-        var sc = dxw * dxw + dyw * dyw;
-        if (sc > bestScore) { bestScore = sc; best = { x: cxw, y: cyw }; }
-      }
-    }
-    if (best) {
-      parts.push('<text class="ac-ocean" x="' + best.x.toFixed(0) +
-        '" y="' + best.y.toFixed(0) + '" text-anchor="middle">' +
-        (BASEMAP.ocean || "") + "</text>");
-    }
+    // ---- ocean watermark: RETIRED on the cone (maps-pass R2 #6). A
+    // panel-filling cone leaves no clean open water, and the coastlines +
+    // graticule already orient the viewer, so "PACIFIC OCEAN" gracefully
+    // drops here. (The track + swath plots keep their best-effort
+    // watermark via oceanWatermark - they show much more open water.)
 
     // hairline frame: the map has edges (#2)
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
