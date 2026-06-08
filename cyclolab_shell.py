@@ -476,6 +476,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     overflow: hidden; }
   .sat-gif-bar i { display: block; height: 100%; width: 0;
     background: var(--cat-accent); transition: width 0.15s linear; }
+  /* floater-inactive note (auto-refresh #4): shown instead of implying a
+     live feed once the floater stops producing frames. */
+  .sat-inactive { margin: 8px 0 0; font-size: 11.5px; font-weight: 600;
+    letter-spacing: 0.3px; color: #d2a93f; }
+  .sat-inactive[hidden] { display: none; }
   .hafs-readout { display: flex; flex-direction: column; gap: 2px;
     min-width: 150px; flex: 1 1 auto;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
@@ -948,6 +953,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div id="sat-empty" class="stub" style="display:none">No floater
           imagery for this storm right now.</div>
+        <div id="sat-inactive" class="sat-inactive" hidden
+             role="status" aria-live="polite"></div>
         <p class="hafs-caption">GOES floater imagery centered on the storm,
           newest frame first. Frames land every few minutes while the
           floater is active.</p>
@@ -1312,7 +1319,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (name !== "advisories" && acRaf) {
       cancelAnimationFrame(acRaf); acRaf = null;
     }
-    if (name !== "satellite") satPause();
+    if (name === "satellite") satStartPoll();   // resume the manifest poll
+    else { satPause(); satStopPoll(); }          // leaving: stop both
     if (name !== "models" && hafsViewer && hafsViewer._pause) {
       hafsViewer._pause();
     }
@@ -1323,6 +1331,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     var b = e.target.closest(".sec-btn");
     if (b) openSec(b.getAttribute("data-sec"));
   });
+  // auto-refresh #5: a BACKGROUNDED page must not keep polling (or playing);
+  // resume the manifest poll on return if the Satellite tab is still active.
+  if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) { satStopPoll(); satPause(); }
+      else satStartPoll();
+    });
+  }
 
   // ---- numeric stats: PLAIN STATIC TEXT (final-gate-3 #2) -------------------
   // The odometer is deleted. odoSet just writes the value as plain text
@@ -2479,13 +2495,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     emitSwath(sw34, "34");
     emitSwath(sw64, "64");
 
-    // a faint center track for context.
+    // a faint center track for context. maps-pass: a thin dark casing under
+    // a solid-white line (mirrors the track-history connector) so it stays
+    // legible over the light-gray land, not just over the swath fill.
     var tp = pts.map(function (p) { return [pr.X(p.lon), pr.Y(p.lat)]; });
     var dline = tp.map(function (c, i) {
       return (i ? "L" : "M") + c[0].toFixed(1) + "," + c[1].toFixed(1);
     }).join(" ");
+    parts.push('<path d="' + dline + '" fill="none" ' +
+      'stroke="rgba(9,22,42,0.45)" stroke-width="3.4" ' +
+      'stroke-linecap="round" stroke-linejoin="round"/>');
     parts.push('<path class="tp-track" d="' + dline +
-      '" stroke="rgba(150,180,220,0.3)"/>');
+      '" stroke="rgba(255,255,255,0.82)"/>');
 
     var swathBox = (function () {
       var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
@@ -3661,7 +3682,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   var sat = { man: null, band: null, frames: [], idx: 0, playing: false,
               timer: null, gen: 0, preloaded: {},
               mode: null, bmp: {}, bmpKeys: [], raf: null, lastT: 0,
-              holdT0: 0, presented: [], speed: 1 };
+              holdT0: 0, presented: [], speed: 1,
+              // auto-refresh (the manifest re-poll): pollTimer = the next
+              // scheduled fetch; inactive = the floater stopped producing
+              // frames (storm dropped from the index OR newest frame stale).
+              pollTimer: null, inactive: false };
+  var SAT_POLL_MS = 60000;          // re-poll the manifest while watching
+  var SAT_POLL_BACKOFF_MS = 300000; // slower cadence once the floater is idle
+  var SAT_STALE_MIN = 40;           // newest frame older than this = inactive
   var SAT_FRAME_MS = 200, SAT_AHEAD = 12, SAT_BMP_MAX = 28;
   // final-gate-3 #5: playback speed presets. The cadence CONTRACT (no
   // interval > 2x the median over a loop) holds at every speed because
@@ -4160,13 +4188,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     step();
   }
 
-  function initSatellite() {
-    satStatus(true, "Loading\u2026");
-    // PER-SOURCE isolation (adversarial-review find): one source's
-    // throwing resolve() or rejected fetch must neither kill the other
-    // sources nor strand the spinner - each entry settles to null on
-    // failure, and the terminal catch lands on the honest empty state.
-    Promise.all(SAT_SOURCES.map(function (src) {
+  // ---- auto-refresh: re-poll the floater manifest while watching ----------
+  // Fetch the floater index -> this storm's sub-manifest -> merged bands map,
+  // exactly as initSatellite's first-open chain. Returns null when the storm
+  // is not in the index (resolve -> null) or no source yields bands.
+  function satFetchBands() {
+    return Promise.all(SAT_SOURCES.map(function (src) {
       return fetchJson(src.top).then(function (top) {
         var mu = top && src.resolve(top);
         return mu ? fetchJson(mu) : null;
@@ -4177,34 +4204,154 @@ HTML_TEMPLATE = r"""<!doctype html>
         if (!man || !man.bands) return;
         for (var bs in man.bands) {
           if (!man.bands.hasOwnProperty(bs) || bands[bs]) continue;
-          bands[bs] = man.bands[bs];
-          got = true;
+          bands[bs] = man.bands[bs]; got = true;
         }
       });
-      if (!got) {
+      return got ? bands : null;
+    });
+  }
+  // chronological-ascending, time-deduped (the SAME contract satSelectBand
+  // applies when it first loads a band - playback order is a hard guarantee).
+  function satSortDedupe(frames) {
+    var raw = (frames || []).slice();
+    raw.sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      if (!out.length || raw[i].t !== out[out.length - 1].t) out.push(raw[i]);
+    }
+    return out;
+  }
+  function satAddBandButton(slug) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "hafs-seg";
+    b.setAttribute("data-slug", slug);
+    b.textContent = (sat.man.bands[slug] && sat.man.bands[slug].label) || slug;
+    b.addEventListener("click", function () {
+      satPause(); satSelectBand(this.getAttribute("data-slug"), true);
+    });
+    satEl("bands").appendChild(b);
+  }
+  function satFmtTime(t) {
+    return String(t).slice(0, 16).replace("T", " ") + "Z";
+  }
+  // the floater is "inactive" if it dropped from the index (droppedFromIndex)
+  // OR its newest frame is older than SAT_STALE_MIN. Show an honest last-frame
+  // note instead of a caption that keeps promising fresh imagery.
+  function satUpdateInactive(droppedFromIndex) {
+    var note = satEl("inactive");
+    if (!sat.frames.length) {
+      sat.inactive = !!droppedFromIndex;
+      if (note) { note.hidden = true; }
+      return;
+    }
+    var newestT = sat.frames[sat.frames.length - 1].t;
+    var ageMin = (Date.now() - new Date(newestT).getTime()) / 60000;
+    sat.inactive = !!droppedFromIndex || !(ageMin <= SAT_STALE_MIN);
+    if (note) {
+      if (sat.inactive) {
+        note.textContent = "Floater inactive \u2014 last frame " +
+          satFmtTime(newestT);
+        note.hidden = false;
+      } else { note.hidden = true; note.textContent = ""; }
+    }
+  }
+  // merge a freshly-polled bands map: refresh every band's frame list (so a
+  // later band switch sees the new frames; a new band gets a rail button),
+  // then APPEND frames newer than the loaded tail to the CURRENT band,
+  // PRESERVING playback state. Newest+paused -> follow-live to the new
+  // newest; playing -> the rAF loop advances into the appended frames on its
+  // own (idx becomes < last, so the next tick steps in rather than wrapping);
+  // paused/scrubbing on an OLDER frame -> idx stays, only the timeline grows.
+  function satRepollApply(bands) {
+    if (!bands) { satUpdateInactive(true); return; }
+    if (!sat.man) sat.man = { bands: {} };
+    for (var bs in bands) {
+      if (!bands.hasOwnProperty(bs)) continue;
+      var isNew = !sat.man.bands[bs];
+      sat.man.bands[bs] = bands[bs];
+      if (isNew) satAddBandButton(bs);
+    }
+    var nb = sat.man.bands[sat.band];
+    var fresh = satSortDedupe(nb && nb.frames);
+    // the current band was empty (server-pruned to zero) and now has frames:
+    // adopt them through the normal loader (lands on newest).
+    if (!sat.frames.length) {
+      if (fresh.length) satSelectBand(sat.band, false);
+      satUpdateInactive();
+      return;
+    }
+    var lastT = sat.frames[sat.frames.length - 1].t;
+    var wasNewest = sat.idx >= sat.frames.length - 1;
+    var added = [];
+    fresh.forEach(function (f) {
+      if (f.t > lastT) { sat.frames.push(f); added.push(sat.frames.length - 1); }
+    });
+    if (added.length) {
+      satEl("scrub").max = String(sat.frames.length - 1);
+      // DECODE GATE: kick the appended frames' decode NOW so they are
+      // presentable before the clock (or a follow-live jump) reaches them.
+      if (satCanvasOk()) {
+        added.forEach(function (i) { satBitmapFor(i); });
+      } else {
+        added.forEach(function (i) {
+          var u = CDN + "/" + sat.frames[i].key;
+          if (!sat.preloaded[u]) {
+            var im = new Image(); sat.preloaded[u] = im; im.src = u;
+          }
+        });
+      }
+      if (wasNewest && !sat.playing) satShow(sat.frames.length - 1);
+    }
+    satUpdateInactive();
+  }
+  // poll only while the Satellite tab is OPEN + the document is VISIBLE;
+  // never on ENDED archive pages; back off once the floater is inactive.
+  function satPollActive() {
+    var s = document.getElementById("sec-satellite");
+    var hidden = (typeof document !== "undefined") && document.hidden;
+    return !ENDED && !!s && s.classList.contains("active") && !hidden;
+  }
+  function satStopPoll() {
+    if (sat.pollTimer) { clearTimeout(sat.pollTimer); sat.pollTimer = null; }
+  }
+  function satSchedulePoll(delay) {
+    satStopPoll();
+    if (ENDED) return;                 // frozen archive: never poll
+    sat.pollTimer = setTimeout(function () {
+      sat.pollTimer = null;
+      if (!satPollActive()) return;    // hidden / off-tab: resume on re-entry
+      satFetchBands().then(function (bands) {
+        satRepollApply(bands);
+        satSchedulePoll(sat.inactive ? SAT_POLL_BACKOFF_MS : SAT_POLL_MS);
+      }).catch(function () { satSchedulePoll(SAT_POLL_MS); });
+    }, delay);
+  }
+  function satStartPoll() {
+    if (ENDED || sat.pollTimer || !satPollActive()) return;
+    satSchedulePoll(sat.inactive ? SAT_POLL_BACKOFF_MS : SAT_POLL_MS);
+  }
+
+  function initSatellite() {
+    satStatus(true, "Loading\u2026");
+    // PER-SOURCE isolation (adversarial-review find): one source's throwing
+    // resolve()/rejected fetch settles to null inside satFetchBands and the
+    // terminal catch lands on the honest empty state. satFetchBands is the
+    // SAME chain the auto-refresh poll reuses.
+    satFetchBands().then(function (bands) {
+      if (!bands) {
         satStatus(false);
         satEl("empty").style.display = "block";
         return;
       }
-      var man = { bands: bands };
-      sat.man = man;
+      sat.man = { bands: bands };
       satStatus(false);
-      var host = satEl("bands");
-      host.innerHTML = "";
+      satEl("bands").innerHTML = "";
       var slugs = [];
-      for (var slug in man.bands) {
-        if (!man.bands.hasOwnProperty(slug)) continue;
+      for (var slug in bands) {
+        if (!bands.hasOwnProperty(slug)) continue;
         slugs.push(slug);
-        var b = document.createElement("button");
-        b.type = "button";
-        b.className = "hafs-seg";
-        b.setAttribute("data-slug", slug);
-        b.textContent = man.bands[slug].label || slug;
-        b.addEventListener("click", function () {
-          satPause();
-          satSelectBand(this.getAttribute("data-slug"), true);
-        });
-        host.appendChild(b);
+        satAddBandButton(slug);
       }
       if (!slugs.length) {
         satEl("empty").style.display = "block";
@@ -4235,6 +4382,10 @@ HTML_TEMPLATE = r"""<!doctype html>
           satNudgeSpeed(-1); e.preventDefault();
         }
       });
+      // auto-refresh: flag staleness now + arm the manifest re-poll (no-op on
+      // ENDED archive pages or when the tab/document is not visible).
+      satUpdateInactive();
+      satStartPoll();
     }).catch(function () {
       // never strand the spinner: any unexpected throw in the band
       // build lands on the honest empty state.
@@ -4261,7 +4412,14 @@ HTML_TEMPLATE = r"""<!doctype html>
                               mode: sat.mode,
                               speed: sat.speed,
                               gifBusy: satGifBusy,
+                              inactive: sat.inactive,
+                              polling: !!sat.pollTimer,
                               presented: sat.presented.slice() };
+                   },
+                   // deterministic single manifest re-poll (tests + ops):
+                   // fetch + merge/append exactly as the timer would, now.
+                   satPollNow: function () {
+                     return satFetchBands().then(satRepollApply);
                    },
                    satSetSpeed: function (m) { satSetSpeed(m); },
                    satExportGif: function () { return satExportGif(); },

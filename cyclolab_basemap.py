@@ -334,9 +334,24 @@ def basemap_for(lat: float, lon: float, basin: str, *,
         for run in _clip_polyline([tuple(p) for p in norm],
                                   lo0, la0, lo1, la1):
             thin = _simplify(run, _adaptive_tol(run))
-            if len(thin) >= 2:
-                coast_out.append([[round(x, 2), round(y, 2)]
-                                  for x, y in thin])
+            if len(thin) < 2:
+                continue
+            rd = [[round(x, 2), round(y, 2)] for x, y in thin]
+            # 2dp rounding can collapse a short run to repeated points; dedup
+            # and then DROP zero/sub-pixel-extent runs - a [[x,y],[x,y]] line
+            # renders as a ~1px white DOT on open water (round linecap). The
+            # land loop drops specks too; the coast keeps real short segments.
+            ded = [rd[0]]
+            for p in rd[1:]:
+                if p != ded[-1]:
+                    ded.append(p)
+            if len(ded) < 2:
+                continue
+            xs = [p[0] for p in ded]
+            ys = [p[1] for p in ded]
+            if (max(xs) - min(xs)) < 0.02 and (max(ys) - min(ys)) < 0.02:
+                continue
+            coast_out.append(ded)
     return {
         "window": [round(la0, 2), round(la1, 2),
                    round(lo0, 2), round(lo1, 2)],
