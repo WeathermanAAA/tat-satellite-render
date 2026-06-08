@@ -1,0 +1,157 @@
+"""Maps-pass tests: the ne_10m basemap bake (land + WHITE coastline,
+distance-adaptive Douglas-Peucker, open-polyline clip) and the CycloLab
+shell maps-pass restyle markers (gear cog, basemap canon CSS, blue-glass
+cone + solid white centerline, white track connector)."""
+import json
+import math
+import unittest
+from pathlib import Path
+
+import cyclolab_basemap as cb
+import cyclolab_shell
+
+HERE = Path(__file__).resolve().parent
+FIXTURE = HERE / "fixtures" / "cyclolab" / "synth_storm.json"
+FEED_URL = "https://cdn.triple-a-tropics.com/feeds/ep_tracks_data.json"
+
+# representative storms: near-land (dense coast), mid-ocean (sparse), and an
+# antimeridian case (the contiguous-unwrap + shift-into-frame path).
+CASES = [("near-land", 11.2, -87.5, "EP"),
+         ("mid-ocean", 22.0, -135.0, "EP"),
+         ("antimeridian", 18.0, 178.0, "WP")]
+
+
+class TestBasemapBake(unittest.TestCase):
+    def test_emits_coast_key(self):
+        bm = cb.basemap_for(11.2, -87.5, "EP")
+        self.assertIn("coast", bm)
+        self.assertIn("land", bm)          # land STILL emitted (watermark)
+        self.assertIsInstance(bm["coast"], list)
+
+    def test_coast_lines_have_at_least_two_points(self):
+        # coastlines are drawn as open polylines (M..L.., no trailing Z).
+        # A mainland-coast segment is open; an ISLAND coast is a naturally
+        # CLOSED LineString (first == last) - both are valid, the renderer
+        # just never appends a Z, so a closed island line still draws as a
+        # loop. The contract is only ">= 2 points".
+        bm = cb.basemap_for(11.2, -87.5, "EP")
+        self.assertGreater(len(bm["coast"]), 0, "near-land bake has coast")
+        for line in bm["coast"]:
+            self.assertGreaterEqual(len(line), 2)
+
+    def test_all_geometry_inside_window(self):
+        for nm, lat, lon, basin in CASES:
+            bm = cb.basemap_for(lat, lon, basin)
+            la0, la1, lo0, lo1 = bm["window"]
+            for layer in ("land", "coast"):
+                for ring in bm[layer]:
+                    for x, y in ring:
+                        self.assertTrue(lo0 - 1 <= x <= lo1 + 1,
+                                        f"{nm} {layer} lon {x} out of window")
+                        self.assertTrue(la0 - 1 <= y <= la1 + 1,
+                                        f"{nm} {layer} lat {y} out of window")
+
+    def test_bakes_are_bounded_in_size(self):
+        # distance-adaptive DP must keep even a worst-case near-land bake
+        # to a sane size (a regression here = the basemap ballooning the
+        # per-storm page). Gulf-of-Mexico landfall is the densest case.
+        bm = cb.basemap_for(27.0, -90.0, "AL")
+        raw = json.dumps(bm, separators=(",", ":"))
+        self.assertLess(len(raw), 200_000,
+                        f"Gulf bake {len(raw)} bytes - DP simplify regressed")
+
+    def test_antimeridian_does_not_crash_or_leak(self):
+        bm = cb.basemap_for(18.0, 178.0, "WP")
+        self.assertEqual(bm["ocean"], "PACIFIC OCEAN")
+        # no land/coast band should span the whole window (the torn-ring bug)
+        for ring in bm["land"] + bm["coast"]:
+            xs = [p[0] for p in ring]
+            self.assertLess(max(xs) - min(xs), 65,
+                            "geometry spans >65 deg lon - antimeridian tear")
+
+
+class TestPolylineClipAndSimplify(unittest.TestCase):
+    def test_clip_polyline_splits_into_disjoint_runs(self):
+        # a line that dips BELOW the box and comes back up (all within the
+        # box's x-range) must split into two disjoint in-window runs.
+        line = [(1, 5), (3, 5), (3, -3), (6, -3), (6, 5), (9, 5)]
+        runs = cb._clip_polyline(line, 0.0, 0.0, 10.0, 10.0)
+        self.assertGreaterEqual(len(runs), 2,
+                                "in/out/in polyline must split into runs")
+        for run in runs:
+            for x, y in run:
+                self.assertTrue(-1e-6 <= x <= 10 + 1e-6)
+                self.assertTrue(-1e-6 <= y <= 10 + 1e-6)
+
+    def test_clip_polyline_fully_outside_is_empty(self):
+        self.assertEqual(cb._clip_polyline(
+            [(20, 20), (30, 30)], 0.0, 0.0, 10.0, 10.0), [])
+
+    def test_simplify_collapses_a_straight_run(self):
+        line = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]  # collinear
+        self.assertEqual(cb._simplify(line, 0.01), [(0, 0), (4, 0)])
+
+    def test_simplify_keeps_a_real_corner(self):
+        line = [(0, 0), (2, 0), (2, 2)]                  # a right angle
+        out = cb._simplify(line, 0.01)
+        self.assertIn((2, 0), out)                       # the corner stays
+
+    def test_adaptive_tol_is_finer_near_centre(self):
+        # a ring grazing the storm centre keeps more detail than the same
+        # shape parked at the window edge.
+        import random
+        rng = random.Random(0)
+        wiggle = [[math.cos(t / 30) * 0.02 + 0.01 * rng.random(),
+                   math.sin(t / 30) * 0.02] for t in range(400)]
+        near = cb._simplify([[c[0], c[1]] for c in wiggle],
+                            cb.TOL_NEAR)
+        far = cb._simplify([[c[0] + 28, c[1]] for c in wiggle],
+                           cb.TOL_FAR)
+        self.assertGreater(len(near), len(far))
+
+
+class TestMapsPassRenderMarkers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        storm = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        cls.html = cyclolab_shell.render_page(storm, feed_url=FEED_URL,
+                                              loader="")
+
+    def test_gear_is_a_real_cog(self):
+        # the settings glyph is the straight-toothed cog (fill-rule evenodd
+        # hollow centre), NOT the old rounded flower/blob.
+        self.assertIn('fill-rule="evenodd" d="M9.81,4.62', self.html)
+        self.assertNotIn("M12 8a4 4 0 100 8", self.html)
+
+    def test_basemap_canon_css(self):
+        # LIGHT-GRAY land, no land stroke; WHITE coastline; the inner frame
+        # is killed (stroke:none).
+        self.assertIn(".ac-land { fill: #a7b2c4; stroke: none; }", self.html)
+        self.assertIn(".ac-coast { fill: none; stroke: #ffffff;", self.html)
+        self.assertIn(".ac-frame { fill: none; stroke: none; }", self.html)
+
+    def test_coast_is_drawn_in_both_furniture_sites(self):
+        # mapFurniture (track + swath) AND the cone inline both emit the
+        # white coast polylines (open - the builder string is present).
+        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 2)
+
+    def test_cone_is_blue_glass_with_solid_white_centerline(self):
+        self.assertIn('<linearGradient id="cone-glass"', self.html)
+        self.assertIn('fill="url(#cone-glass)"', self.html)
+        # the centerline is no longer dotted
+        self.assertNotIn('stroke-dasharray="2 5"', self.html)
+
+    def test_track_connector_is_white_with_casing(self):
+        # the maps-pass white connector: a dark casing (0.5 alpha) under the
+        # white .tp-track line - the casing alpha (0.5) is distinct from the
+        # cone centerline casing (0.55), so it pins the track connector edit.
+        self.assertIn('stroke="rgba(9,22,42,0.5)"', self.html)
+        self.assertIn('<path class="tp-track" d="\' + dline +\n', self.html)
+
+    def test_now_icon_is_enlarged(self):
+        # the NOW glyph scale was 0.95; the maps-pass hero is 1.42.
+        self.assertIn("var scale = (i === 0 ? 1.42 : 0.42)", self.html)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

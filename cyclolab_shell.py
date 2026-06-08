@@ -516,8 +516,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   /* ---- Stage 4: THE CONE reveal + advisory panels (§8.1/8.2/8.5).
      All reveal motion is transform/opacity/clip only; the icon spin is
      the ONE permitted continuous loop; reduced-motion = final frame. */
-  .adv-cone-stage { background: #0a1019; border-radius: 8px;
-    overflow: hidden; }
+  /* maps-pass: the cone map is FULL-BLEED to the card edges (one
+     continuous basemap, no panel-in-panel). The stage background is the
+     OCEAN navy, so any meet-scaling letterbox blends into the ocean
+     instead of reading as a second tone. */
+  .adv-cone-stage { background: #101a2c; margin: 2px -14px 0;
+    border-top: 1px solid var(--border); overflow: hidden; }
   /* Overview hero (final-gate-2 #1/#2): a storm-centered SST render
      from SOURCE data - the per-storm PNGs the poller bakes (storm at
      the EXACT pixel center, native 5 km CRW detail, house recipe +
@@ -573,9 +577,18 @@ HTML_TEMPLATE = r"""<!doctype html>
      step above the panel chrome, hairline inset border, land one step
      above the ocean, graticule legible-but-subtle. */
   .ac-ocean-fill { fill: #101a2c; }
-  .ac-frame { fill: none; stroke: #2c3a52; stroke-width: 1.5; }
-  .ac-land { fill: #1b2536; stroke: #384964;
-    stroke-width: 1.2; }
+  /* maps-pass: the inner hairline frame is RETIRED (it boxed the map into
+     a nested panel-in-panel); the card edge is the only frame now. */
+  .ac-frame { fill: none; stroke: none; }
+  /* maps-pass basemap canon (ne_10m): LIGHT-GRAY land, clearly lighter
+     than the #101a2c ocean so landmasses stand out, with NO stroke (so
+     abutting ne_10m country fills merge into one continuous landmass with
+     no interior borders); the coast is a SEPARATE white stroke from the
+     ne_10m coastline polylines. Land paints OVER the graticule, so the
+     graticule only shows on open water. */
+  .ac-land { fill: #a7b2c4; stroke: none; }
+  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 1.1;
+    stroke-linejoin: round; stroke-linecap: round; }
   .ac-graticule line { stroke: #223048; stroke-width: 1; }
   .ac-graticule text { fill: #4d5f7d; font-size: 13px;
     font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
@@ -845,7 +858,7 @@ HTML_TEMPLATE = r"""<!doctype html>
               title="Settings" aria-label="Settings"
               aria-haspopup="dialog" aria-expanded="false">
         <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
-          <path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4zm8.4 2c0-.5 0-1-.1-1.5l2-1.6-2-3.4-2.4 1a7.6 7.6 0 00-1.3-.8l-.4-2.6H9.8l-.4 2.6c-.5.2-.9.5-1.3.8l-2.4-1-2 3.4 2 1.6c-.1.5-.1 1-.1 1.5s0 1 .1 1.5l-2 1.6 2 3.4 2.4-1c.4.3.8.6 1.3.8l.4 2.6h4.4l.4-2.6c.5-.2.9-.5 1.3-.8l2.4 1 2-3.4-2-1.6c.1-.5.1-1 .1-1.5z"/></svg>
+          <path fill="currentColor" fill-rule="evenodd" d="M9.81,4.62 L9.71,1.24 L14.29,1.24 L14.19,4.62 L15.67,5.23 L17.99,2.77 L21.23,6.01 L18.77,8.33 L19.38,9.81 L22.76,9.71 L22.76,14.29 L19.38,14.19 L18.77,15.67 L21.23,17.99 L17.99,21.23 L15.67,18.77 L14.19,19.38 L14.29,22.76 L9.71,22.76 L9.81,19.38 L8.33,18.77 L6.01,21.23 L2.77,17.99 L5.23,15.67 L4.62,14.19 L1.24,14.29 L1.24,9.71 L4.62,9.81 L5.23,8.33 L2.77,6.01 L6.01,2.77 L8.33,5.23 Z M8.3,12.0 A3.7,3.7 0 1 0 15.7,12.0 A3.7,3.7 0 1 0 8.3,12.0 Z"/></svg>
         <span>Settings</span>
       </button>
       <a class="back-map" href="/global_tracks.html">← Back to map</a>
@@ -1851,6 +1864,15 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
+    // maps-pass: WHITE coastline from the ne_10m coastline polylines,
+    // drawn OVER the light-gray land fill (open lines - no trailing Z).
+    (BASEMAP.coast || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
+          pr.Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-coast" d="' + d + '"/>');
+    });
     return parts;
   }
 
@@ -2184,7 +2206,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     var dline = tp.map(function (c, i) {
       return (i ? "L" : "M") + c[0].toFixed(1) + "," + c[1].toFixed(1);
     }).join(" ");
-    parts.push('<path class="tp-track" d="' + dline + '"/>');
+    // maps-pass: SOLID WHITE observed-track connector (was pale blue), with
+    // a thin dark casing so it stays crisp over the light-gray land too.
+    // The inline stroke beats the shared .tp-track CSS, so the swath plot's
+    // connector (its OWN inline override below) is unaffected.
+    parts.push('<path d="' + dline + '" fill="none" ' +
+      'stroke="rgba(9,22,42,0.5)" stroke-width="3.8" ' +
+      'stroke-linecap="round" stroke-linejoin="round"/>');
+    parts.push('<path class="tp-track" d="' + dline +
+      '" stroke="#ffffff"/>');
 
     // per-fix dots: neon ramp by wind_kt, shape by nature, latest = hero.
     var shapesSeen = {};
@@ -2694,9 +2724,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     var xs = lons.map(pxu), ys = lats.map(pyu);
     var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
     var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
-    var W = 1000, MARGIN = 110;
+    // maps-pass: tighter fit so the cone FILLS the panel - MARGIN was 110
+    // (a generous 22% border); 72 still clears the enlarged NOW icon
+    // (glyph radius ~43 canvas units) while the cone reaches the edges. The
+    // H floor was 540 (forced letterbox on short cones); 430 lets a wide
+    // short cone sit shorter so meet-scaling fills the panel width instead.
+    var W = 1000, MARGIN = 72;
     var S = (W - 2 * MARGIN) / Math.max(1e-6, x1 - x0);
-    var H = Math.max(540, Math.min(1500,
+    var H = Math.max(430, Math.min(1500,
         Math.round((y1 - y0) * S + 2 * MARGIN)));
     var offY = (H - (y1 - y0) * S) / 2;
     function X(lon) { return (pxu(normLon(lon)) - x0) * S + MARGIN; }
@@ -2740,6 +2775,16 @@ HTML_TEMPLATE = r"""<!doctype html>
           Y(c[1]).toFixed(1);
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
+    });
+    // maps-pass: WHITE coastline (ne_10m polylines, open - no Z). The cone
+    // inlines its own furniture, so this mirrors mapFurniture's coast loop
+    // using the cone's local X()/Y().
+    (BASEMAP.coast || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+          Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
 
 
@@ -2972,20 +3017,39 @@ HTML_TEMPLATE = r"""<!doctype html>
         '<stop offset="100%" stop-color="' + c.edge + '"/>' +
         "</linearGradient>";
     });
-    parts.push('<defs>' + gdefs + '<clipPath id="ac-reveal-clip" ' +
+    parts.push('<defs>' + gdefs +
+      // maps-pass: blue-GLASS cone fill - a vertical translucent brand-blue
+      // ramp, lighter "sheen" at the top fading to a deeper blue below, so
+      // the cone reads as blue glass (distinctly blue, not white).
+      '<linearGradient id="cone-glass" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="rgba(112,188,255,0.34)"/>' +
+        '<stop offset="44%" stop-color="rgba(60,152,240,0.20)"/>' +
+        '<stop offset="100%" stop-color="rgba(34,94,178,0.27)"/>' +
+      '</linearGradient>' +
+      '<clipPath id="ac-reveal-clip" ' +
       'clipPathUnits="userSpaceOnUse">' +
       '<path class="ac-reveal-path" d=""/></clipPath></defs>');
     // a degenerate track has no growth axis: the group ships UNCLIPPED
     // (the finished cone IS the only frame).
+    // maps-pass cone restyle: blue-GLASS fill, a BEVELED dark-blue 3D edge
+    // (concentric highlight+shadow strokes - video-safe, no filter), and a
+    // SOLID WHITE centerline (was a faint dotted line). Drawn fill-first,
+    // then the bevel rim outermost->innermost (dark depth -> blue body ->
+    // light top highlight), then the casing+white centerline on top.
     parts.push('<g class="ac-conegrp"' +
       (revealDegenerate ? '' : ' clip-path="url(#ac-reveal-clip)"') + '>' +
-      '<path d="' + dC + '" fill="rgba(205,228,255,0.13)" ' +
-      'stroke="#0a1a2e" stroke-width="4.5"/>' +
-      '<path d="' + dC + '" fill="none" stroke="#dceaff" ' +
-      'stroke-width="1.8"/>' +
+      '<path d="' + dC + '" fill="url(#cone-glass)" stroke="none"/>' +
+      '<path d="' + dC + '" fill="none" stroke="#0a2138" ' +
+      'stroke-width="6.5" stroke-linejoin="round"/>' +
+      '<path d="' + dC + '" fill="none" stroke="#2f74bd" ' +
+      'stroke-width="3.6" stroke-linejoin="round"/>' +
+      '<path d="' + dC + '" fill="none" stroke="#cfe6ff" ' +
+      'stroke-width="2" stroke-opacity="0.92" stroke-linejoin="round"/>' +
+      '<path d="' + dF + '" fill="none" stroke="rgba(9,22,42,0.55)" ' +
+      'stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"/>' +
       '<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
-      'stroke-width="1.6" stroke-dasharray="2 5" ' +
-      'stroke-opacity="0.7"/></g>');
+      'stroke-width="2.4" stroke-linecap="round" ' +
+      'stroke-linejoin="round"/></g>');
 
     // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
     // collision-aware placard layout: alternate sides of the track,
@@ -3026,7 +3090,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     var iconR = [];      // per-point icon half-size (canvas units)
     pts.forEach(function (p, i) {
-      var half = (i === 0 ? 42 : 20);
+      // maps-pass: the NOW marker is ENLARGED (was 42) so it is bigger than
+      // both the forecast glyphs AND the cone's blunt rear cap - the cone
+      // visually emerges from under it (a "pinched" origin without altering
+      // NHC's official polygon).
+      var half = (i === 0 ? 60 : 20);
       iconR.push(half);
       rects.push({ x: tp[i][0] - half, y: tp[i][1] - half,
                    w: 2 * half, h: 2 * half });
@@ -3110,7 +3178,7 @@ HTML_TEMPLATE = r"""<!doctype html>
            ? 600 + i * 150
            : Math.round(HOLD_MS + GROW_MS *
                         invEaseS(Math.max(0.02, cumIcons[i] / Ltot))));
-      var scale = (i === 0 ? 0.95 : 0.42);   // NOW is the hero (#6)
+      var scale = (i === 0 ? 1.42 : 0.42);   // NOW is the enlarged hero
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
         '" data-tropical="' + (tropical ? 1 : 0) +
@@ -3181,6 +3249,23 @@ HTML_TEMPLATE = r"""<!doctype html>
     // ---- ocean watermark (#4): small, auto-placed in the EMPTIEST
     // open water - never behind the cone, placards or the title ------
     var wmW = ((BASEMAP.ocean || "").length * 13) + 30, wmH = 26;
+    // maps-pass: avoid the cone POLYGON, not its axis-aligned bbox. The
+    // tighter panel-filling cone's bbox claims the open diagonal corners
+    // (bottom-left / top-right are OUTSIDE the cone but inside its bbox), so
+    // the old bbox test found no open water. Ray-cast the label box corners
+    // against the real ring instead, keeping the genuinely-open corners.
+    function ptInCone(px, py) {
+      var inside = false;
+      for (var pi = 0, pj = coneXs.length - 1; pi < coneXs.length;
+           pj = pi++) {
+        var xi = coneXs[pi], yi = coneYs[pi], xj = coneXs[pj], yj = coneYs[pj];
+        if (((yi > py) !== (yj > py)) &&
+            (px < (xj - xi) * (py - yi) / ((yj - yi) || 1e-9) + xi)) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    }
     var best = null, bestScore = -1;
     for (var gy2 = 0.14; gy2 <= 0.9; gy2 += 0.095) {
       for (var gx2 = 0.08; gx2 <= 0.92; gx2 += 0.105) {
@@ -3188,7 +3273,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         var r3 = { x: cxw - wmW / 2, y: cyw - wmH / 2, w: wmW, h: wmH };
         if (r3.x < 8 || r3.x + r3.w > W - 8 ||
             r3.y < 8 || r3.y + r3.h > H - 30) continue;
-        var bad = overlapArea(r3, coneBox) > 0;
+        var bad = ptInCone(cxw, cyw) ||
+          ptInCone(r3.x, r3.y) || ptInCone(r3.x + r3.w, r3.y) ||
+          ptInCone(r3.x, r3.y + r3.h) ||
+          ptInCone(r3.x + r3.w, r3.y + r3.h);
         if (!bad) {
           for (var rk = 0; rk < rects.length && !bad; rk++) {
             if (overlapArea(r3, rects[rk]) > 0) bad = true;

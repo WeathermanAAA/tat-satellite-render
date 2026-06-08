@@ -549,7 +549,7 @@ HIDE_FURNITURE_JS = """() => {
   // display.
   const svg = document.getElementById('advcone');
   for (const sel of ['.ac-icon', '.ac-title', '.ac-ocean',
-                     '.ac-graticule', '.ac-land', '.ac-frame',
+                     '.ac-graticule', '.ac-land', '.ac-coast', '.ac-frame',
                      'line[data-role="leader"]']) {
     svg.querySelectorAll(sel).forEach(el => {
       el.style.display = 'none';
@@ -678,10 +678,14 @@ class TestConeCasingRidesTheFront(unittest.TestCase):
         self.assertGreaterEqual(
             cov, self.MIN_COV,
             f"{engine} settle: casing loop incomplete ({cov:.1%})")
-        # PROBE TEETH (in-suite negative control): hiding the boundary
-        # stroke must collapse coverage - the probe can fail.
+        # PROBE TEETH (in-suite negative control): hiding the WHITE casing
+        # highlight must collapse coverage - the probe can fail. maps-pass:
+        # the cone group is now glass-fill[0], bevel dark[1]/blue[2]/light
+        # WHITE highlight[3], centerline casing[4], white centerline[5] - so
+        # the white-casing ink the coverage detector keys on is child[3]
+        # (was child[1], the old single white boundary stroke).
         pg.evaluate("""() => {
-          document.querySelector('.ac-conegrp').children[1]
+          document.querySelector('.ac-conegrp').children[3]
             .style.opacity = '0';
         }""")
         pg.wait_for_timeout(80)
