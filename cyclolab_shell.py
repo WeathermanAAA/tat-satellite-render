@@ -179,6 +179,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     --fg: #e8eef5; --muted: #8ea2bd; --navy-deep: #0a1a2e;
     --cat-ramp: linear-gradient(180deg,#132c40,#3fa4ff,#132c40);
     --cat-accent: #3fa4ff; --cat-ink: #ffffff;
+    /* ONE sizing token (FG-R3 widget-size pass): every content panel/SVG
+       caps its height here so the auto-fit cone + plots stay "a panel, not a
+       poster" - the whole content fits WITHOUT scrolling, composing with the
+       sidebar on one screen. The cone's auto-fit viewBox scales DOWN to the
+       cap (preserveAspectRatio meet = no clip), just a reasonable scale. */
+    --panel-max-h: 62vh;
     /* FG-R3 #3a: the lockup accent rail is ALWAYS the house blue - never a
        category accent. Defined once at :root and NOT overridden by the
        per-category token rules, so every lockup rail (cone / overview /
@@ -359,8 +365,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-radius: 12px; padding: 14px; margin-bottom: 20px; }
   .card h3 { margin: 0 0 10px; font-size: 11.5px; font-weight: 800;
     letter-spacing: 1.4px; text-transform: uppercase; color: var(--muted); }
-  .card svg { width: 100%; height: auto; display: block;
-    touch-action: pan-y; }
+  .card svg { width: 100%; height: auto; max-height: var(--panel-max-h);
+    display: block; touch-action: pan-y; }
   .card .note { font-size: 10.5px; color: var(--muted); margin-top: 8px;
     letter-spacing: 0.3px; }
   .draw path.series { stroke-dasharray: var(--len, 2000);
@@ -400,7 +406,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     display: flex; align-items: center; justify-content: center;
     border-radius: 8px; overflow: hidden; }
   .hafs-stage img, .hafs-stage canvas { display: block; max-width: 100%;
-    max-height: 72vh; width: auto; height: auto; }
+    max-height: var(--panel-max-h); width: auto; height: auto; }
   .hafs-statusbox { position: absolute; inset: 0; display: none;
     align-items: center; justify-content: center; gap: 10px;
     color: var(--muted); background: rgba(10,13,18,0.6); font-size: 13.5px; }
@@ -586,7 +592,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 800; letter-spacing: 0.6px; }
   .ac-title .ac-sub { fill: #b9c6da; font-size: 13px;
     font-weight: 700; letter-spacing: 1.1px; }
-  #advcone, #intensity { display: block; width: 100%; height: auto; }
+  #advcone, #intensity { display: block; width: 100%; height: auto;
+    max-height: var(--panel-max-h); }
   .ac-zoom { animation: ac-pushin calc(var(--motion-med) * 0.85)
     ease-out 1 both; }
   @keyframes ac-pushin { from { transform: scale(0.94); }

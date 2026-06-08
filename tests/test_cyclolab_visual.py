@@ -628,6 +628,12 @@ class TestConeCasingRidesTheFront(unittest.TestCase):
         pg = browser.new_page(viewport={"width": 1280, "height": 900},
                               device_scale_factor=2)
         pg.goto(f"file://{page_file}")
+        # The widget-size pass caps #advcone at --panel-max-h (a live-layout
+        # concern that letterboxes the SVG); this test measures the casing's
+        # GEOMETRY along the reveal front, so render the cone at its full
+        # auto-fit scale here by lifting the cap.
+        pg.evaluate("() => document.documentElement.style"
+                    ".setProperty('--panel-max-h', 'none')")
         pg.wait_for_timeout(1200)
         pg.evaluate("a => window.__lab.applyAdvisory(a)", adv)
         pg.evaluate("window.__lab.openSec('advisories')")
