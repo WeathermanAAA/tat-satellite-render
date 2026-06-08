@@ -409,8 +409,15 @@ const scheduledDelays = [];
         ? tp.querySelectorAll(".tp-cbar-tick").length : 0,
       trackWindField: tp
         ? tp.querySelectorAll('path[fill-rule="evenodd"]').length : 0,
-      trackTitle: tp && tp.querySelector(".ac-title .ac-head")
-        ? tp.querySelector(".ac-title .ac-head").textContent : null,
+      trackTitle: (function () {            // maps-pass R5: HTML overlay
+        var b = document.getElementById("trackplot-lockup");
+        var h = document.getElementById("trackplot-lockup-head");
+        return (b && h && !b.hidden) ? h.textContent.trim() : null;
+      })(),
+      trackWindKey: (function () {
+        var b = document.getElementById("trackplot-windkey");
+        return (b && !b.hidden) ? b.textContent.trim() : null;
+      })(),
       trackLegend: !!(tp && tp.querySelector(".tp-legend-bg")),
       trackNote: text("trackplot-note"),
       trackLand: tp ? tp.querySelectorAll(".ac-land").length : 0,
@@ -422,8 +429,11 @@ const scheduledDelays = [];
         sw.innerHTML.length > 100),
       swath34: sw ? sw.querySelectorAll(".sw-34").length : 0,
       swath64: sw ? sw.querySelectorAll(".sw-64").length : 0,
-      swathTitle: sw && sw.querySelector(".ac-title .ac-head")
-        ? sw.querySelector(".ac-title .ac-head").textContent : null,
+      swathTitle: (function () {            // maps-pass R5: HTML overlay
+        var b = document.getElementById("swathplot-lockup");
+        var h = document.getElementById("swathplot-lockup-head");
+        return (b && h && !b.hidden) ? h.textContent.trim() : null;
+      })(),
       swathEmptyShown:
         ((document.getElementById("swath-empty") || {}).style || {})
           .display === "block",

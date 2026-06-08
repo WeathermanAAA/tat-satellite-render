@@ -553,6 +553,34 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 700; letter-spacing: 1.5px; white-space: nowrap; }
   .adv-lockup .al-name { color: #ffffff; font-size: 18px; font-weight: 800;
     letter-spacing: 0.5px; margin-top: 2px; white-space: nowrap; }
+  /* maps-pass R5: track + swath corner furniture as HTML overlays (the cone's
+     contained-box lockup treatment), pinned to the map's top-left corner in a
+     FLEX STACK so the title + wind-field key never collide; the PACIFIC OCEAN
+     watermark is dropped on these panels. */
+  .map-stage { position: relative; line-height: 0; }
+  .map-corner-tl { position: absolute; top: 12px; left: 12px; z-index: 2;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+    max-width: calc(100% - 24px); pointer-events: none; line-height: 1.25; }
+  .map-lockup, .map-windkey { background: rgba(8,13,22,0.82);
+    border: 1px solid rgba(44,58,82,0.55); border-radius: 8px;
+    width: max-content; max-width: 100%; }
+  .map-lockup { border-left: 3px solid var(--ac-rail); padding: 7px 13px 8px; }
+  .map-lockup[hidden], .map-windkey[hidden] { display: none; }
+  .map-lockup .ml-eyebrow { color: #8fa2bd; font-size: 11px; font-weight: 700;
+    letter-spacing: 1.5px; white-space: nowrap; }
+  .map-lockup .ml-head { color: #ffffff; font-size: 19px; font-weight: 800;
+    letter-spacing: 0.5px; margin-top: 2px; white-space: nowrap; }
+  .map-lockup .ml-sub { color: #9fb0c8; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.8px; margin-top: 2px; white-space: nowrap; }
+  .map-windkey { padding: 6px 11px 7px; display: flex; align-items: center;
+    gap: 9px; }
+  .map-windkey .mwk-h { color: #8fa2bd; font-size: 10px; font-weight: 700;
+    letter-spacing: 1.2px; white-space: nowrap; }
+  .map-windkey .mwk-tier { display: inline-flex; align-items: center;
+    gap: 4px; font-size: 11.5px; font-weight: 800; }
+  .map-windkey .mwk-ring { width: 9px; height: 9px; border-radius: 50%;
+    border: 2px solid currentColor; box-sizing: border-box; }
+  .map-windkey .mwk-u { color: #b9c6da; font-size: 10.5px; }
   /* Overview hero (final-gate-2 #1/#2): a storm-centered SST render
      from SOURCE data - the per-storm PNGs the poller bakes (storm at
      the EXACT pixel center, native 5 km CRW detail, house recipe +
@@ -935,12 +963,33 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div class="ov-col ov-right">
         <div class="card" id="card-track">
-          <svg id="trackplot" viewBox="0 0 1000 620"
-               preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="map-stage">
+            <div class="map-corner-tl">
+              <div class="map-lockup" id="trackplot-lockup" hidden>
+                <div class="ml-eyebrow">TRIPLE-A-TROPICS · CycloLab</div>
+                <div class="ml-head" id="trackplot-lockup-head">TRACK
+                  HISTORY</div>
+                <div class="ml-sub" id="trackplot-lockup-sub"></div>
+              </div>
+              <div class="map-windkey" id="trackplot-windkey" hidden></div>
+            </div>
+            <svg id="trackplot" viewBox="0 0 1000 620"
+                 preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
           <div class="note" id="trackplot-note"></div></div>
         <div class="card" id="card-swath">
-          <svg id="swathplot" viewBox="0 0 1000 620"
-               preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="map-stage">
+            <div class="map-corner-tl">
+              <div class="map-lockup" id="swathplot-lockup" hidden>
+                <div class="ml-eyebrow">TRIPLE-A-TROPICS · CycloLab</div>
+                <div class="ml-head" id="swathplot-lockup-head">WIND
+                  HISTORY</div>
+                <div class="ml-sub" id="swathplot-lockup-sub"></div>
+              </div>
+            </div>
+            <svg id="swathplot" viewBox="0 0 1000 620"
+                 preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
           <div class="sw-empty" id="swath-empty" style="display:none"></div>
           <span class="sw-caption-d" id="swath-derived" hidden>Derived
             product</span>
@@ -2163,6 +2212,58 @@ HTML_TEMPLATE = r"""<!doctype html>
     } catch (e) { /* no layout engine: the width estimate stands */ }
   }
 
+  // maps-pass R5: populate a track/swath HTML title overlay (the cone's
+  // contained-box lockup treatment): eyebrow + panel head + storm-name sub,
+  // box grows to its widest line, type steps down on a narrow card so it
+  // never overflows. The flex stack keeps it clear of the wind-field key.
+  function mapLockup(svgId, head) {
+    var box = document.getElementById(svgId + "-lockup");
+    var headEl = document.getElementById(svgId + "-lockup-head");
+    var subEl = document.getElementById(svgId + "-lockup-sub");
+    if (!box || !headEl) return;
+    var stormName = (document.getElementById("storm-name") || {})
+      .textContent || "";
+    var typeWord = (document.getElementById("storm-type") || {})
+      .textContent || (document.getElementById("chip") || {})
+      .textContent || "";
+    headEl.textContent = head;
+    if (subEl) {
+      subEl.textContent = (typeWord.toUpperCase() + " " +
+                           stormName.toUpperCase()).trim();
+    }
+    box.hidden = false;
+    box.style.transform = "";
+    var svg = document.getElementById(svgId);
+    var avail = (svg && svg.clientWidth ? svg.clientWidth : 360) - 24 - 26;
+    var maxLine = 0;
+    var lines = box.querySelectorAll(".ml-eyebrow,.ml-head,.ml-sub");
+    for (var i = 0; i < lines.length; i++) {
+      maxLine = Math.max(maxLine, lines[i].scrollWidth);
+    }
+    if (maxLine > avail && maxLine > 0) {
+      box.style.transformOrigin = "top left";
+      box.style.transform = "scale(" +
+        Math.max(0.62, avail / maxLine).toFixed(3) + ")";
+    }
+  }
+
+  // maps-pass R5: populate the wind-field key HTML overlay (one ring per tier
+  // that rendered, tier-colored) + the unit - fixing the orphaned "kt", which
+  // now sits with its legend at the end of the row.
+  function mapWindKey(boxId, fieldKey) {
+    var box = document.getElementById(boxId);
+    if (!box) return;
+    if (!fieldKey || !fieldKey.length) { box.hidden = true; return; }
+    var html = '<span class="mwk-h">WIND FIELD</span>';
+    fieldKey.forEach(function (fk) {
+      html += '<span class="mwk-tier" style="color:' + fk[1] + '">' +
+        '<span class="mwk-ring"></span>' + windDisp(Number(fk[0])) + "</span>";
+    });
+    html += '<span class="mwk-u">' + windUnitLabel() + "</span>";
+    box.innerHTML = html;
+    box.hidden = false;
+  }
+
   // ocean watermark, auto-placed in the emptiest open water that misses
   // the track box (a light version of the cone's placement sweep).
   function oceanWatermark(pr, avoidBox) {
@@ -2466,38 +2567,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<text class="tp-legend-k" x="' + (ksx + 124) + '" y="' +
       (kyY) + '">non-trop</text>');
 
-    // tiny inline WIND-FIELD key ("34/50/64 kt"): one swatch per tier that
-    // actually rendered, in the same tier colors as the arcs. Fixed
-    // furniture anchored just under the title lockup so it stays legible.
-    if (fieldKey.length) {
-      var wkX = 20, wkY = 102, wkGap = 40;
-      parts.push('<text class="tp-field-key-h" x="' + wkX + '" y="' + wkY +
-        '">WIND FIELD</text>');
-      var wkRowY = wkY + 16, wkcx = wkX + 6;
-      fieldKey.forEach(function (fk, fi) {
-        parts.push('<circle class="tp-key" cx="' + wkcx + '" cy="' +
-          (wkRowY - 4) + '" r="4.5" fill="none" stroke="' + fk[1] +
-          '" stroke-width="2"/>');
-        parts.push('<text class="tp-field-key" x="' + (wkcx + 9) + '" y="' +
-          wkRowY + '" fill="' + fk[1] + '">' + windDisp(Number(fk[0])) +
-          "</text>");
-        wkcx += wkGap;
-      });
-      parts.push('<text class="tp-field-key-u" x="' + wkcx + '" y="' +
-        wkRowY + '">' + windUnitLabel() + "</text>");
-    }
-
-    // title lockup + watermark + frame.
-    var trackBox = (function () {
-      var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-      tp.forEach(function (c) {
-        x0 = Math.min(x0, c[0]); x1 = Math.max(x1, c[0]);
-        y0 = Math.min(y0, c[1]); y1 = Math.max(y1, c[1]);
-      });
-      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-    })();
-    parts.push(titleLockup(pr, "TRACK HISTORY"));
-    parts.push(oceanWatermark(pr, trackBox));
+    // maps-pass R5: the title lockup + the WIND-FIELD key + the watermark
+    // used to STACK in this top-left corner (and the fill insets in-SVG
+    // furniture). They are now HTML overlays in a flex stack (de-collided,
+    // contained boxes), and the PACIFIC OCEAN watermark is DROPPED - so
+    // nothing here but the hairline frame.
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
       (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
 
@@ -2506,7 +2580,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
     svg._refit = function () { mapRefit(svg, W, H, pr); };   // R4 #1 resize
-    fitLockup(svg);                              // FG-R3 #3b: contain the eyebrow
+    mapLockup("trackplot", "TRACK HISTORY");     // R5: HTML corner lockup
+    mapWindKey("trackplot-windkey", fieldKey);   // R5: HTML wind-field key
 
     // disclosure caption (cite the radii source).
     if (note) {
@@ -2675,16 +2750,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<path class="tp-track" d="' + dline +
       '" stroke="rgba(255,255,255,0.82)"/>');
 
-    var swathBox = (function () {
-      var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-      tp.forEach(function (c) {
-        x0 = Math.min(x0, c[0]); x1 = Math.max(x1, c[0]);
-        y0 = Math.min(y0, c[1]); y1 = Math.max(y1, c[1]);
-      });
-      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-    })();
-    parts.push(titleLockup(pr, "WIND HISTORY"));
-    parts.push(oceanWatermark(pr, swathBox));
+    // maps-pass R5: title -> HTML corner overlay (matching the cone + track);
+    // PACIFIC OCEAN watermark DROPPED. Just the hairline frame in-SVG.
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
       (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
 
@@ -2693,7 +2760,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
     svg._refit = function () { mapRefit(svg, W, H, pr); };   // R4 #1 resize
-    fitLockup(svg);                              // FG-R3 #3b: contain the eyebrow
+    mapLockup("swathplot", "WIND HISTORY");      // R5: HTML corner lockup
 
     if (note) {
       note.textContent =

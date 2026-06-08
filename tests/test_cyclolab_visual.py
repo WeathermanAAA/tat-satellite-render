@@ -889,23 +889,24 @@ class TestLockupRailAndContainment(unittest.TestCase):
                   window.__lab.renderTrackPlot();
                   window.__lab.renderSwathPlot();
                   const res = [];
-                  ['#trackplot', '#swathplot'].forEach(sel => {
-                    const svg = document.querySelector(sel);
-                    const g = svg && svg.querySelector('.ac-title');
-                    if (!g) return;
-                    const bg = g.querySelector('.ac-title-bg');
-                    const rects = g.querySelectorAll('rect');
-                    const rail = rects[1];   // bg first, rail second
-                    const bb = bg.getBBox();
+                  // maps-pass R5: the lockup is an HTML overlay (.map-lockup)
+                  // with a border-left RAIL; every .ml-* line must sit inside
+                  // its box (no overflow).
+                  ['trackplot', 'swathplot'].forEach(id => {
+                    const box = document.getElementById(id + '-lockup');
+                    if (!box || box.hidden) return;
+                    const br = box.getBoundingClientRect();
+                    const rail = getComputedStyle(box).borderLeftColor;
                     const lines = [];
-                    g.querySelectorAll('text').forEach(t => {
-                      const tb = t.getBBox();
-                      lines.push({ txt: t.textContent,
-                                   left: tb.x, right: tb.x + tb.width });
-                    });
-                    res.push({ sel,
-                      bgLeft: bb.x, bgRight: bb.x + bb.width,
-                      railFill: getComputedStyle(rail).fill, lines });
+                    box.querySelectorAll('.ml-eyebrow,.ml-head,.ml-sub')
+                      .forEach(t => {
+                        const tb = t.getBoundingClientRect();
+                        lines.push({ txt: t.textContent.trim(),
+                                     left: tb.left, right: tb.right });
+                      });
+                    res.push({ sel: '#' + id,
+                      bgLeft: br.left, bgRight: br.right,
+                      railFill: rail, lines });
                   });
                   return res;
                 }""", [name, typ])
@@ -995,7 +996,7 @@ class TestWindRoundingSweep(unittest.TestCase):
                   // bare-number SVG wind labels (number + unit are separate
                   // <text> nodes, so the inline regex misses them).
                   document.querySelectorAll(
-                    '.tp-cbar-tick,.tp-field-lbl,.tp-field-key,'
+                    '.tp-cbar-tick,.tp-field-lbl,.mwk-tier,'
                     + '.wp-ytick,.in-ytick').forEach((t) => {
                       const v = (t.textContent || '').trim();
                       if (/^\\d+$/.test(v)) winds.push(+v);
