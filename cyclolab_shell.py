@@ -561,11 +561,28 @@ HTML_TEMPLATE = r"""<!doctype html>
   .map-corner-tl { position: absolute; top: 12px; left: 12px; z-index: 2;
     display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
     max-width: calc(100% - 24px); pointer-events: none; line-height: 1.25; }
-  .map-lockup, .map-windkey { background: rgba(8,13,22,0.82);
+  .map-lockup, .map-windkey, .map-stats { background: rgba(8,13,22,0.82);
     border: 1px solid rgba(44,58,82,0.55); border-radius: 8px;
     width: max-content; max-width: 100%; }
-  .map-lockup { border-left: 3px solid var(--ac-rail); padding: 7px 13px 8px; }
-  .map-lockup[hidden], .map-windkey[hidden] { display: none; }
+  .map-lockup, .map-stats { border-left: 3px solid var(--ac-rail); }
+  .map-lockup { padding: 7px 13px 8px; }
+  .map-lockup[hidden], .map-windkey[hidden], .map-stats[hidden] {
+    display: none; }
+  /* maps-pass R6: the CURRENT stats card, pinned BOTTOM-LEFT of .map-stage in
+     its own flex stack - the same dark-box treatment as the title lockup, so
+     it anchors to the panel corner instead of floating in map space. */
+  .map-corner-bl { position: absolute; bottom: 12px; left: 12px; z-index: 2;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+    max-width: calc(100% - 24px); pointer-events: none; line-height: 1.3; }
+  .map-stats { padding: 7px 12px 8px; }
+  .map-stats .ms-h { color: #8fa2bd; font-size: 10px; font-weight: 700;
+    letter-spacing: 1.2px; }
+  .map-stats .ms-row { color: #cdd9ea; font-size: 12px; margin-top: 3px;
+    white-space: nowrap; }
+  .map-stats .ms-key { display: flex; gap: 11px; margin-top: 6px; }
+  .map-stats .ms-k { display: inline-flex; align-items: center; gap: 4px;
+    color: #b9c6da; font-size: 10.5px; }
+  .map-stats .ms-mk { width: 9px; height: 9px; display: block; }
   .map-lockup .ml-eyebrow { color: #8fa2bd; font-size: 11px; font-weight: 700;
     letter-spacing: 1.5px; white-space: nowrap; }
   .map-lockup .ml-head { color: #ffffff; font-size: 19px; font-weight: 800;
@@ -972,6 +989,24 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <div class="ml-sub" id="trackplot-lockup-sub"></div>
               </div>
               <div class="map-windkey" id="trackplot-windkey" hidden></div>
+            </div>
+            <div class="map-corner-bl">
+              <div class="map-stats" id="trackplot-stats" hidden>
+                <div class="ms-h">CURRENT</div>
+                <div class="ms-row" id="trackplot-stats-vmax"></div>
+                <div class="ms-row" id="trackplot-stats-pmin"></div>
+                <div class="ms-row" id="trackplot-stats-ace"></div>
+                <div class="ms-key">
+                  <span class="ms-k"><svg class="ms-mk" viewBox="0 0 12 12">
+                    <circle cx="6" cy="6" r="4.6" fill="#cdd9ea"/></svg>trop</span>
+                  <span class="ms-k"><svg class="ms-mk" viewBox="0 0 12 12">
+                    <rect x="1.6" y="1.6" width="8.8" height="8.8"
+                      fill="#cdd9ea"/></svg>sub</span>
+                  <span class="ms-k"><svg class="ms-mk" viewBox="0 0 12 12">
+                    <path d="M6 1.4 L10.6 10.6 L1.4 10.6 Z"
+                      fill="#cdd9ea"/></svg>non-trop</span>
+                </div>
+              </div>
             </div>
             <svg id="trackplot" viewBox="0 0 1000 620"
                  preserveAspectRatio="xMidYMid meet"></svg>
@@ -2264,6 +2299,26 @@ HTML_TEMPLATE = r"""<!doctype html>
     box.hidden = false;
   }
 
+  // maps-pass R6: populate the CURRENT stats card HTML overlay (Vmax / Pmin /
+  // ACE) - same content as the retired in-SVG tp-legend, now pinned to the
+  // panel's bottom-left corner. The static trop/sub/non-trop key lives in the
+  // template. fix = the latest track point; ace = storm.ace.
+  function mapStats(svgId, fix, ace) {
+    var box = document.getElementById(svgId + "-stats");
+    if (!box) return;
+    var set = function (k, txt) {
+      var el = document.getElementById(svgId + "-stats-" + k);
+      if (el) el.textContent = txt;
+    };
+    var vmaxKt = fix ? fix.wind_kt : null;
+    set("vmax", "Vmax " + (vmaxKt != null
+      ? windDisp(vmaxKt) + " " + windUnitLabel() : "—"));
+    set("pmin", "Pmin " + (fix && fix.pressure_mb != null
+      ? Math.round(fix.pressure_mb) + " mb" : "—"));
+    set("ace", "ACE " + (ace != null ? Number(ace).toFixed(2) : "0.00"));
+    box.hidden = false;
+  }
+
   // ocean watermark, auto-placed in the emptiest open water that misses
   // the track box (a light version of the cone's placement sweep).
   function oceanWatermark(pr, avoidBox) {
@@ -2534,38 +2589,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       '" y="' + (cbY - 8) + '" text-anchor="middle">' + windUnitLabel() +
       "</text>");
 
-    // LEGEND block: Vmax / Pmin / ACE + a tiny shape key.
-    var lgW = 196, lgH = 96, lgX = 14, lgY = H - lgH - 14;
-    var vmaxKt = last.wind_kt;
-    parts.push('<rect class="tp-legend-bg" x="' + lgX + '" y="' + lgY +
-      '" width="' + lgW + '" height="' + lgH + '" rx="7"/>');
-    parts.push('<text class="tp-legend-h" x="' + (lgX + 12) + '" y="' +
-      (lgY + 18) + '">CURRENT</text>');
-    parts.push('<text class="tp-legend-t" x="' + (lgX + 12) + '" y="' +
-      (lgY + 37) + '">Vmax ' +
-      (vmaxKt != null ? windDisp(vmaxKt) + " " + windUnitLabel() : "—") +
-      "</text>");
-    parts.push('<text class="tp-legend-t" x="' + (lgX + 12) + '" y="' +
-      (lgY + 53) + '">Pmin ' +
-      (last.pressure_mb != null ? Math.round(last.pressure_mb) + " mb"
-        : "—") + "</text>");
-    parts.push('<text class="tp-legend-t" x="' + (lgX + 12) + '" y="' +
-      (lgY + 69) + '">ACE ' +
-      (storm.ace != null ? Number(storm.ace).toFixed(2) : "0.00") + "</text>");
-    // shape key row (its own class so the dot-count probe counts only fixes)
-    var kyY = lgY + 86, ksx = lgX + 14;
-    parts.push(shapeMarker("circle", ksx, kyY - 3, 4, "#cdd9ea",
-      "tp-key"));
-    parts.push(shapeMarker("square", ksx + 56, kyY - 3, 4, "#cdd9ea",
-      "tp-key"));
-    parts.push(shapeMarker("triangle", ksx + 116, kyY - 3, 4, "#cdd9ea",
-      "tp-key"));
-    parts.push('<text class="tp-legend-k" x="' + (ksx + 8) + '" y="' +
-      (kyY) + '">trop</text>');
-    parts.push('<text class="tp-legend-k" x="' + (ksx + 64) + '" y="' +
-      (kyY) + '">sub</text>');
-    parts.push('<text class="tp-legend-k" x="' + (ksx + 124) + '" y="' +
-      (kyY) + '">non-trop</text>');
+    // maps-pass R6: the CURRENT stats card (Vmax / Pmin / ACE + the
+    // trop/sub/non-trop key) was an in-SVG block floating in map space; it is
+    // now the bottom-left HTML corner overlay, populated by mapStats() after
+    // innerHTML (content unchanged). The in-SVG tp-legend is retired.
 
     // maps-pass R5: the title lockup + the WIND-FIELD key + the watermark
     // used to STACK in this top-left corner (and the fill insets in-SVG
@@ -2582,6 +2609,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     svg._refit = function () { mapRefit(svg, W, H, pr); };   // R4 #1 resize
     mapLockup("trackplot", "TRACK HISTORY");     // R5: HTML corner lockup
     mapWindKey("trackplot-windkey", fieldKey);   // R5: HTML wind-field key
+    mapStats("trackplot", last, storm.ace);      // R6: HTML CURRENT card
 
     // disclosure caption (cite the radii source).
     if (note) {

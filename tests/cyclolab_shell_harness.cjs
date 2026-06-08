@@ -418,7 +418,10 @@ const scheduledDelays = [];
         var b = document.getElementById("trackplot-windkey");
         return (b && !b.hidden) ? b.textContent.trim() : null;
       })(),
-      trackLegend: !!(tp && tp.querySelector(".tp-legend-bg")),
+      trackLegend: (function () {           // maps-pass R6: HTML overlay
+        var b = document.getElementById("trackplot-stats");
+        return !!(b && !b.hidden);
+      })(),
       trackNote: text("trackplot-note"),
       trackLand: tp ? tp.querySelectorAll(".ac-land").length : 0,
       trackGraticule: tp ? tp.querySelectorAll(".ac-graticule line").length
