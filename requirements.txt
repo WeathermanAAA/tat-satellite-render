@@ -46,5 +46,5 @@ requests>=2.31
 # retired. Presentation-only: ACE math identical to v0.3.0.
 # v0.6.0: ATCF four-quadrant wind radii carried in the feed (FG-R3 #7/#8) +
 # CRW DOY-climatology support (#6a house-climo anomaly). ACE math unchanged.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.6.0#subdirectory=ace_core
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.6.1#subdirectory=ace_core
 pandas>=2.0
