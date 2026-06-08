@@ -44,5 +44,7 @@ requests>=2.31
 # v0.4.0: invest marker unification - every invest is marker_type invest_x
 # (the red NHC invest-area X) regardless of active state; the 'L' type is
 # retired. Presentation-only: ACE math identical to v0.3.0.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.5.1#subdirectory=ace_core
+# v0.6.0: ATCF four-quadrant wind radii carried in the feed (FG-R3 #7/#8) +
+# CRW DOY-climatology support (#6a house-climo anomaly). ACE math unchanged.
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.6.0#subdirectory=ace_core
 pandas>=2.0

@@ -1856,7 +1856,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   var WIND_TIER_PALETTES = {
     A: { "34": [38, 104, 200], "50": [44, 150, 235], "64": [60, 200, 235] },
     B: { "34": neonRGB(34),    "50": neonRGB(50),    "64": neonRGB(64) },
-    C: { "34": [38, 104, 200], "50": [44, 168, 240], "64": [255, 190, 52] },
+    C: { "34": [44, 140, 255], "50": [40, 178, 250], "64": [255, 202, 66] },
     D: { "34": [150, 128, 232], "50": [168, 86, 214], "64": [200, 48, 150] }
   };
   // resolve a product's palette: explicit JS knob -> URL param -> shared
@@ -1868,14 +1868,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     catch (e) { sp = { get: function () { return null; } }; }
     var k = (window["__lab" + which + "Palette"] ||
              sp.get(which.toLowerCase() + "pal") ||
-             window.__labWindPalette || sp.get("wtier") || "A");
+             window.__labWindPalette || sp.get("wtier") || "C");
     k = String(k).toUpperCase();
-    return WIND_TIER_PALETTES[k] ? k : "A";
+    return WIND_TIER_PALETTES[k] ? k : "C";
   }
   function resolveTierPalette(which) {
     return WIND_TIER_PALETTES[_palKey(which)];
   }
-  var _tierPal = WIND_TIER_PALETTES.A;       // set per-render by each plot
+  // FG-R3 art-r2 verdict: Option C (blue band -> gold core), executed NEON
+  // (electric blue + glowing gold, with edge bloom on swath + rings) is the
+  // LOCKED wind-tier canon for both products. A/B/D stay as selectable knobs.
+  var _tierPal = WIND_TIER_PALETTES.C;       // set per-render by each plot
   function tierRGBA(tier, a) {
     var c = _tierPal[String(tier)] || [255, 255, 255];
     return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")";
@@ -2108,6 +2111,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     var W = pr.W, H = pr.H;
     var parts = mapFurniture(pr);
 
+    // FG-R3 art-r2 (neon C): the quadrant rings get the SAME luminous bloom
+    // as the swath so the two plots stay siblings - a crisp arc with a soft
+    // colored halo (blur merged behind the source). sRGB, tight blur.
+    parts.push('<defs><filter id="ring-bloom" x="-40%" y="-40%" ' +
+      'width="180%" height="180%" color-interpolation-filters="sRGB">' +
+      '<feGaussianBlur stdDeviation="2.4" result="rb"/><feMerge>' +
+      '<feMergeNode in="rb"/><feMergeNode in="rb"/>' +
+      '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>');
+
     // current wind-field arcs (drawn BEFORE the track dots / hero marker so
     // the marker sits on top but the arcs fan visibly beyond it). Three
     // tiered rings (34 outer / 50 / 64 inner), ~2px strokes, bright on the
@@ -2133,7 +2145,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       tiers.forEach(function (t) {
         var arc = quadrantArcs(pr, last.lat, last.lon, lastRad[t[0]],
           'fill="' + t[1] + '" stroke="' + t[2] + '" stroke-width="' +
-          t[3] + '" stroke-linejoin="round"');
+          t[3] + '" stroke-linejoin="round" filter="url(#ring-bloom)"');
         if (!arc) return;
         hasField = true;
         parts.push(arc);
@@ -2359,6 +2371,23 @@ HTML_TEMPLATE = r"""<!doctype html>
     var W = pr.W, H = pr.H;
     var parts = mapFurniture(pr);
 
+    // FG-R3 art-r2 (neon C): edge BLOOM so each band reads as light glowing
+    // on the dark basemap, not flat paint. A blurred copy of the union is
+    // merged UNDER the crisp fill (band wider, core tighter). sRGB filter
+    // interpolation keeps the halo true-colored + video-safe (no dark fringe,
+    // tight blur so no large smooth gradient to band on 8-bit video).
+    parts.push('<defs>' +
+      '<filter id="sw-bloom-band" x="-18%" y="-18%" width="136%" ' +
+      'height="136%" color-interpolation-filters="sRGB">' +
+      '<feGaussianBlur stdDeviation="6" result="b"/><feMerge>' +
+      '<feMergeNode in="b"/><feMergeNode in="b"/>' +
+      '<feMergeNode in="SourceGraphic"/></feMerge></filter>' +
+      '<filter id="sw-bloom-core" x="-22%" y="-22%" width="144%" ' +
+      'height="144%" color-interpolation-filters="sRGB">' +
+      '<feGaussianBlur stdDeviation="4" result="b2"/><feMerge>' +
+      '<feMergeNode in="b2"/><feMergeNode in="b2"/>' +
+      '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>');
+
     // sweep one threshold's wind-field along the track, INTERPOLATING the
     // 4 quadrant radii between consecutive fixes (NHC swath method). Each
     // fix + interpolated sub-step emits the four-quadrant polygon; all are
@@ -2423,11 +2452,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     function emitSwath(polys, fillKey) {
       if (!polys.length) return;
       var d = polys.join(" ");
-      var fill = fillKey === "34" ? tierRGBA("34", 0.5)
+      var fill = fillKey === "34" ? tierRGBA("34", 0.46)
                                   : tierRGBA("64", 0.66);
+      var glow = fillKey === "34" ? "sw-bloom-band" : "sw-bloom-core";
       parts.push('<path class="sw-' + fillKey + '" d="' + d +
-        '" fill="' + fill +
-        '" fill-rule="nonzero" stroke="none"/>');
+        '" fill="' + fill + '" fill-rule="nonzero" stroke="none" filter="' +
+        'url(#' + glow + ')"/>');
     }
     emitSwath(sw34, "34");
     emitSwath(sw64, "64");

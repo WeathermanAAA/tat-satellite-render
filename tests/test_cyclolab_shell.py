@@ -685,8 +685,9 @@ class TestWindTierPalette(unittest.TestCase):
         cores = [tuple(self._tiers(k)["64"]) for k in ("A", "B", "C", "D")]
         self.assertEqual(len(set(cores)), 4, cores)
 
-    def test_unknown_palette_falls_back_to_A(self):
-        self.assertEqual(self._tiers("Z"), self._tiers("A"))
+    def test_unknown_palette_falls_back_to_C(self):
+        # C (neon blue->gold) is the locked canon / default (FG-R3 art-r2).
+        self.assertEqual(self._tiers("Z"), self._tiers("C"))
 
     def test_ring_and_swath_palettes_resolve_independently(self):
         # shared knob drives both; explicit per-product knobs override.
