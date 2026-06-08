@@ -823,5 +823,187 @@ class TestSatellitePresentedCadence(unittest.TestCase):
                                      throttle=False)
 
 
+RADII_FIXTURE = HERE / "fixtures" / "cyclolab" / "synth_storm_radii.json"
+
+
+def _radii_storm():
+    """The radii fixture with the current fix bumped to an active major
+    hurricane (all three ring tiers + 64-kt core render); the committed
+    fixture on disk is left honest/weakening."""
+    s = json.loads(RADII_FIXTURE.read_text(encoding="utf-8"))
+    cur = s["points"][-1]
+    cur["wind_kt"] = 90.0
+    cur["pressure_mb"] = 958.0
+    cur["nature"] = "TS"
+    cur["radii"] = {"34": [110, 100, 80, 92], "50": [62, 54, 40, 50],
+                    "64": [34, 28, 20, 26]}
+    s["current_category"] = "C4"          # major hurricane -> orange accent
+    return s
+
+
+@unittest.skipUnless(HAVE_RENDERER, "playwright + Pillow required")
+class TestLockupRailAndContainment(unittest.TestCase):
+    """FG-R3 #3a/#3b: every overview-plot lockup rail is the house blue
+    (#3fa4ff) regardless of storm category, and the backing panel CONTAINS
+    every line - eyebrow included - even for the longest worst-case name."""
+
+    ENGINES = ("chromium", "webkit")
+    RAIL_RGB = "rgb(63, 164, 255)"        # #3fa4ff, the house blue
+
+    @classmethod
+    def setUpClass(cls):
+        html = cyclolab_shell.render_page(_radii_storm(), feed_url=FEED_URL,
+                                          loader="")
+        cls._td = tempfile.TemporaryDirectory()
+        cls.page = Path(cls._td.name) / "page.html"
+        cls.page.write_text(html, encoding="utf-8")
+
+    def _measure(self, engine, name, typ):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b = getattr(p, engine).launch()
+            pg = b.new_page(viewport={"width": 1380, "height": 1700},
+                            device_scale_factor=2)
+            pg.goto(f"file://{self.page}")
+            pg.wait_for_timeout(3200)
+            out = pg.evaluate(
+                """([nm, tp]) => {
+                  document.getElementById('storm-name').textContent = nm;
+                  document.getElementById('storm-type').textContent = tp;
+                  // C4 is already set from the bake; keep it (orange accent)
+                  window.__lab.renderTrackPlot();
+                  window.__lab.renderSwathPlot();
+                  const res = [];
+                  ['#trackplot', '#swathplot'].forEach(sel => {
+                    const svg = document.querySelector(sel);
+                    const g = svg && svg.querySelector('.ac-title');
+                    if (!g) return;
+                    const bg = g.querySelector('.ac-title-bg');
+                    const rects = g.querySelectorAll('rect');
+                    const rail = rects[1];   // bg first, rail second
+                    const bb = bg.getBBox();
+                    const lines = [];
+                    g.querySelectorAll('text').forEach(t => {
+                      const tb = t.getBBox();
+                      lines.push({ txt: t.textContent,
+                                   left: tb.x, right: tb.x + tb.width });
+                    });
+                    res.push({ sel,
+                      bgLeft: bb.x, bgRight: bb.x + bb.width,
+                      railFill: getComputedStyle(rail).fill, lines });
+                  });
+                  return res;
+                }""", [name, typ])
+            b.close()
+        return out
+
+    def _check(self, engine, name, typ):
+        plots = self._measure(engine, name, typ)
+        self.assertEqual(len(plots), 2, f"{engine}: both plots present")
+        for pl in plots:
+            self.assertEqual(
+                pl["railFill"], self.RAIL_RGB,
+                f"{engine} {pl['sel']}: rail must be the house blue, "
+                f"got {pl['railFill']}")
+            for ln in pl["lines"]:
+                self.assertLessEqual(
+                    ln["right"], pl["bgRight"] + 1.5,
+                    f"{engine} {pl['sel']}: '{ln['txt']}' overflows the "
+                    f"panel right ({ln['right']:.1f} > {pl['bgRight']:.1f})")
+                self.assertGreaterEqual(
+                    ln["left"], pl["bgLeft"] - 1.5,
+                    f"{engine} {pl['sel']}: '{ln['txt']}' spills past the "
+                    f"panel left")
+
+    def test_rail_is_house_blue_and_lines_fit_default_name(self):
+        for e in self.ENGINES:
+            self._check(e, "SYNTH", "HURRICANE")
+
+    def test_long_name_eyebrow_and_sub_stay_inside_the_panel(self):
+        # the worst-case long name: the sub line is the widest line.
+        for e in self.ENGINES:
+            self._check(e, "EIGHTEEN-E", "TROPICAL DEPRESSION")
+
+
+@unittest.skipUnless(HAVE_RENDERER, "playwright + Pillow required")
+class TestWindRoundingSweep(unittest.TestCase):
+    """FG-R3 #4: with a converted unit selected, NO wind value renders off a
+    5-boundary ANYWHERE we draw winds - hero, vitals, cone placards,
+    intensity + W&P axis ticks, track legend / colorbar, field labels, plot
+    captions. (windDisp is unit-tested exhaustively in the jsdom suite; this
+    proves nothing on the live page bypasses it.) NHC's verbatim advisory
+    text is excluded - it is already agency-rounded, not our conversion."""
+
+    def _sweep(self, unit):
+        adv = json.loads(ADV_FIXTURE.read_text(encoding="utf-8"))
+        html = cyclolab_shell.render_page(_radii_storm(), feed_url=FEED_URL,
+                                          loader="")
+        td = tempfile.TemporaryDirectory()
+        page = Path(td.name) / "page.html"
+        page.write_text(html, encoding="utf-8")
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b = p.chromium.launch()
+            pg = b.new_page(viewport={"width": 1380, "height": 2000},
+                            device_scale_factor=2)
+            pg.goto(f"file://{page}?units={unit}")    # boot in the unit
+            pg.wait_for_timeout(3200)
+            nums = pg.evaluate(
+                """(adv) => {
+                  window.__lab.applyAdvisory(adv);
+                  window.__lab.openSec('advisories');
+                  window.__lab.openSec('overview');
+                  window.__lab.renderTrackPlot();
+                  window.__lab.renderSwathPlot();
+                  const winds = [];
+                  // skip NHC's verbatim advisory text (id/class 'advtext')
+                  const inAdvText = (el) => {
+                    while (el) {
+                      const id = el.id || '';
+                      const cl = (el.getAttribute &&
+                        el.getAttribute('class')) || '';
+                      if (/advtext/i.test(id) || /advtext/i.test(cl))
+                        return true;
+                      el = el.parentElement;
+                    }
+                    return false;
+                  };
+                  const tw = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT);
+                  let node;
+                  while ((node = tw.nextNode())) {
+                    if (inAdvText(node.parentElement)) continue;
+                    const re = /(\\d+)\\s*(?:mph|km\\/h)/g; let m;
+                    while ((m = re.exec(node.textContent || '')))
+                      winds.push(+m[1]);
+                  }
+                  // bare-number SVG wind labels (number + unit are separate
+                  // <text> nodes, so the inline regex misses them).
+                  document.querySelectorAll(
+                    '.tp-cbar-tick,.tp-field-lbl,.tp-field-key,'
+                    + '.wp-ytick,.in-ytick').forEach((t) => {
+                      const v = (t.textContent || '').trim();
+                      if (/^\\d+$/.test(v)) winds.push(+v);
+                    });
+                  return winds;
+                }""", adv)
+            b.close()
+        return nums
+
+    def test_mph_no_value_off_a_5_boundary(self):
+        nums = self._sweep("mph")
+        self.assertGreaterEqual(len(nums), 12,
+                                f"too few wind values swept: {nums}")
+        bad = sorted({n for n in nums if n % 5 != 0})
+        self.assertEqual(bad, [], f"mph wind values off a 5-boundary: {bad}")
+
+    def test_kmh_no_value_off_a_5_boundary(self):
+        nums = self._sweep("kmh")
+        self.assertGreaterEqual(len(nums), 12,
+                                f"too few wind values swept: {nums}")
+        bad = sorted({n for n in nums if n % 5 != 0})
+        self.assertEqual(bad, [], f"km/h wind values off a 5-boundary: {bad}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

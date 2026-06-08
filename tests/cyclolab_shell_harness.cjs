@@ -622,6 +622,14 @@ const scheduledDelays = [];
       // test helper: clear banner anim classes to detect re-add / churn.
       const b = document.getElementById("banner");
       if (b) { b.classList.remove("shine"); b.classList.remove("xfade"); }
+    } else if (op.op === "callLab") {
+      // generic: call window.__lab[fn](...args) and return its result
+      // alongside the snapshot (FG-R3 #1/#4 unit + palette tests).
+      const f = window.__lab && window.__lab[op.fn];
+      const r = (typeof f === "function") ? f.apply(null, op.args || []) : null;
+      await drain();
+      out.push({ op: op.op, fn: op.fn, result: r, state: snapshot() });
+      continue;
     } else {
       out.push({ op: op.op, error: "unknown op" });
       continue;

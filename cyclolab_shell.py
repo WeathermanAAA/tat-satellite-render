@@ -179,6 +179,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     --fg: #e8eef5; --muted: #8ea2bd; --navy-deep: #0a1a2e;
     --cat-ramp: linear-gradient(180deg,#132c40,#3fa4ff,#132c40);
     --cat-accent: #3fa4ff; --cat-ink: #ffffff;
+    /* FG-R3 #3a: the lockup accent rail is ALWAYS the house blue - never a
+       category accent. Defined once at :root and NOT overridden by the
+       per-category token rules, so every lockup rail (cone / overview /
+       hero) reads the same blue at any storm intensity. */
+    --ac-rail: #3fa4ff;
     --motion-slow: 4.5s; --motion-med: 1.2s; --motion-fast: 0.6s;
     /* the soft dark scrim that holds light text on bright ramps */
     --ink-scrim: 0 1px 2px rgba(0,0,0,0.65), 0 0 16px rgba(0,0,0,0.38);
@@ -538,7 +543,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     padding-left: 11px; }
   .sst-hero-title .hero-rail { position: absolute; left: 0; top: 2px;
     bottom: 2px; width: 3px; border-radius: 1.5px;
-    background: var(--cat-accent); }
+    background: var(--ac-rail); }
   .sst-hero-title .hero-eyebrow { color: #aebdd4; font-size: 11px;
     font-weight: 700; letter-spacing: 1.6px; }
   .sst-hero-title .hero-head { color: #ffffff; font-size: 19px;
@@ -1133,9 +1138,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (kt == null || isNaN(kt)) return null;
     return WIND_UNITS[settings.windUnits].conv(+kt);
   }
+  // agency-convention rounding (final-gate-3 #4): CONVERTED wind values
+  // (mph / km-h) ALWAYS round to the nearest 5 - NHC-style, so every
+  // converted display ends in 0 or 5 (30 kt -> 35, 64 kt -> 75, 100 kt ->
+  // 115 mph). kt stays the RAW advisory value (nearest 1; the feeds are
+  // already issued in 5-kt steps). This applies EVERYWHERE winds display
+  // because every wind surface routes through windDisp().
+  function round5(v) { return Math.round(v / 5) * 5; }
   function windDisp(kt) {            // rounded display number (string)
     var v = windNum(kt);
-    return v == null ? "—" : String(Math.round(v));
+    if (v == null) return "—";
+    return String(settings.windUnits === "kt" ? Math.round(v) : round5(v));
   }
   function setWindUnits(u) {
     if (!WIND_UNITS[u] || u === settings.windUnits) return;
@@ -1592,7 +1605,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       parts.push('<line x1="' + (padL - 5) + '" y1="' + y.toFixed(1) +
         '" x2="' + padL + '" y2="' + y.toFixed(1) +
         '" stroke="#3a4d6e" stroke-width="1"/>');
-      parts.push('<text x="' + (padL - 9) + '" y="' + (y + 4).toFixed(1) +
+      parts.push('<text class="wp-ytick" x="' + (padL - 9) + '" y="' +
+        (y + 4).toFixed(1) +
         '" text-anchor="end" font-size="12" fill="#8ea2bd">' +
         windDisp(v) + "</text>");
     });
@@ -1676,27 +1690,29 @@ HTML_TEMPLATE = r"""<!doctype html>
     [165,255,  40, 200],   // magenta
     [185,255, 235, 255]    // near-white
   ];
-  function neonColor(kt) {
+  // sample the continuous ramp -> [r,g,b]. neonColor() wraps this; palette B
+  // (FG-R3 #1) reuses it so the wind tiers are EXACT samples of the colorbar.
+  function neonRGB(kt) {
     var v = (kt == null) ? 0 : kt;
     if (v <= NEON_RAMP[0][0]) {
-      return "rgb(" + NEON_RAMP[0][1] + "," + NEON_RAMP[0][2] + "," +
-             NEON_RAMP[0][3] + ")";
+      return [NEON_RAMP[0][1], NEON_RAMP[0][2], NEON_RAMP[0][3]];
     }
     var last = NEON_RAMP[NEON_RAMP.length - 1];
-    if (v >= last[0]) {
-      return "rgb(" + last[1] + "," + last[2] + "," + last[3] + ")";
-    }
+    if (v >= last[0]) { return [last[1], last[2], last[3]]; }
     for (var i = 1; i < NEON_RAMP.length; i++) {
       var a = NEON_RAMP[i - 1], b = NEON_RAMP[i];
       if (v <= b[0]) {
         var f = (v - a[0]) / (b[0] - a[0]);
-        var r = Math.round(a[1] + (b[1] - a[1]) * f);
-        var g = Math.round(a[2] + (b[2] - a[2]) * f);
-        var bl = Math.round(a[3] + (b[3] - a[3]) * f);
-        return "rgb(" + r + "," + g + "," + bl + ")";
+        return [Math.round(a[1] + (b[1] - a[1]) * f),
+                Math.round(a[2] + (b[2] - a[2]) * f),
+                Math.round(a[3] + (b[3] - a[3]) * f)];
       }
     }
-    return "rgb(" + last[1] + "," + last[2] + "," + last[3] + ")";
+    return [last[1], last[2], last[3]];
+  }
+  function neonColor(kt) {
+    var c = neonRGB(kt);
+    return "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
   }
 
   // nature -> marker SHAPE: tropical = circle, subtropical = square,
@@ -1711,10 +1727,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (SUBTROP_NAT[n]) return "square";
     return "triangle";
   }
-  function shapeMarker(shape, cx, cy, r, fill, cls) {
-    // emit one marker glyph centered at cx,cy with radius r.
+  function shapeMarker(shape, cx, cy, r, fill, cls, styleColor) {
+    // emit one marker glyph centered at cx,cy with radius r. styleColor
+    // (optional) sets the element's `color` - the currentColor the CSS glow
+    // reads - decoupled from the fill, so the NOW marker keeps its neon-by-
+    // wind fill but glows in the active tier palette (FG-R3 #1).
     var c = 'class="' + cls + '" fill="' + fill + '" style="color:' +
-            fill + '"';
+            (styleColor || fill) + '"';
     if (shape === "square") {
       var s = r * 1.78;        // visually-matched area
       return '<rect ' + c + ' x="' + (cx - s / 2).toFixed(1) + '" y="' +
@@ -1823,23 +1842,53 @@ HTML_TEMPLATE = r"""<!doctype html>
     return parts;
   }
 
-  // ONE wind-tier palette, used by BOTH overview plots (FG-R3 verdict 1).
-  // These are the canonical SSHS house tokens (== ace_core.SSHS_COLORS /
-  // the inline SSHS var): 34 kt = TS GREEN, 50 kt = C1 GOLD, 64 kt = C3 RED.
-  // The track-plot wind-field rings AND the wind-swath fills both read
-  // through tierRGBA() so the rgba is never hardcoded twice.
-  var WIND_TIER = { "34": [70, 197, 106],     // TS green  #46c56a
-                    "50": [255, 225, 77],     // C1 gold   #ffe14d
-                    "64": [255, 77, 59] };    // C3 red    #ff4d3b
+  // ------------------------------------------------------------- FG-R3 #1
+  // WIND-TIER PALETTE - its OWN palette, deliberately NOT the SSHS category
+  // tokens (the green/red category recolor was rejected: wind tiers must not
+  // borrow category hues at all). FOUR candidate treatments; the live build
+  // picks the ring palette and the swath palette INDEPENDENTLY (per-product)
+  // via the knobs below. Each entry maps the 34/50/64-kt threshold -> [r,g,b].
+  //   A House blues  - incumbent: deep blue 34 field -> lighter cyan 64 core.
+  //   B Neon samples - the track colorbar sampled AT 34/50/64 kt, so the
+  //                    rings/swath harmonize with the per-fix dots + legend.
+  //   C Blue -> Gold - house blue 34/50, warm gold 64 "hurricane" core.
+  //   D Violet ramp  - one non-category hue family, light -> hot = stronger.
+  var WIND_TIER_PALETTES = {
+    A: { "34": [38, 104, 200], "50": [44, 150, 235], "64": [60, 200, 235] },
+    B: { "34": neonRGB(34),    "50": neonRGB(50),    "64": neonRGB(64) },
+    C: { "34": [38, 104, 200], "50": [44, 168, 240], "64": [255, 190, 52] },
+    D: { "34": [150, 128, 232], "50": [168, 86, 214], "64": [200, 48, 150] }
+  };
+  // resolve a product's palette: explicit JS knob -> URL param -> shared
+  // wind knob -> default A (the incumbent). Separate ring/swath knobs so the
+  // user's two independent picks both wire cleanly; the board sets the shared
+  // __labWindPalette to drive both at once.
+  function _palKey(which) {
+    var sp; try { sp = new URLSearchParams(location.search); }
+    catch (e) { sp = { get: function () { return null; } }; }
+    var k = (window["__lab" + which + "Palette"] ||
+             sp.get(which.toLowerCase() + "pal") ||
+             window.__labWindPalette || sp.get("wtier") || "A");
+    k = String(k).toUpperCase();
+    return WIND_TIER_PALETTES[k] ? k : "A";
+  }
+  function resolveTierPalette(which) {
+    return WIND_TIER_PALETTES[_palKey(which)];
+  }
+  var _tierPal = WIND_TIER_PALETTES.A;       // set per-render by each plot
   function tierRGBA(tier, a) {
-    var c = WIND_TIER[String(tier)] || [255, 255, 255];
+    var c = _tierPal[String(tier)] || [255, 255, 255];
     return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")";
   }
   function tierHex(tier) {
-    var c = WIND_TIER[String(tier)] || [255, 255, 255];
+    var c = _tierPal[String(tier)] || [255, 255, 255];
     return "#" + c.map(function (v) {
-      return ("0" + v.toString(16)).slice(-2); }).join("");
+      return ("0" + Math.round(v).toString(16)).slice(-2); }).join("");
   }
+  // the center NOW-marker halo takes the active palette's strongest tier
+  // (64-kt core), replacing the neon-yellow drop-shadow the dot's own fill
+  // produced (FG-R3 #1: "the yellow halo is part of the problem").
+  function tierGlow() { return tierHex("64"); }
 
   // in-plot title lockup (mirror the cone's ac-title #5) at a top corner.
   function titleLockup(pr, head) {
@@ -1849,12 +1898,17 @@ HTML_TEMPLATE = r"""<!doctype html>
       .textContent || (document.getElementById("chip") || {})
       .textContent || "";
     var tx0 = 18, ty0 = 16, TIT_H = 70;
-    // sub line width drives the backing box width (eyebrow + head are
-    // shorter); ~ a char-width estimate at the sub's 13px/700.
+    // the backing panel sizes to the WIDEST line of the lockup - EYEBROW
+    // INCLUDED (FG-R3 #3b: the eyebrow used to hang past the panel's right
+    // edge). These are char-width estimates; fitLockup() corrects the panel
+    // to the EXACT rendered width once it is in the DOM (the estimate is the
+    // jsdom/no-layout fallback, which never reaches a user).
+    var ebTxt = "TRIPLE-A-TROPICS · CycloLab";   // the eyebrow line
     var subTxt = (typeWord.toUpperCase() + " " + stormName.toUpperCase());
-    var headW = head.length * 13.5 + 4;          // head @ 21px/800
-    var subW = subTxt.length * 8.2 + 4;          // sub  @ 13px/700
-    var bgW = Math.max(headW, subW, 160) + 22;
+    var headW = head.length * 13.5 + 4;          // head    @ 21px/800
+    var subW = subTxt.length * 8.2 + 4;          // sub     @ 13px/700
+    var ebW = ebTxt.length * 8.9 + 4;            // eyebrow @ 11.5px/700 +ls
+    var bgW = Math.max(headW, subW, ebW, 160) + 22;
     // SUBTLE DARK BACKING (one lockup canon): a faint rounded panel UNDER
     // the eyebrow/head/sub so the white head always reads clean even when a
     // swath fill or track ring bleeds into this corner - the same guarantee
@@ -1866,14 +1920,39 @@ HTML_TEMPLATE = r"""<!doctype html>
       '" rx="8"/>' +
       '<rect x="' + (tx0 - 9.5) + '" y="' + ty0 +
       '" width="3" height="' + TIT_H +
-      '" rx="1.5" fill="var(--cat-accent)"/>' +
+      '" rx="1.5" fill="var(--ac-rail)"/>' +
       '<text class="ac-eyebrow" x="' + tx0 + '" y="' + (ty0 + 14) +
-      '">TRIPLE-A-TROPICS · CycloLab</text>' +
+      '">' + ebTxt + '</text>' +
       '<text class="ac-head" x="' + tx0 + '" y="' + (ty0 + 42) +
       '">' + head + '</text>' +
       '<text class="ac-sub" x="' + tx0 + '" y="' + (ty0 + 66) + '">' +
       typeWord.toUpperCase() + " " + stormName.toUpperCase() +
       "</text></g>";
+  }
+
+  // measure-and-fit (FG-R3 #3b): after the SVG is in the DOM, grow the
+  // lockup's backing panel so it CONTAINS every lockup line (eyebrow / head /
+  // sub) plus padding - exact rendered widths, not estimates. jsdom has no
+  // layout engine (getBBox throws), so the char-width estimate stands there;
+  // that path never reaches a user. Only ever grows the panel, never shrinks.
+  function fitLockup(svg) {
+    try {
+      var g = svg.querySelector(".ac-title");
+      if (!g) return;
+      var bg = g.querySelector(".ac-title-bg");
+      var texts = g.querySelectorAll("text");
+      if (!bg || !texts.length) return;
+      var bx = parseFloat(bg.getAttribute("x"));
+      var maxRight = 0;
+      for (var i = 0; i < texts.length; i++) {
+        var bb = texts[i].getBBox();         // throws under jsdom -> caught
+        maxRight = Math.max(maxRight, bb.x + bb.width);
+      }
+      var PAD = 13;
+      var needW = (maxRight + PAD) - bx;
+      var curW = parseFloat(bg.getAttribute("width")) || 0;
+      if (needW > curW) bg.setAttribute("width", needW.toFixed(0));
+    } catch (e) { /* no layout engine: the width estimate stands */ }
   }
 
   // ocean watermark, auto-placed in the emptiest open water that misses
@@ -1939,7 +2018,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       // sample the arc; project each point (lon scales with cos lat).
       var a0 = quads[q][0], a1 = quads[q][1];
       var seg = ['M' + cx.toFixed(1) + "," + cy.toFixed(1)];
-      for (var aa = a0; aa <= a1 + 0.001; aa += 9) {
+      // 4-deg arc sampling (FG-R3 #2): fine enough that the swept envelope's
+      // curved edges read smooth, same quality bar as the cone's chain.
+      for (var aa = a0; aa <= a1 + 0.001; aa += 4) {
         var th = aa * Math.PI / 180;          // compass angle from North
         var dlat = rdeg * Math.cos(th);
         var dlon = rdeg * Math.sin(th) /
@@ -1955,6 +2036,36 @@ HTML_TEMPLATE = r"""<!doctype html>
       ' fill-rule="evenodd"/>';
   }
 
+  // SMOOTH wind-field blob for the SWATH only (FG-R3 #2). The quadrant arcs
+  // above are pie SECTORS (center spike + radial edges + a hard radius step
+  // at each 90deg boundary); sweeping them unions into a faceted, scalloped
+  // band. This emits ONE closed smooth curve per fix instead: the four
+  // quadrant radii sit at the quadrant CENTERS (NE 45 / SE 135 / SW 225 /
+  // NW 315) and the radius is cosine-interpolated continuously around the
+  // compass, sampled every 3deg. No center point, no radial facets - the
+  // dense along-track union reads as one clean band, cone-tangent-chain
+  // quality. (Stepped quadrant arcs stay correct for the visible rings.)
+  function swathBlob(pr, lat, lon, radii) {
+    if (!radii) return "";
+    var rv = [radii[0] || 0, radii[1] || 0, radii[2] || 0, radii[3] || 0];
+    if (Math.max(rv[0], rv[1], rv[2], rv[3]) <= 0) return "";
+    var coslat = Math.max(0.2, Math.cos(lat * Math.PI / 180));
+    function rAt(th) {
+      var a = (((th - 45) % 360) + 360) % 360;   // 0 at the NE center
+      var seg = Math.floor(a / 90);              // 0..3
+      var f = (a - seg * 90) / 90;               // 0..1 between centers
+      var w = 0.5 - 0.5 * Math.cos(f * Math.PI); // smoothstep
+      return rv[seg % 4] + (rv[(seg + 1) % 4] - rv[seg % 4]) * w;
+    }
+    var pts = [];
+    for (var th = 0; th < 360; th += 3) {
+      var rdeg = rAt(th) / 60.0, t = th * Math.PI / 180;
+      pts.push(pr.X(lon + rdeg * Math.sin(t) / coslat).toFixed(1) + "," +
+               pr.Y(lat + rdeg * Math.cos(t)).toFixed(1));
+    }
+    return "M" + pts.join("L") + "Z";
+  }
+
   function stormHasRadii(storm) {
     return (storm.points || []).some(function (p) {
       return p && p.radii && (p.radii["34"] || p.radii["50"] ||
@@ -1967,6 +2078,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var svg = document.getElementById("trackplot");
     var note = document.getElementById("trackplot-note");
     if (!svg) return;
+    _tierPal = resolveTierPalette("Ring");      // FG-R3 #1: ring palette
     var pts = (storm.points || []).filter(function (p) {
       return p && p.lat != null && p.lon != null; });
     if (pts.length < 1) { svg.innerHTML = ""; if (note) note.textContent = "";
@@ -1998,9 +2110,9 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     // current wind-field arcs (drawn BEFORE the track dots / hero marker so
     // the marker sits on top but the arcs fan visibly beyond it). Three
-    // color-tiered rings, ~2px strokes, bright on the dark canvas, all from
-    // the ONE house wind-tier palette (verdict 1 - same hues the swath uses):
-    //   34 kt = TS green (outer), 50 kt = C1 gold, 64 kt = C3 red (inner).
+    // tiered rings (34 outer / 50 / 64 inner), ~2px strokes, bright on the
+    // dark canvas, all from the active wind-tier palette (FG-R3 #1, the
+    // user's ring pick) via tierRGBA/tierHex - NOT the SSHS category hues.
     //   Each non-empty tier gets an outer-edge label and an entry in a tiny
     //   inline key. tiers = [thr, fill, stroke, strokeWidth, labelHex, bearing]
     var hasField = false;
@@ -2065,7 +2177,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       shapesSeen[shape] = 1;
       var r = isNow ? 11 : 5.4;
       var cls = "tp-dot" + (isNow ? " tp-now" : "");
-      parts.push(shapeMarker(shape, tp[i][0], tp[i][1], r, col, cls));
+      // NOW marker: neon-by-wind fill, but the halo (currentColor) is the
+      // active tier palette's core hue, not the neon-yellow fill (FG-R3 #1).
+      parts.push(shapeMarker(shape, tp[i][0], tp[i][1], r, col, cls,
+        isNow ? tierGlow() : null));
     });
 
     // LABELED COLORBAR (gradient bar + ticks, units-aware labels).
@@ -2165,14 +2280,15 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     svg.innerHTML = parts.join("");
+    fitLockup(svg);                              // FG-R3 #3b: contain the eyebrow
 
     // disclosure caption (cite the radii source).
     if (note) {
       var cap = "Observed best-track positions colored by 1-min wind; ";
       cap += hasField
         ? "current four-quadrant wind radii from the latest advisory/ATCF " +
-          "best-track deck (34/50/64 " + windUnitLabel() +
-          " thresholds shown)."
+          "best-track deck (" + windDisp(34) + "/" + windDisp(50) + "/" +
+          windDisp(64) + " " + windUnitLabel() + " thresholds shown)."
         : "wind radii unavailable for this storm.";
       note.textContent = cap;
     }
@@ -2189,6 +2305,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var mbody = document.getElementById("swath-method-body");
     var note = document.getElementById("swathplot-note");
     if (!svg) return;
+    _tierPal = resolveTierPalette("Swath");     // FG-R3 #1: swath palette
     var pts = (storm.points || []).filter(function (p) {
       return p && p.lat != null && p.lon != null; });
 
@@ -2254,10 +2371,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (withR.length === 0) return [];
       var polys = [];
       function emit(lat, lon, radii) {
-        var d = quadrantArcs(pr, lat, lon, radii, "");
-        // strip the wrapper the arc helper adds; we only want the path d.
-        var m = d.match(/d="([^"]+)"/);
-        if (m) polys.push(m[1]);
+        // FG-R3 #2: smooth closed blob (not a faceted quadrant sector).
+        var d = swathBlob(pr, lat, lon, radii);
+        if (d) polys.push(d);
       }
       // build a dense per-fix list (in track order, only ones with radii
       // for this threshold), interpolating sub-steps between neighbours.
@@ -2270,7 +2386,14 @@ HTML_TEMPLATE = r"""<!doctype html>
         emit(a.lat, a.lon, a.radii[thr]);
         if (i + 1 < ordered.length) {
           var b = ordered[i + 1];
-          var STEPS = 6;
+          // FG-R3 #2: interpolation density scales with the ON-SCREEN gap
+          // between fixes (~ one sub-step every 7 px) so the swept envelope
+          // has clean edges instead of per-fix scallops on the 64-kt core;
+          // capped so a long jump can't explode the polygon count.
+          var dpx = Math.sqrt(
+            Math.pow(pr.X(b.lon) - pr.X(a.lon), 2) +
+            Math.pow(pr.Y(b.lat) - pr.Y(a.lat), 2));
+          var STEPS = Math.max(6, Math.min(80, Math.ceil(dpx / 4)));
           for (var s = 1; s < STEPS; s++) {
             var f = s / STEPS;
             var lat = a.lat + (b.lat - a.lat) * f;
@@ -2291,12 +2414,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     var sw64 = sweep("64");
 
     // The swath ALWAYS renders FILLED (verdict 2). CLEAN SOLID translucent
-    // bands, NO per-polygon stroke: the swept sectors are all wound the same
+    // bands, NO per-polygon stroke: the smooth blobs are all wound the same
     // way so fill-rule="nonzero" unions every overlap into one seam-free
-    // shape. House GREEN for the 34-kt tropical-storm field; a solid RED core
-    // for the 64-kt hurricane wind on top (verdict 1 - the SAME tier palette
-    // the track rings use). The two read at a glance: green field, red core.
-    // (Any stroke here re-draws every sub-polygon edge -> a mesh.)
+    // shape. The 34-kt tropical-storm field uses the active swath palette's
+    // 34 tier; the 64-kt hurricane core its 64 tier on top (FG-R3 #1, the
+    // user's swath pick) - NOT the SSHS category hues. The two read at a
+    // glance. (Any stroke here re-draws every sub-polygon edge -> a mesh.)
     function emitSwath(polys, fillKey) {
       if (!polys.length) return;
       var d = polys.join(" ");
@@ -2332,12 +2455,14 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     svg.innerHTML = parts.join("");
+    fitLockup(svg);                              // FG-R3 #3b: contain the eyebrow
 
     if (note) {
       note.textContent =
-        "Cumulative tropical-storm-force (34 " + windUnitLabel() +
-        ", green) swath" + (sw64.length ? ", with hurricane-force (64 " +
-        windUnitLabel() + ", red) core overlaid," : "") +
+        "Cumulative tropical-storm-force (" + windDisp(34) + " " +
+        windUnitLabel() + ") swath" + (sw64.length ?
+        ", with the hurricane-force (" + windDisp(64) + " " +
+        windUnitLabel() + ") core overlaid," : "") +
         " swept from the analyzed quadrant wind radii along the observed " +
         "track. Derived from best-track deck radii — not an official " +
         "NHC wind-swath product.";
@@ -3026,7 +3151,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<g class="ac-title">' +
       '<rect x="' + (railX - 1.5) + '" y="' + ty0 +
       '" width="3" height="' + TIT_H +
-      '" rx="1.5" fill="var(--cat-accent)"/>' +
+      '" rx="1.5" fill="var(--ac-rail)"/>' +
       '<text class="ac-eyebrow" x="' + taX + '" y="' + (ty0 + 14) +
       '" text-anchor="' + taA +
       '">TRIPLE-A-TROPICS \u00b7 CycloLab</text>' +
@@ -3267,7 +3392,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     // y-axis: tick GEOMETRY in kt, LABELS in the chosen unit (#3)
     [0, 25, 50, 75, 100, 125, 150].forEach(function (k) {
       if (k > kMax) return;
-      parts.push('<text x="' + (padL - 8) + '" y="' +
+      parts.push('<text class="in-ytick" x="' + (padL - 8) + '" y="' +
         (Yk(k) + 4).toFixed(1) + '" text-anchor="end" font-size="11" ' +
         'fill="#8b95a5">' + windDisp(k) + "</text>");
     });
@@ -4039,6 +4164,13 @@ HTML_TEMPLATE = r"""<!doctype html>
                    setWindUnits: function (u) { setWindUnits(u); },
                    windUnits: function () { return settings.windUnits; },
                    windDisp: function (kt) { return windDisp(kt); },
+                   // FG-R3 #1 palette hooks (board render + tests)
+                   setWindPalette: function (k) {
+                     window.__labWindPalette = k; },
+                   tierColors: function (which) {
+                     var p = resolveTierPalette(which || "Ring");
+                     return { "34": p["34"], "50": p["50"], "64": p["64"] }; },
+                   neonRGB: function (kt) { return neonRGB(kt); },
                    hafsViewer: function () { return hafsViewer; },
                    // FG-R3 #7/#8 overview-plot hooks (tests + ops)
                    renderTrackPlot: function (s) {

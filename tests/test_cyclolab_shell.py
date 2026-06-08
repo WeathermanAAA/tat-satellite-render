@@ -558,8 +558,9 @@ class TestWindUnits(unittest.TestCase):
                           {"op": "setWindUnits", "unit": "mph"}])
         st = recs[-1]["state"]
         self.assertEqual(st["windUnits"], "mph")
-        # 120 kt -> 138 mph (1.15078)
-        self.assertEqual(st["vmaxText"], "138")
+        # 120 kt -> 138.09 mph -> ROUNDED to nearest 5 = 140 (FG-R3 #4,
+        # NHC-style; every converted display ends in 0/5).
+        self.assertEqual(st["vmaxText"], "140")
         self.assertEqual(st["vmaxUnit"], "mph")
         self.assertIn("wind mph", st["chartLabel"])
         # cone placards carry the converted unit, never a bare "kt"
@@ -603,6 +604,98 @@ class TestWindUnits(unittest.TestCase):
         st = recs[-1]["state"]
         self.assertEqual(st["vmaxText"], "120")   # back to the kt value
         self.assertEqual(st["vmaxUnit"], "kt")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestWindRounding(unittest.TestCase):
+    """FG-R3 #4: CONVERTED winds round to the nearest 5 (NHC-style) so every
+    mph / km-h display ends in 0 or 5; kt stays the raw advisory value."""
+
+    def setUp(self):
+        self.html = cyclolab_shell.render_page(load_storm(), feed_url=FEED_URL)
+
+    def _disp_many(self, unit, kts):
+        ops = [{"op": "setWindUnits", "unit": unit}]
+        ops += [{"op": "callLab", "fn": "windDisp", "args": [k]} for k in kts]
+        recs = run_harness(self.html, {"ops": ops})
+        res = [r["result"] for r in recs if r.get("op") == "callLab"]
+        return dict(zip(kts, res))
+
+    def test_mph_table_matches_nhc_published_conversions(self):
+        # NHC advisory conversions, rounded to nearest 5 mph.
+        self.assertEqual(
+            self._disp_many("mph", [30, 50, 64, 100, 120, 160]),
+            {30: "35", 50: "60", 64: "75", 100: "115", 120: "140",
+             160: "185"})
+
+    def test_kmh_table_rounds_to_nearest_5(self):
+        self.assertEqual(
+            self._disp_many("kmh", [34, 64, 100]),
+            {34: "65", 64: "120", 100: "185"})
+
+    def test_kt_stays_the_raw_value(self):
+        self.assertEqual(
+            self._disp_many("kt", [34, 64, 97]),
+            {34: "34", 64: "64", 97: "97"})
+
+    def test_no_converted_value_lands_off_a_5_boundary(self):
+        # property sweep over the whole advisory wind range, both units.
+        kts = list(range(10, 200, 5))
+        for unit in ("mph", "kmh"):
+            got = self._disp_many(unit, kts)
+            for kt, d in got.items():
+                self.assertEqual(int(d) % 5, 0,
+                                 "%d kt -> %s %s is not on a 5-boundary"
+                                 % (kt, d, unit))
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestWindTierPalette(unittest.TestCase):
+    """FG-R3 #1: the wind tiers carry their OWN palette - explicitly NOT the
+    SSHS category tokens - with four candidate treatments resolved per
+    product (ring vs swath chosen independently)."""
+
+    REJECTED = {"34": [70, 197, 106], "50": [255, 225, 77], "64": [255, 77, 59]}
+
+    def setUp(self):
+        self.html = cyclolab_shell.render_page(load_storm(), feed_url=FEED_URL)
+
+    def _tiers(self, key, which="Ring"):
+        recs = run_harness(self.html, {"ops": [
+            {"op": "callLab", "fn": "setWindPalette", "args": [key]},
+            {"op": "callLab", "fn": "tierColors", "args": [which]}]})
+        return recs[-1]["result"]
+
+    def test_palette_B_equals_neon_ramp_samples(self):
+        recs = run_harness(self.html, {"ops": [
+            {"op": "callLab", "fn": "neonRGB", "args": [34]},
+            {"op": "callLab", "fn": "neonRGB", "args": [50]},
+            {"op": "callLab", "fn": "neonRGB", "args": [64]},
+            {"op": "callLab", "fn": "setWindPalette", "args": ["B"]},
+            {"op": "callLab", "fn": "tierColors", "args": ["Ring"]}]})
+        n = [recs[i]["result"] for i in range(3)]
+        tiers = recs[-1]["result"]
+        self.assertEqual([tiers["34"], tiers["50"], tiers["64"]], n)
+
+    def test_no_palette_reproduces_the_rejected_category_tokens(self):
+        for key in ("A", "B", "C", "D"):
+            self.assertNotEqual(self._tiers(key), self.REJECTED, key)
+
+    def test_four_palettes_have_distinct_cores(self):
+        cores = [tuple(self._tiers(k)["64"]) for k in ("A", "B", "C", "D")]
+        self.assertEqual(len(set(cores)), 4, cores)
+
+    def test_unknown_palette_falls_back_to_A(self):
+        self.assertEqual(self._tiers("Z"), self._tiers("A"))
+
+    def test_ring_and_swath_palettes_resolve_independently(self):
+        # shared knob drives both; explicit per-product knobs override.
+        recs = run_harness(self.html, {"ops": [
+            {"op": "callLab", "fn": "setWindPalette", "args": ["A"]},
+            {"op": "callLab", "fn": "tierColors", "args": ["Ring"]},
+            {"op": "callLab", "fn": "tierColors", "args": ["Swath"]}]})
+        ring, swath = recs[1]["result"], recs[2]["result"]
+        self.assertEqual(ring, swath)   # both fall through to the shared "A"
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
