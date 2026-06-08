@@ -275,14 +275,16 @@ const scheduledDelays = [];
         ? (coneSvg.querySelector(".ac-conegrp")
              .getAttribute("clip-path") || "none")
         : "",
-      coneTitle: coneSvg && coneSvg.querySelector(".ac-title")
+      // maps-pass R3 #2: the lockup is an HTML OVERLAY pinned to the panel's
+      // top-left corner (not an in-SVG element), so read it from the DOM.
+      coneTitle: (document.getElementById("advcone-lockup") &&
+                  !document.getElementById("advcone-lockup").hidden)
         ? {
-            head: (coneSvg.querySelector(".ac-title .ac-head") || {})
+            head: (document.getElementById("advcone-lockup-name") || {})
               .textContent || "",
-            eyebrow: (coneSvg.querySelector(".ac-title .ac-eyebrow") ||
-              {}).textContent || "",
-            sub: (coneSvg.querySelector(".ac-title .ac-sub") || {})
-              .textContent || "",
+            eyebrow: (document.querySelector(
+              "#advcone-lockup .al-eyebrow") || {}).textContent || "",
+            corner: "top-left",
           } : null,
       coneWatermark: coneSvg && coneSvg.querySelector(".ac-ocean")
         ? {

@@ -240,3 +240,35 @@ class TestGarbageInput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIntermediateRolledPicksComplete(unittest.TestCase):
+    """maps-pass R3 #4: when NHC's stated INTERMEDIATE time equals the
+    advisory's SYNOPTIC issued_utc (so it resolves +24 h), the nearer
+    COMPLETE time must win - not a ~24 h countdown on an active storm.
+    Modeled on THREE-E adv 2 (issued 1800Z; "Next intermediate ... 1200 PM
+    CST" == 1800Z; "Next complete ... 300 PM CST" == 2100Z)."""
+
+    TCP = (
+        "ZCZC MIATCPEP3 ALL\n"
+        "BULLETIN\n"
+        "Tropical Depression Three-E Advisory Number   2\n"
+        "1200 PM CST Mon Jun 08 2026\n\n"
+        "...THE DEPRESSION CONTINUES...\n\n"
+        "$$\n"
+        "Next intermediate advisory at 1200 PM CST.\n"
+        "Next complete advisory at 300 PM CST.\n"
+    )
+
+    def setUp(self):
+        self.result = parse_next_advisory(self.TCP, "2026-06-08T18:00:00Z")
+
+    def test_picks_the_sooner_complete_not_the_rolled_intermediate(self):
+        self.assertEqual(self.result["next_advisory_utc"],
+                         "2026-06-08T21:00:00Z")
+        self.assertEqual(self.result["kind"], "complete")
+
+    def test_complete_time_still_exposed(self):
+        self.assertEqual(self.result["next_complete_utc"],
+                         "2026-06-08T21:00:00Z")
+        self.assertTrue(self.result["stated"])

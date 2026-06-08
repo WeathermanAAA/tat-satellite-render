@@ -526,7 +526,21 @@ HTML_TEMPLATE = r"""<!doctype html>
      OCEAN navy, so any meet-scaling letterbox blends into the ocean
      instead of reading as a second tone. */
   .adv-cone-stage { background: #101a2c; margin: 2px -14px 0;
-    border-top: 1px solid var(--border); overflow: hidden; }
+    border-top: 1px solid var(--border); overflow: hidden;
+    position: relative; }
+  /* maps-pass R3 #2: the title lockup is an HTML overlay pinned to the
+     panel's TOP-LEFT corner (the SVG is meet-scaled + CENTERED, so an
+     in-SVG lockup floats inset from the card edge). Eyebrow + storm name on
+     a dark backing; the panel <h3> is the canonical "Forecast cone" head. */
+  .adv-lockup { position: absolute; top: 12px; left: 12px; z-index: 2;
+    background: rgba(8,13,22,0.82); border: 1px solid rgba(44,58,82,0.55);
+    border-left: 3px solid var(--ac-rail); border-radius: 8px;
+    padding: 7px 13px 8px; pointer-events: none; max-width: 66%; }
+  .adv-lockup[hidden] { display: none; }
+  .adv-lockup .al-eyebrow { color: #8fa2bd; font-size: 11px;
+    font-weight: 700; letter-spacing: 1.5px; }
+  .adv-lockup .al-name { color: #ffffff; font-size: 18px; font-weight: 800;
+    letter-spacing: 0.5px; margin-top: 2px; white-space: nowrap; }
   /* Overview hero (final-gate-2 #1/#2): a storm-centered SST render
      from SOURCE data - the per-storm PNGs the poller bakes (storm at
      the EXACT pixel center, native 5 km CRW detail, house recipe +
@@ -598,12 +612,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     stroke-linejoin: round; stroke-linecap: round; }
   .ac-border { fill: none; stroke: rgba(255,255,255,0.72);
     stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
-  /* maps-pass R2: drawn ON TOP of the basemap (full extent), so a mid-tone
-     semi-transparent stroke reads subtly on BOTH the light land and the
-     dark ocean (a flat dark line would dominate the light land). */
-  .ac-graticule line { stroke: rgba(120,140,170,0.38); stroke-width: 1; }
-  .ac-graticule text { fill: #4d5f7d; font-size: 13px;
-    font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+  /* maps-pass R3 #3: a CASING/HALO graticule - a dark hairline UNDER a light
+     line - so every line reads over BOTH the light-gray land AND the dark
+     ocean (a flat light line vanished over the light land). Labels get the
+     same dark-casing paint-order stroke and sit on all four edges. */
+  .ac-graticule .grat-cas { stroke: rgba(8,14,26,0.55); stroke-width: 2.6; }
+  .ac-graticule .grat-lin { stroke: rgba(228,236,250,0.6); stroke-width: 1; }
+  .ac-graticule .grat-lab { fill: #e7eef9; font-size: 12.5px;
+    font-variant-numeric: tabular-nums; paint-order: stroke;
+    stroke: rgba(8,14,26,0.82); stroke-width: 2.6; stroke-linejoin: round; }
   .ac-ocean { fill: rgba(202,217,240,0.14); font-size: 17px;
     font-weight: 700; letter-spacing: 4.5px; }
   /* subtle dark backing so the white head always reads clean over any
@@ -1023,6 +1040,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="card">
         <h3>Forecast cone</h3>
         <div class="adv-cone-stage">
+          <div class="adv-lockup" id="advcone-lockup" hidden>
+            <div class="al-eyebrow">TRIPLE-A-TROPICS · CycloLab</div>
+            <div class="al-name" id="advcone-lockup-name"></div>
+          </div>
           <svg id="advcone" viewBox="0 0 1000 620"
                preserveAspectRatio="xMidYMid meet" role="img"
                aria-label="Forecast track and uncertainty cone"></svg>
@@ -1848,38 +1869,53 @@ HTML_TEMPLATE = r"""<!doctype html>
     };
   }
 
-  // 5-deg graticule, drawn ON TOP of the basemap so the lines span the FULL
-  // panel extent (over land too) instead of being clipped where the land
-  // fill begins (maps-pass R2 #4: they used to "just end" at the coast).
-  // Degree labels ride the bottom (lon) / left (lat) edges.
+  // 5-deg graticule (maps-pass R3 #3): drawn as the TOP-MOST layer with a
+  // CASING/HALO - a dark hairline UNDER a light line - so every line reads
+  // over BOTH the light-gray land AND the dark ocean (a flat light line
+  // vanished over the light land in R2). Degree labels on ALL FOUR edges,
+  // each with the same dark-casing paint-order stroke.
   function graticule(pr) {
     var W = pr.W, H = pr.H;
     var lonL = pr.lonAt(0), lonR = pr.lonAt(W);
     var latT = pr.latAt(0), latB = pr.latAt(H);
-    var g = ['<g class="ac-graticule">'];
+    var cas = [], lin = [], lab = [];
     for (var gl = Math.ceil(lonL / 5) * 5; gl <= lonR; gl += 5) {
       var gx = pr.X(gl);
-      g.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' +
-        gx.toFixed(1) + '" y2="' + H + '"/>');
+      if (gx < 1 || gx > W - 1) continue;
+      var gxs = gx.toFixed(1);
+      cas.push('<line class="grat-cas" x1="' + gxs + '" y1="0" x2="' +
+        gxs + '" y2="' + H + '"/>');
+      lin.push('<line class="grat-lin" x1="' + gxs + '" y1="0" x2="' +
+        gxs + '" y2="' + H + '"/>');
       var gn = ((gl % 360) + 360) % 360;
       var glab = gn > 180 ? (360 - gn) + "°W"
                           : (gn === 0 || gn === 180 ? gn + "°" : gn + "°E");
-      if (gx > 30 && gx < W - 60) {
-        g.push('<text x="' + (gx + 6).toFixed(1) + '" y="' +
-          (H - 12) + '">' + glab + "</text>");
+      if (gx > 24 && gx < W - 24) {
+        lab.push('<text class="grat-lab" x="' + gxs +
+          '" y="17" text-anchor="middle">' + glab + "</text>");
+        lab.push('<text class="grat-lab" x="' + gxs + '" y="' + (H - 8) +
+          '" text-anchor="middle">' + glab + "</text>");
       }
     }
     for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
       var gy = pr.Y(ga);
-      g.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W +
-        '" y2="' + gy.toFixed(1) + '"/>');
-      if (gy > 40 && gy < H - 34) {
-        g.push('<text x="10" y="' + (gy - 6).toFixed(1) + '">' +
-          Math.abs(ga) + "°" + (ga >= 0 ? "N" : "S") + "</text>");
+      if (gy < 1 || gy > H - 1) continue;
+      var gys = gy.toFixed(1);
+      cas.push('<line class="grat-cas" x1="0" y1="' + gys + '" x2="' + W +
+        '" y2="' + gys + '"/>');
+      lin.push('<line class="grat-lin" x1="0" y1="' + gys + '" x2="' + W +
+        '" y2="' + gys + '"/>');
+      var llab = Math.abs(ga) + "°" + (ga >= 0 ? "N" : "S");
+      if (gy > 22 && gy < H - 22) {
+        var ly = (gy - 5).toFixed(1);
+        lab.push('<text class="grat-lab" x="7" y="' + ly +
+          '" text-anchor="start">' + llab + "</text>");
+        lab.push('<text class="grat-lab" x="' + (W - 7) + '" y="' + ly +
+          '" text-anchor="end">' + llab + "</text>");
       }
     }
-    g.push("</g>");
-    return g.join("");
+    return '<g class="ac-graticule">' + cas.join("") + lin.join("") +
+      lab.join("") + "</g>";
   }
 
   // basemap furniture (ocean -> land -> borders -> coast -> graticule-on-top)
@@ -2810,8 +2846,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
-    parts.push(graticule({ W: W, H: H, X: X, Y: Y,
-                           lonAt: lonAt, latAt: latAt }));
+    // (the graticule is pushed AFTER the cone group below, so it sits ABOVE
+    // the cone too - maps-pass R3 #3 top-most layer.)
 
 
     // ---- reveal (S4-AD2 #1): ONE continuous arc-length-parameterized
@@ -3112,12 +3148,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       'stroke-width="2.4" stroke-linecap="round" ' +
       'stroke-linejoin="round"/></g>');
 
+    // graticule ON TOP of the cone too (maps-pass R3 #3): the casing/halo
+    // reads over the cone glass + the land + the ocean, edge-to-edge. The
+    // icons + placards below are drawn AFTER, so they stay on top of it.
+    parts.push(graticule({ W: W, H: H, X: X, Y: Y,
+                           lonAt: lonAt, latAt: latAt }));
+
     // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
     // collision-aware placard layout: alternate sides of the track,
     // push outward on overlap, leader line when pushed far.
     var rects = [];      // occupied rects: title, icons, placards
-    // ---- in-plot TITLE LOCKUP (S4-AD2 #5): reserve its corner before
-    // anything else places - the side with less cone overlap wins.
+    // ---- TITLE LOCKUP corner reservation: the lockup is the HTML overlay
+    // pinned TOP-LEFT (maps-pass R3 #2), so reserve the top-left rect here
+    // and placards avoid it.
     var coneXs = coneRing.map(function (c) { return X(c[0]); });
     var coneYs = coneRing.map(function (c) { return Y(c[1]); });
     var coneBox = { x: Math.min.apply(null, coneXs),
@@ -3126,7 +3169,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                        Math.min.apply(null, coneXs),
                     h: Math.max.apply(null, coneYs) -
                        Math.min.apply(null, coneYs) };
-    var TIT_W = 312, TIT_H = 58, TIT_PAD = 22;
+    var TIT_W = 320, TIT_H = 64, TIT_PAD = 18;
     function overlapArea(a, b) {
       var ox = Math.max(0, Math.min(a.x + a.w, b.x + b.w) -
                            Math.max(a.x, b.x));
@@ -3134,12 +3177,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                            Math.max(a.y, b.y));
       return ox * oy;
     }
-    var titleLeft = { x: TIT_PAD, y: TIT_PAD, w: TIT_W, h: TIT_H };
-    var titleRight = { x: W - TIT_W - TIT_PAD, y: TIT_PAD,
-                       w: TIT_W, h: TIT_H };
-    var titleRect = (overlapArea(titleLeft, coneBox) <=
-                     overlapArea(titleRight, coneBox))
-      ? titleLeft : titleRight;
+    var titleRect = { x: TIT_PAD, y: TIT_PAD, w: TIT_W, h: TIT_H };
     rects.push(titleRect);
     function overlaps(r) {
       for (var k = 0; k < rects.length; k++) {
@@ -3153,7 +3191,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     pts.forEach(function (p, i) {
       // maps-pass R2 (legibility): the NOW marker DOMINATES the origin and
       // the forecast glyphs are enlarged so every label reads at a glance.
-      var half = (i === 0 ? 80 : 32);
+      var half = (i === 0 ? 80 : 46);
       iconR.push(half);
       rects.push({ x: tp[i][0] - half, y: tp[i][1] - half,
                    w: 2 * half, h: 2 * half });
@@ -3168,7 +3206,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     // - the placard stays as close and as radial as the cluster allows.
     var placards = [];
     pts.forEach(function (p, i) {
-      var pw = (i === 0 ? 158 : 118), ph = (i === 0 ? 38 : 30);
+      var pw = (i === 0 ? 188 : 152), ph = (i === 0 ? 46 : 40);
       // local track direction -> perpendicular placement sides
       var a = tp[Math.max(0, i - 1)], b = tp[Math.min(tp.length - 1, i + 1)];
       var vx = b[0] - a[0], vy = b[1] - a[1];
@@ -3237,7 +3275,7 @@ HTML_TEMPLATE = r"""<!doctype html>
            ? 600 + i * 150
            : Math.round(HOLD_MS + GROW_MS *
                         invEaseS(Math.max(0.02, cumIcons[i] / Ltot))));
-      var scale = (i === 0 ? 1.9 : 0.66);    // NOW dominates; forecast bigger
+      var scale = (i === 0 ? 1.9 : 0.98);    // NOW dominates; forecast LEGIBLE
       var tau = Math.round(p.tau_h || 0);
       parts.push('<g class="ac-icon" data-tau="' + tau +
         '" data-tropical="' + (tropical ? 1 : 0) +
@@ -3274,7 +3312,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" stroke="rgba(0,0,0,0.3)"/>' +
         '<text x="' + (pw2 / 2) + '" y="' + (ph2 / 2) +
         '" text-anchor="middle" dominant-baseline="central" font-size="' +
-        (i === 0 ? 19 : 16) +
+        (i === 0 ? 25 : 21) +
         '" font-weight="' + (i === 0 ? 800 : 700) +
         // canon ink rule: ALWAYS light on the category ramps (same
         // stroke treatment as the icon SS labels)
@@ -3283,30 +3321,23 @@ HTML_TEMPLATE = r"""<!doctype html>
       parts.push("</g>");
     });
 
-    // ---- title lockup markup (#5) -- maps-pass R2: the STORM IDENTITY on a
-    // DARK BACKING (legible over the cone / land / graticule, never faint).
-    // The redundant "FORECAST CONE" line is DROPPED - the panel's own <h3>
-    // is the canonical "Forecast cone" header; this lockup carries only the
-    // eyebrow + storm name, left-aligned in a corner clamped on-panel.
+    // ---- title lockup (#5; maps-pass R3 #2) -- an HTML OVERLAY pinned to
+    // the panel's TOP-LEFT CORNER (populated here), NOT an in-SVG element:
+    // the cone SVG is meet-scaled + CENTERED in the card, so an in-SVG lockup
+    // floats inset from the card edge. The eyebrow + storm name; the panel
+    // <h3> is the canonical "Forecast cone" head. titleRect (top-left) is
+    // still reserved below so placards avoid the lockup corner.
     var stormName = (document.getElementById("storm-name") || {})
       .textContent || "";
     var typeWord = (document.getElementById("storm-type") || {})
       .textContent || "";
-    var nameLine = (typeWord.toUpperCase() + " " +
-                    stormName.toUpperCase()).trim();
-    var ebLine = "TRIPLE-A-TROPICS \u00b7 CycloLab";
-    var bgW = Math.max(nameLine.length * 11.2, ebLine.length * 7.0) + 30;
-    var bgX = Math.max(TIT_PAD, Math.min(titleRect.x, W - bgW - TIT_PAD));
-    var ty0 = titleRect.y, textX = bgX + 16;
-    parts.push('<g class="ac-title">' +
-      '<rect class="ac-title-bg" x="' + bgX.toFixed(1) + '" y="' +
-      (ty0 - 5) + '" width="' + bgW.toFixed(0) + '" height="50" rx="8"/>' +
-      '<rect x="' + (bgX + 5) + '" y="' + (ty0 - 1) +
-      '" width="3" height="42" rx="1.5" fill="var(--ac-rail)"/>' +
-      '<text class="ac-eyebrow" x="' + textX + '" y="' + (ty0 + 12) +
-      '">' + ebLine + '</text>' +
-      '<text class="ac-head" x="' + textX + '" y="' + (ty0 + 35) +
-      '">' + nameLine + '</text></g>');
+    var lkName = document.getElementById("advcone-lockup-name");
+    var lkBox = document.getElementById("advcone-lockup");
+    if (lkName && lkBox) {
+      lkName.textContent = (typeWord.toUpperCase() + " " +
+                            stormName.toUpperCase()).trim();
+      lkBox.hidden = false;
+    }
 
     // ---- ocean watermark: RETIRED on the cone (maps-pass R2 #6). A
     // panel-filling cone leaves no clean open water, and the coastlines +

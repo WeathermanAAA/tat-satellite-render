@@ -549,12 +549,17 @@ HIDE_FURNITURE_JS = """() => {
   // display.
   const svg = document.getElementById('advcone');
   for (const sel of ['.ac-icon', '.ac-title', '.ac-ocean',
-                     '.ac-graticule', '.ac-land', '.ac-coast', '.ac-frame',
-                     'line[data-role="leader"]']) {
+                     '.ac-graticule', '.ac-land', '.ac-coast', '.ac-border',
+                     '.ac-frame', 'line[data-role="leader"]']) {
     svg.querySelectorAll(sel).forEach(el => {
       el.style.display = 'none';
     });
   }
+  // R3 #2: the title lockup is now an HTML overlay OUTSIDE the SVG, so hide
+  // it here too (its white text would otherwise count as a revealed boundary
+  // with no casing, off in the corner away from the cone).
+  const lk = document.getElementById('advcone-lockup');
+  if (lk) lk.style.display = 'none';
 }"""
 
 

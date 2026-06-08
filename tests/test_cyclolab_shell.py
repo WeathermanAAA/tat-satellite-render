@@ -1531,8 +1531,11 @@ class TestNoLeaderLines(unittest.TestCase):
         self.assertEqual(a["coneLeaders"], [], "bunched case drew a line")
         self._no_overlaps(a["conePlacards"], "bunched")
         for p in a["conePlacards"]:
+            # R3 #1 enlarged the forecast placards (~29% wider), so the
+            # collision-free spread of this pathological 6-tau cluster scales
+            # with them; still leader-free (asserted above) + adjacent.
             self.assertLessEqual(
-                p["gap"], 150.0,
+                p["gap"], 205.0,
                 f"bunched placard {p['i']} gap {p['gap']:.1f} unpairable")
 
 

@@ -617,19 +617,24 @@ def parse_next_advisory(tcp_text: str, issued_utc: str) -> dict:
     if intermediate_utc is None and complete_utc is None:
         return none_result
 
-    if intermediate_utc is not None:
-        # Intermediate is always the nearer upcoming advisory when stated.
-        return {
-            "next_advisory_utc": _iso_z(intermediate_utc),
-            "kind": "intermediate",
-            "next_complete_utc": (_iso_z(complete_utc)
-                                  if complete_utc is not None else None),
-            "stated": True,
-        }
-
+    # The SOONEST upcoming advisory wins next_advisory_utc/kind. Normally the
+    # intermediate is the nearer one, but NHC's footer states the next
+    # intermediate AND complete by clock time relative to the product's OWN
+    # issuance, while issued_utc here is the SYNOPTIC instant - so a stated
+    # intermediate that equals the synoptic time resolves +24 h (e.g. THREE-E
+    # adv 2: "Next intermediate ... 1200 PM CST" == 1800Z issuance -> next
+    # day), leaving the complete ("300 PM CST" = 2100Z, +3 h) the real next.
+    # Pick the earlier of the two rather than blindly trusting the
+    # intermediate (which would show a ~24 h countdown on an active storm).
+    candidates = [(t, k) for t, k in
+                  ((intermediate_utc, "intermediate"),
+                   (complete_utc, "complete")) if t is not None]
+    candidates.sort(key=lambda c: c[0])
+    next_utc, kind = candidates[0]
     return {
-        "next_advisory_utc": _iso_z(complete_utc),
-        "kind": "complete",
-        "next_complete_utc": _iso_z(complete_utc),
+        "next_advisory_utc": _iso_z(next_utc),
+        "kind": kind,
+        "next_complete_utc": (_iso_z(complete_utc)
+                              if complete_utc is not None else None),
         "stated": True,
     }

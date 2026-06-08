@@ -175,8 +175,8 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         self.assertIn('<path class="tp-track" d="\' + dline +\n', self.html)
 
     def test_now_icon_is_enlarged(self):
-        # round-2 legibility: the NOW glyph DOMINATES the origin.
-        self.assertIn("var scale = (i === 0 ? 1.9 : 0.66)", self.html)
+        # legibility: NOW dominates; R3 #1 bumped the forecast glyph to 0.98.
+        self.assertIn("var scale = (i === 0 ? 1.9 : 0.98)", self.html)
 
     def test_country_borders_drawn_in_both_furniture_sites(self):
         # round-2 #3: thin white internal borders (ne_10m boundary_lines),
@@ -185,13 +185,24 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         self.assertIn(".ac-border { fill: none; stroke: rgba(255,255,255,0.72)",
                       self.html)
 
-    def test_lockup_drops_redundant_forecast_cone_line(self):
-        # round-2 #5: the in-SVG lockup carries the storm name, NOT a second
-        # "FORECAST CONE" head (the panel <h3> is the canonical header), and
-        # it sits on a dark backing (.ac-title-bg) so it is never faint.
+    def test_lockup_is_a_top_left_html_overlay(self):
+        # R3 #2: the lockup is an HTML overlay PINNED to the panel's top-left
+        # corner (the SVG is meet-scaled+centered, so an in-SVG lockup floats
+        # inset); the redundant "FORECAST CONE" head is gone (panel <h3> head).
         self.assertNotIn('">FORECAST CONE</text>', self.html)
         self.assertIn("<h3>Forecast cone</h3>", self.html)
-        self.assertIn("var nameLine", self.html)
+        self.assertIn('<div class="adv-lockup" id="advcone-lockup"', self.html)
+        self.assertIn(".adv-lockup { position: absolute; top: 12px; "
+                      "left: 12px;", self.html)
+        self.assertIn('id="advcone-lockup-name"', self.html)
+
+    def test_graticule_has_casing_and_four_edge_labels(self):
+        # R3 #3: a dark-casing/halo graticule (reads over light land) with
+        # labels on all four edges, drawn top-most.
+        self.assertIn(".ac-graticule .grat-cas {", self.html)
+        self.assertIn(".ac-graticule .grat-lin {", self.html)
+        self.assertIn('class="grat-cas"', self.html)
+        self.assertIn('class="grat-lab"', self.html)
 
     def test_reveal_is_arc_length_smoothed(self):
         # round-2 #7: a Catmull-Rom spline densifies the track before the
