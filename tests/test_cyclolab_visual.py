@@ -1005,5 +1005,62 @@ class TestWindRoundingSweep(unittest.TestCase):
         self.assertEqual(bad, [], f"km/h wind values off a 5-boundary: {bad}")
 
 
+@unittest.skipUnless(HAVE_RENDERER, "playwright + Pillow required")
+class TestSettingsControlPlacement(unittest.TestCase):
+    """The in-app settings cog lives in the SIDEBAR FOOTER, never overlapping
+    the banner's corner cyclone glyph - at every category and panel size."""
+
+    CATS = ["TD", "TS", "C1", "C2", "C3", "C4", "C5"]
+    SIZES = [("desktop", 1280, 900), ("mobile", 390, 850)]
+
+    def _measure(self, pg, cat):
+        return pg.evaluate(
+            """(cat) => {
+              if (window.__lab && window.__lab.setCategory) __lab.setCategory(cat);
+              const g = document.querySelector('.banner .glyph');
+              const s = document.getElementById('settings-btn');
+              const foot = document.querySelector('.side-foot');
+              const banner = document.querySelector('.banner');
+              if (!g || !s) return { missing: true };
+              const rg = g.getBoundingClientRect(), rs = s.getBoundingClientRect();
+              const ov = !(rg.right <= rs.left || rs.right <= rg.left ||
+                           rg.bottom <= rs.top || rs.bottom <= rg.top);
+              return { overlap: ov,
+                       inFooter: !!(foot && foot.contains(s)),
+                       inBanner: !!(banner && banner.contains(s)),
+                       sVisible: rs.width > 0 && rs.height > 0 };
+            }""", cat)
+
+    def test_settings_never_overlaps_banner_glyph(self):
+        from playwright.sync_api import sync_playwright
+        storm = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        html = cyclolab_shell.render_page(storm, feed_url=FEED_URL, loader="")
+        with tempfile.TemporaryDirectory() as td:
+            page = Path(td) / "page.html"
+            page.write_text(html, encoding="utf-8")
+            with sync_playwright() as p:
+                b = p.chromium.launch()
+                for label, w, h in self.SIZES:
+                    pg = b.new_page(viewport={"width": w, "height": h},
+                                    device_scale_factor=2)
+                    pg.goto(f"file://{page}")
+                    pg.wait_for_timeout(1200)
+                    for cat in self.CATS:
+                        m = self._measure(pg, cat)
+                        pg.wait_for_timeout(60)
+                        self.assertFalse(m.get("missing"),
+                                         f"{label}/{cat}: glyph or settings missing")
+                        self.assertTrue(m["sVisible"], f"{label}/{cat}: settings hidden")
+                        self.assertTrue(m["inFooter"],
+                                        f"{label}/{cat}: settings not in .side-foot")
+                        self.assertFalse(m["inBanner"],
+                                         f"{label}/{cat}: settings still inside .banner")
+                        self.assertFalse(m["overlap"],
+                                         f"{label}/{cat}: settings overlaps the "
+                                         "banner glyph")
+                    pg.close()
+                b.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

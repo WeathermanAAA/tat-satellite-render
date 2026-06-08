@@ -334,10 +334,11 @@ HTML_TEMPLATE = r"""<!doctype html>
   .sec-btn:hover { color: var(--fg); }
   .sec-btn.active { color: #ffffff; border-left-color: var(--cat-accent);
     background: linear-gradient(90deg, rgba(255,255,255,0.05), transparent); }
-  .back-map { padding: 16px 18px; border-top: 1px solid var(--border);
+  .back-map { color: var(--muted); text-decoration: none;
     font-size: 12.5px; font-weight: 700; letter-spacing: 0.8px;
-    text-transform: uppercase; min-height: 48px; display: flex;
-    align-items: center; }
+    text-transform: uppercase; display: inline-flex; align-items: center;
+    white-space: nowrap; }
+  .back-map:hover { color: var(--fg); }
 
   .ended-strip { display: none; background: #2a2f3a; color: #e8eef5;
     padding: 10px 16px; font-size: 13px; font-weight: 700;
@@ -419,13 +420,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     white-space: nowrap; }
   .hafs-btn:hover { border-color: var(--cat-accent); color: var(--cat-accent); }
   .hafs-play { min-width: 86px; }
-  /* in-app settings (final-gate-3 #3) */
-  .settings-btn { position: absolute; top: 12px; right: 12px;
-    width: 32px; height: 32px; display: flex; align-items: center;
-    justify-content: center; border-radius: 8px; cursor: pointer;
-    background: rgba(0,0,0,0.22); color: #fff; border: 0;
-    transition: background 0.15s; }
-  .settings-btn:hover { background: rgba(0,0,0,0.40); }
+  /* in-app settings reopen-control (final-gate-3 #3): lives in the SIDEBAR
+     FOOTER beside "Back to map" - NEVER over the banner corner glyph. */
+  .side-foot { display: flex; align-items: center;
+    justify-content: space-between; gap: 10px; padding: 13px 18px;
+    border-top: 1px solid var(--border); }
+  .settings-btn { display: inline-flex; align-items: center; gap: 7px;
+    background: rgba(255,255,255,0.04); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 11px; font: inherit; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.6px; text-transform: uppercase; cursor: pointer;
+    transition: color 0.15s, border-color 0.15s; }
+  .settings-btn:hover { color: var(--fg); border-color: var(--cat-accent); }
+  .settings-btn svg { display: block; }
   .settings-pop { position: fixed; inset: 0; z-index: 60;
     display: flex; align-items: flex-start; justify-content: center;
     padding-top: 12vh; background: rgba(4,8,14,0.55); }
@@ -739,7 +746,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       min-height: 52px; font-size: 10.5px; border-left: 0;
       border-top: 3px solid transparent; }
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
-    .back-map { border-top: 0; padding: 8px 12px; min-height: 0; }
+    .side-foot { padding: 8px 12px; }
     .stage { padding: 4px 14px 86px; }
     /* FG-R3 #11: mobile Overview = ONE column, explicit stack order
        hero -> track -> W&P -> swath (the DOM stays logical: left col =
@@ -803,17 +810,6 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="storm-name" id="storm-name">__NAME__</div>
         <span class="chip" id="chip"__CHIP_STYLE__>__CHIP__</span>
       </div>
-      <button type="button" id="settings-btn" class="settings-btn"
-              title="Settings" aria-label="Settings"
-              aria-haspopup="dialog" aria-expanded="false">
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-          <path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8zm0
-            2a2 2 0 110 4 2 2 0 010-4zm8.4 2c0-.5 0-1-.1-1.5l2-1.6-2-3.4-2.4
-            1a7.6 7.6 0 00-1.3-.8l-.4-2.6H9.8l-.4 2.6c-.5.2-.9.5-1.3.8l-2.4-1-2
-            3.4 2 1.6c-.1.5-.1 1-.1 1.5s0 1 .1 1.5l-2 1.6 2 3.4 2.4-1c.4.3.8.6
-            1.3.8l.4 2.6h4.4l.4-2.6c.5-.2.9-.5 1.3-.8l2.4 1 2-3.4-2-1.6c.1-.5.1-1
-            .1-1.5z"/></svg>
-      </button>
     </div>
     <div class="bug-body">
       <div class="heroes">
@@ -837,7 +833,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
     </nav>
-    <a class="back-map" href="/global_tracks.html">← Back to map</a>
+    <div class="side-foot">
+      <button type="button" id="settings-btn" class="settings-btn"
+              title="Settings" aria-label="Settings"
+              aria-haspopup="dialog" aria-expanded="false">
+        <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+          <path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4zm8.4 2c0-.5 0-1-.1-1.5l2-1.6-2-3.4-2.4 1a7.6 7.6 0 00-1.3-.8l-.4-2.6H9.8l-.4 2.6c-.5.2-.9.5-1.3.8l-2.4-1-2 3.4 2 1.6c-.1.5-.1 1-.1 1.5s0 1 .1 1.5l-2 1.6 2 3.4 2.4-1c.4.3.8.6 1.3.8l.4 2.6h4.4l.4-2.6c.5-.2.9-.5 1.3-.8l2.4 1 2-3.4-2-1.6c.1-.5.1-1 .1-1.5z"/></svg>
+        <span>Settings</span>
+      </button>
+      <a class="back-map" href="/global_tracks.html">← Back to map</a>
+    </div>
   </aside>
 
   <main class="stage">
