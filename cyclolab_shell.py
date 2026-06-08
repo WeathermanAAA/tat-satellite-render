@@ -367,6 +367,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     letter-spacing: 1.4px; text-transform: uppercase; color: var(--muted); }
   .card svg { width: 100%; height: auto; max-height: var(--panel-max-h);
     display: block; touch-action: pan-y; }
+  /* maps-pass R4 #1: the track + swath maps get a DEFINITE height (the
+     shared aspect-fill rule) so their basemap COVERS edge-to-edge like the
+     cone, no letterbox; respects the 62vh no-scroll cap. */
+  #trackplot, #swathplot { height: clamp(320px, 56vh, 560px); }
   .card .note { font-size: 10.5px; color: var(--muted); margin-top: 8px;
     letter-spacing: 0.3px; }
   .draw path.series { stroke-dasharray: var(--len, 2000);
@@ -527,18 +531,26 @@ HTML_TEMPLATE = r"""<!doctype html>
      instead of reading as a second tone. */
   .adv-cone-stage { background: #101a2c; margin: 2px -14px 0;
     border-top: 1px solid var(--border); overflow: hidden;
-    position: relative; }
+    position: relative;
+    /* maps-pass R4 #1: a DEFINITE height (respecting the 62vh no-scroll cap)
+       so the SVG below can COVER it edge-to-edge and the fill extent has a
+       real card aspect to measure. */
+    height: clamp(340px, 62vh, 600px); }
   /* maps-pass R3 #2: the title lockup is an HTML overlay pinned to the
      panel's TOP-LEFT corner (the SVG is meet-scaled + CENTERED, so an
      in-SVG lockup floats inset from the card edge). Eyebrow + storm name on
      a dark backing; the panel <h3> is the canonical "Forecast cone" head. */
+  /* maps-pass R4 #2: the box GROWS to its widest line (up to nearly the
+     panel width); a long name steps its type down in JS so it never escapes
+     the box. width:max-content keeps the box hugging its content. */
   .adv-lockup { position: absolute; top: 12px; left: 12px; z-index: 2;
     background: rgba(8,13,22,0.82); border: 1px solid rgba(44,58,82,0.55);
     border-left: 3px solid var(--ac-rail); border-radius: 8px;
-    padding: 7px 13px 8px; pointer-events: none; max-width: 66%; }
+    padding: 7px 13px 8px; pointer-events: none;
+    width: max-content; max-width: calc(100% - 20px); }
   .adv-lockup[hidden] { display: none; }
   .adv-lockup .al-eyebrow { color: #8fa2bd; font-size: 11px;
-    font-weight: 700; letter-spacing: 1.5px; }
+    font-weight: 700; letter-spacing: 1.5px; white-space: nowrap; }
   .adv-lockup .al-name { color: #ffffff; font-size: 18px; font-weight: 800;
     letter-spacing: 0.5px; margin-top: 2px; white-space: nowrap; }
   /* Overview hero (final-gate-2 #1/#2): a storm-centered SST render
@@ -634,7 +646,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 800; letter-spacing: 0.6px; }
   .ac-title .ac-sub { fill: #b9c6da; font-size: 13px;
     font-weight: 700; letter-spacing: 1.1px; }
-  #advcone, #intensity { display: block; width: 100%; height: auto;
+  /* maps-pass R4 #1: the cone SVG COVERS its definite-height stage (slice),
+     full-bleed; the intensity chart keeps its natural aspect (meet). */
+  #advcone { display: block; width: 100%; height: 100%; }
+  #intensity { display: block; width: 100%; height: auto;
     max-height: var(--panel-max-h); }
   .ac-zoom { animation: ac-pushin calc(var(--motion-med) * 0.85)
     ease-out 1 both; }
@@ -1874,56 +1889,134 @@ HTML_TEMPLATE = r"""<!doctype html>
   // over BOTH the light-gray land AND the dark ocean (a flat light line
   // vanished over the light land in R2). Degree labels on ALL FOUR edges,
   // each with the same dark-casing paint-order stroke.
+  // maps-pass R4 #1: the graticule spans the FILL EXTENT [x0,y0..x1,y1] - the
+  // viewBox after it is widened/heightened to the card aspect, which reaches
+  // BEYOND the data box [0,W]x[0,H]. So lat/lon lines + edge labels reach
+  // every PANEL edge (no lineless band). Defaults to the data box.
   function graticule(pr) {
     var W = pr.W, H = pr.H;
-    var lonL = pr.lonAt(0), lonR = pr.lonAt(W);
-    var latT = pr.latAt(0), latB = pr.latAt(H);
+    var x0 = (pr.x0 != null) ? pr.x0 : 0, y0 = (pr.y0 != null) ? pr.y0 : 0;
+    var x1 = (pr.x1 != null) ? pr.x1 : W, y1 = (pr.y1 != null) ? pr.y1 : H;
+    var lonL = pr.lonAt(x0), lonR = pr.lonAt(x1);
+    var latT = pr.latAt(y0), latB = pr.latAt(y1);
+    var sy0 = y0.toFixed(1), sy1 = y1.toFixed(1);
+    var sx0 = x0.toFixed(1), sx1 = x1.toFixed(1);
     var cas = [], lin = [], lab = [];
     for (var gl = Math.ceil(lonL / 5) * 5; gl <= lonR; gl += 5) {
       var gx = pr.X(gl);
-      if (gx < 1 || gx > W - 1) continue;
+      if (gx < x0 + 1 || gx > x1 - 1) continue;
       var gxs = gx.toFixed(1);
-      cas.push('<line class="grat-cas" x1="' + gxs + '" y1="0" x2="' +
-        gxs + '" y2="' + H + '"/>');
-      lin.push('<line class="grat-lin" x1="' + gxs + '" y1="0" x2="' +
-        gxs + '" y2="' + H + '"/>');
+      cas.push('<line class="grat-cas" x1="' + gxs + '" y1="' + sy0 +
+        '" x2="' + gxs + '" y2="' + sy1 + '"/>');
+      lin.push('<line class="grat-lin" x1="' + gxs + '" y1="' + sy0 +
+        '" x2="' + gxs + '" y2="' + sy1 + '"/>');
       var gn = ((gl % 360) + 360) % 360;
       var glab = gn > 180 ? (360 - gn) + "°W"
                           : (gn === 0 || gn === 180 ? gn + "°" : gn + "°E");
-      if (gx > 24 && gx < W - 24) {
-        lab.push('<text class="grat-lab" x="' + gxs +
-          '" y="17" text-anchor="middle">' + glab + "</text>");
-        lab.push('<text class="grat-lab" x="' + gxs + '" y="' + (H - 8) +
-          '" text-anchor="middle">' + glab + "</text>");
+      if (gx > x0 + 24 && gx < x1 - 24) {
+        lab.push('<text class="grat-lab" x="' + gxs + '" y="' +
+          (y0 + 17).toFixed(1) + '" text-anchor="middle">' + glab + "</text>");
+        lab.push('<text class="grat-lab" x="' + gxs + '" y="' +
+          (y1 - 8).toFixed(1) + '" text-anchor="middle">' + glab + "</text>");
       }
     }
     for (var ga = Math.ceil(latB / 5) * 5; ga <= latT; ga += 5) {
       var gy = pr.Y(ga);
-      if (gy < 1 || gy > H - 1) continue;
+      if (gy < y0 + 1 || gy > y1 - 1) continue;
       var gys = gy.toFixed(1);
-      cas.push('<line class="grat-cas" x1="0" y1="' + gys + '" x2="' + W +
-        '" y2="' + gys + '"/>');
-      lin.push('<line class="grat-lin" x1="0" y1="' + gys + '" x2="' + W +
-        '" y2="' + gys + '"/>');
+      cas.push('<line class="grat-cas" x1="' + sx0 + '" y1="' + gys +
+        '" x2="' + sx1 + '" y2="' + gys + '"/>');
+      lin.push('<line class="grat-lin" x1="' + sx0 + '" y1="' + gys +
+        '" x2="' + sx1 + '" y2="' + gys + '"/>');
       var llab = Math.abs(ga) + "°" + (ga >= 0 ? "N" : "S");
-      if (gy > 22 && gy < H - 22) {
+      if (gy > y0 + 22 && gy < y1 - 22) {
         var ly = (gy - 5).toFixed(1);
-        lab.push('<text class="grat-lab" x="7" y="' + ly +
-          '" text-anchor="start">' + llab + "</text>");
-        lab.push('<text class="grat-lab" x="' + (W - 7) + '" y="' + ly +
-          '" text-anchor="end">' + llab + "</text>");
+        lab.push('<text class="grat-lab" x="' + (x0 + 7).toFixed(1) +
+          '" y="' + ly + '" text-anchor="start">' + llab + "</text>");
+        lab.push('<text class="grat-lab" x="' + (x1 - 7).toFixed(1) +
+          '" y="' + ly + '" text-anchor="end">' + llab + "</text>");
       }
     }
     return '<g class="ac-graticule">' + cas.join("") + lin.join("") +
       lab.join("") + "</g>";
   }
 
+  // maps-pass R4 #1: aspect-fill. The data lives in [0,W]x[0,H]; expand THAT
+  // box (plus PAD) out to the card's measured aspect so the basemap fills
+  // the panel edge-to-edge with NO letterbox gap, while the cone / icons /
+  // placards / title (all inside [0,W]x[0,H]) are NEVER cropped - the only
+  // thing the fill ever reveals is more ocean/land/graticule. Returns the
+  // viewBox extent {x0,y0,x1,y1,vw,vh}. Falls back to the data aspect when
+  // the stage is not measurable yet (e.g. a hidden tab).
+  function fillExtent(W, H, stageEl, pad) {
+    pad = (pad == null) ? 30 : pad;
+    var cw = stageEl ? stageEl.clientWidth : 0;
+    var chh = stageEl ? stageEl.clientHeight : 0;
+    var a = (cw > 4 && chh > 4) ? (cw / chh) : (W / H);
+    var dW = W + 2 * pad, dH = H + 2 * pad;
+    var VW, VH;
+    if (a >= dW / dH) { VH = dH; VW = a * dH; }     // landscape card: widen
+    else { VW = dW; VH = dW / a; }                  // portrait card: heighten
+    var cx = W / 2, cy = H / 2;
+    return { x0: cx - VW / 2, y0: cy - VH / 2,
+             x1: cx + VW / 2, y1: cy + VH / 2, vw: VW, vh: VH };
+  }
+
+  // shared fill applier (maps-pass R4 #1): recompute the card-aspect fill
+  // extent + restyle the SVG viewBox (slice = cover, full-bleed), the ocean
+  // rect, and the graticule - WITHOUT touching the data layers. gratPr is the
+  // projection object the graticule reads (X/Y/lonAt/latAt/W/H). Called once
+  // at mount and again on every resize via svg._refit.
+  function mapRefit(svg, W, H, gratPr) {
+    var fe = fillExtent(W, H, svg);
+    svg.setAttribute("viewBox", fe.x0.toFixed(1) + " " + fe.y0.toFixed(1) +
+      " " + fe.vw.toFixed(1) + " " + fe.vh.toFixed(1));
+    svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
+    var oc = svg.querySelector(".ac-ocean-fill");
+    if (oc) {
+      oc.setAttribute("x", fe.x0.toFixed(1));
+      oc.setAttribute("y", fe.y0.toFixed(1));
+      oc.setAttribute("width", fe.vw.toFixed(1));
+      oc.setAttribute("height", fe.vh.toFixed(1));
+    }
+    var og = svg.querySelector(".ac-graticule");
+    if (og) {
+      gratPr.x0 = fe.x0; gratPr.y0 = fe.y0;
+      gratPr.x1 = fe.x1; gratPr.y1 = fe.y1;
+      og.outerHTML = graticule(gratPr);
+    }
+    return fe;
+  }
+
+  // shared resize re-fit: each rendered map stores svg._refit; debounced.
+  var _refitT = null;
+  function refitAllMaps() {
+    ["advcone", "trackplot", "swathplot"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && typeof el._refit === "function") {
+        try { el._refit(); } catch (e) { /* map not mounted */ }
+      }
+    });
+  }
+  if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("resize", function () {
+      if (_refitT) clearTimeout(_refitT);
+      _refitT = setTimeout(refitAllMaps, 180);
+    });
+  }
+
   // basemap furniture (ocean -> land -> borders -> coast -> graticule-on-top)
   // - REUSE the cone classes so one CSS canon dresses all three maps.
   function mapFurniture(pr) {
     var W = pr.W, H = pr.H;
-    var parts = ['<rect class="ac-ocean-fill" width="' + W +
-                 '" height="' + H + '"/>'];
+    // ocean fills the FILL EXTENT (maps-pass R4 #1) so it reaches every
+    // panel edge under the aspect-fill viewBox; defaults to the data box.
+    var ox = ((pr.x0 != null) ? pr.x0 : 0).toFixed(1);
+    var oy = ((pr.y0 != null) ? pr.y0 : 0).toFixed(1);
+    var ow = ((pr.vw != null) ? pr.vw : W).toFixed(1);
+    var oh = ((pr.vh != null) ? pr.vh : H).toFixed(1);
+    var parts = ['<rect class="ac-ocean-fill" x="' + ox + '" y="' + oy +
+                 '" width="' + ow + '" height="' + oh + '"/>'];
     (BASEMAP.land || []).forEach(function (ring) {
       var d = ring.map(function (c, i) {
         return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
@@ -2221,6 +2314,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     var pr = fitProjection(extent, 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
+    // maps-pass R4 #1: aspect-fill - the SHARED basemap rule (same as the
+    // cone): expand the viewBox to the card aspect so the basemap + graticule
+    // fill the panel edge-to-edge; the track dots / radii (in [0,W]x[0,H]) are
+    // never cropped.
+    var fe = fillExtent(W, H, svg);
+    pr.x0 = fe.x0; pr.y0 = fe.y0; pr.x1 = fe.x1; pr.y1 = fe.y1;
+    pr.vw = fe.vw; pr.vh = fe.vh;
     var parts = mapFurniture(pr);
 
     // current wind-field arcs (drawn BEFORE the track dots / hero marker so
@@ -2401,8 +2501,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
       (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
 
-    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("viewBox", fe.x0.toFixed(1) + " " + fe.y0.toFixed(1) +
+      " " + fe.vw.toFixed(1) + " " + fe.vh.toFixed(1));
+    svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
+    svg._refit = function () { mapRefit(svg, W, H, pr); };   // R4 #1 resize
     fitLockup(svg);                              // FG-R3 #3b: contain the eyebrow
 
     // disclosure caption (cite the radii source).
@@ -2479,6 +2582,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     });
     var pr = fitProjection(extent, 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
+    // maps-pass R4 #1: aspect-fill (shared basemap rule) - basemap + graticule
+    // full-bleed; the wind swath (in [0,W]x[0,H]) is never cropped.
+    var fe = fillExtent(W, H, svg);
+    pr.x0 = fe.x0; pr.y0 = fe.y0; pr.x1 = fe.x1; pr.y1 = fe.y1;
+    pr.vw = fe.vw; pr.vh = fe.vh;
     var parts = mapFurniture(pr);
 
     // sweep one threshold's wind-field along the track, INTERPOLATING the
@@ -2580,8 +2688,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
       (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
 
-    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("viewBox", fe.x0.toFixed(1) + " " + fe.y0.toFixed(1) +
+      " " + fe.vw.toFixed(1) + " " + fe.vh.toFixed(1));
+    svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
+    svg._refit = function () { mapRefit(svg, W, H, pr); };   // R4 #1 resize
     fitLockup(svg);                              // FG-R3 #3b: contain the eyebrow
 
     if (note) {
@@ -2819,8 +2930,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     function lonAt(x) { return ((x - MARGIN) / S + x0) / (60 * K); }
     function latAt(y) { return -((y - offY) / S + y0) / 60; }
 
-    var parts = ['<rect class="ac-ocean-fill" width="' + W +
-                 '" height="' + H + '"/>'];
+    // maps-pass R4 #1: aspect-fill the panel. The data is in [0,W]x[0,H];
+    // expand to the card aspect (basemap fills the margin, data uncropped).
+    var fe = fillExtent(W, H, svg);
+
+    var parts = ['<rect class="ac-ocean-fill" x="' + fe.x0.toFixed(1) +
+                 '" y="' + fe.y0.toFixed(1) + '" width="' + fe.vw.toFixed(1) +
+                 '" height="' + fe.vh.toFixed(1) + '"/>'];
 
     // ---- basemap: land -> borders -> coast -> graticule ON TOP (S4-AD1 #2;
     // maps-pass R2 #4: graticule LAST so it spans the full extent over land,
@@ -3152,7 +3268,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     // reads over the cone glass + the land + the ocean, edge-to-edge. The
     // icons + placards below are drawn AFTER, so they stay on top of it.
     parts.push(graticule({ W: W, H: H, X: X, Y: Y,
-                           lonAt: lonAt, latAt: latAt }));
+                           lonAt: lonAt, latAt: latAt,
+                           x0: fe.x0, y0: fe.y0, x1: fe.x1, y1: fe.y1 }));
 
     // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
     // collision-aware placard layout: alternate sides of the track,
@@ -3337,6 +3454,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       lkName.textContent = (typeWord.toUpperCase() + " " +
                             stormName.toUpperCase()).trim();
       lkBox.hidden = false;
+      // maps-pass R4 #2: the box grows to its widest line; for a long name
+      // (e.g. TROPICAL DEPRESSION THREE-E) on a narrow card, STEP THE TYPE
+      // DOWN so it never escapes the box. Measure the actual rendered width
+      // against the available card width (the box can fill almost the whole
+      // panel via max-width: calc(100% - 20px)).
+      lkName.style.fontSize = "";          // reset to the 18px base
+      var stage = lkBox.parentNode;
+      var avail = (stage ? stage.clientWidth : 320) - 20 - 28;  // - margin/pad
+      var natW = lkName.scrollWidth;
+      if (natW > avail && natW > 0) {
+        var fs = Math.max(11, 18 * avail / natW);
+        lkName.style.fontSize = fs.toFixed(1) + "px";
+      }
     }
 
     // ---- ocean watermark: RETIRED on the cone (maps-pass R2 #6). A
@@ -3349,8 +3479,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push('<rect class="ac-frame" x="0.75" y="0.75" width="' +
       (W - 1.5) + '" height="' + (H - 1.5) + '" rx="2"/>');
 
-    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    // maps-pass R4 #1: the viewBox is the FILL EXTENT (card aspect), sliced
+    // to COVER the panel - full-bleed, no letterbox gap. The data box
+    // [0,W]x[0,H] is centered inside it, so slice only ever trims ocean/land.
+    svg.setAttribute("viewBox", fe.x0.toFixed(1) + " " + fe.y0.toFixed(1) +
+      " " + fe.vw.toFixed(1) + " " + fe.vh.toFixed(1));
+    svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
+
+    // re-fit on resize / orientation change (the shared resize handler calls
+    // svg._refit): recompute the fill extent + restyle the viewBox, ocean,
+    // and graticule WITHOUT touching the cone reveal/icons.
+    var coneGratPr = { W: W, H: H, X: X, Y: Y, lonAt: lonAt, latAt: latAt };
+    svg._refit = function () { mapRefit(svg, W, H, coneGratPr); };
 
     // arm the growth front (WAAPI dashoffset); reduced motion / jsdom
     // jump to the final frame

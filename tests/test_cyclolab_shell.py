@@ -1066,7 +1066,14 @@ class TestStage4Advisories(unittest.TestCase):
                 self.assertTrue(clear, f"placards {i}/{j} overlap")
         # basemap + auto-fit viewport (S4-AD1 #2/#3)
         self.assertGreaterEqual(a["coneGraticule"], 2)
-        self.assertTrue(a["coneViewBox"].startswith("0 0 1000 "))
+        # maps-pass R4 #1: the viewBox is now the aspect-FILL extent, which
+        # CONTAINS the data box [0,1000]x[0,H] (so the cone is never cropped)
+        # rather than equalling it - assert containment of the data box.
+        _vb = [float(v) for v in a["coneViewBox"].split()]
+        self.assertEqual(len(_vb), 4)
+        self.assertLessEqual(_vb[0], 0.5, "viewBox left must reach <=0")
+        self.assertLessEqual(_vb[1], 0.5, "viewBox top must reach <=0")
+        self.assertGreaterEqual(_vb[0] + _vb[2], 999.5, "must span the data W")
         self.assertFalse(a["coneEmptyShown"])
 
     def test_non_tropical_points_render_white_with_caption(self):
