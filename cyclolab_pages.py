@@ -54,6 +54,7 @@ def page_url_path(sid: str) -> str:
 # every basin source AFTER its feeds are safely written; best-effort by
 # contract (a page-write blip never fails or stales a basin's feeds).
 # ---------------------------------------------------------------------------
+import datetime as _dt
 import logging as _logging
 import os as _os
 
@@ -65,6 +66,28 @@ PAGES_ENABLED = (_os.environ.get("CYCLOLAB_PAGES") or "1").lower() \
 # consecutive polls before its page freezes (the system's standard
 # transient guard - one flaky poll must not bury a live storm).
 ENDED_DEBOUNCE_POLLS = 2
+# "Shared links never die": on a ledger reset (restart) an inactive storm
+# that ended within this window still gets its frozen archive page re-birthed
+# under the live prefix, so a storm that dissipated between ledger resets is
+# not orphaned. Older storms are left as-is (the season isn't re-minted).
+RECENT_ENDED_DAYS = 30
+
+
+def _recently_ended(storm: dict, now=None) -> bool:
+    """True if an INACTIVE designated storm's last fix is within
+    RECENT_ENDED_DAYS - recent enough that its shared archive link must still
+    resolve. Unparseable / missing / older -> False."""
+    fix = storm.get("latest_fix_valid_utc")
+    if not fix:
+        return False
+    try:
+        t = _dt.datetime.fromisoformat(str(fix).replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001 - malformed timestamp -> not recent
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=_dt.timezone.utc)
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    return (now - t) <= _dt.timedelta(days=RECENT_ENDED_DAYS)
 
 
 class CycloLabPageWriter:
@@ -145,10 +168,29 @@ class CycloLabPageWriter:
                 parse_sid(sid)          # designated storms only (V1)
             except Exception:           # noqa: BLE001 - invests/malformed
                 continue
+            st = self._state.get(sid)
             if not storm.get("is_active"):
+                # "Shared links never die" (FG-R3): a storm that ended
+                # between ledger resets (inactive + unknown to us) still gets
+                # its frozen ENDED archive page re-birthed ONCE under the live
+                # prefix, so the deep-link resolves. Recency-bounded so a
+                # restart never re-mints the whole season; storms that end
+                # WHILE we run are handled by the dissipation sweep below.
+                if st is None and _recently_ended(storm):
+                    from cyclolab_shell import render_page as _rp0
+                    html = _rp0(storm, feed_url=feed_url,
+                                adv_url=self._adv_url(sid), ended=True,
+                                sst_base=self._sst_base(sid))
+                    self.sink.write_html(page_key(sid, prefix=self.prefix),
+                                         html)
+                    self._state[sid] = {
+                        "cat": storm.get("current_category") or "TD",
+                        "fix": storm.get("latest_fix_valid_utc"),
+                        "missing": ENDED_DEBOUNCE_POLLS, "ended": True,
+                        "last": storm}
+                    _log.info("cyclolab page ENDED (re-birth): %s", sid)
                 continue
             seen_active.add(sid)
-            st = self._state.get(sid)
             cat = storm.get("current_category") or "TD"
             fix = storm.get("latest_fix_valid_utc")
             # SST hero layers ride EVERY poll, not just page rewrites:

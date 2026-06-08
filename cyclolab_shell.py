@@ -1856,7 +1856,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   var WIND_TIER_PALETTES = {
     A: { "34": [38, 104, 200], "50": [44, 150, 235], "64": [60, 200, 235] },
     B: { "34": neonRGB(34),    "50": neonRGB(50),    "64": neonRGB(64) },
-    C: { "34": [44, 140, 255], "50": [40, 178, 250], "64": [255, 202, 66] },
+    C: { "34": [38, 104, 200], "50": [44, 168, 240], "64": [255, 190, 52] },
     D: { "34": [150, 128, 232], "50": [168, 86, 214], "64": [200, 48, 150] }
   };
   // resolve a product's palette: explicit JS knob -> URL param -> shared
@@ -1875,9 +1875,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   function resolveTierPalette(which) {
     return WIND_TIER_PALETTES[_palKey(which)];
   }
-  // FG-R3 art-r2 verdict: Option C (blue band -> gold core), executed NEON
-  // (electric blue + glowing gold, with edge bloom on swath + rings) is the
-  // LOCKED wind-tier canon for both products. A/B/D stay as selectable knobs.
+  // FG-R3 art-r2 verdict: Option C (blue band -> gold core) is the LOCKED
+  // wind-tier canon. RINGS render board-C EXACTLY: crisp strokes, no glow/
+  // bloom (only the NOW-marker halo follows the palette). The SWATH uses a
+  // VIVID saturated variant (electric blue + gold) as bright FLAT fills with
+  // crisp smooth edges - see emitSwath (brightness from saturation, not blur).
+  // A/B/D stay selectable knobs for the rings.
   var _tierPal = WIND_TIER_PALETTES.C;       // set per-render by each plot
   function tierRGBA(tier, a) {
     var c = _tierPal[String(tier)] || [255, 255, 255];
@@ -2111,15 +2114,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     var W = pr.W, H = pr.H;
     var parts = mapFurniture(pr);
 
-    // FG-R3 art-r2 (neon C): the quadrant rings get the SAME luminous bloom
-    // as the swath so the two plots stay siblings - a crisp arc with a soft
-    // colored halo (blur merged behind the source). sRGB, tight blur.
-    parts.push('<defs><filter id="ring-bloom" x="-40%" y="-40%" ' +
-      'width="180%" height="180%" color-interpolation-filters="sRGB">' +
-      '<feGaussianBlur stdDeviation="2.4" result="rb"/><feMerge>' +
-      '<feMergeNode in="rb"/><feMergeNode in="rb"/>' +
-      '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>');
-
     // current wind-field arcs (drawn BEFORE the track dots / hero marker so
     // the marker sits on top but the arcs fan visibly beyond it). Three
     // tiered rings (34 outer / 50 / 64 inner), ~2px strokes, bright on the
@@ -2145,7 +2139,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       tiers.forEach(function (t) {
         var arc = quadrantArcs(pr, last.lat, last.lon, lastRad[t[0]],
           'fill="' + t[1] + '" stroke="' + t[2] + '" stroke-width="' +
-          t[3] + '" stroke-linejoin="round" filter="url(#ring-bloom)"');
+          t[3] + '" stroke-linejoin="round"');
         if (!arc) return;
         hasField = true;
         parts.push(arc);
@@ -2317,7 +2311,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     var mbody = document.getElementById("swath-method-body");
     var note = document.getElementById("swathplot-note");
     if (!svg) return;
-    _tierPal = resolveTierPalette("Swath");     // FG-R3 #1: swath palette
     var pts = (storm.points || []).filter(function (p) {
       return p && p.lat != null && p.lon != null; });
 
@@ -2370,23 +2363,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     var pr = fitProjection(extent, 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
     var parts = mapFurniture(pr);
-
-    // FG-R3 art-r2 (neon C): edge BLOOM so each band reads as light glowing
-    // on the dark basemap, not flat paint. A blurred copy of the union is
-    // merged UNDER the crisp fill (band wider, core tighter). sRGB filter
-    // interpolation keeps the halo true-colored + video-safe (no dark fringe,
-    // tight blur so no large smooth gradient to band on 8-bit video).
-    parts.push('<defs>' +
-      '<filter id="sw-bloom-band" x="-18%" y="-18%" width="136%" ' +
-      'height="136%" color-interpolation-filters="sRGB">' +
-      '<feGaussianBlur stdDeviation="6" result="b"/><feMerge>' +
-      '<feMergeNode in="b"/><feMergeNode in="b"/>' +
-      '<feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-      '<filter id="sw-bloom-core" x="-22%" y="-22%" width="144%" ' +
-      'height="144%" color-interpolation-filters="sRGB">' +
-      '<feGaussianBlur stdDeviation="4" result="b2"/><feMerge>' +
-      '<feMergeNode in="b2"/><feMergeNode in="b2"/>' +
-      '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>');
 
     // sweep one threshold's wind-field along the track, INTERPOLATING the
     // 4 quadrant radii between consecutive fixes (NHC swath method). Each
@@ -2442,22 +2418,21 @@ HTML_TEMPLATE = r"""<!doctype html>
     var sw34 = sweep("34");
     var sw64 = sweep("64");
 
-    // The swath ALWAYS renders FILLED (verdict 2). CLEAN SOLID translucent
-    // bands, NO per-polygon stroke: the smooth blobs are all wound the same
-    // way so fill-rule="nonzero" unions every overlap into one seam-free
-    // shape. The 34-kt tropical-storm field uses the active swath palette's
-    // 34 tier; the 64-kt hurricane core its 64 tier on top (FG-R3 #1, the
-    // user's swath pick) - NOT the SSHS category hues. The two read at a
-    // glance. (Any stroke here re-draws every sub-polygon edge -> a mesh.)
+    // The swath ALWAYS renders FILLED. CLEAN SOLID bands, NO per-polygon
+    // stroke and NO glow/bloom (FG-R3 art-r2: bloom read fuzzy - removed):
+    // the smooth blobs are all wound the same way so fill-rule="nonzero"
+    // unions every overlap into one seam-free shape with crisp smooth edges.
+    // VIVID SATURATED Option-C colors as bright FLAT fills - electric blue
+    // 34-kt band, gold 64-kt core - brightness from saturation + opacity, not
+    // blur. (Any stroke here re-draws every sub-polygon edge -> a mesh.)
+    var SWATH_FILL = { "34": "rgba(40,138,255,0.58)",     // electric blue
+                       "64": "rgba(255,196,48,0.86)" };   // bright gold
     function emitSwath(polys, fillKey) {
       if (!polys.length) return;
       var d = polys.join(" ");
-      var fill = fillKey === "34" ? tierRGBA("34", 0.46)
-                                  : tierRGBA("64", 0.66);
-      var glow = fillKey === "34" ? "sw-bloom-band" : "sw-bloom-core";
       parts.push('<path class="sw-' + fillKey + '" d="' + d +
-        '" fill="' + fill + '" fill-rule="nonzero" stroke="none" filter="' +
-        'url(#' + glow + ')"/>');
+        '" fill="' + SWATH_FILL[fillKey] +
+        '" fill-rule="nonzero" stroke="none"/>');
     }
     emitSwath(sw34, "34");
     emitSwath(sw64, "64");

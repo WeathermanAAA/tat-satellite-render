@@ -2,6 +2,7 @@
 refresh / debounced ENDED freeze, invest skip, best-effort contract."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sys
 import unittest
@@ -89,10 +90,37 @@ class TestPageLifecycle(unittest.TestCase):
         h3 = self.sink.writes[2][1]
         self.assertNotIn("data-ended", h3[h3.index("<html"):h3.index("<head")])
 
-    def test_invests_and_inactive_skipped(self):
-        invest = {**SYNTH, "sid": "NHC_EP902026"}
-        inactive = {**SYNTH, "sid": "NHC_EP072026", "is_active": False}
-        self.w.update("ep", feed([invest, inactive]))
+    @staticmethod
+    def _recent_fix(days_ago=2):
+        return (dt.datetime.now(dt.timezone.utc)
+                - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_invest_skipped_but_recent_inactive_rebirths(self):
+        # invests never get a page; a RECENTLY-ended inactive DESIGNATED storm
+        # gets its frozen archive page re-birthed ("shared links never die").
+        invest = {**SYNTH, "sid": "NHC_EP902026", "is_active": False,
+                  "latest_fix_valid_utc": self._recent_fix()}
+        inactive_recent = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,
+                           "latest_fix_valid_utc": self._recent_fix()}
+        self.w.update("ep", feed([invest, inactive_recent]))
+        self.assertEqual(len(self.sink.writes), 1)               # only the TC
+        key, html = self.sink.writes[0]
+        self.assertEqual(key, "shadow/cyclolab/NHC_EP072026/index.html")
+        self.assertIn("data-ended", html[html.index("<html"):html.index("<head")])
+        self.assertIn("THIS STORM HAS ENDED", html)
+
+    def test_recent_inactive_rebirths_only_once(self):
+        inactive = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,
+                    "latest_fix_valid_utc": self._recent_fix()}
+        self.w.update("ep", feed([inactive]))
+        self.w.update("ep", feed([inactive]))   # already known + ended
+        self.assertEqual(len(self.sink.writes), 1)
+
+    def test_old_inactive_is_not_rebirthed(self):
+        # a storm that ended long ago is NOT re-minted on a ledger reset.
+        old = {**SYNTH, "sid": "NHC_EP032026", "is_active": False,
+               "latest_fix_valid_utc": "2020-01-01T00:00:00Z"}
+        self.w.update("ep", feed([old]))
         self.assertEqual(self.sink.writes, [])
 
     def test_other_basin_sweep_isolation(self):
