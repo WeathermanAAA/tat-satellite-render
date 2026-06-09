@@ -387,6 +387,51 @@ HTML_TEMPLATE = r"""<!doctype html>
      mounts - CYCLOLAB_DESIGN §7.3); the Satellite tab reuses the same
      seg/btn/stage idiom for the floater viewer (§7.2). Colors ride the
      category tokens - the app wears the storm here too. */
+  /* ---- Gutter layout (CycloLab polish #3): the rendered frame is ~square, so
+     a full-width stack left a big dead band beside it. Reclaim it - image in the
+     main column, controls stacked in a side gutter, frame strip / scrubber full
+     width beneath. This rule set is a MIRROR of the one in /models/ index.html;
+     keep the two identical (one canon, no drift). Color-agnostic - the storm
+     tokens ride the inner chrome, not this layout. */
+  .vw-grid { display: grid;
+    grid-template-columns: minmax(0, max-content) clamp(214px, 28%, 326px);
+    justify-content: start; align-items: start; gap: 16px 22px; }
+  .vw-grid > .hafs-stage { grid-column: 1; grid-row: 1; min-width: 0; }
+  .vw-grid > .vw-aside { grid-column: 2; grid-row: 1;
+    display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .vw-grid > .vw-below,
+  .vw-grid > .hafs-caption,
+  .vw-grid > .hafs-footer,
+  .vw-grid > .stub { grid-column: 1 / -1; min-width: 0; }
+  /* gutter chrome: tidy wrapping CHIPS + ONE compact transport row, readout
+     on its own line (mirror of /models/ index.html - keep identical). */
+  .vw-aside .hafs-controls { flex-direction: column; align-items: stretch;
+    gap: 14px; padding: 0; background: none; border: none; }
+  .vw-aside .hafs-controls.sat-tools { align-items: stretch; }
+  .vw-aside .sat-gif { align-self: stretch; }   /* full-gutter, not orphaned */
+  .vw-aside .hafs-seg-group { flex-wrap: wrap; gap: 6px; }
+  .vw-aside .hafs-seg-group .hafs-seg { border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 11px; font-size: 11.5px; }
+  .vw-aside .hafs-seg-group .hafs-seg.active { border-color: var(--cat-accent); }
+  .vw-aside .hafs-player { flex-direction: row; flex-wrap: wrap;
+    align-items: center; gap: 8px; padding: 0; background: none; border: none; }
+  .vw-aside .hafs-player .hafs-play { flex: 1 1 auto; }
+  .vw-aside .hafs-player .hafs-readout,
+  .vw-aside .hafs-player .hafs-group { flex: 1 1 100%; }
+  .vw-aside .hafs-group select { width: 100%; min-width: 0; }
+  .vw-below .hafs-hours { padding-left: 0; padding-right: 0; }
+  .vw-below #sat-scrub { width: 100%; }
+  @media (max-width: 760px) {
+    /* no gutter room: stack; the controls become a compact horizontal bar */
+    .vw-grid { display: block; }
+    .vw-aside { flex-direction: row; flex-wrap: wrap; align-items: flex-end;
+      gap: 10px 14px; margin-top: 12px; }
+    .vw-aside .hafs-controls,
+    .vw-aside .hafs-player { flex-direction: row; flex-wrap: wrap;
+      align-items: flex-end; }
+    .vw-aside .hafs-group select { width: auto; }
+    .vw-below { margin-top: 10px; }
+  }
   .hafs-group { display: flex; flex-direction: column; gap: 4px; }
   .hafs-group > label { font-size: 10px; font-weight: 700; letter-spacing: 1px;
     text-transform: uppercase; color: var(--muted); }
@@ -1017,12 +1062,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     </section>
     <section class="sec" id="sec-satellite"><div class="wipe">
       <h2 class="sec-title">Satellite</h2>
-      <div class="card" id="sat-card" tabindex="0">
-        <div class="hafs-controls">
-          <div class="hafs-group"><label>Band</label>
-            <div id="sat-bands" class="hafs-seg-group" role="group"
-                 aria-label="Satellite band"></div></div>
-        </div>
+      <div class="card vw-grid" id="sat-card" tabindex="0">
         <div class="hafs-stage" id="sat-stage">
           <img id="sat-img" alt="Storm floater satellite frame">
           <canvas id="sat-canvas" style="display:none" role="img"
@@ -1030,30 +1070,38 @@ HTML_TEMPLATE = r"""<!doctype html>
           <div id="sat-status" class="hafs-statusbox">
             <div class="hafs-spinner"></div><span>Loading…</span></div>
         </div>
-        <div class="hafs-player">
-          <button id="sat-step-back" class="hafs-btn" type="button"
-                  title="Previous frame (&#8592;)">&#9664;</button>
-          <button id="sat-play" class="hafs-btn hafs-play" type="button"
-                  title="Play / pause (space)">&#9654; Play</button>
-          <button id="sat-step-fwd" class="hafs-btn" type="button"
-                  title="Next frame (&#8594;)">&#9654;</button>
+        <div class="vw-aside">
+          <div class="hafs-controls">
+            <div class="hafs-group"><label>Band</label>
+              <div id="sat-bands" class="hafs-seg-group" role="group"
+                   aria-label="Satellite band"></div></div>
+          </div>
+          <div class="hafs-player">
+            <button id="sat-step-back" class="hafs-btn" type="button"
+                    title="Previous frame (&#8592;)">&#9664;</button>
+            <button id="sat-play" class="hafs-btn hafs-play" type="button"
+                    title="Play / pause (space)">&#9654; Play</button>
+            <button id="sat-step-fwd" class="hafs-btn" type="button"
+                    title="Next frame (&#8594;)">&#9654;</button>
+            <div class="hafs-readout"><span id="sat-time">&#8212;</span>
+              <span id="sat-band-label"></span></div>
+          </div>
+          <div class="hafs-controls sat-tools">
+            <div class="hafs-group"><label>Speed</label>
+              <div id="sat-speed" class="hafs-seg-group" role="group"
+                   aria-label="Playback speed"></div></div>
+            <button id="sat-gif" class="hafs-btn sat-gif" type="button"
+                    title="Export the loaded frames as a GIF">
+              &#8681; GIF</button>
+            <div id="sat-gif-prog" class="sat-gif-prog" hidden
+                 role="status" aria-live="polite">
+              <div class="sat-gif-bar"><i></i></div>
+              <span class="sat-gif-pct">0%</span></div>
+          </div>
+        </div>
+        <div class="vw-below">
           <input id="sat-scrub" type="range" min="0" max="0" value="0"
-                 step="1" aria-label="Frame time">
-          <div class="hafs-readout"><span id="sat-time">&#8212;</span>
-            <span id="sat-band-label"></span></div>
-        </div>
-        <div class="hafs-controls sat-tools">
-          <div class="hafs-group"><label>Speed</label>
-            <div id="sat-speed" class="hafs-seg-group" role="group"
-                 aria-label="Playback speed"></div></div>
-          <button id="sat-gif" class="hafs-btn sat-gif" type="button"
-                  title="Export the loaded frames as a GIF">
-            &#8681; GIF</button>
-          <div id="sat-gif-prog" class="sat-gif-prog" hidden
-               role="status" aria-live="polite">
-            <div class="sat-gif-bar"><i></i></div>
-            <span class="sat-gif-pct">0%</span></div>
-        </div>
+                 step="1" aria-label="Frame time"></div>
         <div id="sat-empty" class="stub" style="display:none">No floater
           imagery for this storm right now.</div>
         <div id="sat-inactive" class="sat-inactive" hidden
@@ -1065,42 +1113,46 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div></section>
     <section class="sec" id="sec-models"><div class="wipe">
       <h2 class="sec-title">Models</h2>
-      <div class="card" id="cl-hafs-root" tabindex="0">
-        <div id="cl-hafs-controls" class="hafs-controls">
-          <div id="cl-hafs-cycle-group" class="hafs-group" style="display:none">
-            <label>Cycle</label>
-            <div id="cl-hafs-cycles" class="hafs-seg-group"></div></div>
-          <div class="hafs-group" style="display:none">
-            <label for="cl-hafs-storm">Storm</label>
-            <select id="cl-hafs-storm"></select></div>
-          <div class="hafs-group"><label>Model</label>
-            <div id="cl-hafs-models" class="hafs-seg-group"></div></div>
-          <div class="hafs-group"><label>Domain</label>
-            <div id="cl-hafs-domains" class="hafs-seg-group"></div></div>
-          <div class="hafs-group"><label>Product</label>
-            <div id="cl-hafs-products" class="hafs-seg-group"></div></div>
-        </div>
+      <div class="card vw-grid" id="cl-hafs-root" tabindex="0">
         <div id="cl-hafs-stage" class="hafs-stage">
           <img id="cl-hafs-img" alt="HAFS forecast frame for this storm">
           <div id="cl-hafs-status" class="hafs-statusbox">
             <div class="hafs-spinner"></div><span>Loading&#8230;</span></div>
           <div id="cl-hafs-buffer"></div>
         </div>
-        <div id="cl-hafs-player" class="hafs-player">
-          <button id="cl-hafs-step-back" class="hafs-btn" type="button"
-                  title="Previous hour (&#8592;)">&#9664;</button>
-          <button id="cl-hafs-play" class="hafs-btn hafs-play" type="button"
-                  title="Play / pause (space)">&#9654; Play</button>
-          <button id="cl-hafs-step-fwd" class="hafs-btn" type="button"
-                  title="Next hour (&#8594;)">&#9654;</button>
-          <div class="hafs-readout">
-            <span id="cl-hafs-fhour">F000</span>
-            <span id="cl-hafs-valid"></span></div>
-          <div class="hafs-group"><label for="cl-hafs-speed">Speed</label>
-            <select id="cl-hafs-speed"></select></div>
+        <div class="vw-aside">
+          <div id="cl-hafs-controls" class="hafs-controls">
+            <div id="cl-hafs-cycle-group" class="hafs-group" style="display:none">
+              <label>Cycle</label>
+              <div id="cl-hafs-cycles" class="hafs-seg-group"></div></div>
+            <div class="hafs-group" style="display:none">
+              <label for="cl-hafs-storm">Storm</label>
+              <select id="cl-hafs-storm"></select></div>
+            <div class="hafs-group"><label>Model</label>
+              <div id="cl-hafs-models" class="hafs-seg-group"></div></div>
+            <div class="hafs-group"><label>Domain</label>
+              <div id="cl-hafs-domains" class="hafs-seg-group"></div></div>
+            <div class="hafs-group"><label>Product</label>
+              <div id="cl-hafs-products" class="hafs-seg-group"></div></div>
+          </div>
+          <div id="cl-hafs-player" class="hafs-player">
+            <button id="cl-hafs-step-back" class="hafs-btn" type="button"
+                    title="Previous hour (&#8592;)">&#9664;</button>
+            <button id="cl-hafs-play" class="hafs-btn hafs-play" type="button"
+                    title="Play / pause (space)">&#9654; Play</button>
+            <button id="cl-hafs-step-fwd" class="hafs-btn" type="button"
+                    title="Next hour (&#8594;)">&#9654;</button>
+            <div class="hafs-readout">
+              <span id="cl-hafs-fhour">F000</span>
+              <span id="cl-hafs-valid"></span></div>
+            <div class="hafs-group"><label for="cl-hafs-speed">Speed</label>
+              <select id="cl-hafs-speed"></select></div>
+          </div>
         </div>
-        <div id="cl-hafs-hours" class="hafs-hours" role="group"
-             aria-label="Forecast hour"></div>
+        <div class="vw-below">
+          <div id="cl-hafs-hours" class="hafs-hours" role="group"
+               aria-label="Forecast hour"></div>
+        </div>
         <div id="cl-hafs-empty" class="stub" style="display:none">No model
           guidance for this storm in the current cycles.</div>
         <p id="cl-hafs-caption" class="hafs-caption">HAFS guidance scoped to
