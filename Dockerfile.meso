@@ -14,11 +14,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Build + runtime libs. curl is here so the compose healthcheck can curl the
-# poller's /health endpoint; the rest cover any sdist fallback for the scientific
-# stack (most install from wheels and won't need these).
+# Build + runtime libs. git is REQUIRED: requirements.txt pulls tat-palettes via
+# a `git+https://...` requirement and pip shells out to git to clone it (the slim
+# base ships no git). curl is here so the compose healthcheck can curl the
+# poller's /health endpoint; gcc/g++/pkg-config cover any sdist fallback for the
+# scientific stack (most install from wheels and won't need these).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc g++ pkg-config curl ca-certificates \
+        git gcc g++ pkg-config curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
