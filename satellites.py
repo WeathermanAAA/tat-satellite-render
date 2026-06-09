@@ -160,8 +160,13 @@ class Satellite(abc.ABC):
         generic_channel: str,
         bbox: list[float],
         nearest_to_target: bool,
+        product_hint: "str | None" = None,
     ) -> ResolvedFile:
-        """Locate the smallest product covering ``bbox`` at ``time``."""
+        """Locate the smallest product covering ``bbox`` at ``time``.
+
+        ``product_hint`` is an optional caller preference (e.g. "target" for the
+        AHI mesoscale Target sector); satellites that don't recognise it ignore it.
+        """
     @abc.abstractmethod
     def open(self, resolved: ResolvedFile) -> tuple[xr.Dataset, str]:
         """Download + open the file. Returns (dataset, tmp_dir).
@@ -528,6 +533,7 @@ class GOESBaseSatellite(Satellite):
         generic_channel: str,
         bbox: list[float],
         nearest_to_target: bool,
+        product_hint: "str | None" = None,   # "meso" forces the CMIPM product
     ) -> ResolvedFile:
         if generic_channel not in self.generic_to_band:
             raise ValueError(
@@ -541,7 +547,13 @@ class GOESBaseSatellite(Satellite):
         # the bbox. CMIPM is only viable for ≤12°×12°; anything larger
         # starts at CMIPC, whose internal footprint check falls through to
         # CMIPF when the bbox lies outside the CONUS/PACUS scan footprint.
-        if lon_w <= MESO_PER_AXIS_DEG_MAX and lat_h <= MESO_PER_AXIS_DEG_MAX:
+        # product_hint=="meso" (the meso-sector poller) forces _pick_meso FIRST
+        # regardless of span: a mesoscale tile's lat/lon BOUNDING box runs wider
+        # than 12° at off-nadir / high latitude (e.g. CMIPM1 over the US can be
+        # ~21°×15°), even though it's the same 1000 km sector. _pick_meso's own
+        # coverage check still falls through to CONUS/full-disk if it doesn't fit.
+        if (product_hint == "meso"
+                or (lon_w <= MESO_PER_AXIS_DEG_MAX and lat_h <= MESO_PER_AXIS_DEG_MAX)):
             candidates = [self._pick_meso, self._pick_conus, self._pick_full_disk]
         else:
             candidates = [self._pick_conus, self._pick_full_disk]
@@ -1067,11 +1079,24 @@ class HimawariPacificSatellite(Satellite):
         generic_channel: str,
         bbox: list[float],
         nearest_to_target: bool,
+        product_hint: "str | None" = None,
     ) -> ResolvedFile:
         if generic_channel not in self.generic_to_band:
             raise ValueError(
                 f"unknown generic channel for {self.family}: {generic_channel!r}"
             )
+        # Mesoscale "Target" path: the AHI Target sector (Region 3) scans ~every
+        # 2.5 min (sub-scans R301..R304 per 10-min slot) vs FLDK's 10 min. When the
+        # caller hints product=="target" (the meso poller), resolve the latest
+        # Target sub-scan. Visible/true-color stays on FLDK -- the true-color
+        # compositor pulls all sub-bands off the resolved red file, so we never mix
+        # a Target red with FLDK greens. Falls back to FLDK if no Target slot lands.
+        if product_hint == "meso" and generic_channel != "visible_red":
+            band = self.generic_to_band[generic_channel]
+            resolved = await _to_thread(
+                self._resolve_target_sync, time, band, nearest_to_target)
+            if resolved is not None:
+                return resolved
         # AHI cycles every 10 minutes; snap target time to the nearest 10-min slot.
         snapped = self._snap_10min(time, nearest_to_target)
         resolved_sat = self.resolve(snapped)
@@ -1090,6 +1115,36 @@ class HimawariPacificSatellite(Satellite):
             sat_name=resolved_sat.name,
             sub_sat_lon=HIMAWARI_SUB_SAT_LON,
         )
+
+    def _resolve_target_sync(self, time: dt.datetime, band: int,
+                             nearest_to_target: bool):
+        """Resolve the latest available AHI Target sub-scan near ``time`` to a
+        ResolvedFile (product 'Target<sub>', scan_start = the sub-scan's approx obs
+        time so distinct sub-scans get distinct frame timestamps). Returns None if
+        no recent Target slot has a sub-scan -> caller falls back to FLDK. Sync
+        (s3 listing); call via _to_thread."""
+        from vendor.ahi_loader import latest_target_subscan
+        fs = _get_fs()
+        base = time.replace(second=0, microsecond=0)
+        floored = base.replace(minute=(base.minute // 10) * 10)
+        # Back off one slot for publish latency, then scan a few slots back.
+        for back in range(1, 4):
+            slot = floored - dt.timedelta(minutes=10 * back)
+            resolved_sat = self.resolve(slot)
+            sub = latest_target_subscan(fs, resolved_sat.bucket, slot, band)
+            if sub:
+                # sub-scan obs time ~ slot + (sub-1)*2.5 min (R301..R304)
+                scan_t = slot + dt.timedelta(seconds=(sub - 1) * 150)
+                return ResolvedFile(
+                    bucket=resolved_sat.bucket,
+                    s3_key=(f"{resolved_sat.bucket}/AHI-L1b-Target/"
+                            f"{slot:%Y/%m/%d/%H%M}/"),
+                    product=f"Target{sub}",
+                    scan_start=scan_t,
+                    sat_name=resolved_sat.name,
+                    sub_sat_lon=HIMAWARI_SUB_SAT_LON,
+                )
+        return None
     @staticmethod
     def _snap_10min(time: dt.datetime, nearest_to_target: bool) -> dt.datetime:
         """Snap to the most relevant 10-min slot.
@@ -1119,14 +1174,24 @@ class HimawariPacificSatellite(Satellite):
         bbox: list[float],
         generic_channel: str,
     ) -> FetchResult:
-        from vendor.ahi_loader import load_band_sync
+        from vendor.ahi_loader import load_band_sync, load_target_band_sync
         band = self.generic_to_band[generic_channel]
         fs = _get_fs()
         # Pass bbox so the loader can drop irrelevant segments before download
         # — critical for B03 (0.5 km visible), where each segment is ~300 MB.
-        disk = load_band_sync(
-            fs, resolved.bucket, resolved.scan_start, band, bbox=tuple(bbox)
-        )
+        if resolved.product.startswith("Target"):
+            sub = int(resolved.product[len("Target"):])
+            # scan_start is the sub-scan obs time; floor back to its 10-min slot
+            # folder (where the Target segments live).
+            slot = resolved.scan_start.replace(second=0, microsecond=0)
+            slot = slot.replace(minute=(slot.minute // 10) * 10)
+            disk = load_target_band_sync(
+                fs, resolved.bucket, slot, band, sub, bbox=tuple(bbox)
+            )
+        else:
+            disk = load_band_sync(
+                fs, resolved.bucket, resolved.scan_start, band, bbox=tuple(bbox)
+            )
         # Antimeridian-safe bbox handling: if e < w (crossing), unwrap east edge.
         lon_min, lat_min, lon_max, lat_max = bbox
         unwrap = lon_max < lon_min

@@ -269,6 +269,9 @@ class RenderRequest(BaseModel):
     # endpoint computes the (generic, was_numeric) pair via normalize_channel.
     channel: Union[int, str]
     enhancement: str = "rainbow_ir"
+    # Optional product hint (e.g. "target" -> AHI mesoscale Target sector, ~2.5 min
+    # vs the 10-min FLDK full disk). Satellites that don't recognise it ignore it.
+    product: Optional[str] = None
     # Optional storm context. When supplied, render.py draws a color-coded
     # intensity badge (name · category · wind · pressure) on the title strip.
     storm: Optional[StormInfo] = None
@@ -397,7 +400,8 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     resolve_channel = "visible_red" if is_true_color else generic_channel
     try:
         resolved = await satellite.find_file(
-            parsed_time, resolve_channel, body.bbox, nearest_to_target
+            parsed_time, resolve_channel, body.bbox, nearest_to_target,
+            product_hint=body.product,
         )
     except Exception as e:
         log.exception("resolve failed: %s", e)
@@ -420,6 +424,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             "X-Cache": cache_state,
             "X-Render-Ms": str(ms),
             "X-Product": resolved.product,
+            "X-Scan-Time": resolved.scan_start.isoformat(),
             "X-Bucket": resolved.bucket,
             "X-Downsample": str(downsample),
             "X-Satellite": resolved.sat_name,

@@ -354,10 +354,15 @@ def load_band_sync(
     )
 
     segments = [_download_and_parse(fs, p) for p in paths]
+    return _assemble_disk(segments)
 
+
+def _assemble_disk(segments: list[HSDSegment]) -> CalibratedDisk:
+    """Stitch + calibrate downloaded HSD segments into a CalibratedDisk. Shared by
+    the FLDK (load_band_sync) and Target (load_target_band_sync) loaders so both
+    produce byte-identical disks; only the segment LISTING differs between them."""
     counts_local, n_lines_local, n_columns, line_offset = _stitch(segments)
     data, units = _calibrate(segments[0], counts_local)
-
     seg0 = segments[0]
     return CalibratedDisk(
         sat_name=seg0.sat_name,
@@ -375,6 +380,54 @@ def load_band_sync(
         units=units,
         obs_start_mjd=seg0.obs_start_mjd,
     )
+
+
+def _target_prefix(bucket, slot) -> str:
+    return (f"{bucket}/AHI-L1b-Target/"
+            f"{slot.year:04d}/{slot.month:02d}/{slot.day:02d}/"
+            f"{slot.hour:02d}{slot.minute:02d}/")
+
+
+def _list_target_segments(fs, bucket, slot, band: int, sub: int) -> list[str]:
+    """List AHI-L1b-Target single-segment paths for (slot, band, sub-scan R30X)."""
+    res = BAND_RES_SUFFIX[band]
+    token = f"_B{band:02d}_R30{sub}_{res}_S"
+    try:
+        files = fs.ls(_target_prefix(bucket, slot))
+    except (FileNotFoundError, OSError):
+        return []
+    return sorted(f for f in files if token in f and f.endswith(".DAT.bz2"))
+
+
+def latest_target_subscan(fs, bucket, slot, band: int) -> Optional[int]:
+    """Highest R30X Target sub-scan present for (slot, band); None if the slot is
+    absent/empty. The Target sector scans 4 sub-scans (R301..R304) per 10-min slot
+    (~2.5 min apart), so the newest present sub-scan is the freshest imagery."""
+    import re
+    res = BAND_RES_SUFFIX[band]
+    try:
+        files = fs.ls(_target_prefix(bucket, slot))
+    except (FileNotFoundError, OSError):
+        return None
+    pat = re.compile(rf"_B{band:02d}_R30(\d)_{res}_S\d+\.DAT\.bz2$")
+    subs = {int(m.group(1)) for f in files if (m := pat.search(f))}
+    return max(subs) if subs else None
+
+
+def load_target_band_sync(fs, bucket, slot, band: int, sub: int,
+                          bbox=None) -> CalibratedDisk:
+    """Target counterpart of load_band_sync. AHI-L1b-Target is single-segment
+    (S0101) per band per sub-scan, so the existing _stitch/_calibrate handle it
+    unchanged via _assemble_disk; only the listing differs."""
+    paths = _list_target_segments(fs, bucket, slot, band, sub)
+    if not paths:
+        raise FileNotFoundError(
+            f"no AHI Target segment at {_target_prefix(bucket, slot)} "
+            f"band {band} sub R30{sub}")
+    if bbox is not None and len(paths) > 1:
+        paths = _filter_segments_for_bbox(paths, bbox, band)
+    segments = [_download_and_parse(fs, p) for p in paths]
+    return _assemble_disk(segments)
 
 
 async def load_band(

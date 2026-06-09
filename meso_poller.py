@@ -131,6 +131,13 @@ R2_PREFIX = _env("R2_PREFIX", "meso").strip("/")
 # sector extent, not a fixed storm crop.
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))         # hot-band target
 SECTORS_REFRESH_S = float(_env("SECTORS_REFRESH_S", "120"))      # re-discover extents
+# Himawari render product: "target" -> the ~2.5-min AHI Target sub-scans
+# (R301..R304) for the 5 scalar bands; "fldk" -> the 10-min full disk. Flip to
+# fldk to revert Himawari to the old cadence WITHOUT a rebuild (env + restart).
+# True-color always uses FLDK (the compositor can't mix a Target red with FLDK
+# greens). GOES is unaffected (it always uses the CMIPM meso product).
+MESO_HIMAWARI_PRODUCT = (_env("MESO_HIMAWARI_PRODUCT", "target")
+                         or "target").strip().lower()
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))    # min gap between /render calls
 EXTENT_STALE_AFTER_S = float(_env("EXTENT_STALE_AFTER_S", "1800"))  # >this since last scan => stale
 
@@ -516,10 +523,13 @@ class RenderSkip(Exception):
 
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
-                enhancement: str, storm: Optional[dict] = None) -> tuple[bytes, dict]:
+                enhancement: str, storm: Optional[dict] = None,
+                product: Optional[str] = None) -> tuple[bytes, dict]:
     body: dict = {"bbox": bbox, "time": "latest", "channel": channel, "enhancement": enhancement}
     if storm is not None:
         body["storm"] = storm
+    if product is not None:
+        body["product"] = product
     last_exc: Exception | None = None
     for attempt in range(RENDER_MAX_RETRIES):
         try:
@@ -732,9 +742,18 @@ class MesoPoller:
         if ext is None:
             return  # sector has no discovered extent yet -> nothing to render
         bbox = list(ext.bbox)
+        # All meso sectors render from their rapid-scan product via the "meso"
+        # hint: GOES -> CMIPM (find_file forces _pick_meso past the 12° span gate),
+        # Himawari -> the ~2.5-min Target sub-scans. MESO_HIMAWARI_PRODUCT=fldk
+        # reverts Himawari to the 10-min full disk (true-color is always FLDK,
+        # guarded in find_file). GOES is unaffected by the flag.
+        product = "meso"
+        if sector.family == "himawari" and MESO_HIMAWARI_PRODUCT == "fldk":
+            product = None
         self.limiter.acquire()
         try:
-            png, headers = call_render(self.session, bbox, band.channel, band.enhancement)
+            png, headers = call_render(self.session, bbox, band.channel,
+                                       band.enhancement, product=product)
         except RenderSkip as e:
             log.info("skip %s/%s: %s", sector.slug, band.key, e)
             self._consec_render_fail = 0
@@ -752,11 +771,13 @@ class MesoPoller:
         h = hashlib.sha256(png).hexdigest()
         if h == u.last_hash:
             return  # no new frame
-        # Prefer the discovered scan time for the loop time-axis; fall back to a
-        # source-scan header, then now.
-        scan_hdr = (headers.get("X-Source-Time") or headers.get("X-Scan-Time")
+        # Stamp the frame with what /render ACTUALLY rendered (X-Scan-Time) so
+        # Himawari Target sub-scans (~2.5 min) get distinct timestamps instead of
+        # collapsing onto the 10-min discovery slot; fall back to the discovered
+        # scan time, then now.
+        scan_hdr = (headers.get("X-Scan-Time") or headers.get("X-Source-Time")
                     or headers.get("X-Timestamp"))
-        ts = ext.scan_start or (parse_iso(scan_hdr) if scan_hdr else None) or utcnow()
+        ts = (parse_iso(scan_hdr) if scan_hdr else None) or ext.scan_start or utcnow()
         key = frame_key(sector.slug, band.key, ts)
         if not self.r2.put_bytes(key, png, "image/png", CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
