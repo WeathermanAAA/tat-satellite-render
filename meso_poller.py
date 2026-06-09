@@ -285,11 +285,18 @@ def discover_goes_extent(sector: MesoSector) -> SectorExtent:
 
     band = _GOES_GENERIC_TO_BAND.get(sector.locate_band, 13)
     target = utcnow()
-    # List the sector's latest scan around now (this hour + previous hour, as
-    # satellites._list_files_around does for edge cases at the hour boundary).
-    files = (satellites._list_hour(sector.bucket, sector.sector, band, target)
-             + satellites._list_hour(sector.bucket, sector.sector, band,
-                                     target - dt.timedelta(hours=1)))
+    # GOES L2 CMIP mesoscale lives under the SINGLE product prefix ABI-L2-CMIPM/;
+    # M1 vs M2 is encoded in the FILENAME (OR_ABI-L2-CMIPM1-... / ...-CMIPM2-...),
+    # NOT in separate ABI-L2-CMIPM1//ABI-L2-CMIPM2/ prefixes (those don't exist on
+    # the bucket -- listing them returns []). So list the CMIPM hour (this hour +
+    # the previous, for the hour-boundary edge) and filter keys to this sector's
+    # M1/M2 token. (_list_hour already filters by the C{band} channel token.)
+    sector_tok = f"-{sector.sector}-"   # "-CMIPM1-" / "-CMIPM2-"
+    files = [f for f in (
+                satellites._list_hour(sector.bucket, "CMIPM", band, target)
+                + satellites._list_hour(sector.bucket, "CMIPM", band,
+                                        target - dt.timedelta(hours=1)))
+             if sector_tok in f]
     if not files:
         raise DiscoverError(f"no {sector.sector} scan found in {sector.bucket}")
     with_t = sorted(((f, satellites._parse_scan_start(f)) for f in files),
@@ -300,17 +307,23 @@ def discover_goes_extent(sector: MesoSector) -> SectorExtent:
         with fs.open(s3_key, mode="rb") as f:
             ds = xr.open_dataset(f, decode_cf=False, engine="h5netcdf")
             try:
-                lat_min = float(ds.attrs["geospatial_lat_min"])
-                lat_max = float(ds.attrs["geospatial_lat_max"])
-                lon_min = float(ds.attrs["geospatial_lon_min"])
-                lon_max = float(ds.attrs["geospatial_lon_max"])
+                # The meso extent is on the geospatial_lat_lon_extent VARIABLE's
+                # attrs (west/south/east/north), NOT global geospatial_lat_min/max
+                # (which don't exist on ABI files). One canon: satellites helper.
+                lon_min, lat_min, lon_max, lat_max = \
+                    satellites._goes_meso_extent_from_ds(ds)
             finally:
                 ds.close()
     except Exception as e:  # noqa: BLE001
-        raise DiscoverError(f"attr read failed for {s3_key}: {e}") from e
+        raise DiscoverError(f"extent read failed for {s3_key}: {e}") from e
     bbox = [round(norm_lon(lon_min), 3), round(lat_min, 3),
             round(norm_lon(lon_max), 3), round(lat_max, 3)]
-    if not (bbox[0] < bbox[2] and bbox[1] < bbox[3]):
+    # lon_e < lon_w is a VALID antimeridian crossing (operators steer M1/M2 across
+    # the dateline -- e.g. a Bering/Aleutians sector; the render + frontend handle
+    # e<w), NOT degenerate. Validate latitude order + a positive WRAPPED lon span
+    # instead of lon_w < lon_e.
+    lon_span = (bbox[2] - bbox[0]) % 360.0
+    if not (bbox[1] < bbox[3] and 0.0 < lon_span < 359.0):
         raise DiscoverError(f"degenerate bbox {bbox} for {s3_key}")
     return SectorExtent(bbox=bbox, scan_start=scan_start,
                         sat_name=satellites.goes_sat_label(sector.bucket))

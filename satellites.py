@@ -295,19 +295,32 @@ async def _list_files_around(bucket: str, product: str, channel: int, target: dt
         _to_thread(_list_hour, bucket, product, channel, target),
     )
     return a + b
+def _goes_meso_extent_from_ds(ds) -> tuple[float, float, float, float]:
+    """(lon_w, lat_s, lon_e, lat_n) for a GOES ABI mesoscale scan.
+
+    The operators steer M1/M2, so the extent is per-file. ABI L1b/L2 files carry
+    it on the ``geospatial_lat_lon_extent`` VARIABLE's attributes
+    (geospatial_{west,east}bound_longitude / {south,north}bound_latitude) -- NOT
+    as global ``geospatial_lat_min/max`` attrs (those do not exist on these
+    files). Reading the missing globals defaulted to the whole globe, which made
+    coverage checks pass for ANY bbox (so M1 was wrongly chosen for M2)."""
+    a = ds["geospatial_lat_lon_extent"].attrs
+    return (float(a["geospatial_westbound_longitude"]),
+            float(a["geospatial_southbound_latitude"]),
+            float(a["geospatial_eastbound_longitude"]),
+            float(a["geospatial_northbound_latitude"]))
+
+
 def _check_meso_coverage_sync(s3_key: str, bbox: list[float], buffer_deg: float = 0.5) -> bool:
     fs = _get_fs()
     try:
         with fs.open(s3_key, mode="rb") as f:
             ds = xr.open_dataset(f, decode_cf=False, engine="h5netcdf")
             try:
-                lat_min = float(ds.attrs.get("geospatial_lat_min", -90))
-                lat_max = float(ds.attrs.get("geospatial_lat_max", 90))
-                lon_min = float(ds.attrs.get("geospatial_lon_min", -180))
-                lon_max = float(ds.attrs.get("geospatial_lon_max", 180))
+                lon_w, lat_s, lon_e, lat_n = _goes_meso_extent_from_ds(ds)
             finally:
                 ds.close()
-        return _bbox_inside(bbox, (lon_min, lat_min, lon_max, lat_max), buffer=buffer_deg)
+        return _bbox_inside(bbox, (lon_w, lat_s, lon_e, lat_n), buffer=buffer_deg)
     except Exception as e:
         log.warning("meso coverage check failed for %s: %s", s3_key, e)
         return False
@@ -551,9 +564,16 @@ class GOESBaseSatellite(Satellite):
             f"no GOES file found for bbox/time/channel across buckets {buckets}; last_err={last_err}"
         )
     async def _pick_meso(self, bucket, bbox, channel, target, nearest_to_target):
-        # Try M1 then M2 — first that covers wins
+        # GOES L2 CMIP mesoscale lives under the SINGLE product prefix
+        # ABI-L2-CMIPM/; M1 vs M2 is in the FILENAME (...-CMIPM1-... / ...-CMIPM2-...),
+        # NOT separate ABI-L2-CMIPM1//ABI-L2-CMIPM2/ prefixes (those don't exist --
+        # listing them returns [], so meso silently fell back to CONUS). List the
+        # real CMIPM prefix and filter to the sector token. Try M1 then M2 — first
+        # that covers wins. `sector` stays the product label for _make_resolved.
         for sector in ("CMIPM1", "CMIPM2"):
-            files = await _list_files_around(bucket, sector, channel, target)
+            tok = f"-{sector}-"
+            files = [f for f in await _list_files_around(bucket, "CMIPM", channel, target)
+                     if tok in f]
             if not files:
                 continue
             files_with_t = sorted([(f, _parse_scan_start(f)) for f in files], key=lambda p: p[1])
