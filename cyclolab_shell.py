@@ -713,15 +713,18 @@ HTML_TEMPLATE = r"""<!doctype html>
   /* ---- Overview plots (FG-R3 #7 track history + #8 wind swath): two
      art-directed client-side panels that REUSE the cone's map furniture
      (.ac-ocean-fill / .ac-land / .ac-graticule / .ac-coast / .ac-border /
-     .ac-frame) and add panel-specific chrome. Neon must POP on the dark
-     ocean - the track dots are a continuous ramp, not the 7 SSHS hues. */
+     .ac-frame) and add panel-specific chrome. The track dots + colorbar are
+     SSHS-anchored category bands (the canonical 7 hues), the color breaking
+     on the Saffir-Simpson thresholds (34/64/83/96/113/137 kt). */
   .tp-track { fill: none; stroke: rgba(150,180,220,0.42);
     stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
   .tp-dot { stroke: rgba(8,12,20,0.55); stroke-width: 1; }
   .tp-dot.tp-now { stroke: #ffffff; stroke-width: 1.6;
     filter: drop-shadow(0 0 6px currentColor); }
-  .tp-cbar-tick { fill: #8ea2bd; font-size: 11px;
-    font-variant-numeric: tabular-nums; }
+  .tp-cbar-tick { fill: #ffffff; font-size: 11px;
+    font-variant-numeric: tabular-nums; paint-order: stroke;
+    stroke: rgba(7,12,22,0.85); stroke-width: 2px;
+    stroke-linejoin: round; }
   .tp-cbar-frame { fill: none; stroke: #3a4d6e; stroke-width: 1; }
   .tp-field-lbl { font-size: 11px; font-weight: 700;
     font-variant-numeric: tabular-nums; paint-order: stroke;
@@ -1860,6 +1863,74 @@ HTML_TEMPLATE = r"""<!doctype html>
     return "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
   }
 
+  // ====================================================================
+  // SSHS-ANCHORED WIND RAMP (backlog E) - the per-fix track dots AND the
+  // right-side colorbar SHARE this ramp, so the color BREAKS land EXACTLY
+  // on the Saffir-Simpson thresholds (34/64/83/96/113/137 kt). DISCRETE
+  // category bands with a thin NEON EDGE separator at each threshold (the
+  // approved treatment). Hues are the CANONICAL ace_core.SSHS_COLORS (the
+  // baked `SSHS` map) the chips, markers and category pills already use - NO
+  // new colors, no drift. Does NOT touch the WIND_TIER blue->gold palette
+  // (rings/swath = its own canon) or neonColor (kept for the wind-tier 'B'
+  // knob).
+  var SSHS_BANDS = [            // [loKt, hiKt, catCode]
+    [0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"], [83, 96, "C2"],
+    [96, 113, "C3"], [113, 137, "C4"], [137, 999, "C5"]
+  ];
+  var SSHS_THRESH = [34, 64, 83, 96, 113, 137];
+  var SSHS_CBAR_MAX = 185;      // bar domain top (kt); C5 fills 137..185
+  function sshsCat(kt) {        // kt -> category code (step)
+    var v = (kt == null || isNaN(kt)) ? 0 : +kt;
+    for (var i = 0; i < SSHS_BANDS.length; i++) {
+      if (v < SSHS_BANDS[i][1]) return SSHS_BANDS[i][2];
+    }
+    return "C5";
+  }
+  function sshsDotColor(kt) {   // discrete: each dot snaps to its category hue
+    return SSHS[sshsCat(kt)];
+  }
+  // Build the right-side colorbar: discrete category bands + a thin neon edge
+  // separator at each threshold + frame + units-aware threshold ticks. Shares
+  // the ramp with the dots so the legend can never desync; tick labels are
+  // tabular-nums (the .tp-cbar-tick CSS) and convert with the unit setting.
+  function sshsColorbar(cbX, cbY, cbW, cbH) {
+    var out = [];
+    var ktY = function (kt) {
+      return cbY + cbH - (Math.min(kt, SSHS_CBAR_MAX) / SSHS_CBAR_MAX) * cbH;
+    };
+    SSHS_BANDS.forEach(function (b) {
+      var y1 = ktY(Math.min(b[1], SSHS_CBAR_MAX)), y0 = ktY(b[0]);
+      out.push('<rect x="' + cbX + '" y="' + y1.toFixed(1) + '" width="' +
+        cbW + '" height="' + (y0 - y1).toFixed(1) + '" fill="' +
+        SSHS[b[2]] + '"/>');
+    });
+    // thin NEON edge separator at each interior threshold: a dark casing
+    // under a bright cyan hairline so it reads over light AND hot bands.
+    SSHS_THRESH.forEach(function (kt) {
+      var ty = ktY(kt);
+      out.push('<line x1="' + cbX + '" y1="' + ty.toFixed(1) + '" x2="' +
+        (cbX + cbW) + '" y2="' + ty.toFixed(1) +
+        '" stroke="rgba(6,11,20,0.85)" stroke-width="2.6"/>');
+      out.push('<line x1="' + cbX + '" y1="' + ty.toFixed(1) + '" x2="' +
+        (cbX + cbW) + '" y2="' + ty.toFixed(1) +
+        '" stroke="#5ef6ff" stroke-width="1.3"/>');
+    });
+    out.push('<rect class="tp-cbar-frame" x="' + cbX + '" y="' + cbY +
+      '" width="' + cbW + '" height="' + cbH + '"/>');
+    SSHS_THRESH.forEach(function (kt) {
+      var ty = ktY(kt);
+      out.push('<line x1="' + (cbX - 4) + '" y1="' + ty.toFixed(1) + '" x2="' +
+        cbX + '" y2="' + ty.toFixed(1) + '" stroke="#3a4d6e" ' +
+        'stroke-width="1"/>');
+      out.push('<text class="tp-cbar-tick" x="' + (cbX - 7) + '" y="' +
+        (ty + 4).toFixed(1) + '" text-anchor="end">' + windDisp(kt) +
+        "</text>");
+    });
+    out.push('<text class="tp-cbar-tick" x="' + (cbX + cbW / 2) + '" y="' +
+      (cbY - 8) + '" text-anchor="middle">' + windUnitLabel() + "</text>");
+    return out.join("");
+  }
+
   // nature -> marker SHAPE: tropical = circle, subtropical = square,
   // non-tropical = triangle. The deck's nature codes (per-fix p.nature):
   // tropical TS/TD/HU/TY/ST/DB (or empty); subtropical SS/SD; everything
@@ -2420,7 +2491,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var shapesSeen = {};
     pts.forEach(function (p, i) {
       var isNow = (i === pts.length - 1);
-      var col = neonColor(p.wind_kt);
+      var col = sshsDotColor(p.wind_kt);
       var shape = natureShape(p.nature);
       shapesSeen[shape] = 1;
       var r = isNow ? 11 : 5.4;
@@ -2431,32 +2502,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         isNow ? tierGlow() : null));
     });
 
-    // LABELED COLORBAR (gradient bar + ticks, units-aware labels).
+    // LABELED COLORBAR - SSHS category bands + neon edges, sharing the ramp
+    // with the per-fix dots (backlog E) so the legend can never desync.
     var cbX = W - 34, cbY = 96, cbW = 16, cbH = H - 200;
-    var gid = "tp-neon-grad";
-    var stops = NEON_RAMP.map(function (s) {
-      var f = s[0] / 185.0;
-      return '<stop offset="' + (Math.min(1, f) * 100).toFixed(1) +
-        '%" stop-color="rgb(' + s[1] + "," + s[2] + "," + s[3] + ')"/>';
-    }).join("");
-    parts.push('<defs><linearGradient id="' + gid +
-      '" x1="0" y1="1" x2="0" y2="0">' + stops + "</linearGradient></defs>");
-    parts.push('<rect x="' + cbX + '" y="' + cbY + '" width="' + cbW +
-      '" height="' + cbH + '" fill="url(#' + gid + ')"/>');
-    parts.push('<rect class="tp-cbar-frame" x="' + cbX + '" y="' + cbY +
-      '" width="' + cbW + '" height="' + cbH + '"/>');
-    [0, 34, 64, 96, 137, 185].forEach(function (kt) {
-      var ty = cbY + cbH - (Math.min(kt, 185) / 185.0) * cbH;
-      parts.push('<line x1="' + (cbX - 4) + '" y1="' + ty.toFixed(1) +
-        '" x2="' + cbX + '" y2="' + ty.toFixed(1) +
-        '" stroke="#3a4d6e" stroke-width="1"/>');
-      parts.push('<text class="tp-cbar-tick" x="' + (cbX - 7) + '" y="' +
-        (ty + 4).toFixed(1) + '" text-anchor="end">' + windDisp(kt) +
-        "</text>");
-    });
-    parts.push('<text class="tp-cbar-tick" x="' + (cbX + cbW / 2) +
-      '" y="' + (cbY - 8) + '" text-anchor="middle">' + windUnitLabel() +
-      "</text>");
+    parts.push(sshsColorbar(cbX, cbY, cbW, cbH));
 
     // maps-pass R6: the CURRENT stats card (Vmax / Pmin / ACE + the
     // trop/sub/non-trop key) was an in-SVG block floating in map space; it is

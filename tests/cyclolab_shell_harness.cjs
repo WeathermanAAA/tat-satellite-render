@@ -404,7 +404,7 @@ const scheduledDelays = [];
       trackChildCount: tp ? tp.children.length : 0,
       trackDotCount: tpShapes.total,
       trackShapes: tpShapes,
-      trackColorbar: !!(tp && tp.querySelector("linearGradient")),
+      trackColorbar: !!(tp && tp.querySelector(".tp-cbar-frame")),
       trackColorbarTicks: tp
         ? tp.querySelectorAll(".tp-cbar-tick").length : 0,
       trackWindField: tp

@@ -1594,7 +1594,7 @@ class TestOverviewPlots(unittest.TestCase):
         self.assertGreater(sh["circle"], 0)
         self.assertGreater(sh["square"], 0)
         self.assertGreater(sh["triangle"], 0)
-        # the LABELED colorbar (gradient + ticks).
+        # the LABELED colorbar (SSHS category bands + threshold ticks).
         self.assertTrue(ov["trackColorbar"])
         self.assertGreaterEqual(ov["trackColorbarTicks"], 6)
         # title lockup + map furniture + legend.
