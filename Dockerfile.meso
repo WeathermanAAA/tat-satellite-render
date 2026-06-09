@@ -1,0 +1,43 @@
+# Dockerfile.meso -- image shared by BOTH meso compose services (meso-render +
+# meso-poller). It installs the full floater/render dependency set, so the same
+# image can run either app.py's /render (uvicorn) or meso_poller.py. The poller
+# itself needs only boto3 + requests + s3fs/xarray/numpy for extent discovery,
+# but reusing one image keeps the two services byte-identical and avoids a
+# second build.
+#
+# Pinned to Python 3.11 to match nixpacks.toml (the Railway build) -- cartopy
+# 0.24 / netCDF4 1.7 / shapely 2.x ship manylinux wheels, so a clean pip install
+# is enough; gcc/pkg-config are a safety net for any sdist.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Build + runtime libs. curl is here so the compose healthcheck can curl the
+# poller's /health endpoint; the rest cover any sdist fallback for the scientific
+# stack (most install from wheels and won't need these).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ pkg-config curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps first (layer-cached) -- same requirements.txt the render service
+# uses (s3fs, aiobotocore, xarray, h5netcdf, netCDF4, scipy, matplotlib,
+# cartopy, pyorbital, pyspectral, boto3 [via the floater delta], fastapi,
+# uvicorn, requests). boto3 + requests are appended here in case the pinned
+# requirements.txt hasn't merged the floater delta yet.
+COPY requirements.txt ./
+RUN pip install -r requirements.txt \
+    && pip install "boto3>=1.34" "requests>=2.31"
+
+# Pre-warm pyspectral's Rayleigh LUTs so the first true-color render isn't slow
+# (non-fatal: the recipe guards a missing LUT and renders hazier).
+RUN python -c "from pyspectral.rayleigh import check_and_download; check_and_download()" || true
+
+# App source (poller + render + the satellite/render canon they share).
+COPY . .
+
+# Default command is overridden per-service in docker-compose.meso.yml.
+CMD ["python", "meso_poller.py"]

@@ -1,0 +1,85 @@
+# docker-compose.meso.yml -- the MESO-SECTOR poller stack, fully isolated from
+# the floater poller (separate services, separate R2 prefix `meso/`, separate
+# health endpoint). Two services share one image (Dockerfile.meso):
+#
+#   meso-render  -- app.py's /render via uvicorn, bound to 127.0.0.1 (loopback
+#                   ONLY: it is reached over the compose network by the poller,
+#                   never exposed to the host/public; the public render service
+#                   stays whatever you already run). No public limiter in the
+#                   way, so the poller polls every band at its 60 s target.
+#   meso-poller  -- meso_poller.py, depends_on meso-render, reads .env. Calls
+#                   http://meso-render:8080/render over the compose network and
+#                   writes meso/ frames + manifests to R2.
+#
+# Both restart: always; both use json-file logging with rotation so a long run
+# can't fill the disk with logs.
+#
+# Bring up:   docker compose -f docker-compose.meso.yml up -d --build
+# Kill switch: set MESO_ENABLED=false in .env, then
+#             docker compose -f docker-compose.meso.yml up -d  (recreates poller)
+
+services:
+  meso-render:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-meso:latest
+    command: uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
+    # Loopback-only host binding: reachable on the compose network as
+    # http://meso-render:8080 but NOT published to the public internet.
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file: .env
+    environment:
+      # Allow the poller's internal origin (CORS is irrelevant for the
+      # server-to-server poller call, but keep localhost for any manual probe).
+      ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8080"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  meso-poller:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-meso:latest
+    command: python meso_poller.py
+    depends_on:
+      meso-render:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Reach the render service over the compose network (NOT the public URL),
+      # so every band polls at its hot/cold cadence without the public limiter.
+      RENDER_BASE_URL: "http://meso-render:8080"
+      RATE_MIN_SPACING_S: "1.0"
+      HEALTH_PORT: "8090"
+      HEALTH_FILE: "/tmp/meso_health.json"
+    # Expose the poller's own health on loopback so the box owner can curl it
+    # (the compose healthcheck below already polls it internally).
+    ports:
+      - "127.0.0.1:8090:8090"
+    restart: always
+    healthcheck:
+      # The poller serves 200 when healthy / booting / intentionally disabled,
+      # 503 when ANY sector is stale or failing -> flips the container unhealthy
+      # so an external watcher (or `docker compose ps`) sees the freeze.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
