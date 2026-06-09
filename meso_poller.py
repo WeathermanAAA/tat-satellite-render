@@ -129,7 +129,8 @@ R2_PREFIX = _env("R2_PREFIX", "meso").strip("/")
 
 # Cadence + geometry. No BBOX_DEG here -- the bbox comes from the discovered
 # sector extent, not a fixed storm crop.
-CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))         # hot-band target
+CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))         # hot-band target (native GOES meso)
+COLD_CADENCE_TARGET_S = float(_env("COLD_CADENCE_TARGET_S", "300"))  # cold-band target (stretched)
 SECTORS_REFRESH_S = float(_env("SECTORS_REFRESH_S", "120"))      # re-discover extents
 # Himawari render product: "target" -> the ~2.5-min AHI Target sub-scans
 # (R301..R304) for the 5 scalar bands; "fldk" -> the 10-min full disk. Flip to
@@ -555,7 +556,13 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
 # ---------------------------------------------------------------------------
 
 def frame_key(slug: str, band_key: str, ts: dt.datetime) -> str:
-    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%MZ')}.png"
+    # SECOND precision. GOES meso scans are ~60 s apart but jitter (the public
+    # bucket shows 57-63 s gaps), so two DISTINCT scans can land in the same
+    # wall-clock minute; a minute-resolution key would collide and the second
+    # scan's PNG would overwrite the first under the same key (the content-hash
+    # dedup can't catch it -- different bytes both pass). Seconds make every scan
+    # a distinct key. SectorExtent.key already uses %Y%m%dT%H%M%SZ.
+    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%M%SZ')}.png"
 
 
 def sector_manifest_key(slug: str) -> str:
@@ -751,6 +758,7 @@ class MesoPoller:
         if sector.family == "himawari" and MESO_HIMAWARI_PRODUCT == "fldk":
             product = None
         self.limiter.acquire()
+        _t_render = time.monotonic()
         try:
             png, headers = call_render(self.session, bbox, band.channel,
                                        band.enhancement, product=product)
@@ -783,31 +791,50 @@ class MesoPoller:
             return  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(sector, band, key, ts, h)
         u.last_hash = h
-        log.info("uploaded %s (%d B, %s)", key, len(png),
-                 headers.get("X-Satellite", "?"))
+        log.info("uploaded %s (%d B, %s, render %.1fs)", key, len(png),
+                 headers.get("X-Satellite", "?"), time.monotonic() - _t_render)
 
     # ---- cadence --------------------------------------------------------
 
     def cold_cadence(self) -> float:
-        """Cold-band per-unit cadence: floors at the 60 s target on private
-        networking, stretches on the public URL so the rate budget protects the
-        hot bands. C = max(60, U_cold * spacing)."""
+        """Cold-band per-unit cadence -- DELIBERATELY stretched well past the hot
+        target so the cold bands (WV / true-color / SWIR) never flood the single
+        render pipeline and starve the hot IR/IRBD lane. Floors at
+        COLD_CADENCE_TARGET_S (default 300 s vs the 60 s hot target) and still
+        widens with the rate budget on the public URL."""
         n_cold = sum(1 for u in self.units.values() if not u.band.hot)
-        return max(CADENCE_TARGET_S, n_cold * self.limiter.min_spacing)
+        return max(COLD_CADENCE_TARGET_S, n_cold * self.limiter.min_spacing)
 
     def tick(self) -> None:
+        # HOT lane first: drain EVERY due hot unit (the 10-unit IR/IRBD fleet
+        # fits inside the 60 s budget at ~4 s/render), so hot refreshes at the
+        # native ~60 s cadence DECOUPLED from the full 5x6 cycle. The old code
+        # drained all 30 due units in one pass with cold on the same 60 s target,
+        # so the 20 cold units serialized ahead of / between hot and pushed hot's
+        # next_due past 60 s -> hot inherited the ~120 s full-cycle latency.
         now = time.monotonic()
         if now < self._circuit_open_until:
             return
-        cold_c = self.cold_cadence()
-        due = [u for u in self.units.values() if u.next_due <= now]
-        due.sort(key=lambda u: (not u.band.hot, u.next_due))
-        for u in due:
+        hot_due = sorted(
+            (u for u in self.units.values() if u.band.hot and u.next_due <= now),
+            key=lambda u: u.next_due)
+        for u in hot_due:
             if time.monotonic() < self._circuit_open_until:
-                break
-            cadence = CADENCE_TARGET_S if u.band.hot else cold_c
+                return
             self.process_unit(u)
-            u.next_due = time.monotonic() + cadence
+            u.next_due = time.monotonic() + CADENCE_TARGET_S
+        # COLD lane: at most ONE cold unit per tick (the most overdue). Caps cold
+        # throughput so a cold backlog can never delay a due hot unit, yet cold
+        # still trickles whenever the hot lane has spare time; cold stretches
+        # gracefully (to its true sustainable rate) when hot is busy.
+        if time.monotonic() < self._circuit_open_until:
+            return
+        cold_due = [u for u in self.units.values()
+                    if not u.band.hot and u.next_due <= now]
+        if cold_due:
+            u = min(cold_due, key=lambda u: u.next_due)
+            self.process_unit(u)
+            u.next_due = time.monotonic() + self.cold_cadence()
 
     # ---- health ---------------------------------------------------------
 
