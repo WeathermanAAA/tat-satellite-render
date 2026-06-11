@@ -138,7 +138,6 @@ TRACKS_REFRESH_S = float(_env("TRACKS_REFRESH_S", "600"))  # storms update every
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))  # min gap between /render calls
 ACTIVE_WINDOW_HOURS = float(_env("ACTIVE_WINDOW_HOURS", "60"))
 NIGHT_ZENITH_DEG = float(_env("NIGHT_ZENITH_DEG", "85"))   # >= this => skip daytime-only bands
-EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapolation
 
 # Retention (R2) -- native recent + thinned history.
 RECENT_WINDOW_H = float(_env("RECENT_WINDOW_H", "6"))      # keep native cadence within this
@@ -294,26 +293,14 @@ class Storm:
     nature: Optional[str] = None
 
 
-def _extrapolate(points: list[dict], now: dt.datetime) -> tuple[float, float]:
-    """Center the floater on the storm's position *now*, linearly extrapolated
-    from its last two 6-hourly fixes (capped at EXTRAPOLATE_MAX_H so a stale
-    JSON can't fling the bbox off the storm)."""
-    last = points[-1]
-    lat, lon = float(last["lat"]), float(last["lon"])
-    lt = parse_iso(last["t"])
-    if len(points) < 2 or lt is None:
-        return lat, lon
-    prev = points[-2]
-    pt = parse_iso(prev["t"])
-    if pt is None or pt >= lt:
-        return lat, lon
-    dt_h = (lt - pt).total_seconds() / 3600.0
-    if dt_h <= 0:
-        return lat, lon
-    dlat = (lat - float(prev["lat"])) / dt_h
-    dlon = (norm_lon(lon - float(prev["lon"]))) / dt_h
-    ahead_h = max(0.0, min(EXTRAPOLATE_MAX_H, (now - lt).total_seconds() / 3600.0))
-    return lat + dlat * ahead_h, norm_lon(lon + dlon * ahead_h)
+# NOTE: the old ``_extrapolate`` helper (linear motion extrapolation between
+# fixes) is deliberately GONE. The floater crop is LOCKED to the storm's
+# latest fix: every storm source below carries pts[-1]/the current advisory
+# position verbatim, and process_unit derives the bbox from that, so every
+# frame rendered within one fix window shares an identical center and the
+# crop steps ONLY when a new fix/advisory lands (~3-6 h). Per-frame position
+# interpolation moves the box a few pixels per frame and reads as jitter in
+# the loop -- do not reintroduce it.
 
 
 def _fetch_tracks_json(session: requests.Session, url: str, basin: str) -> Optional[dict]:
@@ -1178,6 +1165,10 @@ class Poller:
             if zen >= NIGHT_ZENITH_DEG:
                 # Night: nothing to render; defer to next cadence slot.
                 return
+        # The bbox center is the storm's LATEST FIX (storm.lat/lon), held
+        # constant for every frame until a new fix/advisory replaces it --
+        # never a per-frame interpolated position (see the note where the old
+        # _extrapolate helper used to live).
         half = BBOX_DEG / 2.0
         bbox = [round(norm_lon(storm.lon - half), 3), round(storm.lat - half, 3),
                 round(norm_lon(storm.lon + half), 3), round(storm.lat + half, 3)]
