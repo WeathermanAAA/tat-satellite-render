@@ -146,6 +146,11 @@ EXTENT_STALE_AFTER_S = float(_env("EXTENT_STALE_AFTER_S", "1800"))  # >this sinc
 RECENT_WINDOW_H = float(_env("RECENT_WINDOW_H", "6"))
 HISTORY_WINDOW_H = float(_env("HISTORY_WINDOW_H", "24"))
 THIN_SPACING_S = float(_env("THIN_SPACING_S", "300"))
+# Manifest==storage re-sync cadence. The manifest is rebuilt from an R2
+# LISTING (storage is the source of truth) at startup and every RECONCILE_S,
+# so a manifest can never keep advertising frames whose objects are gone
+# (the viewer 404s on those). See reconcile_manifests.
+RECONCILE_S = float(_env("MESO_RECONCILE_S", "900"))
 
 # HTTP timeouts / retries (render + extent discovery).
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
@@ -491,6 +496,16 @@ class R2:
             except Exception as e:  # noqa: BLE001
                 log.warning("R2 delete batch failed: %s", e)
 
+    def list_keys(self, prefix: str) -> list[str]:
+        """Every object key under ``prefix``. Raises on failure -- callers
+        decide whether a listing error may blank state (it must not)."""
+        keys: list[str] = []
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+        return keys
+
 
 # ---------------------------------------------------------------------------
 # Rate limiter (verbatim from floater_poller)
@@ -577,6 +592,30 @@ def health_key() -> str:
     return f"{R2_PREFIX}/health.json"
 
 
+def frame_ts_from_key(key: str) -> Optional[dt.datetime]:
+    """Recover a frame's scan time from its object key name -- frame_key()
+    encodes it ({prefix}/{slug}/{band}/{stamp}.png), so a band's frame list is
+    fully reconstructible from an R2 LISTING alone. Tolerates the legacy
+    minute-precision stamps alongside the current second-precision ones."""
+    name = key.rsplit("/", 1)[-1]
+    if not name.endswith(".png"):
+        return None
+    stamp = name[:-4]
+    # exact-length dispatch: strptime pads greedily, so a minute-precision
+    # stamp would MIS-PARSE under the second-precision format (0441Z ->
+    # 04:04:01) instead of falling through.
+    if len(stamp) == 16:
+        fmt = "%Y%m%dT%H%M%SZ"
+    elif len(stamp) == 14:
+        fmt = "%Y%m%dT%H%MZ"
+    else:
+        return None
+    try:
+        return dt.datetime.strptime(stamp, fmt).replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
 def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list[str]]:
     """Keep native cadence within RECENT_WINDOW_H; thin to THIN_SPACING_S out to
     HISTORY_WINDOW_H; drop older. Returns (kept, deleted_keys). Reused verbatim
@@ -630,14 +669,21 @@ class MesoPoller:
             s.slug: SourceHealth(name=s.slug) for s in MESO_SECTORS
         }
         self._last_sectors_refresh = 0.0
+        self._last_reconcile = 0.0
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
+        # MEMORY-AUTHORITATIVE per-sector manifests (seeded by
+        # reconcile_manifests in run(); this poller is the sole writer).
+        # append_frame must never GET-modify-PUT remote manifest state: a
+        # stale read (e.g. a second poller container left running across a
+        # rebuild) made thinning delete objects that another manifest copy
+        # still listed -- the viewer then 404'd on scattered phantom frames.
+        self.manifests: dict[str, dict] = {}
         # Build the unit set once (sectors are fixed; only their extents move).
+        # last_hash is seeded from the reconciled manifests in run().
         for sector in MESO_SECTORS:
             for band in BANDS:
-                u = Unit(sector=sector, band=band)
-                u.last_hash = self._resync_hash(sector.slug, band.key)
-                self.units[(sector.slug, band.key)] = u
+                self.units[(sector.slug, band.key)] = Unit(sector=sector, band=band)
 
     # ---- extent discovery (per-sector, fully isolated) -----------------
 
@@ -677,16 +723,70 @@ class MesoPoller:
         self.write_top_manifest()
         self.emit_health()
 
-    def _resync_hash(self, slug: str, band_key: str) -> str | None:
-        """On (re)start, recover the last uploaded frame's hash so we don't
-        re-upload an unchanged frame after a restart."""
-        man = self.r2.get_json(sector_manifest_key(slug))
-        if not man:
-            return None
-        band = (man.get("bands") or {}).get(band_key) or {}
-        return band.get("last_hash")
-
     # ---- manifests ------------------------------------------------------
+
+    def reconcile_manifests(self) -> None:
+        """Rebuild every per-sector manifest from an R2 LISTING -- storage is
+        the source of truth. frame_key encodes the scan time in the object
+        name, so each band's frame list is reconstructed wholly from what
+        actually exists; entries a previous manifest advertised but storage
+        doesn't have ("phantom" frames, which the viewer 404s on) are dropped,
+        and out-of-retention objects are pruned. Runs at startup and every
+        RECONCILE_S, so manifest==storage self-heals even across writer
+        accidents (e.g. two poller containers fighting across a rebuild).
+        A band whose LISTING fails keeps its previous body -- a transient list
+        error must never blank a healthy band."""
+        now = utcnow()
+        for sector in MESO_SECTORS:
+            mkey = sector_manifest_key(sector.slug)
+            prev = self.manifests.get(sector.slug) or self.r2.get_json(mkey) or {}
+            old_bands = prev.get("bands") or {}
+            man = {
+                "slug": sector.slug, "satellite": sector.satellite,
+                "sector": sector.sector, "label": sector.label,
+                "generated_utc": iso_z(now), "bands": {},
+            }
+            to_delete: list[str] = []
+            phantoms = 0
+            counts: list[str] = []
+            for band in BANDS:
+                ob = old_bands.get(band.key) or {}
+                try:
+                    keys = self.r2.list_keys(
+                        f"{R2_PREFIX}/{sector.slug}/{band.key}/")
+                except Exception as e:  # noqa: BLE001 - per-band isolation
+                    log.warning("reconcile list %s/%s failed: %s -- keeping "
+                                "prior body", sector.slug, band.key, e)
+                    if ob:
+                        man["bands"][band.key] = ob
+                    continue
+                frames = []
+                for k in keys:
+                    t = frame_ts_from_key(k)
+                    if t is not None:
+                        frames.append({"t": iso_z(t), "key": k})
+                frames.sort(key=lambda f: f["t"])
+                kept, deleted = prune_frames(frames, now)
+                to_delete.extend(deleted)
+                stored = {f["key"] for f in frames}
+                phantoms += sum(1 for f in (ob.get("frames") or [])
+                                if f.get("key") not in stored)
+                man["bands"][band.key] = {
+                    "label": band.label,
+                    "frames": kept,
+                    "latest": kept[-1]["key"] if kept else ob.get("latest"),
+                    "last_hash": ob.get("last_hash"),
+                    "updated_utc": ob.get("updated_utc") or iso_z(now),
+                }
+                counts.append(f"{band.key}:{len(kept)}")
+            if self.r2.put_json(mkey, man, CACHE_MANIFEST):
+                self.manifests[sector.slug] = man
+                if to_delete:
+                    self.r2.delete(to_delete)
+            log.info("reconcile %s: %s%s%s", sector.slug, " ".join(counts),
+                     f" | dropped {phantoms} phantom manifest entries"
+                     if phantoms else "",
+                     f" | pruned {len(to_delete)} objects" if to_delete else "")
 
     def write_top_manifest(self) -> None:
         """Top index mirrors floater write_top_manifest, storms->sectors:
@@ -718,16 +818,15 @@ class MesoPoller:
                      ts: dt.datetime, content_hash: str) -> None:
         """Per-sector manifest with the BYTE-IDENTICAL bands body shape the
         floater poller uses: bands:{<k>:{label,frames:[{t,key}],latest,
-        last_hash,updated_utc}}."""
-        mkey = sector_manifest_key(sector.slug)
-        man = self.r2.get_json(mkey) or {
-            "slug": sector.slug, "satellite": sector.satellite,
-            "sector": sector.sector, "label": sector.label, "bands": {},
-        }
-        man["slug"] = sector.slug
-        man["satellite"] = sector.satellite
-        man["sector"] = sector.sector
-        man["label"] = sector.label
+        last_hash,updated_utc}}. MEMORY-AUTHORITATIVE: appends to this
+        process's own manifest state and writes it out -- never re-reads the
+        remote copy (a stale read is how phantom entries were born); the
+        periodic reconcile re-grounds the state in an actual R2 listing."""
+        man = self.manifests.get(sector.slug)
+        if man is None:
+            man = {"slug": sector.slug, "satellite": sector.satellite,
+                   "sector": sector.sector, "label": sector.label, "bands": {}}
+            self.manifests[sector.slug] = man
         man["generated_utc"] = iso_z(utcnow())
         bands = man.setdefault("bands", {})
         b = bands.setdefault(band.key, {"label": band.label, "frames": []})
@@ -738,7 +837,8 @@ class MesoPoller:
         b["latest"] = kept[-1]["key"] if kept else key
         b["last_hash"] = content_hash
         b["updated_utc"] = iso_z(utcnow())
-        if self.r2.put_json(mkey, man, CACHE_MANIFEST) and deleted:
+        if self.r2.put_json(sector_manifest_key(sector.slug), man,
+                            CACHE_MANIFEST) and deleted:
             self.r2.delete(deleted)
 
     # ---- one unit -------------------------------------------------------
@@ -892,15 +992,27 @@ class MesoPoller:
                 time.sleep(min(SECTORS_REFRESH_S, 60))
 
         log.info("meso poller starting | render=%s | bucket=%s | prefix=%s | "
-                 "sectors=%d | spacing=%gs",
+                 "sectors=%d | spacing=%gs | reconcile=%gs",
                  RENDER_URL, R2_BUCKET, R2_PREFIX, len(MESO_SECTORS),
-                 RATE_MIN_SPACING_S)
+                 RATE_MIN_SPACING_S, RECONCILE_S)
+        # Storage-truth sync BEFORE any frame work: rebuild every manifest
+        # from an R2 listing (drops phantom entries the viewer 404s on), then
+        # seed the per-unit dedup hashes from the reconciled state.
+        self.reconcile_manifests()
+        self._last_reconcile = time.monotonic()
+        for (slug, band_key), u in self.units.items():
+            b = ((self.manifests.get(slug) or {}).get("bands") or {}) \
+                .get(band_key) or {}
+            u.last_hash = b.get("last_hash")
         while True:
             try:
                 if time.monotonic() - self._last_sectors_refresh >= SECTORS_REFRESH_S \
                         or not self.extents:
                     self.refresh_extents()
                     self._last_sectors_refresh = time.monotonic()
+                if time.monotonic() - self._last_reconcile >= RECONCILE_S:
+                    self.reconcile_manifests()
+                    self._last_reconcile = time.monotonic()
                 if not self.extents:
                     time.sleep(min(SECTORS_REFRESH_S, 60))  # idle: low CPU
                     continue
