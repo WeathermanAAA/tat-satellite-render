@@ -66,6 +66,28 @@ class FrameTsFromKeyTests(unittest.TestCase):
         self.assertIsNone(mp.frame_ts_from_key("x/ir/manifest.json"))
         self.assertIsNone(mp.frame_ts_from_key("x/ir/notatime.png"))
 
+    def test_webp_frames_reconcile_like_png(self):
+        # Post-cutover keys are .webp; a reconcile listing holds BOTH codecs
+        # during the retention overlap and every frame must keep its stamp.
+        t = dt.datetime(2026, 6, 11, 4, 41, 26, tzinfo=dt.timezone.utc)
+        self.assertEqual(mp.frame_ts_from_key("x/ir/20260611T044126Z.webp"), t)
+        self.assertEqual(
+            mp.frame_ts_from_key("x/ir/20260611T0441Z.webp"),
+            t.replace(second=0))
+        self.assertIsNone(mp.frame_ts_from_key("x/ir/notatime.webp"))
+
+    def test_meso_frame_key_carries_extension(self):
+        ts = dt.datetime(2026, 6, 12, 6, 0, 29, tzinfo=dt.timezone.utc)
+        self.assertTrue(
+            mp.frame_key("goes19-m1", "ir", ts, ".webp")
+            .endswith("/20260612T060029Z.webp"))
+        # Default stays .png -- pre-existing callers/fixtures unaffected.
+        self.assertTrue(
+            mp.frame_key("goes19-m1", "ir", ts).endswith("/20260612T060029Z.png"))
+        # Round-trip: what frame_key writes, frame_ts_from_key recovers.
+        self.assertEqual(
+            mp.frame_ts_from_key(mp.frame_key("goes19-m1", "ir", ts, ".webp")), ts)
+
 
 class ReconcileTests(unittest.TestCase):
     def setUp(self):

@@ -152,6 +152,14 @@ THIN_SPACING_S = float(_env("THIN_SPACING_S", "300"))
 # (the viewer 404s on those). See reconcile_manifests.
 RECONCILE_S = float(_env("MESO_RECONCILE_S", "900"))
 
+# Frame codec requested from /render. "webp" = 1056 px lossy-WebP loop frames
+# (~6x lighter than the 1320 px PNGs); "png" = the legacy full-res PNG and the
+# instant rollback knob. The poller derives the uploaded extension and
+# content-type from the RESPONSE (see frame_ext), so a render service that
+# predates the format param -- or a rollback flip -- stays self-consistent:
+# whatever /render actually sent is what gets keyed and served.
+FRAME_FORMAT = (_env("FRAME_FORMAT", "webp") or "webp").strip().lower()
+
 # HTTP timeouts / retries (render + extent discovery).
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
 RENDER_MAX_RETRIES = int(_env("RENDER_MAX_RETRIES", "3"))
@@ -541,7 +549,8 @@ class RenderSkip(Exception):
 def call_render(session: requests.Session, bbox: list[float], channel: str,
                 enhancement: str, storm: Optional[dict] = None,
                 product: Optional[str] = None) -> tuple[bytes, dict]:
-    body: dict = {"bbox": bbox, "time": "latest", "channel": channel, "enhancement": enhancement}
+    body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
+                  "enhancement": enhancement, "format": FRAME_FORMAT}
     if storm is not None:
         body["storm"] = storm
     if product is not None:
@@ -570,14 +579,31 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
 # Manifest / frame state per (sector, band) -- meso/ prefix
 # ---------------------------------------------------------------------------
 
-def frame_key(slug: str, band_key: str, ts: dt.datetime) -> str:
+def frame_ext(headers: dict) -> tuple[str, str]:
+    """(key extension, content-type) for a /render response.
+
+    Derived from the response rather than FRAME_FORMAT so the poller can never
+    mislabel a frame across a mixed-version window: an old render service that
+    ignores the format param answers image/png and gets keyed .png; the new
+    service answers image/webp and gets keyed .webp. Header lookup is
+    case-insensitive (call_render hands back a plain dict)."""
+    ctype = next(
+        (v for k, v in headers.items() if k.lower() == "content-type"), ""
+    )
+    ctype = (ctype or "").split(";")[0].strip().lower()
+    if ctype == "image/webp":
+        return ".webp", "image/webp"
+    return ".png", "image/png"
+
+
+def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png") -> str:
     # SECOND precision. GOES meso scans are ~60 s apart but jitter (the public
     # bucket shows 57-63 s gaps), so two DISTINCT scans can land in the same
     # wall-clock minute; a minute-resolution key would collide and the second
-    # scan's PNG would overwrite the first under the same key (the content-hash
+    # scan's frame would overwrite the first under the same key (the content-hash
     # dedup can't catch it -- different bytes both pass). Seconds make every scan
     # a distinct key. SectorExtent.key already uses %Y%m%dT%H%M%SZ.
-    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%M%SZ')}.png"
+    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%M%SZ')}{ext}"
 
 
 def sector_manifest_key(slug: str) -> str:
@@ -594,13 +620,17 @@ def health_key() -> str:
 
 def frame_ts_from_key(key: str) -> Optional[dt.datetime]:
     """Recover a frame's scan time from its object key name -- frame_key()
-    encodes it ({prefix}/{slug}/{band}/{stamp}.png), so a band's frame list is
-    fully reconstructible from an R2 LISTING alone. Tolerates the legacy
-    minute-precision stamps alongside the current second-precision ones."""
+    encodes it ({prefix}/{slug}/{band}/{stamp}.png or .webp), so a band's frame
+    list is fully reconstructible from an R2 LISTING alone. Tolerates the
+    legacy minute-precision stamps alongside the current second-precision ones,
+    and both frame codecs (.png pre-cutover, .webp after)."""
     name = key.rsplit("/", 1)[-1]
-    if not name.endswith(".png"):
+    if name.endswith(".png"):
+        stamp = name[: -len(".png")]
+    elif name.endswith(".webp"):
+        stamp = name[: -len(".webp")]
+    else:
         return None
-    stamp = name[:-4]
     # exact-length dispatch: strptime pads greedily, so a minute-precision
     # stamp would MIS-PARSE under the second-precision format (0441Z ->
     # 04:04:01) instead of falling through.
@@ -886,8 +916,10 @@ class MesoPoller:
         scan_hdr = (headers.get("X-Scan-Time") or headers.get("X-Source-Time")
                     or headers.get("X-Timestamp"))
         ts = (parse_iso(scan_hdr) if scan_hdr else None) or ext.scan_start or utcnow()
-        key = frame_key(sector.slug, band.key, ts)
-        if not self.r2.put_bytes(key, png, "image/png", CACHE_FRAME):
+        # fext, not ext -- ext is the SectorExtent above.
+        fext, ctype = frame_ext(headers)
+        key = frame_key(sector.slug, band.key, ts, fext)
+        if not self.r2.put_bytes(key, png, ctype, CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(sector, band, key, ts, h)
         u.last_hash = h
