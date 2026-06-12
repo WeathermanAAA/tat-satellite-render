@@ -341,6 +341,52 @@ class HeaderCaseTests(unittest.TestCase):
         self.assertTrue(ka.endswith("20260612T194702Z.webp"), ka)
 
 
+class EffectiveExtentTests(unittest.TestCase):
+    def _grid(self, lon0, lon1, lat0, lat1, n=21):
+        lons, lats = np.meshgrid(np.linspace(lon0, lon1, n),
+                                 np.linspace(lat1, lat0, n))
+        return lats, lons
+
+    def test_full_valid_keeps_request(self):
+        from render import _effective_extent
+        bbox = [-85.759, 32.274, -71.996, 45.808]
+        lats, lons = self._grid(bbox[0], bbox[2], bbox[1], bbox[3])
+        valid = np.ones_like(lats, dtype=bool)
+        eff = _effective_extent(lats, lons, valid, bbox, bbox[2] - bbox[0])
+        self.assertEqual(eff, (bbox[0], bbox[2], bbox[1], bbox[3]))
+
+    def test_limb_corner_cropped(self):
+        from render import _effective_extent
+        bbox = [-85.0, 30.0, -71.0, 44.0]
+        lats, lons = self._grid(bbox[0], bbox[2], bbox[1], bbox[3])
+        # Off-disk: everything west of -78 AND south of 37 invalid.
+        valid = (lons >= -78.0) & (lats >= 37.0)
+        lo, hi, la, lb = _effective_extent(lats, lons, valid, bbox, 14.0)
+        self.assertGreaterEqual(lo, -78.1)
+        self.assertGreaterEqual(la, 36.9)
+        self.assertEqual((hi, lb), (-71.0, 44.0))
+
+    def test_crossing_unwrap(self):
+        from render import _effective_extent
+        bbox = [141.5, 46.318, -140.321, 71.477]
+        span = (bbox[2] - bbox[0]) % 360.0
+        # Grid over the unwrapped range, lons stored wrapped to ±180.
+        lats, lons_uw = self._grid(141.5, 141.5 + span, bbox[1], bbox[3])
+        lons = ((lons_uw + 180.0) % 360.0) - 180.0
+        valid = lons_uw >= 160.0          # west 18.5 deg off-disk
+        lo, hi, la, lb = _effective_extent(lats, lons, valid, bbox, span)
+        self.assertGreaterEqual(lo, 159.9)
+        self.assertAlmostEqual(hi, 141.5 + span, places=6)
+
+    def test_empty_valid_falls_back(self):
+        from render import _effective_extent
+        bbox = [-85.0, 30.0, -71.0, 44.0]
+        lats, lons = self._grid(*[bbox[0], bbox[2], bbox[1], bbox[3]])
+        eff = _effective_extent(lats, lons, np.zeros_like(lats, bool),
+                                bbox, 14.0)
+        self.assertEqual(eff, (-85.0, -71.0, 30.0, 44.0))
+
+
 class AzimuthUpsampleTests(unittest.TestCase):
     def test_wrap_crossing_does_not_tear(self):
         # 358..2 degrees across the field: naive bilinear would pass

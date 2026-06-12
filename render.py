@@ -64,6 +64,38 @@ def _fill_coord_nan(a: np.ndarray) -> np.ndarray:
     return out
 
 
+def _effective_extent(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    valid: "np.ndarray | None",
+    bbox: list,
+    lon_span_req: float,
+) -> tuple[float, float, float, float]:
+    """(lon_lo, lon_hi, lat_lo, lat_hi) of valid-data ∩ bbox, with longitudes
+    UNWRAPPED from the bbox's west edge (monotonic even across ±180).
+
+    A disk-limb meso sector (e.g. GOES-18 M2 over the Bering) carries a big
+    off-disk corner in its lat/lon bounding box; framing the full request
+    renders mostly-empty black margins. Cropping to the valid bounding box
+    keeps the frame tight around real imagery while a genuine limb edge
+    inside it still shows. Sectors whose data fills the request (every
+    normal sector + storm floater) clip to exactly the request — unchanged
+    by construction."""
+    lon_min, lat_min, lon_max, lat_max = bbox
+    fallback = (lon_min, lon_min + lon_span_req, lat_min, lat_max)
+    if valid is None or not valid.any():
+        return fallback
+    vlat = lats[valid]
+    vlon_uw = lon_min + ((lons[valid] - lon_min) % 360.0)
+    lo = max(lon_min, float(vlon_uw.min()))
+    hi = min(lon_min + lon_span_req, float(vlon_uw.max()))
+    la = max(lat_min, float(vlat.min()))
+    lb = min(lat_max, float(vlat.max()))
+    if hi - lo < 0.5 or lb - la < 0.5:   # degenerate crop -> keep request
+        return fallback
+    return lo, hi, la, lb
+
+
 def _gridline_step(span: float) -> float:
     """Pick a sane gridline interval (degrees) for the given bbox span."""
     if span <= 2:
@@ -80,14 +112,16 @@ def _gridline_step(span: float) -> float:
 def _coast_resolution(span_deg: float) -> str:
     """Natural Earth scale matched to bbox size.
 
-    10m on a wide view is the most likely cause of jagged/fragmented
-    coastlines because the dense polyline gets aggressively path-clipped
-    by matplotlib at viewport scale, producing visible polyline gaps and
-    stair-stepping along long edges. Step down to 50m / 110m for wide views.
+    10m up to 90°: every meso sector (incl. the ~70°-wide GOES-18 M2 limb
+    box, the view that exposed the blockiness) and every storm floater gets
+    crisp coastlines — 50m at these zooms reads visibly blocky, especially
+    at high latitude. The old jagged path-clipping concern applies to
+    genuinely wide (near-disk) views, which still step down. The 10m
+    geometry caches in cartopy after the first draw (~+6 s once, then ~0).
     """
-    if span_deg < 5:
+    if span_deg < 90:
         return "10m"
-    if span_deg < 30:
+    if span_deg < 180:
         return "50m"
     return "110m"
 
@@ -243,49 +277,14 @@ def render_png(
     # wraps it into the shifted frame continuously, so a GOES-18 meso sector
     # steered over the Bering Sea renders seamlessly.
     crosses = lon_max < lon_min
-    lon_span = (lon_max - lon_min) % 360.0 or 360.0
-    lat_span = lat_max - lat_min
-    aspect = lon_span / max(lat_span, 1e-6)
+    lon_span_req = (lon_max - lon_min) % 360.0 or 360.0
 
-    # Figure size: target ~1400 px wide, height by aspect, dpi=110
-    fig_w = 12.0
-    fig_h = max(4.0, fig_w / max(aspect, 0.3))
-    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
-
-    # Layout: title strip on top (~6%), main map fills the rest with a small
-    # bottom margin for gridline labels. A labeled vertical colorbar sits in a
-    # reserved right margin for every scalar (non-RGB) product; true color has
-    # no colorbar so the map uses the full width.
-    title_h = 0.06
-    bottom_pad = 0.04  # leaves room for x-axis gridline labels
-    map_h = 1.0 - title_h - bottom_pad
-    show_cbar = not is_rgb
-    map_w = 0.84 if show_cbar else 0.92
-
-    if crosses:
-        center_lon = ((lon_min + lon_span / 2.0 + 180.0) % 360.0) - 180.0
-        map_crs = ccrs.PlateCarree(central_longitude=center_lon)
-        extent = [-lon_span / 2.0, lon_span / 2.0, lat_min, lat_max]
-    else:
-        map_crs = ccrs.PlateCarree()
-        extent = [lon_min, lon_max, lat_min, lat_max]
-
-    ax = fig.add_axes([0.04, bottom_pad, map_w, map_h], projection=map_crs)
-    ax.set_facecolor(DARK_BG)
-    ax.set_extent(extent, crs=map_crs)
-
-    mesh = None
-    # Plot with the (lats, lons) arrays we computed via inverse projection.
+    # ---- per-pixel validity (degenerate guards + extent crop) -------------
     if is_rgb:
-        # True-color RGB is resampled onto a REGULAR lat/lon grid (see
-        # _compose_true_color_sync), so imshow with a PlateCarree extent is
-        # exact — no curvilinear warp to honor, and it sidesteps cartopy's
-        # GeoQuadMesh.set_array(None) limitation for RGB pcolormesh. NaNs
-        # (off-disk) -> black. origin "upper" because row 0 = lat_max.
         # ---- DEGENERATE-RGB GUARD --------------------------------------
         # Truecolor pulls 5 input bands (R/G/B/veggie/clean-IR) and a
         # transient cache race on ANY of them can leave the composite
-        # mostly-NaN -- the nan_to_num below would then paint those
+        # mostly-NaN -- nan_to_num at draw time would then paint those
         # regions pure black and the render would ship a 200 OK with a
         # black PNG. Detect this and raise so /render returns 500: the
         # poller's retry/skip path discards the frame instead of uploading
@@ -304,7 +303,6 @@ def render_png(
         if geom is not None:
             n_geom = float(geom.sum())
             if n_geom == 0:
-                plt.close(fig)
                 raise RuntimeError("bbox has no on-disk pixels to render")
             nan_frac = float((~finite_mask & geom).sum() / n_geom)
         else:
@@ -321,7 +319,6 @@ def render_png(
                 "-- bailing out so the poller doesn't ship a black frame",
                 nan_frac * 100.0, valid_max,
             )
-            plt.close(fig)
             raise RuntimeError(
                 f"truecolor render produced degenerate RGB "
                 f"(nan={nan_frac * 100:.0f}%, mean_valid_max={valid_max:.3f}) "
@@ -329,29 +326,84 @@ def render_png(
                 f"the next scan cycle will re-render"
             )
         # ----------------------------------------------------------------
-        rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
-        # ``extent`` in map_crs coords: the composite grid is regular over the
-        # UNWRAPPED lon range (see _compose_true_color_sync), which in the
-        # re-centered crossing frame is exactly [-span/2, +span/2] — identity
-        # transform either way, so imshow stays a fast non-warping draw.
-        ax.imshow(
-            rgb,
-            origin="upper",
-            extent=extent,
-            transform=map_crs,
-            interpolation="nearest",
-            zorder=1,
-        )
+        valid_px = finite_mask & geom if geom is not None else finite_mask
     else:
         # Disk-limb sectors: off-disk pixels inverse-project to NaN lat/lon,
         # which pcolormesh hard-rejects. Mask those cells in the field and
         # nearest-fill the coords — the repeated coordinates collapse the
         # phantom quads to zero area, so only real data draws.
         coord_bad = ~(np.isfinite(lats) & np.isfinite(lons))
+        valid_px = ~np.ma.getmaskarray(plot_field) & ~coord_bad
         if coord_bad.any():
             plot_field = np.ma.masked_where(coord_bad, plot_field)
             lats = _fill_coord_nan(lats)
             lons = _fill_coord_nan(lons)
+
+    # ---- frame geometry: tighten the view to the valid-data extent --------
+    eff_lo, eff_hi, eff_lat_lo, eff_lat_hi = _effective_extent(
+        lats, lons, valid_px, bbox, lon_span_req
+    )
+    lon_span = eff_hi - eff_lo
+    lat_span = eff_lat_hi - eff_lat_lo
+    aspect = lon_span / max(lat_span, 1e-6)
+
+    # Figure size: target ~1400 px wide, height by aspect, dpi=110
+    fig_w = 12.0
+    fig_h = max(4.0, fig_w / max(aspect, 0.3))
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
+
+    # Layout: title strip on top (~6%), main map fills the rest with a small
+    # bottom margin for gridline labels. A labeled vertical colorbar sits in a
+    # reserved right margin for every scalar (non-RGB) product; true color has
+    # no colorbar so the map uses the full width.
+    title_h = 0.06
+    bottom_pad = 0.04  # leaves room for x-axis gridline labels
+    map_h = 1.0 - title_h - bottom_pad
+    show_cbar = not is_rgb
+    map_w = 0.84 if show_cbar else 0.92
+
+    # The map frame is the EFFECTIVE (valid-data) extent; the image keeps its
+    # own full-request extent (img_extent) so imshow pixel registration is
+    # untouched and set_extent simply crops the view.
+    if crosses:
+        center_uw = lon_min + lon_span_req / 2.0
+        center_lon = ((center_uw + 180.0) % 360.0) - 180.0
+        map_crs = ccrs.PlateCarree(central_longitude=center_lon)
+        view_extent = [eff_lo - center_uw, eff_hi - center_uw,
+                       eff_lat_lo, eff_lat_hi]
+        img_extent = [-lon_span_req / 2.0, lon_span_req / 2.0,
+                      lat_min, lat_max]
+    else:
+        map_crs = ccrs.PlateCarree()
+        view_extent = [eff_lo, eff_hi, eff_lat_lo, eff_lat_hi]
+        img_extent = [lon_min, lon_max, lat_min, lat_max]
+
+    ax = fig.add_axes([0.04, bottom_pad, map_w, map_h], projection=map_crs)
+    ax.set_facecolor(DARK_BG)
+    ax.set_extent(view_extent, crs=map_crs)
+
+    mesh = None
+    # Plot with the (lats, lons) arrays we computed via inverse projection.
+    if is_rgb:
+        # True-color RGB is resampled onto a REGULAR lat/lon grid (see
+        # _compose_true_color_sync), so imshow with a PlateCarree extent is
+        # exact — no curvilinear warp to honor, and it sidesteps cartopy's
+        # GeoQuadMesh.set_array(None) limitation for RGB pcolormesh. NaNs
+        # (off-disk) -> black. origin "upper" because row 0 = lat_max.
+        # ``img_extent`` in map_crs coords: the composite grid is regular over
+        # the UNWRAPPED lon range (see _compose_true_color_sync), which in the
+        # re-centered crossing frame is exactly [-span/2, +span/2] — identity
+        # transform either way, so imshow stays a fast non-warping draw.
+        rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
+        ax.imshow(
+            rgb,
+            origin="upper",
+            extent=img_extent,
+            transform=map_crs,
+            interpolation="nearest",
+            zorder=1,
+        )
+    else:
         mesh = ax.pcolormesh(
             lons,
             lats,
@@ -376,14 +428,14 @@ def render_png(
         linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
     )
 
-    # Dashed gridlines auto-spaced. Crossing frames lay xlocs out on the
-    # unwrapped lon range then wrap to ±180 (true longitudes, so the
-    # gridliner labels them correctly in the re-centered frame); plain
-    # frames keep the raw values — wrapping would map a bbox edge at
-    # exactly 180 to -180 and silently drop that meridian's gridline.
+    # Dashed gridlines auto-spaced over the EFFECTIVE extent. Crossing frames
+    # lay xlocs out on the unwrapped lon range then wrap to ±180 (true
+    # longitudes, so the gridliner labels them correctly in the re-centered
+    # frame); plain frames keep the raw values — wrapping would map a bbox
+    # edge at exactly 180 to -180 and silently drop that meridian's gridline.
     step = _gridline_step(max(lon_span, lat_span))
     xlocs = np.arange(
-        np.floor(lon_min / step) * step, lon_min + lon_span + step, step
+        np.floor(eff_lo / step) * step, eff_hi + step, step
     )
     if crosses:
         xlocs = ((xlocs + 180.0) % 360.0) - 180.0
@@ -395,7 +447,8 @@ def render_png(
         color=GRID_COLOR,
         alpha=0.7,
         xlocs=xlocs,
-        ylocs=np.arange(np.floor(lat_min / step) * step, lat_max + step, step),
+        ylocs=np.arange(np.floor(eff_lat_lo / step) * step,
+                        eff_lat_hi + step, step),
     )
     gl.top_labels = False
     gl.right_labels = False
