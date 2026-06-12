@@ -136,7 +136,19 @@ BBOX_DEG = float(_env("BBOX_DEG", "12"))           # square floater width (deg)
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))   # hot-band target
 TRACKS_REFRESH_S = float(_env("TRACKS_REFRESH_S", "600"))  # storms update every 6 h
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))  # min gap between /render calls
-ACTIVE_WINDOW_HOURS = float(_env("ACTIVE_WINDOW_HOURS", "60"))
+# Recency gate for "this storm still floats". A genuinely active storm gets
+# b-deck fixes every ~6 h, so 24 h = four missed cycles; the old 60 h kept a
+# dissipated storm's floater on /satellite/ for 2.5 days (the upstream feed's
+# is_active degrades to ITS 60 h staleness window whenever a storm's b-deck
+# simply stops without a terminal EX/DS row -- CRISTINA's final fix was a
+# TD 30 kt still marked nature=TS).
+ACTIVE_WINDOW_HOURS = float(_env("ACTIVE_WINDOW_HOURS", "24"))
+# Prompt NHC retirement: a named AL/EP/CP storm ABSENT from a successfully
+# fetched CurrentStorms.json (NHC drops a storm there the moment advisories
+# end -- the authoritative final-advisory signal) is retired once its latest
+# fix is older than this grace window. The grace keeps a storm with FRESH
+# fixes afloat through a transient CurrentStorms listing hiccup.
+NHC_RETIRE_GRACE_H = float(_env("NHC_RETIRE_GRACE_H", "12"))
 NIGHT_ZENITH_DEG = float(_env("NIGHT_ZENITH_DEG", "85"))   # >= this => skip daytime-only bands
 EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapolation
 
@@ -780,6 +792,47 @@ def fetch_current_named(session: requests.Session) -> Optional[dict[str, Storm]]
     return out
 
 
+def retire_dissipated_named(
+    named: "dict[str, Storm]",
+    current_named: "dict[str, Storm]",
+    nhc_list_fresh: bool,
+    now: dt.datetime,
+) -> "dict[str, Storm]":
+    """Drop named NHC-basin storms whose advisories have ENDED.
+
+    NHC removes a storm from CurrentStorms.json with its final advisory
+    (dissipated / post-tropical / remnant low) -- the authoritative signal.
+    The tracks feed's is_active can't see that: a dissipating TD's b-deck
+    often just STOPS while its last row still reads a tropical nature, so
+    is_active degrades to a 60 h staleness window and the dead storm's
+    floater lingered for days (CRISTINA).
+
+    A storm is retired iff ALL of: its basin is NHC's (AL/EP/CP -- WP/JTWC
+    has no CurrentStorms coverage and rides ACTIVE_WINDOW_HOURS instead);
+    CurrentStorms fetched cleanly THIS cycle (``nhc_list_fresh`` -- never
+    mass-retire on a fetch failure) and doesn't list it; and its latest fix
+    is older than NHC_RETIRE_GRACE_H (so a transient listing hiccup can't
+    drop a storm with fresh fixes). Invests never pass through here -- they
+    are a separate source with their own lifecycle.
+    """
+    if not nhc_list_fresh:
+        return named
+    nhc_basins = set(NHC_BASIN_PREFIXES.values())
+    grace = dt.timedelta(hours=NHC_RETIRE_GRACE_H)
+    kept: dict[str, Storm] = {}
+    for slug, s in named.items():
+        if s.basin in nhc_basins and slug not in current_named:
+            fix_t = parse_iso(s.last_fix)
+            if fix_t is None or now - fix_t > grace:
+                log.info(
+                    "retiring %s/%s: absent from NHC CurrentStorms, last fix "
+                    "%s -- advisories have ended", s.name, slug,
+                    s.last_fix or "(unknown)")
+                continue
+        kept[slug] = s
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # R2 client
 # ---------------------------------------------------------------------------
@@ -1079,6 +1132,12 @@ class Poller:
         # authoritative NHC TCs (One-E shows the cycle it is designated, with its
         # real TD/TS status rather than waiting on the derived feed).
         named_combined: dict[str, Storm] = {**self.named, **self.current_named}
+
+        # PROMPT RETIREMENT of dissipated NHC storms (see NHC_RETIRE_GRACE_H):
+        # only when CurrentStorms fetched cleanly THIS cycle (current is not
+        # None) -- a fetch failure must never mass-retire on stale knowledge.
+        named_combined = retire_dissipated_named(
+            named_combined, self.current_named, current is not None, utcnow())
 
         # Designated-invest handoff (the 90E -> One-E pattern), two signals,
         # uniform across basins. Keep every invest that is STILL an invest --

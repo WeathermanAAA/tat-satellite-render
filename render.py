@@ -52,14 +52,16 @@ def _gridline_step(span: float) -> float:
 def _coast_resolution(span_deg: float) -> str:
     """Natural Earth scale matched to bbox size.
 
-    10m on a wide view is the most likely cause of jagged/fragmented
-    coastlines because the dense polyline gets aggressively path-clipped
-    by matplotlib at viewport scale, producing visible polyline gaps and
-    stair-stepping along long edges. Step down to 50m / 110m for wide views.
+    10m up to 90°: every meso sector (incl. the ~70°-wide GOES-18 M2 limb
+    box, the view that exposed the blockiness) and every storm floater gets
+    crisp coastlines — 50m at these zooms reads visibly blocky, especially
+    at high latitude. The old jagged path-clipping concern applies to
+    genuinely wide (near-disk) views, which still step down. The 10m
+    geometry caches in cartopy after the first draw (~+6 s once, then ~0).
     """
-    if span_deg < 5:
+    if span_deg < 90:
         return "10m"
-    if span_deg < 30:
+    if span_deg < 180:
         return "50m"
     return "110m"
 
