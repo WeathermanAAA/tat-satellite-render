@@ -896,6 +896,14 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
 # Manifest / frame state per (storm, band)
 # ---------------------------------------------------------------------------
 
+def header_get(headers: dict, name: str) -> "str | None":
+    """Case-insensitive lookup in a plain header dict — uvicorn lowercases
+    response headers, so a literal .get("X-Source-Time") always missed and
+    frames silently fell back to poll-time (utcnow) stamps."""
+    lname = name.lower()
+    return next((v for k, v in headers.items() if k.lower() == lname), None)
+
+
 def frame_ext(headers: dict) -> tuple[str, str]:
     """(key extension, content-type) for a /render response.
 
@@ -1243,8 +1251,9 @@ class Poller:
         if h == u.last_hash:
             return  # no new frame
         # Source scan time if exposed (more accurate loop time axis); else now.
-        scan_hdr = (headers.get("X-Source-Time") or headers.get("X-Scan-Time")
-                    or headers.get("X-Timestamp"))
+        scan_hdr = (header_get(headers, "X-Source-Time")
+                    or header_get(headers, "X-Scan-Time")
+                    or header_get(headers, "X-Timestamp"))
         ts = parse_iso(scan_hdr) if scan_hdr else None
         ts = ts or utcnow()
         ext, ctype = frame_ext(headers)

@@ -30,11 +30,14 @@ fetch/render failure NEVER touches another sector or the floater poller):
   2. For the FULL band palette (the SAME BANDS table the floater poller uses, at
      full parity) call the LOCAL /render over private networking, exactly like
      floater_poller.call_render, with the discovered bbox + time=latest:
-       * HOT bands (ir, irbd) target 60 s.
-       * COLD bands (wv_up, wv_low, truecolor, swir) ride the cold cadence,
-         which stretches with the unit count so the rate budget protects the hot
-         bands. The render-side night blend handles day/night inside /render --
-         no daytime-only special-casing here.
+       * HOT bands (ir, irbd) target 60 s on their OWN lane thread + their own
+         render container (RENDER_BASE_URL).
+       * COLD bands (wv_up, wv_low, truecolor, swir) run on a SEPARATE lane
+         thread against a SEPARATE render container (RENDER_BASE_URL_COLD) at
+         the stretched cold cadence -- strict isolation, so a multi-second
+         true-color render can never delay a due hot unit. The render-side
+         night blend handles day/night inside /render -- no daytime-only
+         special-casing here.
      sha256(png) is the new-frame source of truth (skip if unchanged).
 
   3. Write R2 under the ``meso/`` prefix:
@@ -118,6 +121,13 @@ MESO_ENABLED = _env_bool("MESO_ENABLED", True)
 # Falls back to the public URL (then set RATE_MIN_SPACING_S=7).
 RENDER_BASE_URL = _env("RENDER_BASE_URL", "https://web-production-b88d.up.railway.app").rstrip("/")
 RENDER_URL = RENDER_BASE_URL + "/render"
+# COLD-lane /render base. The compose stack points this at a SECOND render
+# container (meso-render-cold) so a slow cold render (true-color ~spans
+# seconds even optimized) physically cannot occupy the hot lane's render
+# worker — the hot IR/IRBD 60 s cadence survives any cold-band weather.
+# Defaults to the hot URL so a single-service deployment still works.
+RENDER_BASE_URL_COLD = (_env("RENDER_BASE_URL_COLD") or RENDER_BASE_URL).rstrip("/")
+RENDER_URL_COLD = RENDER_BASE_URL_COLD + "/render"
 
 # R2 / S3 -- SAME bucket as the floater worker, but a distinct prefix so the two
 # never touch each other's keys.
@@ -239,6 +249,14 @@ def norm_lon(lon: float) -> float:
     while lon < -180:
         lon += 360
     return lon
+
+
+def sector_family_hint(sector: MesoSector) -> str:
+    """/render ``satellite`` hint for a sector -- the satellite FAMILY that
+    owns the sector's imagery (mirrors satellites.SATELLITES_BY_FAMILY keys)."""
+    if sector.family == "himawari":
+        return "Himawari-Pacific"
+    return "GOES-West" if sector.bucket == "noaa-goes18" else "GOES-East"
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +393,10 @@ def discover_himawari_extent(sector: MesoSector) -> SectorExtent:
     floored = base.replace(minute=(base.minute // 10) * 10)
     seg_paths: list[str] = []
     chosen_slot: Optional[dt.datetime] = None
-    for back in range(1, 4):  # try last 3 slots (publish latency / gaps)
+    # back=0 first: Target sub-scans land every ~2.5 min, so the current
+    # 10-min folder usually already has segments (matches find_file's
+    # _resolve_target_sync, which also starts at the current slot).
+    for back in range(0, 4):  # current slot + 3 back (publish latency / gaps)
         slot = floored - dt.timedelta(minutes=10 * back)
         prefix = (f"{sector.bucket}/AHI-L1b-Target/"
                   f"{slot.year:04d}/{slot.month:02d}/{slot.day:02d}/"
@@ -548,17 +569,20 @@ class RenderSkip(Exception):
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
                 enhancement: str, storm: Optional[dict] = None,
-                product: Optional[str] = None) -> tuple[bytes, dict]:
+                product: Optional[str] = None, satellite: Optional[str] = None,
+                url: str = RENDER_URL) -> tuple[bytes, dict]:
     body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
                   "enhancement": enhancement, "format": FRAME_FORMAT}
     if storm is not None:
         body["storm"] = storm
     if product is not None:
         body["product"] = product
+    if satellite is not None:
+        body["satellite"] = satellite
     last_exc: Exception | None = None
     for attempt in range(RENDER_MAX_RETRIES):
         try:
-            r = session.post(RENDER_URL, json=body, timeout=RENDER_TIMEOUT_S)
+            r = session.post(url, json=body, timeout=RENDER_TIMEOUT_S)
             if r.status_code == 422:
                 raise RenderSkip(r.text[:200])
             if r.status_code == 429:
@@ -578,6 +602,17 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
 # ---------------------------------------------------------------------------
 # Manifest / frame state per (sector, band) -- meso/ prefix
 # ---------------------------------------------------------------------------
+
+def header_get(headers: dict, name: str) -> Optional[str]:
+    """Case-insensitive lookup in a plain header dict. call_render hands back
+    dict(r.headers) with the SERVER's casing — uvicorn lowercases everything,
+    so a literal .get("X-Scan-Time") silently missed and every frame fell
+    back to the stale discovery slot time (new scans then OVERWROTE the
+    previous frame under the old stamp, and Himawari Target sub-scans
+    collapsed onto their 10-min slot)."""
+    lname = name.lower()
+    return next((v for k, v in headers.items() if k.lower() == lname), None)
+
 
 def frame_ext(headers: dict) -> tuple[str, str]:
     """(key extension, content-type) for a /render response.
@@ -685,14 +720,38 @@ class Unit:
     last_hash: str | None = None   # sha256 of last uploaded frame
 
 
+class Lane:
+    """One scheduling lane (hot or cold), STRICTLY isolated from its sibling:
+    its own units, its own requests.Session, its own rate limiter, its own
+    circuit breaker, and its own /render URL — run on its own thread by
+    MesoPoller._lane_loop. A cold render physically cannot delay a hot unit:
+    nothing in the hot lane ever waits on cold state, and the compose stack
+    points each lane at a separate render container."""
+
+    def __init__(self, name: str, units: list[Unit], render_url: str,
+                 min_spacing_s: float, drain_all: bool) -> None:
+        self.name = name
+        self.units = units
+        self.render_url = render_url
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = f"tat-meso-poller/1.0 ({name})"
+        self.limiter = RateLimiter(min_spacing_s)
+        # drain_all: hot processes EVERY due unit per pass (the whole IR/IRBD
+        # fleet must land inside the 60 s budget); cold takes only the single
+        # most-overdue unit per pass, so cold throughput self-paces to the
+        # cold service's actual render speed.
+        self.drain_all = drain_all
+        self.consec_fail = 0
+        self.circuit_open_until = 0.0
+
+
 class MesoPoller:
     def __init__(self) -> None:
         self.r2 = R2()
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = "tat-meso-poller/1.0"
-        self.limiter = RateLimiter(RATE_MIN_SPACING_S)
         self.units: dict[tuple[str, str], Unit] = {}
         # Per-sector last-known-good extent (preserved on a discovery failure).
+        # Written by the main (discovery) thread, read by the lane threads --
+        # whole-value dict assignment, so readers always see a complete extent.
         self.extents: dict[str, SectorExtent] = {}
         # Per-sector health -- the freshness heartbeat (poller_framework).
         self.health: dict[str, SourceHealth] = {
@@ -700,20 +759,32 @@ class MesoPoller:
         }
         self._last_sectors_refresh = 0.0
         self._last_reconcile = 0.0
-        self._consec_render_fail = 0
-        self._circuit_open_until = 0.0
         # MEMORY-AUTHORITATIVE per-sector manifests (seeded by
         # reconcile_manifests in run(); this poller is the sole writer).
         # append_frame must never GET-modify-PUT remote manifest state: a
         # stale read (e.g. a second poller container left running across a
         # rebuild) made thinning delete objects that another manifest copy
         # still listed -- the viewer then 404'd on scattered phantom frames.
+        # Both lanes (+ the main reconcile loop) mutate manifest state, so
+        # every mutation+upload holds _manifest_lock.
         self.manifests: dict[str, dict] = {}
+        self._manifest_lock = threading.Lock()
         # Build the unit set once (sectors are fixed; only their extents move).
         # last_hash is seeded from the reconciled manifests in run().
         for sector in MESO_SECTORS:
             for band in BANDS:
                 self.units[(sector.slug, band.key)] = Unit(sector=sector, band=band)
+        # STRICT lane isolation (hot = IR/IRBD at the 60 s target; cold =
+        # WV/true-color/SWIR on the stretched cadence). Separate threads,
+        # sessions, limiters, circuits, and -- via RENDER_BASE_URL_COLD --
+        # separate render containers, so a slow cold render can never starve
+        # the hot lane.
+        self.hot_lane = Lane(
+            "hot", [u for u in self.units.values() if u.band.hot],
+            RENDER_URL, RATE_MIN_SPACING_S, drain_all=True)
+        self.cold_lane = Lane(
+            "cold", [u for u in self.units.values() if not u.band.hot],
+            RENDER_URL_COLD, RATE_MIN_SPACING_S, drain_all=False)
 
     # ---- extent discovery (per-sector, fully isolated) -----------------
 
@@ -809,10 +880,33 @@ class MesoPoller:
                     "updated_utc": ob.get("updated_utc") or iso_z(now),
                 }
                 counts.append(f"{band.key}:{len(kept)}")
-            if self.r2.put_json(mkey, man, CACHE_MANIFEST):
-                self.manifests[sector.slug] = man
-                if to_delete:
-                    self.r2.delete(to_delete)
+            # Hold the manifest lock across the swap+upload so a concurrent
+            # lane append can't interleave between our PUT and state swap
+            # (the listing above is a snapshot either way; the next
+            # reconcile re-grounds whatever raced in).
+            with self._manifest_lock:
+                # Re-graft any frames a lane appended for this sector while
+                # we were listing -- they're newer than the listing snapshot
+                # and must not be dropped from the manifest.
+                cur = self.manifests.get(sector.slug) or {}
+                for bk, cb in (cur.get("bands") or {}).items():
+                    mb = man["bands"].setdefault(bk, {"label": cb.get("label"),
+                                                      "frames": []})
+                    known = {f["key"] for f in mb["frames"]}
+                    fresh = [f for f in (cb.get("frames") or [])
+                             if f["key"] not in known
+                             and f["key"] not in set(to_delete)
+                             and (parse_iso(f["t"]) or now) >= now -
+                             dt.timedelta(minutes=10)]
+                    if fresh:
+                        mb["frames"] = sorted(mb["frames"] + fresh,
+                                              key=lambda f: f["t"])
+                        mb["latest"] = mb["frames"][-1]["key"]
+                        mb["last_hash"] = cb.get("last_hash") or mb.get("last_hash")
+                if self.r2.put_json(mkey, man, CACHE_MANIFEST):
+                    self.manifests[sector.slug] = man
+                    if to_delete:
+                        self.r2.delete(to_delete)
             log.info("reconcile %s: %s%s%s", sector.slug, " ".join(counts),
                      f" | dropped {phantoms} phantom manifest entries"
                      if phantoms else "",
@@ -852,28 +946,29 @@ class MesoPoller:
         process's own manifest state and writes it out -- never re-reads the
         remote copy (a stale read is how phantom entries were born); the
         periodic reconcile re-grounds the state in an actual R2 listing."""
-        man = self.manifests.get(sector.slug)
-        if man is None:
-            man = {"slug": sector.slug, "satellite": sector.satellite,
-                   "sector": sector.sector, "label": sector.label, "bands": {}}
-            self.manifests[sector.slug] = man
-        man["generated_utc"] = iso_z(utcnow())
-        bands = man.setdefault("bands", {})
-        b = bands.setdefault(band.key, {"label": band.label, "frames": []})
-        b["label"] = band.label
-        b["frames"].append({"t": iso_z(ts), "key": key})
-        kept, deleted = prune_frames(b["frames"], utcnow())
-        b["frames"] = kept
-        b["latest"] = kept[-1]["key"] if kept else key
-        b["last_hash"] = content_hash
-        b["updated_utc"] = iso_z(utcnow())
-        if self.r2.put_json(sector_manifest_key(sector.slug), man,
-                            CACHE_MANIFEST) and deleted:
-            self.r2.delete(deleted)
+        with self._manifest_lock:
+            man = self.manifests.get(sector.slug)
+            if man is None:
+                man = {"slug": sector.slug, "satellite": sector.satellite,
+                       "sector": sector.sector, "label": sector.label, "bands": {}}
+                self.manifests[sector.slug] = man
+            man["generated_utc"] = iso_z(utcnow())
+            bands = man.setdefault("bands", {})
+            b = bands.setdefault(band.key, {"label": band.label, "frames": []})
+            b["label"] = band.label
+            b["frames"].append({"t": iso_z(ts), "key": key})
+            kept, deleted = prune_frames(b["frames"], utcnow())
+            b["frames"] = kept
+            b["latest"] = kept[-1]["key"] if kept else key
+            b["last_hash"] = content_hash
+            b["updated_utc"] = iso_z(utcnow())
+            if self.r2.put_json(sector_manifest_key(sector.slug), man,
+                                CACHE_MANIFEST) and deleted:
+                self.r2.delete(deleted)
 
     # ---- one unit -------------------------------------------------------
 
-    def process_unit(self, u: Unit) -> None:
+    def process_unit(self, u: Unit, lane: Lane) -> None:
         sector, band = u.sector, u.band
         ext = self.extents.get(sector.slug)
         if ext is None:
@@ -887,24 +982,31 @@ class MesoPoller:
         product = "meso"
         if sector.family == "himawari" and MESO_HIMAWARI_PRODUCT == "fldk":
             product = None
-        self.limiter.acquire()
+        # Tell /render WHICH satellite this sector's bbox came from -- the
+        # picker's sub-point-distance tie-break lands antimeridian sectors on
+        # the wrong satellite (Himawari "wins" a Bering Sea GOES-18 M2 box).
+        sat_hint = sector_family_hint(sector)
+        lane.limiter.acquire()
         _t_render = time.monotonic()
         try:
-            png, headers = call_render(self.session, bbox, band.channel,
-                                       band.enhancement, product=product)
+            png, headers = call_render(lane.session, bbox, band.channel,
+                                       band.enhancement, product=product,
+                                       satellite=sat_hint,
+                                       url=lane.render_url)
         except RenderSkip as e:
             log.info("skip %s/%s: %s", sector.slug, band.key, e)
-            self._consec_render_fail = 0
+            lane.consec_fail = 0
             return
         except RenderError as e:
-            self._consec_render_fail += 1
-            log.warning("render fail %s/%s (%d): %s",
-                        sector.slug, band.key, self._consec_render_fail, e)
-            if self._consec_render_fail >= CIRCUIT_TRIP_FAILS:
-                self._circuit_open_until = time.monotonic() + CIRCUIT_COOLDOWN_S
-                log.error("circuit OPEN: cooling down %ss", CIRCUIT_COOLDOWN_S)
+            lane.consec_fail += 1
+            log.warning("[%s] render fail %s/%s (%d): %s", lane.name,
+                        sector.slug, band.key, lane.consec_fail, e)
+            if lane.consec_fail >= CIRCUIT_TRIP_FAILS:
+                lane.circuit_open_until = time.monotonic() + CIRCUIT_COOLDOWN_S
+                log.error("[%s] circuit OPEN: cooling down %ss",
+                          lane.name, CIRCUIT_COOLDOWN_S)
             return
-        self._consec_render_fail = 0
+        lane.consec_fail = 0
 
         h = hashlib.sha256(png).hexdigest()
         if h == u.last_hash:
@@ -913,8 +1015,9 @@ class MesoPoller:
         # Himawari Target sub-scans (~2.5 min) get distinct timestamps instead of
         # collapsing onto the 10-min discovery slot; fall back to the discovered
         # scan time, then now.
-        scan_hdr = (headers.get("X-Scan-Time") or headers.get("X-Source-Time")
-                    or headers.get("X-Timestamp"))
+        scan_hdr = (header_get(headers, "X-Scan-Time")
+                    or header_get(headers, "X-Source-Time")
+                    or header_get(headers, "X-Timestamp"))
         ts = (parse_iso(scan_hdr) if scan_hdr else None) or ext.scan_start or utcnow()
         # fext, not ext -- ext is the SectorExtent above.
         fext, ctype = frame_ext(headers)
@@ -923,50 +1026,54 @@ class MesoPoller:
             return  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(sector, band, key, ts, h)
         u.last_hash = h
-        log.info("uploaded %s (%d B, %s, render %.1fs)", key, len(png),
-                 headers.get("X-Satellite", "?"), time.monotonic() - _t_render)
+        log.info("[%s] uploaded %s (%d B, %s, render %.1fs)", lane.name, key,
+                 len(png), header_get(headers, "X-Satellite") or "?",
+                 time.monotonic() - _t_render)
 
     # ---- cadence --------------------------------------------------------
 
-    def cold_cadence(self) -> float:
-        """Cold-band per-unit cadence -- DELIBERATELY stretched well past the hot
-        target so the cold bands (WV / true-color / SWIR) never flood the single
-        render pipeline and starve the hot IR/IRBD lane. Floors at
-        COLD_CADENCE_TARGET_S (default 300 s vs the 60 s hot target) and still
-        widens with the rate budget on the public URL."""
-        n_cold = sum(1 for u in self.units.values() if not u.band.hot)
-        return max(COLD_CADENCE_TARGET_S, n_cold * self.limiter.min_spacing)
+    def lane_cadence(self, lane: Lane) -> float:
+        """Per-unit cadence for a lane. Hot = the native 60 s GOES meso scan
+        target. Cold is DELIBERATELY stretched well past that so the cold
+        bands (WV / true-color / SWIR) self-pace: floors at
+        COLD_CADENCE_TARGET_S (default 300 s) and still widens with the rate
+        budget when the lane is pointed at the public URL."""
+        if lane.drain_all:
+            return CADENCE_TARGET_S
+        return max(COLD_CADENCE_TARGET_S,
+                   len(lane.units) * lane.limiter.min_spacing)
 
-    def tick(self) -> None:
-        # HOT lane first: drain EVERY due hot unit (the 10-unit IR/IRBD fleet
-        # fits inside the 60 s budget at ~4 s/render), so hot refreshes at the
-        # native ~60 s cadence DECOUPLED from the full 5x6 cycle. The old code
-        # drained all 30 due units in one pass with cold on the same 60 s target,
-        # so the 20 cold units serialized ahead of / between hot and pushed hot's
-        # next_due past 60 s -> hot inherited the ~120 s full-cycle latency.
-        now = time.monotonic()
-        if now < self._circuit_open_until:
-            return
-        hot_due = sorted(
-            (u for u in self.units.values() if u.band.hot and u.next_due <= now),
-            key=lambda u: u.next_due)
-        for u in hot_due:
-            if time.monotonic() < self._circuit_open_until:
-                return
-            self.process_unit(u)
-            u.next_due = time.monotonic() + CADENCE_TARGET_S
-        # COLD lane: at most ONE cold unit per tick (the most overdue). Caps cold
-        # throughput so a cold backlog can never delay a due hot unit, yet cold
-        # still trickles whenever the hot lane has spare time; cold stretches
-        # gracefully (to its true sustainable rate) when hot is busy.
-        if time.monotonic() < self._circuit_open_until:
-            return
-        cold_due = [u for u in self.units.values()
-                    if not u.band.hot and u.next_due <= now]
-        if cold_due:
-            u = min(cold_due, key=lambda u: u.next_due)
-            self.process_unit(u)
-            u.next_due = time.monotonic() + self.cold_cadence()
+    def _lane_loop(self, lane: Lane) -> None:
+        """The lane's scheduler thread. Hot drains EVERY due unit per pass (the
+        10-unit IR/IRBD fleet fits the 60 s budget at ~2.5 s/render against its
+        dedicated render container); cold takes only the single most-overdue
+        unit per pass, so a cold backlog self-paces to the cold container's
+        real render speed. The two lanes share NOTHING but the discovered
+        extents and the (locked) manifest writer -- the old single-threaded
+        tick() let one ~18 s cold render push every hot unit past its 60 s
+        slot, which is exactly the starvation this kills."""
+        while True:
+            try:
+                now = time.monotonic()
+                if now < lane.circuit_open_until or not self.extents:
+                    time.sleep(1.0)
+                    continue
+                due = [u for u in lane.units if u.next_due <= now]
+                if not due:
+                    time.sleep(0.25)
+                    continue
+                if lane.drain_all:
+                    due.sort(key=lambda u: u.next_due)
+                else:
+                    due = [min(due, key=lambda u: u.next_due)]
+                for u in due:
+                    if time.monotonic() < lane.circuit_open_until:
+                        break
+                    self.process_unit(u, lane)
+                    u.next_due = time.monotonic() + self.lane_cadence(lane)
+            except Exception as e:  # noqa: BLE001 - a lane must never die
+                log.exception("[%s] lane error (continuing): %s", lane.name, e)
+                time.sleep(5)
 
     # ---- health ---------------------------------------------------------
 
@@ -983,6 +1090,7 @@ class MesoPoller:
             sources[sector.slug] = snap
             if snap["state"] != FRESH:
                 healthy = False
+        mono = time.monotonic()
         return {
             "poller": "meso",
             "enabled": MESO_ENABLED,
@@ -993,6 +1101,21 @@ class MesoPoller:
             "healthy": healthy,
             "process": process_mem_mb(),
             "sources": sources,
+            # Per-lane scheduler visibility (strict hot/cold isolation): the
+            # render endpoint each lane talks to, its breaker state, and how
+            # late its most-overdue unit is running -- "is hot keeping its
+            # 60 s promise" is readable straight off /health.
+            "lanes": {
+                lane.name: {
+                    "render_url": lane.render_url,
+                    "units": len(lane.units),
+                    "consec_fail": lane.consec_fail,
+                    "circuit_open": mono < lane.circuit_open_until,
+                    "max_overdue_s": round(max(
+                        (mono - u.next_due for u in lane.units), default=0.0), 1),
+                }
+                for lane in (self.hot_lane, self.cold_lane)
+            },
         }
 
     def emit_health(self) -> None:
@@ -1023,10 +1146,10 @@ class MesoPoller:
                 self.emit_health()
                 time.sleep(min(SECTORS_REFRESH_S, 60))
 
-        log.info("meso poller starting | render=%s | bucket=%s | prefix=%s | "
-                 "sectors=%d | spacing=%gs | reconcile=%gs",
-                 RENDER_URL, R2_BUCKET, R2_PREFIX, len(MESO_SECTORS),
-                 RATE_MIN_SPACING_S, RECONCILE_S)
+        log.info("meso poller starting | render hot=%s cold=%s | bucket=%s | "
+                 "prefix=%s | sectors=%d | spacing=%gs | reconcile=%gs",
+                 RENDER_URL, RENDER_URL_COLD, R2_BUCKET, R2_PREFIX,
+                 len(MESO_SECTORS), RATE_MIN_SPACING_S, RECONCILE_S)
         # Storage-truth sync BEFORE any frame work: rebuild every manifest
         # from an R2 listing (drops phantom entries the viewer 404s on), then
         # seed the per-unit dedup hashes from the reconciled state.
@@ -1036,6 +1159,13 @@ class MesoPoller:
             b = ((self.manifests.get(slug) or {}).get("bands") or {}) \
                 .get(band_key) or {}
             u.last_hash = b.get("last_hash")
+        # Lane scheduler threads -- started AFTER the manifests + dedup hashes
+        # are seeded so neither lane can race the startup reconcile. Daemon:
+        # they die with the main (discovery/health) thread.
+        for lane in (self.hot_lane, self.cold_lane):
+            threading.Thread(target=self._lane_loop, args=(lane,),
+                             name=f"meso-{lane.name}", daemon=True).start()
+        # Main thread owns discovery, reconcile, and the health heartbeat.
         while True:
             try:
                 if time.monotonic() - self._last_sectors_refresh >= SECTORS_REFRESH_S \
@@ -1045,11 +1175,8 @@ class MesoPoller:
                 if time.monotonic() - self._last_reconcile >= RECONCILE_S:
                     self.reconcile_manifests()
                     self._last_reconcile = time.monotonic()
-                if not self.extents:
-                    time.sleep(min(SECTORS_REFRESH_S, 60))  # idle: low CPU
-                    continue
-                self.tick()
-                time.sleep(1.0)
+                time.sleep(2.0 if self.extents
+                           else min(SECTORS_REFRESH_S, 60))
             except KeyboardInterrupt:
                 log.info("shutting down")
                 return

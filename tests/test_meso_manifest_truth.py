@@ -50,9 +50,11 @@ class FakeR2:
 
 
 def _bare_poller(fake):
+    import threading
     p = object.__new__(mp.MesoPoller)   # skip __init__ (no boto3 client)
     p.r2 = fake
     p.manifests = {}
+    p._manifest_lock = threading.Lock()  # lanes + reconcile serialize here
     return p
 
 

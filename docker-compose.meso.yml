@@ -1,51 +1,67 @@
 # docker-compose.meso.yml -- the MESO-SECTOR poller stack, fully isolated from
 # the floater poller (separate services, separate R2 prefix `meso/`, separate
-# health endpoint). Two services share one image (Dockerfile.meso):
+# health endpoint). THREE services share one image (Dockerfile.meso):
 #
-#   meso-render  -- app.py's /render via uvicorn, bound to 127.0.0.1 (loopback
-#                   ONLY: it is reached over the compose network by the poller,
-#                   never exposed to the host/public; the public render service
-#                   stays whatever you already run). No public limiter in the
-#                   way, so the poller polls every band at its 60 s target.
-#   meso-poller  -- meso_poller.py, depends_on meso-render, reads .env. Calls
-#                   http://meso-render:8080/render over the compose network and
-#                   writes meso/ frames + manifests to R2.
+#   meso-render       -- the HOT lane's /render (app.py via uvicorn), bound to
+#                        127.0.0.1 (loopback ONLY: reached over the compose
+#                        network by the poller, never exposed to the public).
+#                        Serves ONLY the hot IR/IRBD units, so the 60 s hot
+#                        cadence never queues behind a slow cold render.
+#   meso-render-cold  -- an IDENTICAL second render container for the COLD
+#                        lane (WV / true-color / SWIR). Strict lane isolation:
+#                        a multi-second true-color render occupies THIS
+#                        worker, never the hot one.
+#   meso-poller       -- meso_poller.py, depends_on both renders, reads .env.
+#                        Hot lane -> meso-render, cold lane -> meso-render-cold
+#                        over the compose network; writes meso/ frames +
+#                        manifests to R2. Internal calls are exempt from the
+#                        public rate limit (private peer + no X-Forwarded-For).
 #
-# Both restart: always; both use json-file logging with rotation so a long run
+# All restart: always; all use json-file logging with rotation so a long run
 # can't fill the disk with logs.
 #
 # Bring up:   docker compose -f docker-compose.meso.yml up -d --build
 # Kill switch: set MESO_ENABLED=false in .env, then
 #             docker compose -f docker-compose.meso.yml up -d  (recreates poller)
 
+x-meso-render: &meso-render-base
+  build:
+    context: .
+    dockerfile: Dockerfile.meso
+  image: tat-meso:latest
+  command: uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
+  env_file: .env
+  environment:
+    # Allow the poller's internal origin (CORS is irrelevant for the
+    # server-to-server poller call, but keep localhost for any manual probe).
+    ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8080"
+  restart: always
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 40s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
 services:
   meso-render:
-    build:
-      context: .
-      dockerfile: Dockerfile.meso
-    image: tat-meso:latest
-    command: uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
+    <<: *meso-render-base
     # Loopback-only host binding: reachable on the compose network as
     # http://meso-render:8080 but NOT published to the public internet.
     ports:
       - "127.0.0.1:8080:8080"
-    env_file: .env
-    environment:
-      # Allow the poller's internal origin (CORS is irrelevant for the
-      # server-to-server poller call, but keep localhost for any manual probe).
-      ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8080"
-    restart: always
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 40s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+
+  meso-render-cold:
+    <<: *meso-render-base
+    # Loopback host port 8081 for manual probing; compose-internal name
+    # meso-render-cold:8080 is what the poller's cold lane calls.
+    ports:
+      - "127.0.0.1:8081:8080"
 
   meso-poller:
     build:
@@ -56,11 +72,15 @@ services:
     depends_on:
       meso-render:
         condition: service_healthy
+      meso-render-cold:
+        condition: service_healthy
     env_file: .env
     environment:
-      # Reach the render service over the compose network (NOT the public URL),
-      # so every band polls at its hot/cold cadence without the public limiter.
+      # Reach the render services over the compose network (NOT the public
+      # URL). Hot and cold lanes get SEPARATE containers so they can't queue
+      # behind each other; internal calls bypass the public rate limit.
       RENDER_BASE_URL: "http://meso-render:8080"
+      RENDER_BASE_URL_COLD: "http://meso-render-cold:8080"
       RATE_MIN_SPACING_S: "1.0"
       HEALTH_PORT: "8090"
       HEALTH_FILE: "/tmp/meso_health.json"
