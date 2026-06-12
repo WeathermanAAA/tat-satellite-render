@@ -144,8 +144,10 @@ def compute_downsample_factor(bbox: list[float], channel) -> int:
     which strides the cmi/lats/lons arrays by [::N, ::N] before pcolormesh.
     """
     # Wrapped span: lon_max < lon_min is a valid antimeridian crossing
-    # (e.g. a GOES-18 meso sector steered over the Bering Sea).
-    lon_w_deg = (bbox[2] - bbox[0]) % 360.0
+    # (e.g. a GOES-18 meso sector steered over the Bering Sea). A zero
+    # remainder is the legal full-width [-180, 180] box (the validator
+    # rejects the zero-span [180, -180] form).
+    lon_w_deg = (bbox[2] - bbox[0]) % 360.0 or 360.0
     lat_h_deg = bbox[3] - bbox[1]
     km_per_px = _native_km_per_pixel(channel)
     px_w = (lon_w_deg * DEG_TO_KM) / km_per_px
@@ -382,9 +384,13 @@ class RenderRequest(BaseModel):
         # lon_max < lon_min is a VALID antimeridian crossing (e < w
         # convention — same one the meso poller, floater frontend, and the
         # satellite picker already speak). Each edge must still be a real
-        # longitude, and a zero-width box is degenerate.
+        # longitude, and a zero-width box is degenerate — including the
+        # [180, -180] form, whose edges are the same meridian even though
+        # the floats differ ([-180, 180] is the legal full-width box).
         if not (-180 <= lon_min <= 180 and -180 <= lon_max <= 180
                 and lon_min != lon_max):
+            raise ValueError("invalid longitude range")
+        if lon_min > lon_max and (lon_max - lon_min) % 360.0 == 0.0:
             raise ValueError("invalid longitude range")
         if not (-90 <= lat_min < lat_max <= 90):
             raise ValueError("invalid latitude range")

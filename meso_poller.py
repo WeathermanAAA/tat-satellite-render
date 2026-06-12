@@ -887,22 +887,36 @@ class MesoPoller:
             with self._manifest_lock:
                 # Re-graft any frames a lane appended for this sector while
                 # we were listing -- they're newer than the listing snapshot
-                # and must not be dropped from the manifest.
+                # and must not be dropped from the manifest. Membership in
+                # the in-memory manifest (the sole writer's own state) is
+                # the test; a scan-TIME cutoff would wrongly drop Himawari
+                # FLDK frames, whose scan stamps trail wall clock by 10-20
+                # minutes of mirror lag.
+                dead = set(to_delete)
                 cur = self.manifests.get(sector.slug) or {}
                 for bk, cb in (cur.get("bands") or {}).items():
                     mb = man["bands"].setdefault(bk, {"label": cb.get("label"),
                                                       "frames": []})
                     known = {f["key"] for f in mb["frames"]}
                     fresh = [f for f in (cb.get("frames") or [])
-                             if f["key"] not in known
-                             and f["key"] not in set(to_delete)
-                             and (parse_iso(f["t"]) or now) >= now -
-                             dt.timedelta(minutes=10)]
+                             if f["key"] not in known and f["key"] not in dead]
                     if fresh:
                         mb["frames"] = sorted(mb["frames"] + fresh,
                                               key=lambda f: f["t"])
                         mb["latest"] = mb["frames"][-1]["key"]
                         mb["last_hash"] = cb.get("last_hash") or mb.get("last_hash")
+                # Re-prune with a FRESH clock inside the lock: a lane's
+                # append_frame may have pruned (and deleted from R2) a
+                # boundary-age frame AFTER our listing snapshot -- the
+                # snapshot-era prune above would still advertise it.
+                now_locked = utcnow()
+                for bk, mb in man["bands"].items():
+                    kept, deleted = prune_frames(mb.get("frames") or [],
+                                                 now_locked)
+                    mb["frames"] = kept
+                    if kept:
+                        mb["latest"] = kept[-1]["key"]
+                    to_delete.extend(deleted)
                 if self.r2.put_json(mkey, man, CACHE_MANIFEST):
                     self.manifests[sector.slug] = man
                     if to_delete:

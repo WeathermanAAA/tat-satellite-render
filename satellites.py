@@ -123,8 +123,9 @@ def _bbox_overlaps(a: list[float], b: tuple[float, float, float, float]) -> bool
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 def bbox_lon_span(bbox) -> float:
     """Longitudinal width in degrees; lon_max < lon_min is an antimeridian
-    crossing (e < w convention) and wraps to the positive span."""
-    return (bbox[2] - bbox[0]) % 360.0
+    crossing (e < w convention) and wraps to the positive span. A zero
+    remainder is the full-width [-180, 180] box -> 360."""
+    return (bbox[2] - bbox[0]) % 360.0 or 360.0
 def _bbox_inside(inner: list[float], outer: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
     """Wrap-aware containment: either box may cross the antimeridian
     (lon_max < lon_min). Longitudes compare as the inner box's wrapped
@@ -1220,10 +1221,33 @@ class HimawariPacificSatellite(Satellite):
             sub_sat_lon=HIMAWARI_SUB_SAT_LON,
         )
 
+    @staticmethod
+    def _fldk_band_complete(listing: "list[str]", band: int) -> bool:
+        """True iff EVERY segment of ``band`` is present in the slot listing.
+        NOAA uploads segments sequentially over minutes; the _SkkLL filename
+        token carries (segment, total), so presence-of-any is NOT enough —
+        a half-published B03 stitches to a shorter line window and would
+        ship a part-black frame straight past the degenerate guard (which
+        counts NaNs inside the stitched window only)."""
+        token = f"_B{band:02d}_"
+        segs: set[int] = set()
+        total = None
+        for f in listing:
+            if token not in f or not f.endswith(".DAT.bz2"):
+                continue
+            try:
+                s_part = f.rsplit("_S", 1)[1].split(".", 1)[0]
+                seq, tot = int(s_part[:2]), int(s_part[2:])
+            except (IndexError, ValueError):
+                continue
+            segs.add(seq)
+            total = tot
+        return total is not None and len(segs) >= total
+
     def _first_available_fldk_slot_sync(
         self, snapped: dt.datetime, bands: "list[int]", max_back: int = 4,
     ) -> "dt.datetime | None":
-        """Newest FLDK slot at/before ``snapped`` whose listing has segments
+        """Newest FLDK slot at/before ``snapped`` with a COMPLETE segment set
         for EVERY band in ``bands``. One fs.ls per probed slot. None if no
         slot qualifies (caller keeps the snapped guess and the load surfaces
         the error as before)."""
@@ -1236,7 +1260,7 @@ class HimawariPacificSatellite(Satellite):
                 listing = fs.ls(prefix)
             except (FileNotFoundError, OSError):
                 continue
-            if all(any(f"_B{b:02d}_" in f for f in listing) for b in bands):
+            if all(self._fldk_band_complete(listing, b) for b in bands):
                 return slot
         return None
 

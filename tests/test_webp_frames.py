@@ -135,12 +135,15 @@ class TestPollerExtensionFromResponse(unittest.TestCase):
         self.assertEqual(fp.frame_ext({}), (".png", "image/png"))
 
     def test_frame_key_carries_extension(self):
+        # SECOND-precision stamps: with true scan times (the header_get fix)
+        # two GOES meso scans can share a wall-clock minute, so minute keys
+        # collided -- see frame_key's comment.
         ts = dt.datetime(2026, 6, 12, 6, 0, tzinfo=dt.timezone.utc)
         self.assertTrue(
-            fp.frame_key("wp06", "ir", ts, ".webp").endswith("/20260612T0600Z.webp")
+            fp.frame_key("wp06", "ir", ts, ".webp").endswith("/20260612T060000Z.webp")
         )
         # Default stays .png -- pre-existing callers/fixtures unaffected.
-        self.assertTrue(fp.frame_key("wp06", "ir", ts).endswith("/20260612T0600Z.png"))
+        self.assertTrue(fp.frame_key("wp06", "ir", ts).endswith("/20260612T060000Z.png"))
 
     def test_call_render_sends_format(self):
         sent = {}

@@ -243,7 +243,7 @@ def render_png(
     # wraps it into the shifted frame continuously, so a GOES-18 meso sector
     # steered over the Bering Sea renders seamlessly.
     crosses = lon_max < lon_min
-    lon_span = (lon_max - lon_min) % 360.0
+    lon_span = (lon_max - lon_min) % 360.0 or 360.0
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
@@ -376,13 +376,17 @@ def render_png(
         linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
     )
 
-    # Dashed gridlines auto-spaced. xlocs are laid out on the unwrapped lon
-    # range then wrapped to ±180 — true longitudes either way, so the
-    # gridliner labels them correctly in the re-centered crossing frame.
+    # Dashed gridlines auto-spaced. Crossing frames lay xlocs out on the
+    # unwrapped lon range then wrap to ±180 (true longitudes, so the
+    # gridliner labels them correctly in the re-centered frame); plain
+    # frames keep the raw values — wrapping would map a bbox edge at
+    # exactly 180 to -180 and silently drop that meridian's gridline.
     step = _gridline_step(max(lon_span, lat_span))
-    xlocs_uw = np.arange(
+    xlocs = np.arange(
         np.floor(lon_min / step) * step, lon_min + lon_span + step, step
     )
+    if crosses:
+        xlocs = ((xlocs + 180.0) % 360.0) - 180.0
     gl = ax.gridlines(
         crs=ccrs.PlateCarree(),
         draw_labels=True,
@@ -390,7 +394,7 @@ def render_png(
         linestyle="--",
         color=GRID_COLOR,
         alpha=0.7,
-        xlocs=((xlocs_uw + 180.0) % 360.0) - 180.0,
+        xlocs=xlocs,
         ylocs=np.arange(np.floor(lat_min / step) * step, lat_max + step, step),
     )
     gl.top_labels = False

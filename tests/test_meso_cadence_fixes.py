@@ -87,9 +87,19 @@ class AntimeridianBboxTests(unittest.TestCase):
 
     def test_validator_still_rejects_garbage(self):
         for bad in ([200.0, 0, 10, 10], [0, 0, 200.0, 10], [5, 0, 5, 10],
-                    [0, 50, 10, 40]):
+                    [0, 50, 10, 40], [180.0, 0, -180.0, 10]):
             with self.assertRaises(Exception, msg=bad):
                 app.RenderRequest(bbox=bad, channel="clean_ir")
+
+    def test_full_width_box_still_legal(self):
+        # [-180, 180] spans the whole world and predates the crossing
+        # support; its span must read 360, not (360 % 360) == 0.
+        v = app.RenderRequest(bbox=[-180.0, -30.0, 180.0, 30.0],
+                              channel="clean_ir")
+        self.assertEqual(v.bbox[2], 180.0)
+        self.assertEqual(satellites.bbox_lon_span(v.bbox), 360.0)
+        self.assertGreater(
+            app.compute_downsample_factor(v.bbox, "clean_ir"), 1)
 
     def test_downsample_uses_wrapped_span(self):
         crossing = app.compute_downsample_factor(
@@ -190,8 +200,14 @@ class FindBandAtMesoTests(unittest.TestCase):
         orig = satellites._list_hour
         satellites._list_hour = lambda bucket, product, channel, t: (
             calls.append(product) or list(fake_files))
+        # An installed, OPEN loop (not asyncio.run, which tears the policy
+        # loop down): the legacy live-smoke tests (test_himawari /
+        # test_goes_west) still use get_event_loop().run_until_complete and
+        # RuntimeError on 3.12 if a prior test left no current loop.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            resolved = asyncio.run(satellites.GOES_EAST._find_band_at(
+            resolved = loop.run_until_complete(satellites.GOES_EAST._find_band_at(
                 "noaa-goes19", "CMIPM1", 1, scan))
         finally:
             satellites._list_hour = orig
@@ -223,10 +239,20 @@ class TargetFreshnessTests(unittest.TestCase):
         self.assertEqual(resolved.scan_start.minute, 42)  # slot + 2.5 min
         self.assertEqual(resolved.scan_start.second, 30)
 
-    def test_fldk_probe_skips_unpublished_slot(self):
+    @staticmethod
+    def _fldk_files(band: int, segs: range, total: int) -> list:
+        return [f"HS_H09_20260612_2000_B{band:02d}_FLDK_R20_S{s:02d}{total:02d}.DAT.bz2"
+                for s in segs]
+
+    def test_fldk_probe_requires_complete_segment_sets(self):
+        full = lambda b: self._fldk_files(b, range(1, 11), 10)
         listings = {
-            "2010": [],                                     # still uploading
-            "2000": ["x_B01_a", "x_B02_a", "x_B03_a", "x_B04_a", "x_B13_a"],
+            "2010": [],                                          # nothing yet
+            # B03 half-published: presence alone would pick this slot and
+            # ship a part-black true-color frame past the degenerate guard.
+            "2000": (full(1) + full(2) + full(4) + full(13)
+                     + self._fldk_files(3, range(1, 6), 10)),
+            "1950": full(1) + full(2) + full(3) + full(4) + full(13),
         }
 
         class FakeFS:
@@ -245,8 +271,15 @@ class TargetFreshnessTests(unittest.TestCase):
                 snapped, [1, 2, 3, 4, 13])
         finally:
             satellites._get_fs = orig
-        self.assertEqual(slot.minute, 0)
-        self.assertEqual(slot.hour, 20)
+        self.assertEqual((slot.hour, slot.minute), (19, 50))
+
+    def test_fldk_band_complete(self):
+        comp = satellites.HimawariPacificSatellite._fldk_band_complete
+        self.assertTrue(comp(self._fldk_files(3, range(1, 11), 10), 3))
+        self.assertFalse(comp(self._fldk_files(3, range(1, 10), 10), 3))
+        # H8-era single-file repack (S0101) is complete with one segment.
+        self.assertTrue(comp(self._fldk_files(13, range(1, 2), 1), 13))
+        self.assertFalse(comp([], 3))
 
 
 class LaneTests(unittest.TestCase):
@@ -294,6 +327,18 @@ class HeaderCaseTests(unittest.TestCase):
         import floater_poller as fp
         self.assertEqual(fp.header_get(lowered, "X-Scan-Time"),
                          "2026-06-12T20:16:56+00:00")
+
+    def test_floater_frame_key_is_second_precision(self):
+        """With true scan stamps, two GOES meso scans can land in the same
+        wall-clock minute — a minute-precision key would make the second
+        overwrite the first's object while the manifest lists both."""
+        import floater_poller as fp
+        a = dt.datetime(2026, 6, 12, 19, 47, 2, tzinfo=dt.timezone.utc)
+        b = dt.datetime(2026, 6, 12, 19, 47, 59, tzinfo=dt.timezone.utc)
+        ka = fp.frame_key("ep03", "ir", a, ".webp")
+        kb = fp.frame_key("ep03", "ir", b, ".webp")
+        self.assertNotEqual(ka, kb)
+        self.assertTrue(ka.endswith("20260612T194702Z.webp"), ka)
 
 
 class AzimuthUpsampleTests(unittest.TestCase):

@@ -922,7 +922,13 @@ def frame_ext(headers: dict) -> tuple[str, str]:
 
 
 def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png") -> str:
-    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%MZ')}{ext}"
+    # SECOND precision (mirrors meso_poller.frame_key). Frames now stamp the
+    # TRUE scan time (header_get fixed the X-Source-Time lookup), and GOES
+    # meso scans jitter 57-63 s apart -- two distinct scans in one wall-clock
+    # minute would collide under a minute key: the second overwrites the
+    # first's object while the manifest lists both entries, and the floater
+    # has no reconcile loop to heal the resulting 404 phantom.
+    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%M%SZ')}{ext}"
 
 
 def storm_manifest_key(slug: str) -> str:
@@ -1263,7 +1269,7 @@ class Poller:
         self.append_frame(storm, band, key, ts, h)
         u.last_hash = h
         log.info("uploaded %s (%d B, %s)", key, len(frame),
-                 headers.get("X-Satellite", "?"))
+                 header_get(headers, "X-Satellite") or "?")
 
     # ---- cadence --------------------------------------------------------
 
