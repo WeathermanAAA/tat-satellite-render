@@ -195,16 +195,23 @@ def build_global_geojson_feed(storms_by_basin: dict[str, list],
 
 
 def recompute_tracks_feed(tracks_base: dict, live: Optional[pd.DataFrame],
-                          build_now: Optional[dt.datetime] = None) -> dict:
+                          build_now: Optional[dt.datetime] = None,
+                          nhc_active_sids: "set[str] | None" = None) -> dict:
     """Base + live -> the live tracks feed (exact current shape). Reuses
     ace_core.merge_and_extract_storms + compute_header_stats, so the tracks
-    storm set + header match the cron and ace == tracks holds by construction."""
+    storm set + header match the cron and ace == tracks holds by construction.
+
+    ``nhc_active_sids`` (ace_core.fetch_nhc_active_sids) enables the prompt
+    final-advisory retirement of is_active — STATUS ONLY (ace_core 0.7.0):
+    a dissipated NHC storm drops from active counts / live markers while its
+    track and season ACE stay byte-identical. None = no retirement."""
     build_now = build_now or pf.utcnow().replace(tzinfo=None)
     cfg = tracks_base["basin_cfg"]
     ibtracs_frame = _df_from_records(tracks_base["current_year_ibtracs"], _TRACKS_COLS)
     live_frame = live if live is not None else pd.DataFrame()
 
-    storms = ac.merge_and_extract_storms(ibtracs_frame, live_frame, cfg)
+    storms = ac.merge_and_extract_storms(ibtracs_frame, live_frame, cfg,
+                                         nhc_active_sids=nhc_active_sids)
     header = ac.compute_header_stats(storms)
 
     fix_times = [s["latest_fix_valid_utc"] for s in storms

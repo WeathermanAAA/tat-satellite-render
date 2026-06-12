@@ -41,6 +41,7 @@ import datetime as dt
 import json
 import logging
 import os
+import threading
 import time
 from typing import Callable, Optional
 
@@ -374,6 +375,27 @@ def _combine(named: pd.DataFrame, invests: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+# NHC CurrentStorms.json — the authoritative final-advisory signal feeding
+# ace_core 0.7.0's prompt is_active retirement (status only: a dissipated
+# NHC storm drops from active counts / live markers while its track and
+# season ACE stay byte-identical). One fetch per cycle shared across the
+# three basin sources via a short TTL cache; None (failed fetch) makes the
+# retirement a no-op for that build — ace_core's contract, never
+# mass-retire on missing information.
+_NHC_ACTIVE_TTL_S = 120.0
+_nhc_active_cache: dict = {"t": 0.0, "sids": None}
+_nhc_active_lock = threading.Lock()
+
+
+def _nhc_active_sids() -> "set[str] | None":
+    with _nhc_active_lock:
+        now = time.monotonic()
+        if now - _nhc_active_cache["t"] > _NHC_ACTIVE_TTL_S:
+            _nhc_active_cache["sids"] = ac.fetch_nhc_active_sids()
+            _nhc_active_cache["t"] = now
+        return _nhc_active_cache["sids"]
+
+
 class GlobalGeojsonComposer:
     """Holds each basin's latest tracks-feed storms and re-emits the composed
     global geojson (feed_recompute.build_global_geojson_feed -> the shared
@@ -502,7 +524,8 @@ def make_basin_source(basin: str, session: requests.Session,
         # Tracks: named + invests (preserves the cron's invest cards).
         tracks_live = _combine(data["named"], data["invests"])
         tracks_feed = fr.recompute_tracks_feed(data["tracks_base"], tracks_live,
-                                               build_now=now_naive)
+                                               build_now=now_naive,
+                                               nhc_active_sids=_nhc_active_sids())
         ctx.sink.write(f"feeds/{basin}_ace_data.json", ace_feed)
         ctx.sink.write(f"feeds/{basin}_tracks_data.json", tracks_feed)
         # Phase 3: feed the global-map composer AFTER the basin feeds are
