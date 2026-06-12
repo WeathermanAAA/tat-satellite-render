@@ -1,7 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.4
-slowapi==0.1.9
 xarray==2024.11.0
 netCDF4==1.7.2
 h5netcdf==1.4.1

@@ -98,6 +98,11 @@ class FetchResult:
     # True-color only: per-pixel cos(solar zenith), exposed so the render path
     # can apply the day/night terminator (GeoColor-lite fade to IR at night).
     cos_sza: Optional[np.ndarray] = None
+    # True-color only: which target-grid pixels are geometrically ON the
+    # satellite's visible disk. The render-side degenerate-RGB guard counts
+    # NaNs over these pixels only, so a disk-limb sector (big legitimate
+    # off-disk corner) isn't mistaken for a broken fetch.
+    geom_valid: Optional[np.ndarray] = None
 # ---------------------------------------------------------------------------
 # S3 filesystem (singleton)
 # ---------------------------------------------------------------------------
@@ -116,13 +121,23 @@ async def _to_thread(fn, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 def _bbox_overlaps(a: list[float], b: tuple[float, float, float, float]) -> bool:
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+def bbox_lon_span(bbox) -> float:
+    """Longitudinal width in degrees; lon_max < lon_min is an antimeridian
+    crossing (e < w convention) and wraps to the positive span."""
+    return (bbox[2] - bbox[0]) % 360.0
 def _bbox_inside(inner: list[float], outer: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
-    return (
-        inner[0] >= outer[0] - buffer
-        and inner[1] >= outer[1] - buffer
-        and inner[2] <= outer[2] + buffer
-        and inner[3] <= outer[3] + buffer
-    )
+    """Wrap-aware containment: either box may cross the antimeridian
+    (lon_max < lon_min). Longitudes compare as the inner box's wrapped
+    offset east of the outer's west edge; a crossing inner box can never
+    sit inside a non-crossing outer (the offset math rejects it)."""
+    if inner[1] < outer[1] - buffer or inner[3] > outer[3] + buffer:
+        return False
+    o_span = (outer[2] - outer[0]) % 360.0
+    i_span = (inner[2] - inner[0]) % 360.0
+    i_off = (inner[0] - outer[0]) % 360.0
+    if i_off > 180.0:  # inner west edge slightly WEST of outer's -> small negative
+        i_off -= 360.0
+    return i_off >= -buffer and i_off + i_span <= o_span + buffer
 # ---------------------------------------------------------------------------
 # Antimeridian-safe bbox center
 # ---------------------------------------------------------------------------
@@ -448,10 +463,17 @@ def _sample_geos(
     )
     out = interp(np.stack([y_q.ravel(), x_q.ravel()], axis=-1)).reshape(x_q.shape)
     return out.astype(np.float32)
-def _truecolor_target_dims(lon_span: float, lat_span: float, max_px: int = 2400) -> tuple[int, int]:
+# True-color target grid long-axis cap. The figure it feeds is 1320 px wide
+# (12 in @ 110 dpi), so 1600 px still oversamples the final raster — the old
+# 2400 px default bought no visible sharpness and paid ~2.3x the pixels in
+# interpolation, Rayleigh, and solar/satellite geometry per frame.
+TRUECOLOR_MAX_PX = int(os.getenv("TRUECOLOR_MAX_PX", "1600"))
+def _truecolor_target_dims(lon_span: float, lat_span: float, max_px: int = None) -> tuple[int, int]:
     """Pixel (W, H) for a true-color target grid at ~0.5 km red GSD, long axis
-    capped at ``max_px`` (matches the single-band MAX_PX_PER_AXIS so output
-    size and render time stay bounded)."""
+    capped at ``max_px`` (defaults to TRUECOLOR_MAX_PX so output size and
+    render time stay bounded)."""
+    if max_px is None:
+        max_px = TRUECOLOR_MAX_PX
     deg_per_px = 0.5 / 111.0
     nat_w = lon_span / deg_per_px
     nat_h = lat_span / deg_per_px
@@ -541,7 +563,7 @@ class GOESBaseSatellite(Satellite):
             )
         band = self.generic_to_band[generic_channel]
         buckets = self._buckets_for_time(time)
-        lon_w = bbox[2] - bbox[0]
+        lon_w = bbox_lon_span(bbox)
         lat_h = bbox[3] - bbox[1]
         # Product preference: smallest sector that could plausibly cover
         # the bbox. CMIPM is only viable for ≤12°×12°; anything larger
@@ -650,11 +672,26 @@ class GOESBaseSatellite(Satellite):
     ) -> ResolvedFile:
         """Locate band ``band``'s file for the SAME product + scan_start as an
         already-resolved sibling band. All bands of one ABI scan share the
-        scan-start token, so the RGB bands are guaranteed co-temporal."""
-        files = await _to_thread(_list_hour, bucket, product, band, scan_start)
+        scan-start token, so the RGB bands are guaranteed co-temporal.
+
+        Mesoscale gotcha (same one _pick_meso handles): CMIPM1/CMIPM2 are NOT
+        S3 prefixes — everything lives under ABI-L2-CMIPM/ with the sector in
+        the FILENAME. Listing "CMIPM1" returns [] and broke every GOES meso
+        true-color render, so list CMIPM and filter to the sector token."""
+        list_product, sector_tok = product, None
+        if product.startswith("CMIPM") and product != "CMIPM":
+            list_product, sector_tok = "CMIPM", f"-{product}-"
+
+        def _list(t: dt.datetime) -> list[str]:
+            files = _list_hour(bucket, list_product, band, t)
+            if sector_tok:
+                files = [f for f in files if sector_tok in f]
+            return files
+
+        files = await _to_thread(_list, scan_start)
         if not files:
             # The scan can straddle an hour boundary for the previous-hour edge.
-            files = await _to_thread(_list_hour, bucket, product, band, scan_start - dt.timedelta(hours=1))
+            files = await _to_thread(_list, scan_start - dt.timedelta(hours=1))
         if not files:
             raise RuntimeError(f"no band {band} file for {product} at {scan_start.isoformat()}")
         with_t = [(f, _parse_scan_start(f)) for f in files]
@@ -670,38 +707,56 @@ class GOESBaseSatellite(Satellite):
         grid (shared geos x/y → exact co-registration), and hands off to
         truecolor.assemble_truecolor. ABI green is synthesized inside.
         """
+        # Sibling-band lookups run concurrently (S3 listings). Clean-IR
+        # (band 13) backs the GeoColor-lite night fade; same product + scan
+        # so everything co-registers with the visible bands.
+        roles = [(role, band) for role, band in self.truecolor_bands.items()
+                 if role != "red"]
+        roles.append(("ir", self.generic_to_band["clean_ir"]))
+        resolved_list = await asyncio.gather(*(
+            self._find_band_at(red_resolved.bucket, red_resolved.product,
+                               band, red_resolved.scan_start)
+            for _, band in roles
+        ))
         band_files: dict[str, ResolvedFile] = {"red": red_resolved}
-        for role, band in self.truecolor_bands.items():
-            if role == "red":
-                continue
-            band_files[role] = await self._find_band_at(
-                red_resolved.bucket, red_resolved.product, band, red_resolved.scan_start
-            )
-        # Clean-IR (band 13) backs the GeoColor-lite night fade. Same product +
-        # scan so it co-registers with the visible bands.
-        band_files["ir"] = await self._find_band_at(
-            red_resolved.bucket, red_resolved.product,
-            self.generic_to_band["clean_ir"], red_resolved.scan_start,
-        )
+        band_files.update(zip((r for r, _ in roles), resolved_list))
         return await _to_thread(self._compose_true_color_sync, band_files, bbox, red_resolved)
     def _compose_true_color_sync(
         self, band_files: dict[str, ResolvedFile], bbox: list[float], red_resolved: ResolvedFile
     ) -> FetchResult:
+        from concurrent.futures import ThreadPoolExecutor
         import truecolor
-        crops: dict[str, tuple] = {}
-        proj = None
-        for role, rf in band_files.items():
+
+        def _open_crop(rf: ResolvedFile) -> tuple:
             ds, tmp_dir = self.open(rf)
             try:
-                cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol = self._crop_to_bbox(ds, bbox)
+                return self._crop_to_bbox(ds, bbox)
             finally:
                 ds.close()
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # Each band downloads its own file to its own tmp dir — fully
+        # independent, so fetch+crop all of them concurrently instead of
+        # serializing four S3 downloads per frame.
+        with ThreadPoolExecutor(max_workers=len(band_files)) as pool:
+            futures = {role: pool.submit(_open_crop, rf)
+                       for role, rf in band_files.items()}
+            results = {role: f.result() for role, f in futures.items()}
+        crops: dict[str, tuple] = {}
+        proj = None
+        for role, (cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol) in results.items():
             crops[role] = (cmi, x_sub, y_sub)
             proj = (lon_origin, H, r_eq, r_pol)
         r_cmi, r_x, r_y = crops["red"]
         lon_origin, H, r_eq, r_pol = proj
         H_pix, W_pix = r_cmi.shape
+        # Cap the target grid like the AHI path: the figure raster is 1320 px,
+        # so a 2000 px meso red crop only inflates interpolation + Rayleigh +
+        # geometry cost with no visible sharpness.
+        cap_scale = min(1.0, TRUECOLOR_MAX_PX / max(H_pix, W_pix, 1))
+        if cap_scale < 1.0:
+            H_pix = max(16, int(round(H_pix * cap_scale)))
+            W_pix = max(16, int(round(W_pix * cap_scale)))
         # Regular lat/lon target grid over the bbox at the red pixel count.
         # Image row order = north→south (row 0 = lat_max) for imshow origin
         # "upper". Antimeridian (lon_max < lon_min) is unwrapped so the target
@@ -720,6 +775,16 @@ class GOESBaseSatellite(Satellite):
         green = grid("green") if "green" in crops else None
         veggie = grid("veggie") if "veggie" in crops else None
         ir_bt = grid("ir") if "ir" in crops else None  # clean-IR (K) for night fade
+        # "Could have data" mask: on-disk (forward projection finite) AND
+        # inside the red crop's scan-angle window. A limb-grazing meso
+        # sector's lat/lon bounding box is mostly OUTSIDE its actual scan
+        # quadrilateral — only pixels the scan could cover should count
+        # toward the degenerate-frame NaN statistic.
+        geom_valid = (
+            np.isfinite(TX) & np.isfinite(TY)
+            & (TX >= r_x.min()) & (TX <= r_x.max())
+            & (TY >= r_y.min()) & (TY <= r_y.max())
+        )
         lats, lons = TLAT.astype(np.float32), TLON.astype(np.float32)
         platform_name = self._pyspectral_platform(red_resolved.bucket)
         rgb, cos_sza = truecolor.assemble_truecolor(
@@ -743,6 +808,7 @@ class GOESBaseSatellite(Satellite):
             sub_sat_lon=red_resolved.sub_sat_lon,
             units="rgb",
             cos_sza=cos_sza,
+            geom_valid=geom_valid,
         )
     @staticmethod
     def _pyspectral_platform(bucket: str) -> str:
@@ -786,10 +852,14 @@ class GOESBaseSatellite(Satellite):
         # x, y stored as 1D coords in the file
         x = ds["x"].values  # radians
         y = ds["y"].values
-        # Sample bbox corners + center to get xy span (use a denser grid for safety)
+        # Sample bbox corners + center to get xy span (use a denser grid for
+        # safety). Antimeridian crossing (lon_max < lon_min): unwrap the east
+        # edge so the sample sweep covers the bbox, not the far side of the
+        # planet — _latlon_to_xy is trig-based, so lons past 180 are fine.
         lon_min, lat_min, lon_max, lat_max = bbox
+        lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
         n_sample = 16
-        sample_lons = np.linspace(lon_min, lon_max, n_sample)
+        sample_lons = np.linspace(lon_min, lon_max_uw, n_sample)
         sample_lats = np.linspace(lat_min, lat_max, n_sample)
         LON, LAT = np.meshgrid(sample_lons, sample_lats)
         sx, sy = _latlon_to_xy(LAT, LON, lon_origin, H, r_eq, r_pol)
@@ -970,18 +1040,15 @@ HIMAWARI_DISK_LAT_LIMIT = 75.0  # bbox lat must lie strictly inside ±75°
 #   ~2017-01-01 00:00 UTC: earliest H-8 data on the noaa-himawari8 bucket.
 H9_OPERATIONAL_DATE = dt.datetime(2022, 12, 13, 0, 0, tzinfo=dt.timezone.utc)
 H8_ARCHIVE_START = dt.datetime(2017, 1, 1, 0, 0, tzinfo=dt.timezone.utc)
-def _ahi_latlon_to_colline(
-    lat_deg: np.ndarray, lon_deg: np.ndarray,
-    sub_lon: float, cfac: int, lfac: int, coff: float, loff: float,
+def _ahi_latlon_to_xy_deg(
+    lat_deg: np.ndarray, lon_deg: np.ndarray, sub_lon: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Forward AHI geos projection: WGS84 lat/lon (deg) -> column/line indices.
-    Reference: CGMS LRIT/HRIT Global Specification §4.4 (cited by JMA HSD spec §3).
-    Both ``CFAC`` and ``LFAC`` are positive on AHI, matching the convention
-    where x-scan-angle increases east (col 1 = west) and y-scan-angle
-    increases north (line 1 = south of disk center). Column 1 / line 1 sit
-    in the disk corner; ``COFF`` / ``LOFF`` (~2750.5 for 2 km bands)
-    locate the sub-satellite point.
-    """
+    """AHI geos scan angles (degrees) for WGS84 lat/lon — the expensive trig
+    half of the forward projection. Band-INDEPENDENT: every AHI band shares
+    the same viewing geometry and differs only in the linear CFAC/LFAC/COFF/
+    LOFF scaling, so a multi-band composite computes this ONCE and applies
+    each band's scaling via _ahi_xy_deg_to_colline (the per-band recompute
+    was ~8 s of pure duplicate trig per true-color frame)."""
     R_s = 42164.0           # km, satellite-Earth-center distance
     r_eq = 6378.1370        # km, WGS84
     r_pol = 6356.7523       # km, WGS84
@@ -997,11 +1064,29 @@ def _ahi_latlon_to_colline(
     with np.errstate(invalid="ignore"):
         x = np.arctan2(-R2, R1)
         y = np.arcsin(-R3 / R_n)
-        x_deg = np.rad2deg(x)
-        y_deg = np.rad2deg(y)
-        col = coff + cfac / (2 ** 16) * x_deg
-        line = loff + lfac / (2 ** 16) * y_deg
+    return np.rad2deg(x), np.rad2deg(y)
+def _ahi_xy_deg_to_colline(
+    x_deg: np.ndarray, y_deg: np.ndarray,
+    cfac: int, lfac: int, coff: float, loff: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply one band's linear scaling to shared AHI scan angles."""
+    col = coff + cfac / (2 ** 16) * x_deg
+    line = loff + lfac / (2 ** 16) * y_deg
     return col, line
+def _ahi_latlon_to_colline(
+    lat_deg: np.ndarray, lon_deg: np.ndarray,
+    sub_lon: float, cfac: int, lfac: int, coff: float, loff: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward AHI geos projection: WGS84 lat/lon (deg) -> column/line indices.
+    Reference: CGMS LRIT/HRIT Global Specification §4.4 (cited by JMA HSD spec §3).
+    Both ``CFAC`` and ``LFAC`` are positive on AHI, matching the convention
+    where x-scan-angle increases east (col 1 = west) and y-scan-angle
+    increases north (line 1 = south of disk center). Column 1 / line 1 sit
+    in the disk corner; ``COFF`` / ``LOFF`` (~2750.5 for 2 km bands)
+    locate the sub-satellite point.
+    """
+    x_deg, y_deg = _ahi_latlon_to_xy_deg(lat_deg, lon_deg, sub_lon)
+    return _ahi_xy_deg_to_colline(x_deg, y_deg, cfac, lfac, coff, loff)
 def _ahi_colline_to_latlon(
     col: np.ndarray, line: np.ndarray,
     sub_lon: float, cfac: int, lfac: int, coff: float, loff: float,
@@ -1099,6 +1184,25 @@ class HimawariPacificSatellite(Satellite):
                 return resolved
         # AHI cycles every 10 minutes; snap target time to the nearest 10-min slot.
         snapped = self._snap_10min(time, nearest_to_target)
+        if not nearest_to_target:
+            # LIVE path: the snapped slot may not have landed yet — NOAA's
+            # bucket trails JMA by ~8-12 min for FLDK, so "floored − 10 min"
+            # is often still empty and every consumer 500'd ("no AHI
+            # segments found"). Probe slots (one listing each) until one
+            # actually has this band's segments; for a true-color resolve
+            # (visible_red) require the WHOLE recipe's bands so the
+            # compositor can't trip over a half-published slot.
+            need = [self.generic_to_band[generic_channel]]
+            if generic_channel == "visible_red":
+                need = sorted({*self.truecolor_bands.values(),
+                               self.generic_to_band["clean_ir"]})
+            # Probe from the FLOORED slot (snapped already backed off 10 min):
+            # if the current slot has somehow fully landed, use it.
+            probed = await _to_thread(
+                self._first_available_fldk_slot_sync,
+                snapped + dt.timedelta(minutes=10), need)
+            if probed is not None:
+                snapped = probed
         resolved_sat = self.resolve(snapped)
         # ``s3_key`` holds the time-folder prefix; the loader globs band segments
         # off that prefix at open() time so that the same ResolvedFile shape works
@@ -1116,6 +1220,26 @@ class HimawariPacificSatellite(Satellite):
             sub_sat_lon=HIMAWARI_SUB_SAT_LON,
         )
 
+    def _first_available_fldk_slot_sync(
+        self, snapped: dt.datetime, bands: "list[int]", max_back: int = 4,
+    ) -> "dt.datetime | None":
+        """Newest FLDK slot at/before ``snapped`` whose listing has segments
+        for EVERY band in ``bands``. One fs.ls per probed slot. None if no
+        slot qualifies (caller keeps the snapped guess and the load surfaces
+        the error as before)."""
+        fs = _get_fs()
+        for back in range(0, max_back + 1):
+            slot = snapped - dt.timedelta(minutes=10 * back)
+            bucket = self.resolve(slot).bucket
+            prefix = f"{bucket}/AHI-L1b-FLDK/{slot:%Y/%m/%d/%H%M}/"
+            try:
+                listing = fs.ls(prefix)
+            except (FileNotFoundError, OSError):
+                continue
+            if all(any(f"_B{b:02d}_" in f for f in listing) for b in bands):
+                return slot
+        return None
+
     def _resolve_target_sync(self, time: dt.datetime, band: int,
                              nearest_to_target: bool):
         """Resolve the latest available AHI Target sub-scan near ``time`` to a
@@ -1127,8 +1251,12 @@ class HimawariPacificSatellite(Satellite):
         fs = _get_fs()
         base = time.replace(second=0, microsecond=0)
         floored = base.replace(minute=(base.minute // 10) * 10)
-        # Back off one slot for publish latency, then scan a few slots back.
-        for back in range(1, 4):
+        # Start at the CURRENT slot (back=0): Target sub-scans land every
+        # ~2.5 min with low publish latency, so the current 10-min folder
+        # usually already has the freshest R30x. Skipping straight to back=1
+        # (the old behavior) quantized Himawari freshness to 10+ minutes —
+        # the whole point of the Target product is the 2.5-min cadence.
+        for back in range(0, 4):
             slot = floored - dt.timedelta(minutes=10 * back)
             resolved_sat = self.resolve(slot)
             sub = latest_target_subscan(fs, resolved_sat.bucket, slot, band)
@@ -1210,9 +1338,12 @@ class HimawariPacificSatellite(Satellite):
         line_g = line_g[finite_mask]
         if col_g.size == 0:
             raise RuntimeError("bbox has no projection-valid sample points")
-        # Convert to local indices for slicing into ``disk.data``.
-        ic_lo = max(0, int(np.floor(col_g.min())) - 5)
-        ic_hi = min(disk.n_columns, int(np.ceil(col_g.max())) + 5)
+        # Convert to local indices for slicing into ``disk.data`` (the disk
+        # may be line- AND column-banded when the loader pre-cropped to bbox).
+        ic_lo_g = int(np.floor(col_g.min())) - 5
+        ic_hi_g = int(np.ceil(col_g.max())) + 5
+        ic_lo = max(0, ic_lo_g - disk.col_offset)
+        ic_hi = min(disk.n_columns, ic_hi_g - disk.col_offset)
         il_lo_g = int(np.floor(line_g.min())) - 5
         il_hi_g = int(np.ceil(line_g.max())) + 5
         il_lo = max(0, il_lo_g - disk.line_offset)
@@ -1226,10 +1357,11 @@ class HimawariPacificSatellite(Satellite):
         x_stride = max(1, (ic_hi - ic_lo) // MAX_PX_PER_AXIS)
         y_stride = max(1, (il_hi - il_lo) // MAX_PX_PER_AXIS)
         sub_data = disk.data[il_lo:il_hi:y_stride, ic_lo:ic_hi:x_stride]
-        # Inverse projection takes GLOBAL col/line — add line_offset back.
-        sub_cols_global = np.arange(ic_lo, ic_hi, x_stride, dtype=np.float64)[
-            : sub_data.shape[1]
-        ]
+        # Inverse projection takes GLOBAL col/line — add the offsets back.
+        sub_cols_global = np.arange(
+            ic_lo + disk.col_offset, ic_hi + disk.col_offset, x_stride,
+            dtype=np.float64,
+        )[: sub_data.shape[1]]
         sub_lines_global = np.arange(
             il_lo + disk.line_offset, il_hi + disk.line_offset, y_stride, dtype=np.float64
         )[: sub_data.shape[0]]
@@ -1259,22 +1391,26 @@ class HimawariPacificSatellite(Satellite):
     def _compose_true_color_sync(
         self, bbox: list[float], red_resolved: ResolvedFile
     ) -> FetchResult:
+        from concurrent.futures import ThreadPoolExecutor
         from vendor.ahi_loader import load_band_sync
         from scipy.interpolate import RegularGridInterpolator
         import truecolor
         fs = _get_fs()
-        # Load each true-color band's calibrated disk (segment-filtered to the
-        # bbox's line band so B03's 0.5 km segments don't blow memory).
-        disks: dict[str, object] = {}
-        for role, band in self.truecolor_bands.items():
-            disks[role] = load_band_sync(
-                fs, red_resolved.bucket, red_resolved.scan_start, band, bbox=tuple(bbox)
-            )
-        # Clean-IR (band 13) for the GeoColor-lite night fade.
-        disks["ir"] = load_band_sync(
-            fs, red_resolved.bucket, red_resolved.scan_start,
-            self.generic_to_band["clean_ir"], bbox=tuple(bbox),
-        )
+        # Load every band's calibrated disk CONCURRENTLY (segment-filtered to
+        # the bbox's line band so B03's 0.5 km segments don't blow memory).
+        # The five sequential loads were the single biggest cost of a
+        # true-color frame; bz2 decompression releases the GIL, so threads
+        # genuinely overlap download + decompress.
+        roles = dict(self.truecolor_bands)
+        roles["ir"] = self.generic_to_band["clean_ir"]  # GeoColor-lite night fade
+        with ThreadPoolExecutor(max_workers=len(roles)) as pool:
+            futures = {
+                role: pool.submit(
+                    load_band_sync, fs, red_resolved.bucket,
+                    red_resolved.scan_start, band, bbox=tuple(bbox))
+                for role, band in roles.items()
+            }
+            disks: dict[str, object] = {r: f.result() for r, f in futures.items()}
         # Regular lat/lon target grid (same scheme as GOES); antimeridian
         # unwrap keeps target longitudes monotonic for the AHI disk (centered
         # at 140.7°E, so W-Pac bboxes routinely cross ±180°).
@@ -1284,25 +1420,46 @@ class HimawariPacificSatellite(Satellite):
         tgt_lons = ((np.linspace(lon_min, lon_max_uw, W_pix) + 180.0) % 360.0) - 180.0
         tgt_lats = np.linspace(lat_max, lat_min, H_pix)
         TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+        # Scan angles are band-independent (all AHI bands share the viewing
+        # geometry; only the linear CFAC/COFF scaling differs per resolution),
+        # so the expensive trig runs ONCE for the target mesh.
+        x_deg, y_deg = _ahi_latlon_to_xy_deg(
+            TLAT, TLON, disks["red"].sub_lon
+        )
         def grid(role: str) -> np.ndarray:
             d = disks[role]
-            # Forward-project target lat/lon -> this band's GLOBAL col/line, then
-            # shift line into the local (segment-banded) window before sampling.
-            col_g, line_g = _ahi_latlon_to_colline(
-                TLAT, TLON, d.sub_lon, d.cfac, d.lfac, d.coff, d.loff
+            # This band's GLOBAL col/line off the shared angles, then shift
+            # both axes into the local (line- and column-banded) window.
+            col_g, line_g = _ahi_xy_deg_to_colline(
+                x_deg, y_deg, d.cfac, d.lfac, d.coff, d.loff
             )
             line_local = line_g - d.line_offset
+            col_local = col_g - d.col_offset
             interp = RegularGridInterpolator(
                 (np.arange(d.n_lines), np.arange(d.n_columns)),
                 d.data, bounds_error=False, fill_value=np.nan, method="linear",
             )
-            out = interp(np.stack([line_local.ravel(), col_g.ravel()], axis=-1))
+            out = interp(np.stack([line_local.ravel(), col_local.ravel()], axis=-1))
             return out.reshape(TLON.shape).astype(np.float32)
         red = grid("red")
         green = grid("green")
         blue = grid("blue")
         veggie = grid("veggie") if "veggie" in disks else None
         ir_bt = grid("ir") if "ir" in disks else None  # clean-IR (K) for night fade
+        # "Could have data" mask: inside the red disk's (possibly line- and
+        # column-banded) data window. Counting NaNs only there keeps the
+        # degenerate-frame guard meaningful for limb sectors whose lat/lon
+        # bounding box mostly misses the actual scan region.
+        d_red = disks["red"]
+        col_r, line_r = _ahi_xy_deg_to_colline(
+            x_deg, y_deg, d_red.cfac, d_red.lfac, d_red.coff, d_red.loff)
+        geom_valid = (
+            np.isfinite(col_r) & np.isfinite(line_r)
+            & (col_r - d_red.col_offset >= 0)
+            & (col_r - d_red.col_offset <= d_red.n_columns - 1)
+            & (line_r - d_red.line_offset >= 0)
+            & (line_r - d_red.line_offset <= d_red.n_lines - 1)
+        )
         lats, lons = TLAT.astype(np.float32), TLON.astype(np.float32)
         rgb, cos_sza = truecolor.assemble_truecolor(
             red, green, blue, veggie, lats, lons,
@@ -1325,6 +1482,7 @@ class HimawariPacificSatellite(Satellite):
             sub_sat_lon=red_resolved.sub_sat_lon,
             units="rgb",
             cos_sza=cos_sza,
+            geom_valid=geom_valid,
         )
 # ---------------------------------------------------------------------------
 # Singletons + picker
@@ -1335,13 +1493,32 @@ HIMAWARI_PACIFIC = HimawariPacificSatellite()
 # Order matters for ties in pick_satellite: candidates are filtered by can_see
 # then sorted by |sub_sat_lon - center_lon|.
 ALL_SATELLITES: list[Satellite] = [GOES_EAST, GOES_WEST, HIMAWARI_PACIFIC]
-def pick_satellite(bbox: list[float], time: dt.datetime) -> Satellite:
+SATELLITES_BY_FAMILY = {s.family.lower(): s for s in ALL_SATELLITES}
+def pick_satellite(bbox: list[float], time: dt.datetime,
+                   family_hint: "str | None" = None) -> Satellite:
     """Pick the best satellite for ``bbox`` at ``time``.
     Filter by visible-disk overlap, then break ties by minimum angular
     distance between the satellite's sub_sat-lon and the bbox center.
+    ``family_hint`` (e.g. "GOES-West") names the satellite the caller KNOWS
+    owns this imagery — the meso poller discovered its bbox from a GOES-18
+    CMIPM2 scan, so /render must not re-guess. Center-distance picking gets
+    antimeridian sectors wrong: the Bering Sea M2 box sits 2.5° closer to
+    Himawari's sub-point than to GOES-West's, but only GOES-West actually
+    images it. A hinted satellite still must pass its own can_see (422
+    otherwise); an unknown hint falls back to the normal picker.
     Raises ``CoverageError`` if no satellite can see the bbox.
     """
     center_lon = antimeridian_safe_center_lon(bbox)
+    if family_hint:
+        hinted = SATELLITES_BY_FAMILY.get(family_hint.strip().lower())
+        if hinted is not None:
+            if not hinted.can_see(bbox, time):
+                raise CoverageError(
+                    f"bbox center {center_lon:.1f}° not visible from the "
+                    f"requested satellite {hinted.family}"
+                )
+            hinted.resolve(time)  # may raise UnsupportedTimeError — propagate
+            return hinted
     candidates = [s for s in ALL_SATELLITES if s.can_see(bbox, time)]
     if not candidates:
         raise CoverageError(

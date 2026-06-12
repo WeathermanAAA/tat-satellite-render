@@ -85,12 +85,14 @@ class CalibratedDisk:
     ``data`` may cover only a subset of the full disk's lines if the loader
     pre-filtered segments by bbox — in which case ``line_offset`` is the
     global (full-disk) 0-based line index of local row 0, and ``n_lines``
-    is the local span. Columns always span the full disk.
+    is the local span. Likewise ``col_offset``/``n_columns`` describe the
+    column window when a bbox was supplied (calibrating full-width rows for
+    a narrow bbox was most of a true-color frame's CPU).
 
     ``coff`` / ``loff`` / ``cfac`` / ``lfac`` are read off the segment
     Block #3 and ALWAYS describe the full disk's coordinate system, so
-    forward projection produces global indices. Subtract ``line_offset``
-    when indexing into ``data``.
+    forward projection produces global indices. Subtract ``line_offset`` /
+    ``col_offset`` when indexing into ``data``.
     """
 
     sat_name: str            # "Himawari-8" / "Himawari-9"
@@ -103,9 +105,10 @@ class CalibratedDisk:
     coff: float
     loff: float
 
-    n_columns: int           # full-disk width
+    n_columns: int           # local span of ``data`` columns
     n_lines: int             # local span of ``data`` (may be < full_lines)
     line_offset: int         # 0-based global line index of local row 0
+    col_offset: int          # 0-based global column index of local col 0
 
     # Calibrated array, float32, shape (n_lines, n_columns).
     # IR/WV bands: brightness_temperature [K]. Visible/NIR bands: reflectance [0..1].
@@ -171,10 +174,10 @@ def _filter_segments_for_bbox(
     lines_per_seg = full_lines // total
 
     lon_min, lat_min, lon_max, lat_max = bbox
-    if lon_max < lon_min:
-        # Antimeridian crossing — sampling on the unwrapped grid is fine,
-        # we only care about lat in this filter step.
-        pass
+    # Antimeridian crossing: unwrap the east edge so the lon midpoint below
+    # lands INSIDE the bbox (only lat drives the line filter, but an off-box
+    # lon can push a sample off-disk and silently weaken the lat bound).
+    lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
 
     # Forward-project the bbox lat range only (line is the y axis). We use
     # the standard AHI 2km grid params and then rescale to the band's actual
@@ -189,7 +192,8 @@ def _filter_segments_for_bbox(
     # Sample lat extremes at a few longitudes spanning the bbox; line index
     # depends on lat (and weakly on lon via the WGS84 ellipsoid term).
     sample_lats = [lat_min, (lat_min + lat_max) / 2, lat_max]
-    sample_lons = [lon_min, (lon_min + lon_max) / 2, lon_max]
+    sample_lons = [((v + 180.0) % 360.0) - 180.0
+                   for v in (lon_min, (lon_min + lon_max_uw) / 2, lon_max_uw)]
     lines = []
     for lat in sample_lats:
         for lon in sample_lons:
@@ -353,17 +357,69 @@ def load_band_sync(
         band, dt_floor10, n_listed, len(paths),
     )
 
-    segments = [_download_and_parse(fs, p) for p in paths]
-    return _assemble_disk(segments)
+    segments = _download_all(fs, paths)
+    return _assemble_disk(segments, bbox=bbox)
 
 
-def _assemble_disk(segments: list[HSDSegment]) -> CalibratedDisk:
+def _download_all(fs: s3fs.S3FileSystem, paths: list[str]) -> list[HSDSegment]:
+    """Download + parse segments concurrently. bz2 decompression releases the
+    GIL, so threads overlap transfer AND decompress — multi-segment loads
+    (FLDK true-color bands especially) were serializing here."""
+    if len(paths) == 1:
+        return [_download_and_parse(fs, paths[0])]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(4, len(paths))) as pool:
+        return list(pool.map(lambda p: _download_and_parse(fs, p), paths))
+
+
+def _bbox_col_range(seg0: HSDSegment, bbox, n_columns: int) -> tuple[int, int]:
+    """0-based [col_lo, col_hi) column window for ``bbox`` on this band's
+    grid, padded ±5 px. Falls back to the full width if no sample projects."""
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
+    cols = []
+    for lat in (lat_min, (lat_min + lat_max) / 2, lat_max):
+        for lon_uw in (lon_min, (lon_min + lon_max_uw) / 2, lon_max_uw):
+            lon = ((lon_uw + 180.0) % 360.0) - 180.0
+            # Horizon guard: the scalar forward projection happily "projects"
+            # far-side points to mirror columns; only on-disk samples may
+            # shape the window (cos ψ at the geo horizon is ~0.151).
+            cos_psi = (np.cos(np.deg2rad(lat)) *
+                       np.cos(np.deg2rad(lon - seg0.sub_lon)))
+            if cos_psi <= 0.15:
+                continue
+            col, _ = _forward_for_filter(
+                lat, lon, seg0.sub_lon, seg0.cfac, seg0.lfac,
+                seg0.coff, seg0.loff)
+            if np.isfinite(col):
+                cols.append(col)
+    if not cols:
+        return 0, n_columns
+    lo = max(0, int(np.floor(min(cols))) - 1 - 5)   # cols are 1-based
+    hi = min(n_columns, int(np.ceil(max(cols))) + 5)
+    if hi <= lo:
+        return 0, n_columns
+    return lo, hi
+
+
+def _assemble_disk(segments: list[HSDSegment], bbox=None) -> CalibratedDisk:
     """Stitch + calibrate downloaded HSD segments into a CalibratedDisk. Shared by
     the FLDK (load_band_sync) and Target (load_target_band_sync) loaders so both
-    produce byte-identical disks; only the segment LISTING differs between them."""
+    produce byte-identical disks; only the segment LISTING differs between them.
+
+    When ``bbox`` is given, the stitched COUNTS are column-cropped to the
+    bbox's window before calibration — calibrating full-disk-width rows for
+    a ~1/10-width bbox was most of a true-color frame's CPU."""
     counts_local, n_lines_local, n_columns, line_offset = _stitch(segments)
-    data, units = _calibrate(segments[0], counts_local)
     seg0 = segments[0]
+    col_offset = 0
+    if bbox is not None and n_columns > 64:
+        col_lo, col_hi = _bbox_col_range(seg0, bbox, n_columns)
+        if (col_lo, col_hi) != (0, n_columns):
+            counts_local = counts_local[:, col_lo:col_hi]
+            col_offset = col_lo
+            n_columns = counts_local.shape[1]
+    data, units = _calibrate(seg0, counts_local)
     return CalibratedDisk(
         sat_name=seg0.sat_name,
         band_number=seg0.band_number,
@@ -376,6 +432,7 @@ def _assemble_disk(segments: list[HSDSegment]) -> CalibratedDisk:
         n_columns=n_columns,
         n_lines=n_lines_local,
         line_offset=line_offset,
+        col_offset=col_offset,
         data=data,
         units=units,
         obs_start_mjd=seg0.obs_start_mjd,
@@ -426,8 +483,8 @@ def load_target_band_sync(fs, bucket, slot, band: int, sub: int,
             f"band {band} sub R30{sub}")
     if bbox is not None and len(paths) > 1:
         paths = _filter_segments_for_bbox(paths, bbox, band)
-    segments = [_download_and_parse(fs, p) for p in paths]
-    return _assemble_disk(segments)
+    segments = _download_all(fs, paths)
+    return _assemble_disk(segments, bbox=bbox)
 
 
 async def load_band(

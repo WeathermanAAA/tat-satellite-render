@@ -3,32 +3,37 @@
 POST /render -> image/png
 GET  /health -> {status, goes_bucket_reachable, cache_size}
 
-Rate limit: 10 req/min/IP on /render (cache hits exempt).
+Rate limit: RATE_LIMIT (default 10 req/min) per public client IP on /render.
+INTERNAL requests — direct connections from a private/loopback peer with no
+X-Forwarded-For header (the compose-network meso poller, Railway private
+networking) — are exempt: our own pollers must never be 429'd by our own
+render service. Every public request arrives through an edge proxy that
+appends X-Forwarded-For, so public traffic cannot claim the exemption.
 Concurrency: max 2 simultaneous renders via asyncio.Semaphore.
 CORS: origins from ALLOWED_ORIGINS env var.
 
-NOTE: do not enable `from __future__ import annotations` here — slowapi's
-decorator + FastAPI body-param inference + pydantic 2 forward-ref resolution
-will fail if RenderRequest is a stringified annotation.
+NOTE: do not enable `from __future__ import annotations` here — FastAPI
+body-param inference + pydantic 2 forward-ref resolution will fail if
+RenderRequest is a stringified annotation.
 """
 
 import asyncio
 import gc
 import hashlib
+import ipaddress
 import json
 import logging
 import math
 import os
+import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional, Union
 
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
@@ -85,6 +90,11 @@ ALLOWED_ORIGINS = [
 ]
 MAX_CONCURRENT_RENDERS = int(os.getenv("MAX_CONCURRENT_RENDERS", "2"))
 RATE_LIMIT = os.getenv("RATE_LIMIT", "10/minute")
+# Internal-poller exemption (see module docstring). "0" restores the old
+# behavior where even compose-internal requests count against RATE_LIMIT.
+RATE_LIMIT_EXEMPT_INTERNAL = os.getenv(
+    "RATE_LIMIT_EXEMPT_INTERNAL", "1"
+).strip().lower() not in ("0", "false", "no", "off")
 LATEST_CACHE_TTL = float(os.getenv("LATEST_CACHE_TTL", "300"))  # 5 min
 # format=webp loop frames: the 1320 px render Lanczos-downscaled to this width
 # (1056 = the 525 CSS px player box at 2x Retina, and exactly 0.8 x 1320) and
@@ -133,7 +143,9 @@ def compute_downsample_factor(bbox: list[float], channel) -> int:
     Returns 1 when the request already fits. Caller passes N to render_png
     which strides the cmi/lats/lons arrays by [::N, ::N] before pcolormesh.
     """
-    lon_w_deg = bbox[2] - bbox[0]
+    # Wrapped span: lon_max < lon_min is a valid antimeridian crossing
+    # (e.g. a GOES-18 meso sector steered over the Bering Sea).
+    lon_w_deg = (bbox[2] - bbox[0]) % 360.0
     lat_h_deg = bbox[3] - bbox[1]
     km_per_px = _native_km_per_pixel(channel)
     px_w = (lon_w_deg * DEG_TO_KM) / km_per_px
@@ -192,16 +204,83 @@ def normalize_channel(raw) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# slowapi keyed on real client IP (X-Forwarded-For first hop)
+# Rate limiting — explicit sliding window keyed on real client IP
+# (X-Forwarded-For first hop). Replaces slowapi: its per-limit exempt_when
+# hook is called with no arguments, so it cannot exempt by peer address —
+# and exempting the internal poller→render path is exactly what we need
+# (the meso poller was being 429'd by its OWN loopback render service,
+# which throttled every band to a crawl).
 # ---------------------------------------------------------------------------
 def real_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
     if xff:
         return xff.split(",")[0].strip()
-    return get_remote_address(request)
+    return request.client.host if request.client else "unknown"
 
 
-limiter = Limiter(key_func=real_ip)
+def _parse_rate(limit: str) -> tuple[int, float]:
+    """'10/minute' -> (10, 60.0). Supports second/minute/hour."""
+    count_s, _, period_s = limit.partition("/")
+    period = {"second": 1.0, "minute": 60.0, "hour": 3600.0}[
+        period_s.strip().lower()
+    ]
+    return int(count_s), period
+
+
+class SlidingWindowLimiter:
+    """Per-key sliding-window counter. check() records the hit and returns
+    None when allowed, or the seconds until a slot frees up when limited."""
+
+    def __init__(self, limit: str) -> None:
+        self.count, self.period = _parse_rate(limit)
+        self._hits: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def check(self, key: str) -> Optional[float]:
+        now = time.monotonic()
+        with self._lock:
+            q = self._hits.get(key)
+            if q is None:
+                q = self._hits[key] = deque()
+            cutoff = now - self.period
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if len(q) >= self.count:
+                return max(0.0, q[0] + self.period - now)
+            q.append(now)
+            # Opportunistic GC so one-off client IPs don't accumulate forever.
+            if len(self._hits) > 4096:
+                self._hits = {
+                    k: v for k, v in self._hits.items() if v and v[-1] > cutoff
+                }
+        return None
+
+
+def _is_private_peer(request: Request) -> bool:
+    host = request.client.host if request.client else None
+    if not host:
+        return False
+    try:
+        addr = ipaddress.ip_address(host.split("%")[0])  # strip IPv6 zone id
+    except ValueError:
+        return False
+    # is_private covers RFC1918, IPv6 ULA (fc00::/7), loopback, link-local.
+    return addr.is_private or addr.is_loopback
+
+
+def is_internal_request(request: Request) -> bool:
+    """True for our own pollers: a DIRECT connection from a private/loopback
+    peer that carries no X-Forwarded-For. Public traffic always traverses an
+    edge proxy that appends XFF, so it can never satisfy this — an attacker
+    can prepend forwarding entries but cannot remove the proxy's own."""
+    if not RATE_LIMIT_EXEMPT_INTERNAL:
+        return False
+    if request.headers.get("x-forwarded-for"):
+        return False
+    return _is_private_peer(request)
+
+
+render_limiter = SlidingWindowLimiter(RATE_LIMIT)
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +302,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="tat-satellite-render", version="0.2.0", lifespan=lifespan)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -278,6 +355,13 @@ class RenderRequest(BaseModel):
     # Optional product hint (e.g. "target" -> AHI mesoscale Target sector, ~2.5 min
     # vs the 10-min FLDK full disk). Satellites that don't recognise it ignore it.
     product: Optional[str] = None
+    # Optional satellite-family hint ("GOES-West" / "GOES-East" /
+    # "Himawari-Pacific"). The meso poller KNOWS which satellite a sector's
+    # bbox came from; without the hint the picker chooses by sub-point
+    # distance, which lands antimeridian sectors on the wrong satellite
+    # (Himawari "wins" the Bering Sea GOES-18 M2 box by 2.5°). Unknown
+    # values fall back to the normal picker.
+    satellite: Optional[str] = Field(default=None, max_length=24)
     # Optional storm context. When supplied, render.py draws a color-coded
     # intensity badge (name · category · wind · pressure) on the title strip.
     storm: Optional[StormInfo] = None
@@ -295,7 +379,12 @@ class RenderRequest(BaseModel):
         # Disk-overlap check moved to pick_satellite() — out-of-coverage bboxes
         # surface as a 422 CoverageError that names the missing region/satellite.
         lon_min, lat_min, lon_max, lat_max = v
-        if not (-180 <= lon_min < lon_max <= 180):
+        # lon_max < lon_min is a VALID antimeridian crossing (e < w
+        # convention — same one the meso poller, floater frontend, and the
+        # satellite picker already speak). Each edge must still be a real
+        # longitude, and a zero-width box is degenerate.
+        if not (-180 <= lon_min <= 180 and -180 <= lon_max <= 180
+                and lon_min != lon_max):
             raise ValueError("invalid longitude range")
         if not (-90 <= lat_min < lat_max <= 90):
             raise ValueError("invalid latitude range")
@@ -383,9 +472,16 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
 
 
 @app.post("/render")
-@limiter.limit(RATE_LIMIT)
 async def render(request: Request, body: RenderRequest = Body(...)):
     t0 = time.perf_counter()
+    if not is_internal_request(request):
+        retry_after = render_limiter.check(real_ip(request))
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"rate limit exceeded: {RATE_LIMIT}",
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
     is_latest = body.time == "latest"
 
     # Channel input may be a generic name (preferred) or numeric (back-compat).
@@ -408,7 +504,9 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # region (e.g. Himawari for Western Pacific).
     parsed_time, _ = parse_request_time(body.time)
     try:
-        satellite: Satellite = pick_satellite(body.bbox, parsed_time)
+        satellite: Satellite = pick_satellite(
+            body.bbox, parsed_time, family_hint=body.satellite
+        )
     except (CoverageError, UnsupportedTimeError) as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 

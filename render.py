@@ -36,6 +36,34 @@ ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
 
 
+def _fill_coord_nan(a: np.ndarray) -> np.ndarray:
+    """Nearest-finite fill for inverse-projection coordinate arrays.
+
+    A meso sector steered onto the disk limb (e.g. GOES-18 M2 over the
+    Bering Sea) has bbox corners past the geometric horizon — those pixels
+    have no lat/lon. pcolormesh requires finite coords everywhere, so fill
+    NaNs with the nearest finite value along each row (then column). The
+    affected cells are masked in the data, and repeating a coordinate makes
+    the phantom quads zero-area, so nothing fictional is drawn."""
+    out = a.astype(np.float64, copy=True)
+    for _ in range(2):          # pass 1: along rows; pass 2: along columns
+        cols = np.arange(out.shape[1])
+        rows = np.arange(out.shape[0])[:, None]
+        # Forward fill: index of the last finite column so far (a leading
+        # NaN run pulls col 0's value, which is NaN — the mirrored pass
+        # below catches it).
+        idx = np.where(np.isfinite(out), cols, 0)
+        np.maximum.accumulate(idx, axis=1, out=idx)
+        out = out[rows, idx]
+        # Backward fill = forward fill on the mirror.
+        rev = out[:, ::-1]
+        idx = np.where(np.isfinite(rev), cols, 0)
+        np.maximum.accumulate(idx, axis=1, out=idx)
+        out = rev[rows, idx][:, ::-1]
+        out = out.T
+    return out
+
+
 def _gridline_step(span: float) -> float:
     """Pick a sane gridline interval (degrees) for the given bbox span."""
     if span <= 2:
@@ -176,7 +204,17 @@ def render_png(
             # is ~0% NaN, a partial fetch is ~80%+, so this only trips on the
             # broken frames (off-disk on-demand boxes are already 422'd by the
             # satellite picker before reaching here).
-            nan_frac = float((~np.isfinite(bt_c)).mean())
+            # Counted over GEOMETRICALLY VALID pixels only: a disk-limb meso
+            # sector (e.g. GOES-18 M2 over the Bering) legitimately has a
+            # big off-disk corner whose coords are NaN — that's geometry,
+            # not a broken fetch, and must not permanently 500 the sector.
+            valid_geom = np.isfinite(lats) & np.isfinite(lons)
+            n_valid = float(valid_geom.sum())
+            if n_valid == 0:
+                raise RuntimeError("bbox has no on-disk pixels to render")
+            nan_frac = float(
+                (~np.isfinite(bt_c) & valid_geom).sum() / n_valid
+            )
             if nan_frac > 0.55:
                 log.warning(
                     "scalar IR/WV degenerate (nan=%.0f%%) -- bailing out so the "
@@ -199,7 +237,13 @@ def render_png(
             cbar_label = enh.get("cbar_label", "Brightness Temperature (°C)")
 
     lon_min, lat_min, lon_max, lat_max = bbox
-    lon_span = lon_max - lon_min
+    # Antimeridian crossing (lon_max < lon_min, e < w convention): draw in a
+    # PlateCarree frame re-centered on the bbox so the ±180 seam falls on the
+    # far side of the planet. Data keeps transform=PlateCarree(0) — cartopy
+    # wraps it into the shifted frame continuously, so a GOES-18 meso sector
+    # steered over the Bering Sea renders seamlessly.
+    crosses = lon_max < lon_min
+    lon_span = (lon_max - lon_min) % 360.0
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
@@ -218,11 +262,17 @@ def render_png(
     show_cbar = not is_rgb
     map_w = 0.84 if show_cbar else 0.92
 
-    ax = fig.add_axes(
-        [0.04, bottom_pad, map_w, map_h], projection=ccrs.PlateCarree()
-    )
+    if crosses:
+        center_lon = ((lon_min + lon_span / 2.0 + 180.0) % 360.0) - 180.0
+        map_crs = ccrs.PlateCarree(central_longitude=center_lon)
+        extent = [-lon_span / 2.0, lon_span / 2.0, lat_min, lat_max]
+    else:
+        map_crs = ccrs.PlateCarree()
+        extent = [lon_min, lon_max, lat_min, lat_max]
+
+    ax = fig.add_axes([0.04, bottom_pad, map_w, map_h], projection=map_crs)
     ax.set_facecolor(DARK_BG)
-    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=map_crs)
 
     mesh = None
     # Plot with the (lats, lons) arrays we computed via inverse projection.
@@ -244,7 +294,21 @@ def render_png(
         # mean-of-valid-channel-max <0.04 (~almost-pure-black even where
         # not NaN) counts as degenerate.
         finite_mask = np.isfinite(cmi).all(axis=-1)
-        nan_frac = float((~finite_mask).mean())
+        # NaN fraction counted over geometrically-valid (on-disk) pixels
+        # only, when the fetch supplied the mask: a disk-limb sector's big
+        # off-disk corner is geometry, not a broken fetch (mirrors the
+        # scalar guard). The mask strides with the data above.
+        geom = data.geom_valid
+        if geom is not None and downsample > 1:
+            geom = geom[::downsample, ::downsample]
+        if geom is not None:
+            n_geom = float(geom.sum())
+            if n_geom == 0:
+                plt.close(fig)
+                raise RuntimeError("bbox has no on-disk pixels to render")
+            nan_frac = float((~finite_mask & geom).sum() / n_geom)
+        else:
+            nan_frac = float((~finite_mask).mean())
         if finite_mask.any():
             valid_max = float(
                 np.clip(cmi[finite_mask], 0.0, 1.0).max(axis=-1).mean()
@@ -266,15 +330,28 @@ def render_png(
             )
         # ----------------------------------------------------------------
         rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
+        # ``extent`` in map_crs coords: the composite grid is regular over the
+        # UNWRAPPED lon range (see _compose_true_color_sync), which in the
+        # re-centered crossing frame is exactly [-span/2, +span/2] — identity
+        # transform either way, so imshow stays a fast non-warping draw.
         ax.imshow(
             rgb,
             origin="upper",
-            extent=[lon_min, lon_max, lat_min, lat_max],
-            transform=ccrs.PlateCarree(),
+            extent=extent,
+            transform=map_crs,
             interpolation="nearest",
             zorder=1,
         )
     else:
+        # Disk-limb sectors: off-disk pixels inverse-project to NaN lat/lon,
+        # which pcolormesh hard-rejects. Mask those cells in the field and
+        # nearest-fill the coords — the repeated coordinates collapse the
+        # phantom quads to zero area, so only real data draws.
+        coord_bad = ~(np.isfinite(lats) & np.isfinite(lons))
+        if coord_bad.any():
+            plot_field = np.ma.masked_where(coord_bad, plot_field)
+            lats = _fill_coord_nan(lats)
+            lons = _fill_coord_nan(lons)
         mesh = ax.pcolormesh(
             lons,
             lats,
@@ -299,8 +376,13 @@ def render_png(
         linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
     )
 
-    # Dashed gridlines auto-spaced
+    # Dashed gridlines auto-spaced. xlocs are laid out on the unwrapped lon
+    # range then wrapped to ±180 — true longitudes either way, so the
+    # gridliner labels them correctly in the re-centered crossing frame.
     step = _gridline_step(max(lon_span, lat_span))
+    xlocs_uw = np.arange(
+        np.floor(lon_min / step) * step, lon_min + lon_span + step, step
+    )
     gl = ax.gridlines(
         crs=ccrs.PlateCarree(),
         draw_labels=True,
@@ -308,7 +390,7 @@ def render_png(
         linestyle="--",
         color=GRID_COLOR,
         alpha=0.7,
-        xlocs=np.arange(np.floor(lon_min / step) * step, lon_max + step, step),
+        xlocs=((xlocs_uw + 180.0) % 360.0) - 180.0,
         ylocs=np.arange(np.floor(lat_min / step) * step, lat_max + step, step),
     )
     gl.top_labels = False

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import datetime as dt
+import threading
 from typing import Optional
 
 import numpy as np
@@ -67,26 +68,64 @@ WL_VEGGIE = 0.86
 # ---------------------------------------------------------------------------
 # Geometry (pyorbital)
 # ---------------------------------------------------------------------------
+# Stride for the angle-geometry fields (solar + satellite zenith/azimuth).
+# These vary over hundreds of km, so computing them on a coarse subgrid and
+# bilinear-upsampling is visually exact while cutting pyorbital's per-pixel
+# trig (~3 s/frame at full res) to noise. 1 disables the shortcut.
+GEOMETRY_STRIDE = 8
+
+
+def _upsample_to(field: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Bilinear-resize a 2D field to ``shape`` (smooth angle fields only)."""
+    from scipy.ndimage import zoom
+    if field.shape == shape:
+        return field
+    zy = shape[0] / field.shape[0]
+    zx = shape[1] / field.shape[1]
+    return zoom(field, (zy, zx), order=1, mode="nearest", grid_mode=True,
+                output=np.float64)[: shape[0], : shape[1]]
+
+
+def _upsample_azimuth(az_deg: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Upsample an azimuth field via its sin/cos components — bilinear on the
+    raw degrees would tear wherever the field crosses the 0/360 wrap (routine
+    for sun azimuth in the tropics near local noon)."""
+    rad = np.deg2rad(np.asarray(az_deg, dtype=np.float64))
+    s = _upsample_to(np.sin(rad), shape)
+    c = _upsample_to(np.cos(rad), shape)
+    return np.rad2deg(np.arctan2(s, c)) % 360.0
+
+
 def solar_geometry(lats: np.ndarray, lons: np.ndarray, when: dt.datetime):
-    """(cos_sza, sun_zenith_deg, sun_azimuth_deg) for each pixel."""
+    """(cos_sza, sun_zenith_deg, sun_azimuth_deg) for each pixel. Angles are
+    computed on a GEOMETRY_STRIDE subgrid and bilinear-upsampled — sun
+    geometry is smooth at the ~10 km scale of the stride."""
     from pyorbital.astronomy import sun_zenith_angle, get_alt_az
 
-    sza = sun_zenith_angle(when, lons, lats)          # degrees
-    alt, az = get_alt_az(when, lons, lats)            # radians
-    sun_az = np.rad2deg(az) % 360.0
+    s = GEOMETRY_STRIDE
+    cl_lats, cl_lons = lats[::s, ::s], lons[::s, ::s]
+    sza_c = sun_zenith_angle(when, cl_lons, cl_lats)  # degrees
+    alt, az = get_alt_az(when, cl_lons, cl_lats)      # radians
+    sza = _upsample_to(np.asarray(sza_c, dtype=np.float64), lats.shape)
+    sun_az = _upsample_azimuth(np.rad2deg(az), lats.shape)
     cos_sza = np.cos(np.deg2rad(sza))
     return cos_sza, sza, sun_az
 
 
 def satellite_geometry(lats: np.ndarray, lons: np.ndarray, sub_sat_lon: float, when: dt.datetime):
-    """(sat_zenith_deg, sat_azimuth_deg) for a geostationary bird at sub_sat_lon."""
+    """(sat_zenith_deg, sat_azimuth_deg) for a geostationary bird at
+    sub_sat_lon — same coarse-subgrid + upsample scheme as solar_geometry."""
     from pyorbital.orbital import get_observer_look
 
-    sat_az, sat_elev = get_observer_look(
-        sub_sat_lon, 0.0, GEO_SAT_ALT_KM, when, lons, lats, 0.0
+    s = GEOMETRY_STRIDE
+    cl_lats, cl_lons = lats[::s, ::s], lons[::s, ::s]
+    sat_az_c, sat_elev_c = get_observer_look(
+        sub_sat_lon, 0.0, GEO_SAT_ALT_KM, when, cl_lons, cl_lats, 0.0
     )
-    sat_zenith = 90.0 - sat_elev
-    return sat_zenith, sat_az % 360.0
+    sat_az = _upsample_azimuth(np.asarray(sat_az_c), lats.shape)
+    sat_elev = _upsample_to(np.asarray(sat_elev_c, dtype=np.float64),
+                            lats.shape)
+    return 90.0 - sat_elev, sat_az
 
 
 # ---------------------------------------------------------------------------
@@ -104,18 +143,33 @@ def synth_green(red: np.ndarray, veggie: np.ndarray, blue: np.ndarray) -> np.nda
     return fr * red + fv * veggie + fb * blue
 
 
+# Rayleigh correctors cached per (platform, sensor): construction re-reads the
+# pyspectral LUT HDF5 from disk, which is pure waste when every truecolor frame
+# rebuilds it. Only SUCCESSFUL constructions cache, so a transient init failure
+# (e.g. LUTs still downloading) retries on the next frame instead of pinning
+# the degraded no-Rayleigh path forever.
+_RAYLEIGH_CACHE: dict = {}
+_RAYLEIGH_LOCK = threading.Lock()
+
+
 def _make_rayleigh(platform_name: str, sensor: str):
-    """Build a pyspectral Rayleigh corrector, or None if unavailable."""
-    try:
-        from pyspectral.rayleigh import Rayleigh
-    except Exception as e:  # pragma: no cover - import guard
-        log.warning("pyspectral unavailable (%s); skipping Rayleigh correction", e)
-        return None
-    try:
-        return Rayleigh(platform_name, sensor)
-    except Exception as e:
-        log.warning("Rayleigh(%s,%s) init failed (%s); skipping", platform_name, sensor, e)
-        return None
+    """Build (or reuse) a pyspectral Rayleigh corrector, or None if unavailable."""
+    key = (platform_name, sensor)
+    with _RAYLEIGH_LOCK:
+        if key in _RAYLEIGH_CACHE:
+            return _RAYLEIGH_CACHE[key]
+        try:
+            from pyspectral.rayleigh import Rayleigh
+        except Exception as e:  # pragma: no cover - import guard
+            log.warning("pyspectral unavailable (%s); skipping Rayleigh correction", e)
+            return None
+        try:
+            corrector = Rayleigh(platform_name, sensor)
+        except Exception as e:
+            log.warning("Rayleigh(%s,%s) init failed (%s); skipping", platform_name, sensor, e)
+            return None
+        _RAYLEIGH_CACHE[key] = corrector
+        return corrector
 
 
 def rayleigh_band(
