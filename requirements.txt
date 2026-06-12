@@ -51,5 +51,5 @@ requests>=2.31
 # fetch_nhc_active_sids) + ACTIVE_WINDOW_HOURS 60 -> 24. STATUS ONLY: a
 # dissipated storm keeps its track + season ACE, it just stops being
 # "active" (counts, live markers). ACE math unchanged.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.7.0#subdirectory=ace_core
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.7.1#subdirectory=ace_core
 pandas>=2.0
