@@ -417,3 +417,24 @@ def render_png(
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
+
+def transcode_frame(png: bytes, width: int, quality: int) -> bytes:
+    """Downscale a rendered PNG and re-encode it as lossy WebP loop-frame bytes.
+
+    The figure is still rendered at the full 1320 px and downscaled here, NOT
+    rendered natively at the target width: Lanczos from the oversampled render
+    is exactly what browsers were already doing client-side (1320 -> 1050
+    device px inside the 525 CSS px frame box), so this path changes the codec
+    and the transfer weight, not the displayed look. Frames are opaque
+    (DARK_BG facecolor) -- encode RGB, no alpha.
+    """
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    if width < im.width:
+        height = max(1, round(im.height * width / im.width))
+        im = im.resize((width, height), Image.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, "WEBP", quality=quality, method=6)
+    return out.getvalue()

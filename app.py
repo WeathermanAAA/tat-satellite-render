@@ -32,7 +32,7 @@ from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from render import render_png
+from render import render_png, transcode_frame
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -86,6 +86,12 @@ ALLOWED_ORIGINS = [
 MAX_CONCURRENT_RENDERS = int(os.getenv("MAX_CONCURRENT_RENDERS", "2"))
 RATE_LIMIT = os.getenv("RATE_LIMIT", "10/minute")
 LATEST_CACHE_TTL = float(os.getenv("LATEST_CACHE_TTL", "300"))  # 5 min
+# format=webp loop frames: the 1320 px render Lanczos-downscaled to this width
+# (1056 = the 525 CSS px player box at 2x Retina, and exactly 0.8 x 1320) and
+# encoded lossy-WebP at this quality (q90 verified visually transparent on the
+# IR/IRBD enhancements -- the banding/chroma worst cases).
+WEBP_FRAME_WIDTH = int(os.getenv("WEBP_FRAME_WIDTH", "1056"))
+WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "90"))
 
 render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
 cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
@@ -272,6 +278,11 @@ class RenderRequest(BaseModel):
     # Optional storm context. When supplied, render.py draws a color-coded
     # intensity badge (name · category · wind · pressure) on the title strip.
     storm: Optional[StormInfo] = None
+    # Output codec. "png" (default) is the full-resolution lossless render --
+    # the draw-a-box panel and every legacy caller keep getting exactly what
+    # they got. "webp" is the loop-frame path used by the floater + meso
+    # pollers: WEBP_FRAME_WIDTH px, lossy WebP (see transcode_frame).
+    format: str = "png"
 
     @field_validator("bbox")
     @classmethod
@@ -303,6 +314,13 @@ class RenderRequest(BaseModel):
             raise ValueError(
                 "enhancement must be one of: " + " | ".join(_ENHANCEMENTS)
             )
+        return v
+
+    @field_validator("format")
+    @classmethod
+    def _v_format(cls, v):
+        if v not in ("png", "webp"):
+            raise ValueError("format must be png or webp")
         return v
 
 
@@ -353,7 +371,11 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
         )
     else:
         storm_part = ""
-    raw = f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}|{bucket}{storm_part}"
+    # Output format joins the key ONLY when non-default so every pre-existing
+    # png key stays byte-identical (cache continuity across the deploy); png
+    # and webp variants of the same scan cache as distinct entries.
+    fmt_part = "" if body.format == "png" else f"|fmt={body.format}"
+    raw = f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}|{bucket}{storm_part}{fmt_part}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -431,7 +453,8 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
-        return Response(content=content, media_type="image/png", headers=headers)
+        media_type = "image/webp" if body.format == "webp" else "image/png"
+        return Response(content=content, media_type=media_type, headers=headers)
 
     cached = cache.get(cache_key)
     if cached is not None:
@@ -451,9 +474,8 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 data = await satellite.fetch_true_color(body.bbox, resolved)
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
-            png_bytes = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: render_png(
+            def _render_job() -> bytes:
+                out = render_png(
                     data,
                     body.bbox,
                     native_band,
@@ -461,7 +483,16 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     body.enhancement,
                     downsample,
                     storm=body.storm.model_dump() if body.storm is not None else None,
-                ),
+                )
+                # webp loop frames transcode inside the same executor job so
+                # the render semaphore covers the whole CPU burst and the
+                # cache below stores the final (already-encoded) bytes.
+                if body.format == "webp":
+                    out = transcode_frame(out, WEBP_FRAME_WIDTH, WEBP_QUALITY)
+                return out
+
+            frame_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _render_job
             )
         except Exception as e:
             log.exception("render failed: %s", e)
@@ -470,10 +501,10 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             gc.collect()
 
     ttl: Optional[float] = LATEST_CACHE_TTL if is_latest else None
-    cache.put(cache_key, png_bytes, ttl_seconds=ttl)
+    cache.put(cache_key, frame_bytes, ttl_seconds=ttl)
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     log.info(
-        "render ok key=%s sat=%s bucket=%s product=%s gen=%s band=%d enh=%s downsample=%d ms=%d bytes=%d",
+        "render ok key=%s sat=%s bucket=%s product=%s gen=%s band=%d enh=%s downsample=%d fmt=%s ms=%d bytes=%d",
         cache_key[:10],
         resolved.sat_name,
         resolved.bucket,
@@ -482,7 +513,8 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         native_band,
         body.enhancement,
         downsample,
+        body.format,
         elapsed_ms,
-        len(png_bytes),
+        len(frame_bytes),
     )
-    return _response(png_bytes, "MISS", elapsed_ms)
+    return _response(frame_bytes, "MISS", elapsed_ms)

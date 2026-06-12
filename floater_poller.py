@@ -146,6 +146,14 @@ HISTORY_WINDOW_H = float(_env("HISTORY_WINDOW_H", "24"))   # thin to THIN_SPACIN
 THIN_SPACING_S = float(_env("THIN_SPACING_S", "300"))      # 5 min
 DEACTIVATE_GRACE_H = float(_env("DEACTIVATE_GRACE_H", "24"))  # keep frames after storm ends
 
+# Frame codec requested from /render. "webp" = 1056 px lossy-WebP loop frames
+# (~6x lighter than the 1320 px PNGs); "png" = the legacy full-res PNG and the
+# instant rollback knob. The poller derives the uploaded extension and
+# content-type from the RESPONSE (see frame_ext), so a render service that
+# predates the format param -- or a rollback flip -- stays self-consistent:
+# whatever /render actually sent is what gets keyed and served.
+FRAME_FORMAT = (_env("FRAME_FORMAT", "webp") or "webp").strip().lower()
+
 # HTTP timeouts / retries
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
 RENDER_MAX_RETRIES = int(_env("RENDER_MAX_RETRIES", "3"))
@@ -855,9 +863,10 @@ class RenderSkip(Exception):
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
                 enhancement: str, storm: Optional[dict] = None) -> tuple[bytes, dict]:
-    body: dict = {"bbox": bbox, "time": "latest", "channel": channel, "enhancement": enhancement}
+    body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
+                  "enhancement": enhancement, "format": FRAME_FORMAT}
     # When supplied, /render burns a color-coded intensity badge into the
-    # rendered PNG's title strip (left side). Only sent from the poller path;
+    # rendered frame's title strip (left side). Only sent from the poller path;
     # legacy draw-a-box /satellite/ UI omits it and gets the plain title.
     if storm is not None:
         body["storm"] = storm
@@ -887,8 +896,25 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
 # Manifest / frame state per (storm, band)
 # ---------------------------------------------------------------------------
 
-def frame_key(slug: str, band_key: str, ts: dt.datetime) -> str:
-    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%MZ')}.png"
+def frame_ext(headers: dict) -> tuple[str, str]:
+    """(key extension, content-type) for a /render response.
+
+    Derived from the response rather than FRAME_FORMAT so the poller can never
+    mislabel a frame across a mixed-version window: an old render service that
+    ignores the format param answers image/png and gets keyed .png; the new
+    service answers image/webp and gets keyed .webp. Header lookup is
+    case-insensitive (call_render hands back a plain dict)."""
+    ctype = next(
+        (v for k, v in headers.items() if k.lower() == "content-type"), ""
+    )
+    ctype = (ctype or "").split(";")[0].strip().lower()
+    if ctype == "image/webp":
+        return ".webp", "image/webp"
+    return ".png", "image/png"
+
+
+def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png") -> str:
+    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%MZ')}{ext}"
 
 
 def storm_manifest_key(slug: str) -> str:
@@ -1194,7 +1220,7 @@ class Poller:
         }
         self.limiter.acquire()
         try:
-            png, headers = call_render(
+            frame, headers = call_render(
                 self.session, bbox, band.channel, band.enhancement, storm=storm_ctx,
             )
         except RenderSkip as e:
@@ -1211,7 +1237,7 @@ class Poller:
             return
         self._consec_render_fail = 0
 
-        h = hashlib.sha256(png).hexdigest()
+        h = hashlib.sha256(frame).hexdigest()
         # X-Cache:HIT is a cheap hint that the source scan is unchanged, but
         # the content hash decides (handles HIT/MISS edge cases uniformly).
         if h == u.last_hash:
@@ -1221,12 +1247,13 @@ class Poller:
                     or headers.get("X-Timestamp"))
         ts = parse_iso(scan_hdr) if scan_hdr else None
         ts = ts or utcnow()
-        key = frame_key(storm.slug, band.key, ts)
-        if not self.r2.put_bytes(key, png, "image/png", CACHE_FRAME):
+        ext, ctype = frame_ext(headers)
+        key = frame_key(storm.slug, band.key, ts, ext)
+        if not self.r2.put_bytes(key, frame, ctype, CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(storm, band, key, ts, h)
         u.last_hash = h
-        log.info("uploaded %s (%d B, %s)", key, len(png),
+        log.info("uploaded %s (%d B, %s)", key, len(frame),
                  headers.get("X-Satellite", "?"))
 
     # ---- cadence --------------------------------------------------------
