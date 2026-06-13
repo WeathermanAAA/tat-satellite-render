@@ -151,6 +151,18 @@ POLL_INTERVAL_S = float(_env("POLL_INTERVAL_S", "120"))
 STALE_AFTER_S = float(_env("STALE_AFTER_S", str(RENDER_TIMEOUT_S + 30 * 60)))
 PROGRESS_HEARTBEAT_S = float(_env("PROGRESS_HEARTBEAT_S", "30"))
 
+# Upstream-quiescence gate: when the newest AVAILABLE upstream cycle (from a
+# CLEAN listing) is older than this, NOAA has stopped running HAFS for the
+# storm (dissipated) or the season — the manifest must EMPTY itself instead
+# of serving a dead storm's frozen last run as current (03E/Cristina sat on
+# /models/ for ~2 days after dissipation: quiet upstream meant change_key
+# never changed and nothing ever rewrote the manifest). HAFS publishes every
+# ~6 h while a storm is tasked, so 30 h = five missed cycles. A listing
+# FAILURE never reaches this path — resolve_active_cycle raises on a total
+# outage so the spine keeps the last-known-good manifest (never mass-hide
+# on an error).
+HAFS_QUIET_AFTER_H = float(_env("HAFS_QUIET_AFTER_H", "30"))
+
 # Memory-telemetry sample cadence: while a render subprocess runs, the parent
 # samples the whole render tree's RSS (every process in the child's process
 # group, via /proc) at this interval and records the peak. The Railway bill is
@@ -914,17 +926,25 @@ def resolve_active_cycle(models: str = HAFS_MODELS) -> Optional[str]:
     """The newest cycle id with ANY upstream presence across the configured
     models - a cycle dir exists as soon as its first artifact (storm_info,
     ~1.3 h before f000) posts, which is the pre-announce beacon. Progressive
-    mode switches to a new cycle here instead of waiting for completeness."""
+    mode switches to a new cycle here instead of waiting for completeness.
+
+    OUTAGE != QUIESCENCE: if EVERY model's listing fails, raise (the spine
+    treats it as a transient fetch failure and keeps last-known-good). A
+    silent ``None`` here would be indistinguishable from a genuinely empty
+    bucket and would let the quiescence gate blank the live manifest during
+    an NOAA/network blip."""
     from hafs_render.generate_hafs_plots import list_dates, list_hours  # lazy
     import requests
     sess = requests.Session()
     best: Optional[str] = None
+    listed_ok = 0
     for model in [m.strip() for m in models.split(",") if m.strip()]:
         try:
             dates = list_dates(model, session=sess)
         except Exception as e:  # noqa: BLE001 - one model's listing failing
             log.warning("resolve_active_cycle: %s listing failed: %s", model, e)
             continue
+        listed_ok += 1
         for date in reversed(dates[-4:]):
             hours = list_hours(model, date, session=sess)
             if hours:
@@ -932,7 +952,23 @@ def resolve_active_cycle(models: str = HAFS_MODELS) -> Optional[str]:
                 if best is None or cand > best:
                     best = cand
                 break
+    if listed_ok == 0:
+        raise pf.TransientFetchError(
+            "resolve_active_cycle: every model listing failed - treating as "
+            "an outage (last-known-good manifest kept)")
     return best
+
+
+def cycle_age_hours(cycle: str, now: dt.datetime) -> Optional[float]:
+    """Age of a ``YYYYMMDDHH`` cycle id at ``now`` (naive or aware), or None
+    when the id doesn't parse (never let a malformed dir trip the gate)."""
+    try:
+        t = dt.datetime.strptime(cycle, "%Y%m%d%H")
+    except (ValueError, TypeError):
+        return None
+    if now.tzinfo is not None:
+        now = now.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return (now - t).total_seconds() / 3600.0
 
 
 _FXX_GRB_RE = re.compile(r"\.f(\d{3})\.grb2$")
@@ -1480,13 +1516,28 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
                 state["bootstrapped"] = True
         cycle = resolve()
         if not cycle:
-            return {"cycle": None, "posted": ()}
+            # Clean listings with no cycle dirs in the lookback at all:
+            # deep off-season — same quiescence handling as a stale cycle.
+            return {"cycle": None, "posted": (), "quiet": True,
+                    "stale_cycle": None}
+        age_h = cycle_age_hours(cycle, clock())
+        if age_h is not None and age_h > HAFS_QUIET_AFTER_H:
+            # Genuine quiescence: the newest run NOAA ever published is old
+            # news (storm dissipated / season over). Signal publish-empty.
+            # Listing failures never get here — resolve() raises on outage.
+            return {"cycle": None, "posted": (), "quiet": True,
+                    "stale_cycle": cycle}
         return {"cycle": cycle, "posted": tuple(posted_fn(cycle))}
 
     def change_key(data):
         # Fires on a NEW cycle dir (pre-announce beacon) and on every newly
         # posted upstream frame - the progressive trigger. Quiet upstream =
         # the spine's cheap path.
+        if data.get("quiet"):
+            # Stable while quiet -> process() publishes the empty manifest
+            # ONCE per quiet episode; re-keys when upstream resumes (or a
+            # different stale cycle id appears).
+            return ("quiet", data.get("stale_cycle"))
         if not data["cycle"]:
             return None
         return (data["cycle"], data["posted"])
@@ -1501,6 +1552,9 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             return None
 
     def process(ctx: pf.ProcessContext):
+        if ctx.data.get("quiet"):
+            _go_quiet(ctx.data.get("stale_cycle"))
+            return
         cycle = ctx.data["cycle"]
         posted = set(ctx.data["posted"])
         if not cycle:
@@ -1510,6 +1564,26 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             _begin_cycle(cycle)
         _render_delta(cycle, posted)
         _update_completion(posted)
+
+    def _go_quiet(stale_cycle) -> None:
+        """Genuine upstream quiescence (clean listing; newest cycle older
+        than HAFS_QUIET_AFTER_H, or no cycles at all): the storm is over.
+        Publish the EMPTY manifest the frontend self-hides on — a dead
+        storm's frozen last run must never sit on /models/ looking current.
+        In-memory entries reset so a restart's bootstrap (which reads the
+        live manifest) agrees. Durable per-cycle render summaries are left
+        untouched. PNG frames are left in place (invisible once the
+        manifest is empty; the next active cycle's completion prune
+        retires them)."""
+        was_empty = state["entry"] is None and state["prev_entry"] is None
+        state.update(cycle=None, entry=None, prev_entry=None,
+                     complete=False, rendered=set(), attempts={},
+                     given_up=set())
+        _publish_manifest()
+        log.info("upstream quiet (newest cycle %s, older than %.0fh) - "
+                 "published EMPTY manifest%s", stale_cycle or "(none)",
+                 HAFS_QUIET_AFTER_H,
+                 " (was already empty)" if was_empty else "")
 
     def _begin_cycle(cycle):
         if state["entry"] is not None and state["complete"]:

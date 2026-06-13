@@ -1453,5 +1453,145 @@ class TestProgressive(unittest.TestCase):
         self.assertEqual(frames, (("hafsa", "01e", "storm.atm", 0),))
 
 
+
+class TestQuiescenceGate(unittest.TestCase):
+    """Upstream quiescence -> EMPTY manifest (the 03E/Cristina freeze fix).
+
+    A dead storm's last run sat on /models/ for days because a quiet bucket
+    never changed change_key and nothing rewrote the manifest. The gate:
+    newest upstream cycle older than HAFS_QUIET_AFTER_H (from a CLEAN
+    listing) -> publish the empty manifest the frontend self-hides on,
+    exactly once per quiet episode. An outage (listing failure) must NEVER
+    blank the manifest."""
+    PREFIX = "models/hafs"
+
+    def setUp(self):
+        self._saved = (hp.FXX_END, hp.FXX_STEP)
+        hp.FXX_END, hp.FXX_STEP = 6, 3
+
+    def tearDown(self):
+        hp.FXX_END, hp.FXX_STEP = self._saved
+
+    # The frozen-manifest shape the live bug exhibited: one dead complete
+    # cycle still advertised as current.
+    DEAD_MAN = {
+        "cycles": [{"cycle": "2026053100", "in_progress": False,
+                    "frames_done": 6, "frames_expected": 6,
+                    "storms": [{"id": "03e", "name": "03E", "frames":
+                                {"hafsa": {"storm": {"mslp_wind": [0, 3, 6]}}}}]}],
+    }
+
+    def _engine(self, r2, tmp, resolver, posted_fn=lambda c: (), renders=None):
+        return hp.build_engine(
+            r2, progressive=True, prefix=self.PREFIX, interval_s=1.0,
+            clock=FakeClock(), sleep=lambda s: None,
+            cycle_resolver=resolver, posted_frames_fn=posted_fn,
+            render_fn=renders or (lambda *a, **k: {}),
+            headers_fn=lambda: FAKE_HEADERS,
+            out_dir_factory=lambda c: str(Path(tmp) / c.replace("/", "_")))
+
+    def test_stale_cycle_publishes_empty_manifest_once(self):
+        # Clock starts 2026-06-02; newest upstream run is 2026-05-31 00z
+        # (~60 h old) -> quiet. The dead manifest must be replaced by the
+        # empty one, and ONLY once (change-gated) across repeated polls.
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(self.DEAD_MAN).encode()})
+            puts = []
+            orig_put = r2.put_json
+            def counting_put(key, obj, cache):
+                if key.endswith("manifest.json"):
+                    puts.append(json.loads(json.dumps(obj)))
+                return orig_put(key, obj, cache)
+            r2.put_json = counting_put
+
+            eng = self._engine(r2, tmp, lambda: "2026053100")
+            eng.poll_once()
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"], [])
+            self.assertIsNone(man.get("cycle"))
+            n_after_first = len(puts)
+            self.assertGreaterEqual(n_after_first, 1)
+
+            eng.poll_once()
+            eng.poll_once()
+            self.assertEqual(len(puts), n_after_first,
+                             "quiet polls must not re-publish every cycle")
+
+    def test_no_cycles_at_all_is_also_quiet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(self.DEAD_MAN).encode()})
+            eng = self._engine(r2, tmp, lambda: None)
+            eng.poll_once()
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"], [])
+
+    def test_outage_never_blanks_the_manifest(self):
+        def boom():
+            raise pf.TransientFetchError("listing outage")
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(self.DEAD_MAN).encode()})
+            eng = self._engine(r2, tmp, boom)
+            eng.poll_once()
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["cycle"], "2026053100",
+                             "an outage must keep last-known-good")
+
+    def test_fresh_cycle_recovers_from_quiet(self):
+        state = {"cycle": "2026053100"}
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2(preload={
+                f"{self.PREFIX}/manifest.json": json.dumps(self.DEAD_MAN).encode()})
+            eng = self._engine(r2, tmp, lambda: state["cycle"])
+            eng.poll_once()   # quiet -> empty
+            self.assertEqual(json.loads(
+                r2.store[f"{self.PREFIX}/manifest.json"])["cycles"], [])
+            state["cycle"] = "2026060212"   # NOAA resumes (fresh vs FakeClock)
+            eng.poll_once()   # pre-announce
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["cycle"], "2026060212")
+            self.assertTrue(man["cycles"][0]["in_progress"])
+
+    def test_fresh_cycle_within_window_not_quiet(self):
+        # ~0 h old vs the 2026-06-02 FakeClock: the gate must not trip.
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = FakeR2()
+            eng = self._engine(r2, tmp, lambda: "2026060212")
+            eng.poll_once()
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            self.assertEqual(man["cycles"][0]["cycle"], "2026060212")
+
+    def test_cycle_age_hours(self):
+        naive = dt.datetime(2026, 6, 2, 12, 0)
+        aware = naive.replace(tzinfo=dt.timezone.utc)
+        self.assertAlmostEqual(hp.cycle_age_hours("2026060100", naive), 36.0)
+        self.assertAlmostEqual(hp.cycle_age_hours("2026060100", aware), 36.0)
+        self.assertIsNone(hp.cycle_age_hours("garbage", naive))
+
+    def test_resolver_raises_when_every_listing_fails(self):
+        import sys, types
+        fake = types.SimpleNamespace(
+            list_dates=lambda model, session=None: (_ for _ in ()).throw(
+                RuntimeError("503")),
+            list_hours=lambda model, date, session=None: [])
+        saved = sys.modules.get("hafs_render.generate_hafs_plots")
+        saved_pkg = sys.modules.get("hafs_render")
+        sys.modules["hafs_render"] = types.SimpleNamespace(
+            generate_hafs_plots=fake)
+        sys.modules["hafs_render.generate_hafs_plots"] = fake
+        try:
+            with self.assertRaises(pf.TransientFetchError):
+                hp.resolve_active_cycle("hfsa,hfsb")
+        finally:
+            for name, mod in (("hafs_render", saved_pkg),
+                              ("hafs_render.generate_hafs_plots", saved)):
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
