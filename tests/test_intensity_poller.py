@@ -648,5 +648,60 @@ class TestMirrorFallthrough(unittest.TestCase):
         self.assertTrue(any("good.example" in u for u in calls))
 
 
+class TestInvestBasinDerivation(unittest.TestCase):
+    """knackwx invest discovery keys the basin off the atcf_id's trailing
+    letter, NOT the separate origin_basin field.
+
+    THE 2026-06-14 BUG: knackwx serves EP invest 93E with origin_basin=null,
+    so the old `(origin_basin or "").upper() != letter` filter dropped it from
+    the live tracks feed -> global_storms.geojson (the home map), even though
+    HAFS was already running it and the b-deck existed. WPAC 92W (origin_basin
+    "W") was unaffected, which masked the gap. Mirrors the main-repo
+    generate_tracks_plot.fetch_live_invests fix + its regression test.
+    """
+
+    # 93E: origin_basin=null (the bug trigger). 92W: "W". 96P: South Pacific.
+    SAMPLE = [
+        {"atcf_id": "93E", "origin_basin": None, "storm_name": "INVEST",
+         "cyclone_nature": "DB", "latitude": 8.1, "longitude": -132.0,
+         "winds": 25, "pressure": 1009, "analysis_time": "2026-06-14T18:00:00.000Z"},
+        {"atcf_id": "92W", "origin_basin": "W", "storm_name": "INVEST",
+         "cyclone_nature": "WV", "latitude": 9.1, "longitude": 164.2,
+         "winds": 20, "pressure": 1008, "analysis_time": "2026-06-14T12:00:00.000Z"},
+        {"atcf_id": "96P", "origin_basin": "P", "storm_name": "INVEST",
+         "cyclone_nature": "SD", "latitude": -15.0, "longitude": 169.3,
+         "winds": 25, "pressure": 1005, "analysis_time": "2026-06-14T12:00:00.000Z"},
+    ]
+
+    def setUp(self):
+        self._orig = ip._get_text
+        ip._get_text = lambda *a, **k: json.dumps(self.SAMPLE)
+
+    def tearDown(self):
+        ip._get_text = self._orig
+
+    @staticmethod
+    def _mkcfg(letter, short):
+        return {"invest_letter": letter, "agency_name": "NHC", "short": short,
+                "atcf_patterns": []}
+
+    def test_ep_keeps_93e_despite_null_origin_basin(self):
+        df = ip.fetch_live_invests(None, self._mkcfg("E", "ep"), 2026)
+        self.assertFalse(df.empty, "EP invest feed was empty - 93E dropped")
+        self.assertEqual(set(df["storm_num"]), {93})
+        self.assertEqual(df.iloc[0]["NAME"], "93E")
+        self.assertEqual(df.iloc[0]["SID"], "NHC_EP932026")
+
+    def test_wp_still_keeps_92w(self):
+        df = ip.fetch_live_invests(None, self._mkcfg("W", "wp"), 2026)
+        self.assertEqual(set(df["storm_num"]), {92})
+
+    def test_foreign_basin_invest_excluded(self):
+        for letter, short in (("E", "ep"), ("W", "wp"), ("L", "al")):
+            df = ip.fetch_live_invests(None, self._mkcfg(letter, short), 2026)
+            nums = set(df["storm_num"]) if not df.empty else set()
+            self.assertNotIn(96, nums, f"96P leaked into {short}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -211,9 +211,18 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
         return pd.DataFrame()
     rows = []
     for it in data:
-        if (it.get("origin_basin") or "").upper() != letter:
+        atcf_id = (it.get("atcf_id") or "").strip().upper()
+        # Basin match off the ATCF id's trailing letter (the authoritative ATCF
+        # basin designator: "93E" -> E.Pac, "92W" -> W.Pac, "96P" -> S.Pac).
+        # knackwx's separate origin_basin field is sometimes null (observed on
+        # EP invests like 93E, which dropped them off the live tracks map), so
+        # deriving the basin from the id itself keeps EP/AL invests from being
+        # silently dropped; origin_basin is only a fallback when the id has no
+        # usable trailing letter. Mirrors generate_tracks_plot.fetch_live_invests.
+        id_letter = atcf_id[-1] if atcf_id[-1:].isalpha() else ""
+        basin_letter = id_letter or (it.get("origin_basin") or "").strip().upper()
+        if basin_letter != letter:
             continue
-        atcf_id = (it.get("atcf_id") or "").strip()
         try:
             storm_num = int(atcf_id[:-1])
         except (ValueError, IndexError):
