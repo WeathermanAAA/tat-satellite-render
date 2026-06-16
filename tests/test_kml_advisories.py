@@ -309,10 +309,12 @@ class TestBuildAdvisoryJson(unittest.TestCase):
                                        text_urls=TEXT_URLS)
 
     def test_exact_contract_keys(self):
+        # "ww" (Phase 4) is part of the contract now — the coastal
+        # watches/warnings overlay array (empty when no WW KMZ was supplied).
         self.assertEqual(
             set(self.adv.keys()),
             {"sid", "advisory", "issued_utc", "source", "method",
-             "cone", "points", "text", "provenance"})
+             "cone", "points", "text", "ww", "provenance"})
 
     def test_scalar_fields(self):
         self.assertEqual(self.adv["sid"], SID)
