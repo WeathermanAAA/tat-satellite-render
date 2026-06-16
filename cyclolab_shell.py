@@ -2847,6 +2847,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     var shapesSeen = {};
     pts.forEach(function (p, i) {
       var isNow = (i === pts.length - 1);
+      // Stage C: an invest's CURRENT-position marker is a RED X (matching the
+      // banner identity), not the wind-coloured hurricane dot. Historical track
+      // dots are unchanged; named-storm now-markers are unchanged.
+      if (isNow && IS_INVEST) {
+        var nx = tp[i][0], ny = tp[i][1], s = 10;
+        parts.push('<path d="M' + (nx - s).toFixed(1) + ',' + (ny - s).toFixed(1) +
+          'L' + (nx + s).toFixed(1) + ',' + (ny + s).toFixed(1) + 'M' +
+          (nx + s).toFixed(1) + ',' + (ny - s).toFixed(1) + 'L' + (nx - s).toFixed(1) +
+          ',' + (ny + s).toFixed(1) + '" stroke="#ff3b3b" stroke-width="3.6" ' +
+          'stroke-linecap="round" fill="none" ' +
+          'style="filter:drop-shadow(0 0 5px rgba(255,59,59,0.7));"/>');
+        return;
+      }
       var col = sshsDotColor(p.wind_kt);
       var shape = natureShape(p.nature);
       shapesSeen[shape] = 1;
