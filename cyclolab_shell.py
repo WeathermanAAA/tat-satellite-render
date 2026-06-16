@@ -244,6 +244,32 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     border: 1px solid rgba(255,255,255,0.4);
     text-shadow: 0 1px 1px rgba(0,0,0,0.5); }
+  /* ---- Stage C: NHC formation-chance pill (invests) ----
+     The KEY invest metric: 48-hour + 7-day genesis odds, colour-coded by the
+     canonical NHC low/medium/high scheme (<=30 yellow, 40-60 orange, >=70 red)
+     - a pop of forecast colour on the otherwise-grey invest banner. */
+  .formation-pill { display: inline-flex; align-items: center; gap: 8px;
+    margin-top: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+    border: 1px solid currentColor; width: fit-content; }
+  /* "FORMATION" with "chance" stacked beneath it */
+  .formation-pill .fp-eyebrow { display: inline-flex; flex-direction: column;
+    line-height: 1.04; font-size: 9px; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase; opacity: 0.95; }
+  .formation-pill .fp-eyebrow .fp-e2 { font-size: 8px; font-weight: 700; opacity: 0.8; }
+  /* the two windows sit CLOSE together with a thin vertical divider between them */
+  .formation-pill .fp-wins { display: inline-flex; align-items: center; gap: 6px; }
+  .formation-pill .fp-div { flex: 0 0 auto; width: 1px; align-self: stretch;
+    background: currentColor; opacity: 0.5; }
+  /* both windows (48h left, 7-day right) styled IDENTICALLY */
+  .formation-pill .fp-win { color: #f3f7fc; font-weight: 700; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
+  .formation-pill .fp-win b { font-weight: 800; }
+  .formation-pill .fp-dot { flex: 0 0 auto; width: 6px; height: 6px;
+    border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }
+  .formation-pill[data-level="low"]    { color: #f5c842; background: rgba(245,200,66,0.14); }
+  .formation-pill[data-level="medium"] { color: #ff9a4d; background: rgba(255,140,61,0.16); }
+  .formation-pill[data-level="high"]   { color: #ff6b6b; background: rgba(255,77,77,0.18); }
   /* glyph box is OVERSIZED relative to the ink (viewBox ±44 vs path
      reach ~41.4 when rotated) so a full 360° spin never clips the
      swirl tails; position compensates to keep the ink center put. */
@@ -262,6 +288,26 @@ HTML_TEMPLATE = r"""<!doctype html>
     paint-order: stroke; }
   @keyframes lab-spin { from { transform: rotate(360deg); }
                         to { transform: rotate(0deg); } }
+  /* ---- Stage C: INVEST grey identity + giant red X ----
+     data-invest OVERRIDES the category vars to grey, so the banner ramp,
+     accent, sec-btn, vitals, chips - everything keyed on --cat-* - reads grey
+     with no per-element edits. The red X replaces the spinning cyclone glyph;
+     the cone + advisories + HAFS-models sections (no official invest products)
+     are hidden, along with their nav buttons. */
+  .banner .glyph .invest-x { display: none; }
+  html[data-invest] { --cat-ramp: linear-gradient(180deg,#2a2f3a,#8b95a5,#2a2f3a);
+    --cat-accent: #9aa6b6; --cat-ink: #ffffff; }
+  html[data-invest] .banner .glyph { filter: drop-shadow(0 0 7px rgba(255,59,59,0.55))
+    drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
+  html[data-invest] .banner .glyph .spin,
+  html[data-invest] .banner .glyph #glyph-cat { display: none; }
+  html[data-invest] .banner .glyph .invest-x { display: block; }
+  html[data-invest] [data-sec="models"],
+  html[data-invest] [data-sec="advisories"] { display: none; }
+  html[data-invest] #sec-models,
+  html[data-invest] #sec-advisories { display: none !important; }
+  html[data-invest] #vrow-ace,
+  html[data-invest] #vrow-next { display: none; }
   .banner::after { content: ""; position: absolute; top: 0; bottom: 0;
     width: 55%; left: -60%; transform: skewX(-18deg);
     background: linear-gradient(90deg, transparent,
@@ -957,6 +1003,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       <svg class="glyph" viewBox="-44 -44 88 88" aria-hidden="true">
         <g class="spin"><path d="__HPATH__" fill="#ffffff"
           stroke="rgba(0,0,0,0.30)" stroke-width="1"/></g>
+        <!-- Stage C: invests show a GIANT RED X here instead of the spinning
+             cyclone glyph + category label (CSS toggles on html[data-invest]). -->
+        <g class="invest-x"><path d="M -22,-22 L 22,22 M 22,-22 L -22,22"
+          fill="none" stroke="#ff3b3b" stroke-width="11"
+          stroke-linecap="round"/></g>
         <!-- canonical icon label (tracks-map / storm-card canon:
              generate_tracks_plot.py sshs_label + spinnerSvg) - D / S /
              1-5, stationary while only the path spins. Weight 800, not
@@ -973,6 +1024,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="storm-type" id="storm-type">__TYPE_WORD__</div>
         <div class="storm-name" id="storm-name">__NAME__</div>
         <span class="chip" id="chip"__CHIP_STYLE__>__CHIP__</span>
+        <!-- Stage C: NHC formation-chance pill (invests only; populated by
+             loadFormation() from cyclolab/{sid}/formation.json). -->
+        <div class="formation-pill" id="formation-pill" hidden></div>
       </div>
     </div>
     <div class="bug-body">
@@ -1298,6 +1352,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 (function () {
   "use strict";
   var SID = "__SID__";
+  var IS_INVEST = __IS_INVEST__;     // Stage C: grey/red-X subset page
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   // per-storm SST hero layer base (final-gate-2 #1): meta.json +
@@ -1672,6 +1727,32 @@ HTML_TEMPLATE = r"""<!doctype html>
   // expose for tests/manual re-render
   window.__gRenderAll = gRenderAll;
 
+  // NHC formation-chance pill (invests only) - eager (not lazy): the genesis
+  // odds belong in the banner, not behind a tab. Reads cyclolab/{SID}/
+  // formation.json (the poller's parse of the Tropical Weather Outlook).
+  function loadFormation() {
+    if (!IS_INVEST) return;
+    var pill = document.getElementById("formation-pill");
+    if (!pill) return;
+    fetchJson(CDN + "/cyclolab/" + encodeURIComponent(SID) + "/formation.json")
+      .then(function (f) {
+        if (!f || (f.p48 == null && f.p7 == null)) return;
+        var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
+        var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
+        pill.setAttribute("data-level", f.level || "low");
+        pill.innerHTML = '<span class="fp-dot"></span>' +
+          '<span class="fp-eyebrow"><span>Formation</span>' +
+            '<span class="fp-e2">chance</span></span>' +
+          '<span class="fp-wins">' +
+            '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
+            '<span class="fp-div"></span>' +
+            '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
+          '</span>';
+        pill.hidden = false;
+      });
+  }
+  window.__loadFormation = loadFormation;
+
   // ---- section nav (lazy init on first open) ------------------------------
   var inited = {};
   function openSec(name) {
@@ -1751,6 +1832,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     { id: "next", lbl: "Next advisory", unit: "" },
   ];
   function buildVitals() {
+    // Stage C: an invest has no advisory and no ACE; those rows are HIDDEN via
+    // CSS (html[data-invest] #vrow-ace/#vrow-next) rather than dropped, so
+    // apply()'s odometer writes still find every element.
     document.getElementById("vitals").innerHTML = VITALS.map(function (s) {
       return '<div class="vrow" id="vrow-' + s.id + '">' +
         '<span class="lbl">' + s.lbl + '</span>' +
@@ -2763,6 +2847,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     var shapesSeen = {};
     pts.forEach(function (p, i) {
       var isNow = (i === pts.length - 1);
+      // Stage C: an invest's CURRENT-position marker is a RED X (matching the
+      // banner identity), not the wind-coloured hurricane dot. Historical track
+      // dots are unchanged; named-storm now-markers are unchanged.
+      if (isNow && IS_INVEST) {
+        var nx = tp[i][0], ny = tp[i][1], s = 10;
+        parts.push('<path d="M' + (nx - s).toFixed(1) + ',' + (ny - s).toFixed(1) +
+          'L' + (nx + s).toFixed(1) + ',' + (ny + s).toFixed(1) + 'M' +
+          (nx + s).toFixed(1) + ',' + (ny - s).toFixed(1) + 'L' + (nx - s).toFixed(1) +
+          ',' + (ny + s).toFixed(1) + '" stroke="#ff3b3b" stroke-width="3.6" ' +
+          'stroke-linecap="round" fill="none" ' +
+          'style="filter:drop-shadow(0 0 5px rgba(255,59,59,0.7));"/>');
+        return;
+      }
       var col = sshsDotColor(p.wind_kt);
       var shape = natureShape(p.nature);
       shapesSeen[shape] = 1;
@@ -3102,6 +3199,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   buildVitals();
   buildSettingsUI();
+  loadFormation();          // Stage C: eager NHC formation pill (invests only)
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   // ENDED pages used to skip the fetch entirely, which left advFull
@@ -4927,6 +5025,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     base of the per-storm SST hero layers (final-gate-2 #1); default =
     the live Worker path."""
     ids = parse_sid(storm["sid"])
+    is_invest = ids.is_invest or bool(storm.get("is_invest"))
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
         cat = "TD"
@@ -4936,7 +5035,10 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     chip = {"TD": "Tropical Depression", "TS": "Tropical Storm",
             "C1": "Category 1", "C2": "Category 2", "C3": "Category 3",
             "C4": "Category 4", "C5": "Category 5"}.get(cat, cat)
-    type_word = _type_word(cat, ids.basin)
+    # Stage C - an invest gets a GREY identity (data-invest CSS overrides the
+    # category vars) + a red-X glyph; "INVEST AREA" not a category type word.
+    type_word = "INVEST AREA" if is_invest else _type_word(cat, ids.basin)
+    chip_hidden = is_invest or cat in ("TD", "TS")
     og_title = f"{name} · {chip} · CycloLab"
     bits = []
     if wind is not None:
@@ -4965,7 +5067,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__TYPE_WORD__", _esc(type_word.upper()))
             .replace("__CHIP__", _esc(chip))
             .replace("__CHIP_STYLE__",
-                     ' style="display:none"' if cat in ("TD", "TS") else "")
+                     ' style="display:none"' if chip_hidden else "")
+            .replace("__IS_INVEST__", "true" if is_invest else "false")
             .replace("__OG_TITLE__", _esc(og_title))
             .replace("__OG_DESC__", _esc(og_desc))
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
@@ -4999,7 +5102,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SSHS_JSON__", json.dumps(SSHS_COLORS))
             .replace("__ENDED__", "true" if ended else "false")
             .replace("__BAKED__", baked))
-    if ended:
+    attrs = ("data-invest " if is_invest else "") + ("data-ended " if ended else "")
+    if attrs:
         html = html.replace("<html lang=\"en\" data-cat=",
-                            "<html lang=\"en\" data-ended data-cat=")
+                            f"<html lang=\"en\" {attrs}data-cat=")
     return html

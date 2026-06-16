@@ -188,13 +188,27 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn('<html lang="en" data-cat="C4">', live)
         self.assertNotIn('<html lang="en" data-ended', live)
 
-    def test_invest_sid_raises(self):
-        # storm_ids contract: invests (90-99) get no page. render_page parses
-        # the sid up front, so the guard propagates.
+    def test_invest_gets_grey_redx_subset_page(self):
+        # Stage C: an invest renders a grey / red-X SUBSET page (no longer
+        # rejected). data-invest drives the grey override + red-X glyph; the
+        # cone/advisories/HAFS sections are CSS-hidden; IS_INVEST is baked true.
         s = copy.deepcopy(self.storm)
         s["sid"] = "NHC_EP902026"
-        with self.assertRaises(InvestSidError):
-            cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        s["is_invest"] = True
+        s["name"] = "90E"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('<html lang="en" data-invest data-cat=', html)
+        self.assertIn('class="invest-x"', html)
+        self.assertIn("var IS_INVEST = true", html)
+        self.assertIn("INVEST AREA", html)
+        # NHC formation-chance pill scaffold + eager loader
+        self.assertIn('id="formation-pill"', html)
+        self.assertIn("function loadFormation", html)
+        # named-storm pages must NOT carry the invest attribute on <html>
+        # (the data-invest CSS rules are baked into every page; assert the TAG).
+        named = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertNotIn('<html lang="en" data-invest', named)
+        self.assertIn("var IS_INVEST = false", named)
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")

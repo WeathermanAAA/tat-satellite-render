@@ -207,5 +207,79 @@ class TestPoller(unittest.TestCase):
         self.assertEqual(gp.run_once(Boom(), lambda k, o: True), [])   # heartbeat skip, no crash
 
 
+_TWO_EP = (
+    "<rss><channel><item><description><![CDATA[000<br />TWOEP<br /><br />"
+    "Tropical Weather Outlook<br /><br />"
+    "Well East-Southeast of the Hawaiian Islands (EP93):<br />"
+    "A broad area of low pressure...<br />"
+    "* Formation chance through 48 hours...low...20 percent.<br />"
+    "* Formation chance through 7 days...low...30 percent.<br /><br />$$<br />"
+    "]]></description></item></channel></rss>")
+
+# two numbered areas in one outlook (Atlantic), different levels.
+_TWO_AT = (
+    "Northwestern Gulf of America (AL90):\n"
+    "A trough... long flooding text spanning several lines that must not\n"
+    "break the block boundary before the chances.\n"
+    "* Formation chance through 48 hours...medium...60 percent.\n"
+    "* Formation chance through 7 days...medium...60 percent.\n\n"
+    "Far Eastern Atlantic (AL91):\n"
+    "A vigorous tropical wave...\n"
+    "* Formation chance through 48 hours...high...70 percent.\n"
+    "* Formation chance through 7 days...high...90 percent.\n$$")
+
+
+class TestTWO(unittest.TestCase):
+    def test_level_buckets_match_nhc(self):
+        # <=30 low (yellow), 40-60 medium (orange), >=70 high (red)
+        self.assertEqual([cg.formation_level(p) for p in (0, 30, 40, 60, 70, 100)],
+                         ["low", "low", "medium", "medium", "high", "high"])
+        self.assertIsNone(cg.formation_level(None))
+
+    def test_parse_single_invest_area_from_rss(self):
+        out = cg.parse_two(_TWO_EP, 2026)
+        self.assertIn("NHC_EP932026", out)
+        f = out["NHC_EP932026"]
+        self.assertEqual((f["p48"], f["p7"]), (20, 30))
+        self.assertEqual(f["level"], "low")                 # max(20,30)=30 -> low
+        self.assertEqual(f["area"], "Well East-Southeast of the Hawaiian Islands")
+
+    def test_parse_two_areas_distinct_levels(self):
+        out = cg.parse_two(_TWO_AT, 2026)
+        self.assertEqual(out["NHC_AL902026"]["p7"], 60)
+        self.assertEqual(out["NHC_AL902026"]["level"], "medium")
+        self.assertEqual(out["NHC_AL912026"]["p7"], 90)
+        self.assertEqual(out["NHC_AL912026"]["level"], "high")   # red
+
+    def test_no_numbered_area_is_empty(self):
+        self.assertEqual(cg.parse_two("an area of low pressure, no invest yet", 2026), {})
+
+
+class TestFormationWrite(unittest.TestCase):
+    def test_invest_gets_formation_json_named_does_not(self):
+        writes = {}
+        put = lambda k, o: writes.__setitem__(k, o) or True
+        fmap = {"NHC_EP932026": {"sid": "NHC_EP932026", "p48": 20, "p7": 30, "level": "low"}}
+        # invest -> formation.json written from the map
+        gp.process_entity("NHC_EP932026", _StubSession(), put, fmap)
+        self.assertIn("cyclolab/NHC_EP932026/formation.json", writes)
+        self.assertEqual(writes["cyclolab/NHC_EP932026/formation.json"]["p7"], 30)
+        # a designated storm gets NO formation.json
+        writes.clear()
+        gp.process_entity("NHC_EP012026", _StubSession(), put, fmap)
+        self.assertNotIn("cyclolab/NHC_EP012026/formation.json", writes)
+
+
+class _StubSession:
+    """Minimal requests.Session stand-in: a-deck/SHIPS fetches return empty so
+    process_entity reaches the formation branch without network."""
+    def get(self, url, **kw):
+        class _R:
+            status_code = 404
+            content = b""
+            text = ""
+        return _R()
+
+
 if __name__ == "__main__":
     unittest.main()

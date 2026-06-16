@@ -34,22 +34,28 @@ class StormIds:
     sid: str          # the tracks-feed sid, verbatim
     agency: str       # NHC / JTWC
     basin: str        # AL / EP / CP / WP
-    number: int       # 1-49 designated (invests 90-99 rejected for V1)
+    number: int       # 1-49 designated, 90-99 invest
     year: int
-    atcf_long: str    # ep012026
-    hafs_id: str      # 01e
-    nhc_id: str       # EP012026
+    atcf_long: str    # ep012026 / ep932026
+    hafs_id: str      # 01e  (EMPTY for invests - they never run the HAFS pipeline)
+    nhc_id: str       # EP012026 / EP932026
+    is_invest: bool = False   # 90-99: an invest AREA (grey / red-X subset page)
 
 
 class InvestSidError(ValueError):
-    """V1 scope: designated storms only - invests (90-99) get no page."""
+    """Retained for compatibility. Stage C made invests page-able (a grey /
+    red-X SUBSET page), so parse_sid NO LONGER raises this - the only hard
+    rejects are malformed sids, unmapped basins, and the 50-89 ATCF gap."""
 
 
 def parse_sid(sid: str) -> StormIds:
     """Parse a tracks-feed sid into every dialect. Raises ValueError on a
-    malformed sid, KeyError on an unmapped basin (fail LOUD - a wrong
-    suffix would silently 404 every model frame), InvestSidError on an
-    invest-range storm number (V1 designated-only guard)."""
+    malformed sid or out-of-range storm number, KeyError on an unmapped basin
+    (fail LOUD - a wrong suffix would silently 404 every model frame).
+
+    Numbers: 1-49 = designated (full page); 90-99 = INVEST (``is_invest`` True;
+    a SUBSET grey / red-X page - guidance + satellite + vitals, no cone /
+    advisories / HAFS, so ``hafs_id`` is empty). 50-89 stay rejected (ATCF gap)."""
     try:
         agency, rest = sid.split("_", 1)
         basin, num_s, year_s = rest[:2], rest[2:4], rest[4:]
@@ -59,13 +65,13 @@ def parse_sid(sid: str) -> StormIds:
     if basin not in BASIN_SUFFIX:
         raise KeyError(f"unmapped basin {basin!r} in sid {sid!r} "
                        f"(BASIN_SUFFIX has {sorted(BASIN_SUFFIX)})")
-    if number >= 90:
-        raise InvestSidError(f"invest sid {sid!r} - V1 is designated-only")
-    if not (1 <= number <= 49) or not (2000 <= year <= 2100):
+    is_invest = 90 <= number <= 99
+    if not (2000 <= year <= 2100) or not (is_invest or 1 <= number <= 49):
         raise ValueError(f"implausible storm number/year in sid {sid!r}")
     return StormIds(
         sid=sid, agency=agency, basin=basin, number=number, year=year,
         atcf_long=f"{basin.lower()}{number:02d}{year}",
-        hafs_id=f"{number:02d}{BASIN_SUFFIX[basin]}",
+        hafs_id="" if is_invest else f"{number:02d}{BASIN_SUFFIX[basin]}",
         nhc_id=f"{basin}{number:02d}{year}",
+        is_invest=is_invest,
     )
