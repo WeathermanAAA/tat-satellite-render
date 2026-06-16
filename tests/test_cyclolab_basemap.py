@@ -156,10 +156,10 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         self.assertIn(".ac-coast { fill: none; stroke: #ffffff;", self.html)
         self.assertIn(".ac-frame { fill: none; stroke: none; }", self.html)
 
-    def test_coast_is_drawn_in_both_furniture_sites(self):
-        # mapFurniture (track + swath) AND the cone inline both emit the
-        # white coast polylines (open - the builder string is present).
-        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 2)
+    def test_coast_is_drawn_in_all_furniture_sites(self):
+        # all THREE basemap sites (guidance gBasemap, mapFurniture track+swath,
+        # and the cone inline) emit the white coast polylines.
+        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 3)
 
     def test_cone_is_blue_glass_with_solid_white_centerline(self):
         self.assertIn('<linearGradient id="cone-glass"', self.html)
@@ -178,11 +178,21 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         # legibility: NOW dominates; R3 #1 bumped the forecast glyph to 0.98.
         self.assertIn("var scale = (i === 0 ? 1.9 : 0.98)", self.html)
 
-    def test_country_borders_drawn_in_both_furniture_sites(self):
-        # round-2 #3: thin white internal borders (ne_10m boundary_lines),
-        # drawn in BOTH mapFurniture (track+swath) and the cone inline.
-        self.assertEqual(self.html.count('<path class="ac-border" d="'), 2)
+    def test_country_borders_drawn_in_all_furniture_sites(self):
+        # thin white internal country borders (ne_10m boundary_lines), drawn in
+        # all THREE basemap sites: the guidance gBasemap, mapFurniture
+        # (track+swath), and the cone inline.
+        self.assertEqual(self.html.count('<path class="ac-border" d="'), 3)
         self.assertIn(".ac-border { fill: none; stroke: rgba(255,255,255,0.72)",
+                      self.html)
+
+    def test_state_borders_drawn_in_all_furniture_sites(self):
+        # ne_10m admin_1 state/province lines, dimmer than the country border,
+        # drawn UNDER it in all three basemap sites (guidance + track/swath +
+        # cone). A dim .ac-state stroke; the maps degrade gracefully if an old
+        # baked basemap lacks the 'states' key.
+        self.assertEqual(self.html.count('<path class="ac-state" d="'), 3)
+        self.assertIn(".ac-state { fill: none; stroke: rgba(255,255,255,0.40)",
                       self.html)
 
     def test_lockup_is_a_top_left_html_overlay(self):
