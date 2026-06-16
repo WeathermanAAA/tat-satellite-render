@@ -142,10 +142,15 @@ def _storm_entries(current_storms: dict) -> list[dict]:
             adv = int(str(cone.get("advNum")).lstrip("0") or "0")
         except ValueError:
             continue
+        # Coastal watch/warning layer (Phase 4): the WW KMZ from the SAME GIS
+        # package. Optional - absent before the first watch/warning is issued,
+        # and the renderer/poller degrade gracefully when it is.
+        ww = s.get("windWatchesWarnings") or {}
         out.append({
             "sid": sid, "ids": ids, "adv": adv,
             "name": str(s.get("name") or nhc_id),
             "cone_url": cone["kmzFile"], "track_url": track["kmzFile"],
+            "ww_url": ww.get("kmzFile"),
             "text": {
                 "tcp_url": (s.get("publicAdvisory") or {}).get("url"),
                 "tcd_url": (s.get("forecastDiscussion") or {}).get("url"),
@@ -302,8 +307,20 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                     raise AdvisoryParseError(
                         f"{sid} adv {adv}: KMZ missing "
                         f"(cone={bool(cone_b)}, track={bool(track_b)})")
+                # Watches/warnings (Phase 4): best-effort fetch of the WW KMZ.
+                # A missing URL or a fetch hiccup -> None -> build_advisory_json
+                # writes ww=[]; the cone is NEVER blocked by the WW layer.
+                ww_b = None
+                if e.get("ww_url"):
+                    try:
+                        ww_b = get_bytes(e["ww_url"])
+                    except Exception as wx:  # noqa: BLE001
+                        log.warning("%s adv %d: WW fetch failed: %s",
+                                    sid, adv, wx)
+                        ww_b = None
                 payload = build_advisory_json(sid, cone_b, track_b,
-                                              text_urls=e["text"])
+                                              text_urls=e["text"],
+                                              ww_kmz_bytes=ww_b)
                 text_done = _attach_text(e, adv, payload)
                 # ISSUANCE-REGRESSION GUARD: never replace cached state
                 # with an OLDER advisory (stale mirror / CDN echo).

@@ -375,21 +375,100 @@ def parse_track_kmz(kmz_bytes: bytes) -> dict:
 # ASSEMBLY
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WATCHES / WARNINGS (Phase 4) - the coastal tropical-cyclone watch/warning
+# line segments from the advisory GIS package's WW KMZ (CurrentStorms
+# windWatchesWarnings.kmzFile). NHC AL/EP/CP only; never JTWC/WP (we never
+# fabricate watches/warnings). Each Placemark/LineString connects the
+# breakpoints delimiting one watch/warning.
+# ---------------------------------------------------------------------------
+
+# NHC's watch/warning vocabulary -> our canonical type code. Keyed first by the
+# Placemark <name> (explicit, human-readable), then by the styleUrl id
+# (TWA/TWR/HWA/HWR observed in the wind WW KMZ; SSA/SSR for storm surge). An
+# unknown segment keeps its raw name so it is never silently dropped (the
+# renderer falls back to a neutral color).
+_WW_NAME_TO_TYPE = {
+    "TROPICAL STORM WATCH": "TS_WATCH",
+    "TROPICAL STORM WARNING": "TS_WARNING",
+    "HURRICANE WATCH": "HU_WATCH",
+    "HURRICANE WARNING": "HU_WARNING",
+    "STORM SURGE WATCH": "SS_WATCH",
+    "STORM SURGE WARNING": "SS_WARNING",
+}
+_WW_STYLE_TO_TYPE = {
+    "TWA": "TS_WATCH", "TWR": "TS_WARNING",
+    "HWA": "HU_WATCH", "HWR": "HU_WARNING",
+    "SSA": "SS_WATCH", "SSR": "SS_WARNING",
+}
+
+
+def _ww_type(name: str, style_id: str) -> str:
+    n = (name or "").strip().upper()
+    if n in _WW_NAME_TO_TYPE:
+        return _WW_NAME_TO_TYPE[n]
+    sid = (style_id or "").lstrip("#").strip().upper()
+    if sid in _WW_STYLE_TO_TYPE:
+        return _WW_STYLE_TO_TYPE[sid]
+    return n or sid or "UNKNOWN"
+
+
+def parse_ww_kmz(kmz_bytes: bytes) -> list[dict]:
+    """WW KMZ bytes -> coastal watch/warning segments::
+
+        [{"type": "TS_WATCH", "geometry": [[lon, lat], ...]}, ...]
+
+    Each segment is ONE Placemark/LineString (NHC connects the breakpoints
+    delimiting a watch/warning). ``type`` is the canonical code (see
+    ``_WW_NAME_TO_TYPE``). NO watches/warnings in effect -> ``[]``. Raises
+    :class:`AdvisoryParseError` on a malformed document so the caller degrades
+    gracefully (the cone is written WITHOUT a ``ww`` overlay rather than not at
+    all). Namespace-agnostic (localname matching) like the cone/track parsers.
+    """
+    root = _parse_xml(_read_kml(kmz_bytes))
+    out: list[dict] = []
+    for pm in _iter(root, "Placemark"):
+        ls = _first(pm, "LineString")
+        if ls is None:
+            continue                            # skip non-line placemarks
+        coords = _first(ls, "coordinates")
+        if coords is None or not (coords.text or "").strip():
+            continue
+        pts = _parse_coord_blob(coords.text)
+        if len(pts) < 2:                        # a segment needs >= 2 points
+            continue
+        _validate_lonlat(pts, "ww")
+        name_el = _first(pm, "name")
+        style_el = _first(pm, "styleUrl")
+        seg_type = _ww_type(
+            name_el.text if name_el is not None else "",
+            style_el.text if style_el is not None else "")
+        out.append({"type": seg_type, "geometry": pts})
+    return out
+
+
 def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
                         track_kmz_bytes: bytes,
-                        text_urls: dict | None = None) -> dict:
-    """Assemble the §8.3 cached-advisory contract from CONE + TRACK KMZs.
+                        text_urls: dict | None = None,
+                        ww_kmz_bytes: bytes | None = None) -> dict:
+    """Assemble the §8.3 cached-advisory contract from CONE + TRACK (+ WW) KMZs.
 
-    Returns a json-serializable dict with EXACTLY the contract keys::
+    Returns a json-serializable dict with the contract keys::
 
         {sid, advisory, issued_utc, source, method, cone, points, text,
-         provenance}
+         ww, provenance}
 
     source == "nhc", method == "official-cone". Validation (raises
     :class:`AdvisoryParseError`): the cone ring closes (>= 4 verts),
     points >= 2, taus strictly increasing, issued_utc parses. provenance
     carries the raw-bytes hashes/sizes; ``parsed_utc`` is left None for
     the caller to stamp (clock-free for testability).
+
+    ``ww`` (Phase 4) is the coastal watch/warning overlay from the optional
+    ``ww_kmz_bytes`` (CurrentStorms windWatchesWarnings.kmzFile): a list of
+    ``{type, geometry}`` segments, or ``[]`` when no WW KMZ is supplied OR it
+    fails to parse. ADDITIVE + GRACEFUL by construction: a missing/malformed
+    WW layer never raises here, so it can never break the cone the page needs.
     """
     cone = parse_cone_kmz(cone_kmz_bytes)
     track = parse_track_kmz(track_kmz_bytes)
@@ -426,6 +505,15 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
             "tcd_url": text_urls.get("tcd_url"),
         }
 
+    # Watches/warnings overlay - ADDITIVE + GRACEFUL. A malformed/absent WW
+    # layer degrades to [] and NEVER raises, so it can't break the cone.
+    ww: list[dict] = []
+    if ww_kmz_bytes:
+        try:
+            ww = parse_ww_kmz(ww_kmz_bytes)
+        except AdvisoryParseError:
+            ww = []
+
     provenance = {
         "cone_sha256": hashlib.sha256(cone_kmz_bytes).hexdigest(),
         "track_sha256": hashlib.sha256(track_kmz_bytes).hexdigest(),
@@ -433,6 +521,9 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
         "track_bytes": len(track_kmz_bytes),
         "parsed_utc": None,                     # caller stamps the clock
     }
+    if ww_kmz_bytes:
+        provenance["ww_sha256"] = hashlib.sha256(ww_kmz_bytes).hexdigest()
+        provenance["ww_bytes"] = len(ww_kmz_bytes)
 
     return {
         "sid": sid,
@@ -443,6 +534,7 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
         "cone": cone,
         "points": points,
         "text": text,
+        "ww": ww,
         "provenance": provenance,
     }
 
