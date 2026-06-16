@@ -41,6 +41,19 @@ Guidance tab for the only systems active right now (invests).
   `test_cyclolab_page_writer` (invest rebirth), `test_cyclolab_shell`
   (`test_invest_gets_grey_redx_subset_page`), `test_cyclolab_advisories` (skip).
 
+## NHC formation-chance pill (invest banner)
+The invest banner carries a colour-coded **formation-chance pill** - the genesis
+odds, the headline invest metric - eagerly (not behind a tab). Source = the NHC
+**Tropical Weather Outlook** (`https://www.nhc.noaa.gov/xml/TWO{AT|EP|CP}.xml`),
+parsed by `cyclolab_guidance.parse_two` (matches the invest ref `(EP93)`/`(AL90)`,
+pulls the 48-hour + 7-day chances). The guidance poller fetches the TWO once per
+basin per poll and writes `cyclolab/{sid}/formation.json` for each invest; the shell
+`loadFormation()` reads it. Colours are the canonical NHC low/medium/high buckets,
+which match the spec exactly: **<=30% yellow, 40-60% orange, >=70% red** (10%-step
+values never fall in the 31-39 / 61-69 gaps). Live: EP93 20% yellow, AL90 60% orange.
+The pill shows both windows (7-day headline + 48h), coloured by the higher level;
+hides cleanly when the TWO has no area for the invest.
+
 ## GO-LIVE companion (ship WITH the merge, after sign-off)
 The map's invest-X markers are still **non-launchable** by design: making them link
 to `/cyclolab/{sid}/` BEFORE the invest pages are live would create dead links. So

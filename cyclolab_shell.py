@@ -244,6 +244,25 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     border: 1px solid rgba(255,255,255,0.4);
     text-shadow: 0 1px 1px rgba(0,0,0,0.5); }
+  /* ---- Stage C: NHC formation-chance pill (invests) ----
+     The KEY invest metric: 48-hour + 7-day genesis odds, colour-coded by the
+     canonical NHC low/medium/high scheme (<=30 yellow, 40-60 orange, >=70 red)
+     - a pop of forecast colour on the otherwise-grey invest banner. */
+  .formation-pill { display: inline-flex; align-items: center; gap: 8px;
+    margin-top: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+    border: 1px solid currentColor; width: fit-content; }
+  .formation-pill .fp-eyebrow { font-size: 9px; font-weight: 800;
+    letter-spacing: 0.09em; text-transform: uppercase; opacity: 0.95; }
+  .formation-pill .fp-win { color: #f3f7fc; font-weight: 700;
+    font-variant-numeric: tabular-nums; }
+  .formation-pill .fp-win b { font-weight: 800; }
+  .formation-pill .fp-48 { opacity: 0.72; }
+  .formation-pill .fp-dot { width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor; box-shadow: 0 0 6px currentColor; }
+  .formation-pill[data-level="low"]    { color: #f5c842; background: rgba(245,200,66,0.14); }
+  .formation-pill[data-level="medium"] { color: #ff9a4d; background: rgba(255,140,61,0.16); }
+  .formation-pill[data-level="high"]   { color: #ff6b6b; background: rgba(255,77,77,0.18); }
   /* glyph box is OVERSIZED relative to the ink (viewBox ±44 vs path
      reach ~41.4 when rotated) so a full 360° spin never clips the
      swirl tails; position compensates to keep the ink center put. */
@@ -998,6 +1017,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="storm-type" id="storm-type">__TYPE_WORD__</div>
         <div class="storm-name" id="storm-name">__NAME__</div>
         <span class="chip" id="chip"__CHIP_STYLE__>__CHIP__</span>
+        <!-- Stage C: NHC formation-chance pill (invests only; populated by
+             loadFormation() from cyclolab/{sid}/formation.json). -->
+        <div class="formation-pill" id="formation-pill" hidden></div>
       </div>
     </div>
     <div class="bug-body">
@@ -1697,6 +1719,28 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   // expose for tests/manual re-render
   window.__gRenderAll = gRenderAll;
+
+  // NHC formation-chance pill (invests only) - eager (not lazy): the genesis
+  // odds belong in the banner, not behind a tab. Reads cyclolab/{SID}/
+  // formation.json (the poller's parse of the Tropical Weather Outlook).
+  function loadFormation() {
+    if (!IS_INVEST) return;
+    var pill = document.getElementById("formation-pill");
+    if (!pill) return;
+    fetchJson(CDN + "/cyclolab/" + encodeURIComponent(SID) + "/formation.json")
+      .then(function (f) {
+        if (!f || (f.p48 == null && f.p7 == null)) return;
+        var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
+        var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
+        pill.setAttribute("data-level", f.level || "low");
+        pill.innerHTML = '<span class="fp-dot"></span>' +
+          '<span class="fp-eyebrow">Formation</span>' +
+          '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
+          '<span class="fp-win fp-48">48h <b>' + p48 + '</b></span>';
+        pill.hidden = false;
+      });
+  }
+  window.__loadFormation = loadFormation;
 
   // ---- section nav (lazy init on first open) ------------------------------
   var inited = {};
@@ -3131,6 +3175,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   buildVitals();
   buildSettingsUI();
+  loadFormation();          // Stage C: eager NHC formation pill (invests only)
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   // ENDED pages used to skip the fetch entirely, which left advFull

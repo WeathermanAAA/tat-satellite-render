@@ -62,6 +62,75 @@ def init_to_iso(cycle: str) -> Optional[str]:
     return f"{cycle[:4]}-{cycle[4:6]}-{cycle[6:8]}T{cycle[8:10]}:00:00Z"
 
 
+# ===========================================================================
+# NHC Tropical Weather Outlook (TWO) - invest FORMATION chances
+# ===========================================================================
+_TWO_REF = re.compile(r"\(([A-Z]{2})(9\d)\)")          # invest ref e.g. (EP93)
+_TWO_FC = re.compile(
+    r"Formation chance through\s+(\d+)\s*(hour|day)s?\b[.\s]*([A-Za-z]+)[.\s]*?(\d+)\s*percent",
+    re.IGNORECASE)
+
+
+def _two_body(xml_text: str) -> str:
+    """The outlook text: the RSS CDATA with <br/> -> newlines (or the raw text
+    if already de-XML'd)."""
+    m = re.search(r"<!\[CDATA\[(.*?)\]\]>", xml_text, re.S)
+    body = m.group(1) if m else xml_text
+    return (body.replace("<br />", "\n").replace("<br/>", "\n")
+                .replace("<br>", "\n"))
+
+
+def formation_level(pct: Optional[int]) -> Optional[str]:
+    """NHC genesis category from a formation percent - the canonical low / medium
+    / high colour buckets: <= 30 'low' (yellow), 40-60 'medium' (orange), >= 70
+    'high' (red). None when there is no chance."""
+    if pct is None:
+        return None
+    if pct <= 30:
+        return "low"
+    if pct <= 60:
+        return "medium"
+    return "high"
+
+
+def parse_two(xml_text: str, year: int) -> Dict[str, dict]:
+    """Parse an NHC Tropical Weather Outlook (TWO{AT|EP|CP}) into per-INVEST
+    formation chances, keyed by tracks-feed sid (``NHC_{BASIN}{NN}{YYYY}``).
+
+    Each outlook 'area' that references an invest number - '(EP93)', '(AL90)' -
+    yields its 48-hour and 7-day formation percentages + NHC level. Areas with no
+    invest number (pre-genesis) are skipped (no sid to attach). Returns {} for an
+    outlook with no numbered areas (the common quiet case)."""
+    lines = _two_body(xml_text).splitlines()
+    refs = []
+    for li, ln in enumerate(lines):
+        m = _TWO_REF.search(ln)
+        if m:
+            refs.append((li, m.group(1).upper(), m.group(2)))
+    out: Dict[str, dict] = {}
+    for k, (li, basin, nn) in enumerate(refs):
+        end_li = refs[k + 1][0] if k + 1 < len(refs) else len(lines)
+        block = "\n".join(lines[li:end_li])
+        p48 = p7 = None
+        for fm in _TWO_FC.finditer(block):
+            unit, pct = fm.group(2).lower(), int(fm.group(4))
+            if unit.startswith("hour"):
+                p48 = pct
+            elif unit.startswith("day"):
+                p7 = pct
+        if p48 is None and p7 is None:
+            continue
+        area = re.sub(r"\s*\([A-Z]{2}9\d\):?.*$", "", lines[li]).strip()
+        sid = f"NHC_{basin}{nn}{year}"
+        out[sid] = {
+            "sid": sid, "p48": p48, "p7": p7,
+            "level48": formation_level(p48), "level7": formation_level(p7),
+            "level": formation_level(max(x for x in (p48, p7) if x is not None)),
+            "area": area or None,
+        }
+    return out
+
+
 def parse_adeck(text: str) -> dict:
     """Parse the public a-deck into model guidance for the CURRENT synoptic init.
 

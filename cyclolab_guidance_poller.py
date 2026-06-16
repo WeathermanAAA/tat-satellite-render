@@ -131,6 +131,29 @@ def fetch_ships(session: requests.Session, cycle: str, basin: str, nn: str, year
     return None
 
 
+# --- NHC Tropical Weather Outlook (TWO) -> invest formation chances ----------
+TWO_BASE = "https://www.nhc.noaa.gov/xml"
+# tracks-feed basin -> TWO product code (Atlantic's product is "AT", not "AL").
+_TWO_PRODUCT = {"AL": "AT", "EP": "EP", "CP": "CP"}
+
+
+def two_url(basin: str) -> str:
+    return f"{TWO_BASE}/TWO{_TWO_PRODUCT.get(basin.upper(), basin.upper())}.xml"
+
+
+def fetch_two(session: requests.Session, basin: str, year: int) -> Dict[str, dict]:
+    """Fetch + parse the NHC TWO for a basin -> {sid: formation}. {} on any
+    failure (best-effort - a missing TWO just hides the banner pill)."""
+    try:
+        r = session.get(two_url(basin), headers=UA, timeout=_TIMEOUT)
+        if r.status_code != 200 or not r.text:
+            return {}
+        return cg.parse_two(r.text, year)
+    except Exception as e:  # noqa: BLE001
+        log.warning("TWO fetch %s failed: %s", basin, e)
+        return {}
+
+
 # --------------------------------------------------------------------------
 # QC + per-entity processing
 # --------------------------------------------------------------------------
@@ -151,15 +174,28 @@ def _qc_guidance(g: dict) -> List[str]:
 
 
 def process_entity(sid: str, session: requests.Session,
-                   put_json: Callable[[str, dict], bool]) -> dict:
-    """Fetch + parse + write one entity's guidance.json + ships.json. Returns a
-    per-entity status dict (for the heartbeat). Raises nothing the caller must catch
-    beyond its own isolation guard."""
+                   put_json: Callable[[str, dict], bool],
+                   formation_map: Optional[Dict[str, dict]] = None) -> dict:
+    """Fetch + parse + write one entity's guidance.json + ships.json (+ for an
+    invest, formation.json from the pre-parsed TWO map). Returns a per-entity
+    status dict (for the heartbeat). Raises nothing the caller must catch beyond
+    its own isolation guard."""
     parts = sid_parts(sid)
     if not parts:
         return {"sid": sid, "ok": False, "reason": "bad sid"}
     basin, nn, year = parts
     status: dict = {"sid": sid, "ok": False, "guidance": False, "ships": False, "warns": []}
+
+    # NHC formation chance (INVESTS only) - the genesis odds for the banner pill.
+    # Written even when the TWO has no area for this invest (nulls -> pill hides),
+    # so the eager fetch is a clean 200 rather than a 404.
+    if int(nn) >= 90:
+        fc = (formation_map or {}).get(sid)
+        formation = dict(fc) if fc else {"sid": sid, "p48": None, "p7": None,
+                                         "level": None, "area": None}
+        formation.update({"generated_at": _iso_now(), "source": "nhc-two"})
+        status["formation"] = put_json(f"{R2_PREFIX}/{sid}/formation.json", formation)
+        status["formation_p7"] = formation.get("p7")
 
     raw = fetch_adeck(session, adeck_url(basin, nn, year))
     if raw is None:
@@ -200,10 +236,17 @@ def run_once(session: requests.Session, put_json: Callable[[str, dict], bool],
         log.warning("guidance heartbeat: active-feed fetch failed (%s); skipping tick", e)
         return []
     sids = discover_entities(feed)
+    # NHC formation chances (TWO) for the invest basins present, fetched ONCE per
+    # basin per poll then shared across that basin's invests.
+    year = dt.datetime.now(UTC).year
+    formation_map: Dict[str, dict] = {}
+    for b in {sid_parts(s)[0] for s in sids
+              if sid_parts(s) and int(sid_parts(s)[1]) >= 90}:
+        formation_map.update(fetch_two(session, b, year))
     statuses: List[dict] = []
     for sid in sids:
         try:
-            statuses.append(process_entity(sid, session, put_json))
+            statuses.append(process_entity(sid, session, put_json, formation_map))
         except Exception as e:  # noqa: BLE001 - PER-ENTITY isolation
             log.warning("guidance: entity %s FAILED (isolated): %s", sid, e)
             statuses.append({"sid": sid, "ok": False, "reason": f"exception: {e}"})

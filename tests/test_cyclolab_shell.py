@@ -201,6 +201,9 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn('class="invest-x"', html)
         self.assertIn("var IS_INVEST = true", html)
         self.assertIn("INVEST AREA", html)
+        # NHC formation-chance pill scaffold + eager loader
+        self.assertIn('id="formation-pill"', html)
+        self.assertIn("function loadFormation", html)
         # named-storm pages must NOT carry the invest attribute on <html>
         # (the data-invest CSS rules are baked into every page; assert the TAG).
         named = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
