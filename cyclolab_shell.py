@@ -1367,6 +1367,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   var IS_INVEST = __IS_INVEST__;     // Stage C: grey/red-X subset page
   var IS_PTC = __IS_PTC__;           // Potential Tropical Cyclone: grey/red-X
                                      // identity but KEEPS cone/advisories/Models
+  var SPAWN_SID = "__SPAWN_SID__";   // PTC: sid of the invest it spawned (the
+                                     // NHC TWO formation odds live there)
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   // per-storm SST hero layer base (final-gate-2 #1): meta.json +
@@ -1752,22 +1754,34 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!IS_INVEST && !IS_PTC) return;
     var pill = document.getElementById("formation-pill");
     if (!pill) return;
-    fetchJson(CDN + "/cyclolab/" + encodeURIComponent(SID) + "/formation.json")
-      .then(function (f) {
-        if (!f || (f.p48 == null && f.p7 == null)) return;
-        var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
-        var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
-        pill.setAttribute("data-level", f.level || "low");
-        pill.innerHTML = '<span class="fp-dot"></span>' +
-          '<span class="fp-eyebrow"><span>Formation</span>' +
-            '<span class="fp-e2">chance</span></span>' +
-          '<span class="fp-wins">' +
-            '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
-            '<span class="fp-div"></span>' +
-            '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
-          '</span>';
-        pill.hidden = false;
-      });
+    function render(f) {
+      if (!f || (f.p48 == null && f.p7 == null)) return false;
+      var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
+      var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
+      pill.setAttribute("data-level", f.level || "low");
+      pill.innerHTML = '<span class="fp-dot"></span>' +
+        '<span class="fp-eyebrow"><span>Formation</span>' +
+          '<span class="fp-e2">chance</span></span>' +
+        '<span class="fp-wins">' +
+          '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
+          '<span class="fp-div"></span>' +
+          '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
+        '</span>';
+      pill.hidden = false;
+      return true;
+    }
+    function tryUrl(sid) {
+      return fetchJson(CDN + "/cyclolab/" +
+                       encodeURIComponent(sid) + "/formation.json");
+    }
+    // A PTC's OWN formation.json usually 404s — once NHC designates the
+    // system the TWO odds stay under the INVEST it spawned (SPAWN_SID). Try
+    // own first, then fall back to the spawning invest. Invests read their
+    // own. Always graceful: no data anywhere -> the pill stays hidden.
+    tryUrl(SID).then(function (f) {
+      if (render(f)) return;
+      if (IS_PTC && SPAWN_SID) tryUrl(SPAWN_SID).then(render);
+    });
   }
   window.__loadFormation = loadFormation;
 
@@ -2048,16 +2062,20 @@ HTML_TEMPLATE = r"""<!doctype html>
       ((document.getElementById("storm-type") || {}).textContent || "")
         .toUpperCase() + " " + (storm.name || "").toUpperCase();
     // glyph: the cone-hero treatment - spinning path, stationary label;
-    // ALWAYS at the panel center (the render is storm-centered).
+    // ALWAYS at the panel center (the render is storm-centered). A PTC is NOT
+    // a depression: the glyph reads GREY with "PTC" (not a category color +
+    // "D"), matching the storm's grey invest identity.
     var cat = storm.current_category || "TD";
+    var gFill = IS_PTC ? "#9aa6b6" : (SSHS[cat] || SSHS.TD);
+    var gLabel = IS_PTC ? "PTC" : sshsLabel(cat);
+    var gSize = IS_PTC ? 25 : 34;   // "PTC" (3 glyphs) needs a smaller size
     document.getElementById("sst-hero-glyph").innerHTML =
       '<svg viewBox="-62 -62 124 124">' +
-      '<g class="ac-spin"><path d="__HPATH__" fill="' +
-      (SSHS[cat] || SSHS.TD) +
+      '<g class="ac-spin"><path d="__HPATH__" fill="' + gFill +
       '" stroke="rgba(0,0,0,0.35)" stroke-width="2"/></g>' +
-      '<text class="ac-cat" y="12" text-anchor="middle" font-size="34" ' +
-      'font-weight="800" fill="#ffffff" stroke="rgba(0,0,0,0.45)" ' +
-      'stroke-width="1">' + sshsLabel(cat) + "</text></svg>";
+      '<text class="ac-cat" y="11" text-anchor="middle" font-size="' + gSize +
+      '" font-weight="800" fill="#ffffff" stroke="rgba(0,0,0,0.45)" ' +
+      'stroke-width="1">' + gLabel + "</text></svg>";
     var fixKey = (last.t || "") + "|" + cat;
     if (heroMeta && heroFixKey === fixKey) { heroCaption(); return; }
     fetchJson(SST_BASE + "/meta.json").then(function (m) {
@@ -5091,8 +5109,10 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__CAT_CSS__", cat_css())
             .replace("__HPATH__", HURRICANE_PATH)
             .replace("__CAT__", cat)
-            .replace("__CAT_LABEL__", _esc(_sshs_label(cat)))
-            .replace("__CAT_ODO__", _odo_static(_sshs_label(cat)))
+            .replace("__CAT_LABEL__",
+                     _esc("PTC" if is_ptc else _sshs_label(cat)))
+            .replace("__CAT_ODO__",
+                     _odo_static("PTC" if is_ptc else _sshs_label(cat)))
             .replace("__VMAX_A11Y__", _esc(
                 round(float(wind)) if wind is not None else "—"))
             .replace("__VMAX_ODO__", _odo_static(
@@ -5108,6 +5128,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__OG_DESC__", _esc(og_desc))
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
             .replace("__SID__", _esc(storm["sid"]))
+            .replace("__SPAWN_SID__", _esc(storm.get("spawn_sid") or ""))
             .replace("__FEED_URL__", _esc(feed_url))
             .replace("__HAFS_ID__", _esc(ids.hafs_id))
             .replace("__OG_IMAGE__",
