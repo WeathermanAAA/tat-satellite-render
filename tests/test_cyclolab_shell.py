@@ -210,6 +210,34 @@ class TestRenderContract(unittest.TestCase):
         self.assertNotIn('<html lang="en" data-invest', named)
         self.assertIn("var IS_INVEST = false", named)
 
+    def test_ptc_gets_grey_redx_but_keeps_cone_and_models(self):
+        # A Potential Tropical Cyclone wears the invest grey/red-X identity under
+        # its REAL designation, but — unlike a 90-99 invest — KEEPS the cone +
+        # advisories + Models (NHC is actively advising). Banner reads the NHC
+        # classification "POTENTIAL TROPICAL CYCLONE", no category chip, no ACE.
+        s = copy.deepcopy(self.storm)
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["name"] = "ONE"
+        s["current_category"] = "TD"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('<html lang="en" data-ptc data-cat=', html)
+        self.assertNotIn('<html lang="en" data-invest', html)     # NOT an invest
+        self.assertIn('class="invest-x"', html)                   # shares the red X
+        self.assertIn("var IS_PTC = true", html)
+        self.assertIn("var IS_INVEST = false", html)
+        self.assertIn("POTENTIAL TROPICAL CYCLONE", html)         # NHC classification
+        self.assertIn('id="formation-pill"', html)                # keeps the pill
+        # grey identity + ACE-hide are SHARED with invests; cone/advisories
+        # hiding is INVEST-ONLY (a PTC keeps them).
+        self.assertIn("html[data-ptc] #vrow-ace", html)           # PTC hides ACE
+        self.assertNotIn("html[data-ptc] #sec-advisories", html)  # PTC keeps cone
+        self.assertNotIn('html[data-ptc] [data-sec="advisories"]', html)
+        # a named storm carries neither attribute
+        named = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertNotIn('<html lang="en" data-ptc', named)
+        self.assertIn("var IS_PTC = false", named)
+
 
 @unittest.skipIf(NODE is None, "node not on PATH")
 class TestIntegratedCard(unittest.TestCase):

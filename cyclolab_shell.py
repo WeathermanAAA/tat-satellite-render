@@ -288,26 +288,38 @@ HTML_TEMPLATE = r"""<!doctype html>
     paint-order: stroke; }
   @keyframes lab-spin { from { transform: rotate(360deg); }
                         to { transform: rotate(0deg); } }
-  /* ---- Stage C: INVEST grey identity + giant red X ----
-     data-invest OVERRIDES the category vars to grey, so the banner ramp,
-     accent, sec-btn, vitals, chips - everything keyed on --cat-* - reads grey
-     with no per-element edits. The red X replaces the spinning cyclone glyph;
-     the cone + advisories + HAFS-models sections (no official invest products)
-     are hidden, along with their nav buttons. */
+  /* ---- Stage C: INVEST + PTC grey identity + giant red X ----
+     data-invest (a 90-99 invest) AND data-ptc (a Potential Tropical Cyclone:
+     a DESIGNATED system NHC is advising on while still a DB/DS disturbance)
+     SHARE the grey identity: both OVERRIDE the category vars to grey, so the
+     banner ramp, accent, sec-btn, vitals, chips - everything keyed on --cat-* -
+     reads grey with no per-element edits, and both swap the spinning cyclone
+     glyph for the red X. They DIVERGE on official products: an invest has none,
+     so it hides the cone/advisories section + nav button and the next-advisory
+     vital; a PTC KEEPS them (NHC is actively advising). Both hide the ACE vital
+     (a PTC accrues no ACE; an invest none either). The Models tab is shown for
+     BOTH (guidance lives there now - Phase 3b); HAFS degrades gracefully when a
+     storm has no run. */
   .banner .glyph .invest-x { display: none; }
-  html[data-invest] { --cat-ramp: linear-gradient(180deg,#2a2f3a,#8b95a5,#2a2f3a);
+  html[data-invest], html[data-ptc] {
+    --cat-ramp: linear-gradient(180deg,#2a2f3a,#8b95a5,#2a2f3a);
     --cat-accent: #9aa6b6; --cat-ink: #ffffff; }
-  html[data-invest] .banner .glyph { filter: drop-shadow(0 0 7px rgba(255,59,59,0.55))
+  html[data-invest] .banner .glyph,
+  html[data-ptc] .banner .glyph { filter: drop-shadow(0 0 7px rgba(255,59,59,0.55))
     drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
   html[data-invest] .banner .glyph .spin,
-  html[data-invest] .banner .glyph #glyph-cat { display: none; }
-  html[data-invest] .banner .glyph .invest-x { display: block; }
-  html[data-invest] [data-sec="models"],
+  html[data-invest] .banner .glyph #glyph-cat,
+  html[data-ptc] .banner .glyph .spin,
+  html[data-ptc] .banner .glyph #glyph-cat { display: none; }
+  html[data-invest] .banner .glyph .invest-x,
+  html[data-ptc] .banner .glyph .invest-x { display: block; }
+  /* INVEST-ONLY: no official cone/advisories + no next-advisory countdown. */
   html[data-invest] [data-sec="advisories"] { display: none; }
-  html[data-invest] #sec-models,
   html[data-invest] #sec-advisories { display: none !important; }
-  html[data-invest] #vrow-ace,
   html[data-invest] #vrow-next { display: none; }
+  /* SHARED: neither an invest nor a PTC accrues ACE. */
+  html[data-invest] #vrow-ace,
+  html[data-ptc] #vrow-ace { display: none; }
   .banner::after { content: ""; position: absolute; top: 0; bottom: 0;
     width: 55%; left: -60%; transform: skewX(-18deg);
     background: linear-gradient(90deg, transparent,
@@ -597,8 +609,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-color: var(--cat-accent); font-weight: 700; }
   .hafs-caption { color: var(--muted); font-size: 12px; line-height: 1.5;
     margin: 8px 0 0; }
-  /* --- Model guidance (Stage B) --- */
-  #sec-guidance > .wipe > .card > svg { width: 100%; height: auto; display: block;
+  /* --- Model guidance (Stage B; merged into the Models tab in Phase 3b, so
+         the guidance SVGs are now scoped by id rather than by #sec-guidance) --- */
+  #gtracks, #gintensity { width: 100%; height: auto; display: block;
     background: #101a2c; border-radius: 10px; }
   .g-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 9px;
     font-size: 11.5px; color: var(--muted); font-weight: 600; align-items: center; }
@@ -1050,7 +1063,6 @@ HTML_TEMPLATE = r"""<!doctype html>
       <button class="sec-btn" data-sec="satellite">Satellite</button>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
-      <button class="sec-btn" data-sec="guidance">Guidance</button>
     </nav>
     <div class="side-foot">
       <button type="button" id="settings-btn" class="settings-btn"
@@ -1250,6 +1262,38 @@ HTML_TEMPLATE = r"""<!doctype html>
           <span id="cl-hafs-badge" class="hafs-badge" style="display:none"></span>
         </div>
       </div>
+      <!-- Model guidance (merged into Models - Phase 3b): named storms get
+           HAFS above + guidance here; invests + PTCs get guidance with HAFS
+           gracefully absent (cl-hafs-empty). -->
+      <div class="card">
+        <h3>Model forecast tracks</h3>
+        <svg id="gtracks" viewBox="0 0 1000 560"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Model forecast track guidance"></svg>
+        <div class="g-legend" id="gtracks-legend"></div>
+        <p class="hafs-caption">Operational track aids, NHC ATCF aid_public.
+          Colored by each model's peak forecast wind (SSHWS category).
+          Consensus aids (TVCN, HCCA) are drawn heavier.</p>
+        <div id="gtracks-empty" class="stub" style="display:none">No model
+          guidance for this storm yet.</div>
+      </div>
+      <div class="card">
+        <h3>Model forecast intensity</h3>
+        <svg id="gintensity" viewBox="0 0 1000 380"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Model forecast intensity guidance"></svg>
+        <div class="g-legend" id="gintensity-legend"></div>
+        <p class="hafs-caption">Intensity aids vs forecast hour over the SSHWS
+          category bands. Regional hurricane models are emphasized; the global
+          and statistical aids are drawn lighter.</p>
+        <div id="gintensity-empty" class="stub" style="display:none"></div>
+      </div>
+      <div class="card">
+        <h3>SHIPS output diagram</h3>
+        <div id="gships-root"></div>
+        <p class="hafs-caption">Statistical Hurricane Intensity Prediction
+          Scheme: environment, rapid-intensification probabilities, annularity.</p>
+      </div>
     </div></section>
     <section class="sec" id="sec-advisories"><div class="wipe">
       <h2 class="sec-title">Advisories</h2>
@@ -1297,38 +1341,6 @@ HTML_TEMPLATE = r"""<!doctype html>
         <pre id="advtext" class="advtext">(loading advisory data…)</pre>
       </div>
     </div></section>
-    <section class="sec" id="sec-guidance"><div class="wipe">
-      <h2 class="sec-title">Model guidance</h2>
-      <div class="card">
-        <h3>Model forecast tracks</h3>
-        <svg id="gtracks" viewBox="0 0 1000 560"
-             preserveAspectRatio="xMidYMid meet" role="img"
-             aria-label="Model forecast track guidance"></svg>
-        <div class="g-legend" id="gtracks-legend"></div>
-        <p class="hafs-caption">Operational track aids, NHC ATCF aid_public.
-          Colored by each model's peak forecast wind (SSHWS category).
-          Consensus aids (TVCN, HCCA) are drawn heavier.</p>
-        <div id="gtracks-empty" class="stub" style="display:none">No model
-          guidance for this storm yet.</div>
-      </div>
-      <div class="card">
-        <h3>Model forecast intensity</h3>
-        <svg id="gintensity" viewBox="0 0 1000 380"
-             preserveAspectRatio="xMidYMid meet" role="img"
-             aria-label="Model forecast intensity guidance"></svg>
-        <div class="g-legend" id="gintensity-legend"></div>
-        <p class="hafs-caption">Intensity aids vs forecast hour over the SSHWS
-          category bands. Regional hurricane models are emphasized; the global
-          and statistical aids are drawn lighter.</p>
-        <div id="gintensity-empty" class="stub" style="display:none"></div>
-      </div>
-      <div class="card">
-        <h3>SHIPS output diagram</h3>
-        <div id="gships-root"></div>
-        <p class="hafs-caption">Statistical Hurricane Intensity Prediction
-          Scheme: environment, rapid-intensification probabilities, annularity.</p>
-      </div>
-    </div></section>
   </main>
 </div>
 
@@ -1353,6 +1365,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   "use strict";
   var SID = "__SID__";
   var IS_INVEST = __IS_INVEST__;     // Stage C: grey/red-X subset page
+  var IS_PTC = __IS_PTC__;           // Potential Tropical Cyclone: grey/red-X
+                                     // identity but KEEPS cone/advisories/Models
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   // per-storm SST hero layer base (final-gate-2 #1): meta.json +
@@ -1731,7 +1745,11 @@ HTML_TEMPLATE = r"""<!doctype html>
   // odds belong in the banner, not behind a tab. Reads cyclolab/{SID}/
   // formation.json (the poller's parse of the Tropical Weather Outlook).
   function loadFormation() {
-    if (!IS_INVEST) return;
+    // Invests AND Potential Tropical Cyclones carry the NHC formation-chance
+    // pill (same TWO source). For a PTC the TWO may have transitioned it out
+    // once advisories began — fetchJson + the null-guard degrade gracefully
+    // (the pill simply stays hidden); we NEVER fabricate odds.
+    if (!IS_INVEST && !IS_PTC) return;
     var pill = document.getElementById("formation-pill");
     if (!pill) return;
     fetchJson(CDN + "/cyclolab/" + encodeURIComponent(SID) + "/formation.json")
@@ -1766,9 +1784,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!inited[name]) {
       inited[name] = true;
       // Stage 3: nothing is fetched until the tab opens (lazy mounts).
-      if (name === "models") initModels();
+      // Phase 3b: the Models tab now hosts BOTH HAFS and the model guidance
+      // (the standalone Guidance tab is gone), so opening Models hydrates both.
+      if (name === "models") { initModels(); initGuidance(); }
       else if (name === "satellite") initSatellite();
-      else if (name === "guidance") initGuidance();
     }
     // THE CONE reveal plays once per tab OPEN (not once per session):
     // rebuilding the SVG re-arms every CSS animation naturally.
@@ -5026,6 +5045,12 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     the live Worker path."""
     ids = parse_sid(storm["sid"])
     is_invest = ids.is_invest or bool(storm.get("is_invest"))
+    # A Potential Tropical Cyclone (ace_core is_ptc): a DESIGNATED system NHC is
+    # advising on while still a DB/DS disturbance. It wears the INVEST visual
+    # identity (grey + red X + formation pill) under its REAL designation, but —
+    # unlike a 90-99 invest — KEEPS its cone + advisories + Models tab, because
+    # NHC is actively advising on it. is_invest and is_ptc are mutually exclusive.
+    is_ptc = bool(storm.get("is_ptc")) and not is_invest
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
         cat = "TD"
@@ -5036,9 +5061,18 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             "C1": "Category 1", "C2": "Category 2", "C3": "Category 3",
             "C4": "Category 4", "C5": "Category 5"}.get(cat, cat)
     # Stage C - an invest gets a GREY identity (data-invest CSS overrides the
-    # category vars) + a red-X glyph; "INVEST AREA" not a category type word.
-    type_word = "INVEST AREA" if is_invest else _type_word(cat, ids.basin)
-    chip_hidden = is_invest or cat in ("TD", "TS")
+    # category vars) + a red-X glyph; "INVEST AREA" not a category type word. A
+    # PTC reuses that grey/X identity (data-ptc) but its banner reads the NHC
+    # classification "POTENTIAL TROPICAL CYCLONE", NOT a category-derived word.
+    if is_ptc:
+        type_word = "POTENTIAL TROPICAL CYCLONE"
+    elif is_invest:
+        type_word = "INVEST AREA"
+    else:
+        type_word = _type_word(cat, ids.basin)
+    # No category chip for an invest OR a PTC (a PTC accrues no category), nor
+    # for a plain TD/TS (chip is reserved for hurricanes C1-C5).
+    chip_hidden = is_invest or is_ptc or cat in ("TD", "TS")
     og_title = f"{name} · {chip} · CycloLab"
     bits = []
     if wind is not None:
@@ -5069,6 +5103,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__CHIP_STYLE__",
                      ' style="display:none"' if chip_hidden else "")
             .replace("__IS_INVEST__", "true" if is_invest else "false")
+            .replace("__IS_PTC__", "true" if is_ptc else "false")
             .replace("__OG_TITLE__", _esc(og_title))
             .replace("__OG_DESC__", _esc(og_desc))
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
@@ -5102,7 +5137,9 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SSHS_JSON__", json.dumps(SSHS_COLORS))
             .replace("__ENDED__", "true" if ended else "false")
             .replace("__BAKED__", baked))
-    attrs = ("data-invest " if is_invest else "") + ("data-ended " if ended else "")
+    attrs = (("data-invest " if is_invest else "")
+             + ("data-ptc " if is_ptc else "")
+             + ("data-ended " if ended else ""))
     if attrs:
         html = html.replace("<html lang=\"en\" data-cat=",
                             f"<html lang=\"en\" {attrs}data-cat=")
