@@ -254,12 +254,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     border: 1px solid currentColor; width: fit-content; }
   .formation-pill .fp-eyebrow { font-size: 9px; font-weight: 800;
     letter-spacing: 0.09em; text-transform: uppercase; opacity: 0.95; }
+  /* both windows (48h left, 7-day right) styled IDENTICALLY */
   .formation-pill .fp-win { color: #f3f7fc; font-weight: 700;
     font-variant-numeric: tabular-nums; }
   .formation-pill .fp-win b { font-weight: 800; }
-  .formation-pill .fp-48 { opacity: 0.72; }
-  .formation-pill .fp-dot { width: 6px; height: 6px; border-radius: 50%;
-    background: currentColor; box-shadow: 0 0 6px currentColor; }
+  .formation-pill .fp-dot { flex: 0 0 auto; width: 6px; height: 6px;
+    border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }
   .formation-pill[data-level="low"]    { color: #f5c842; background: rgba(245,200,66,0.14); }
   .formation-pill[data-level="medium"] { color: #ff9a4d; background: rgba(255,140,61,0.16); }
   .formation-pill[data-level="high"]   { color: #ff6b6b; background: rgba(255,77,77,0.18); }
@@ -1735,8 +1735,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         pill.setAttribute("data-level", f.level || "low");
         pill.innerHTML = '<span class="fp-dot"></span>' +
           '<span class="fp-eyebrow">Formation</span>' +
-          '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
-          '<span class="fp-win fp-48">48h <b>' + p48 + '</b></span>';
+          '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
+          '<span class="fp-win">7-day <b>' + p7 + '</b></span>';
         pill.hidden = false;
       });
   }
