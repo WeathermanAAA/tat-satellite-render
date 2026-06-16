@@ -829,6 +829,24 @@ HTML_TEMPLATE = r"""<!doctype html>
                       to { transform: scale(1); opacity: 1; } }
   .ac-spin { transform-box: fill-box; transform-origin: center;
     animation: lab-spin 3.2s linear infinite; }
+  /* ---- Phase 4: coastal watches/warnings overlay control + legend ----
+     Official NHC data (windWatchesWarnings KMZ); no derived disclosure.
+     ART-GATED palette - canonical NHC TCWW colors, awaiting sign-off. */
+  .ac-ww-bar { display: flex; flex-wrap: wrap; align-items: center;
+    gap: 6px 16px; margin: 9px 0 0; }
+  .ac-ww-toggle { display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; font-size: 12px; font-weight: 700; color: #cfe0f2;
+    letter-spacing: 0.3px; user-select: none; }
+  .ac-ww-toggle input { accent-color: #9fc6f5; cursor: pointer; }
+  .ac-ww-legend { display: flex; flex-wrap: wrap; gap: 5px 14px;
+    align-items: center; font-size: 11.5px; color: var(--muted);
+    font-weight: 600; }
+  .ac-ww-legend .ww-lg { display: inline-flex; align-items: center; gap: 5px; }
+  .ac-ww-legend .ww-sw { width: 16px; height: 4px; border-radius: 2px;
+    display: inline-block; box-shadow: 0 0 0 1px rgba(6,12,22,0.7); }
+  .ac-ww .ww-cas { fill: none; stroke: rgba(6,12,22,0.72);
+    stroke-linecap: round; stroke-linejoin: round; }
+  .ac-ww .ww-lin { fill: none; stroke-linecap: round; stroke-linejoin: round; }
   .adv-method { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
   .adv-method summary { cursor: pointer; color: #9fc6f5;
     font-weight: 600; font-size: 12px; letter-spacing: 0.4px; }
@@ -1307,6 +1325,11 @@ HTML_TEMPLATE = r"""<!doctype html>
           <svg id="advcone" viewBox="0 0 1000 620"
                preserveAspectRatio="xMidYMid meet" role="img"
                aria-label="Forecast track and uncertainty cone"></svg>
+        </div>
+        <div class="ac-ww-bar" id="advcone-ww" hidden>
+          <label class="ac-ww-toggle"><input type="checkbox" id="advcone-ww-chk" checked>
+            <span>Watches &amp; warnings</span></label>
+          <div class="ac-ww-legend" id="advcone-ww-legend"></div>
         </div>
         <p class="hafs-caption" id="advcone-note"></p>
         <details class="adv-method" id="advcone-method">
@@ -3287,6 +3310,21 @@ HTML_TEMPLATE = r"""<!doctype html>
   // else (EX/PT/LO/DB/remnants) is the user-ordered WHITE emphasis -
   // "white = forecast non-tropical" (S4-AD1 #4).
   var TROPICAL_DEV = { TD: 1, TS: 1, HU: 1, TY: 1, ST: 1, SD: 1, SS: 1 };
+
+  // ---- Phase 4: coastal watches/warnings overlay (NHC AL/EP/CP only) ------
+  // adv.ww = [{type, geometry:[[lon,lat],...]}], parsed from the official NHC
+  // windWatchesWarnings KMZ (kml_advisories.parse_ww_kmz). Canonical NHC TCWW
+  // colors keyed by type. ART-GATED: exact hues await sign-off. Storm-surge
+  // types ride the same overlay if/when their geometry is present.
+  var WW_STYLE = {
+    TS_WATCH:   { color: "#ffe14d", label: "TS Watch" },             // yellow
+    TS_WARNING: { color: "#3a8bff", label: "TS Warning" },           // blue
+    HU_WATCH:   { color: "#ff8cf0", label: "Hurricane Watch" },      // pink
+    HU_WARNING: { color: "#ff3b3b", label: "Hurricane Warning" },    // red
+    SS_WATCH:   { color: "#c89bff", label: "Storm Surge Watch" },    // lt purple
+    SS_WARNING: { color: "#ff3bd4", label: "Storm Surge Warning" }   // magenta
+  };
+  var wwShown = true;   // overlay visibility (toggle); default ON.
   function pointCat(p) {
     if (p.dev_label && SSHS[p.dev_label]) return p.dev_label;
     return catForKt(p.intensity_kt);
@@ -3691,6 +3729,33 @@ HTML_TEMPLATE = r"""<!doctype html>
                            lonAt: lonAt, latAt: latAt,
                            x0: fe.x0, y0: fe.y0, x1: fe.x1, y1: fe.y1 }));
 
+    // ---- Phase 4: coastal watches/warnings (official NHC TCWW segments) ----
+    // Drawn ABOVE the cone + graticule (so the colored coastline reads) but
+    // BELOW the forecast icons (added after). Each segment is a dark casing +
+    // a canonical-color line. Outside the cone reveal clip, so it is never
+    // hidden by the reveal. A separate, toggleable group. NHC basins only;
+    // never JTWC/WP (the WW KMZ is absent there -> ww is []).
+    var wwSegs = (advFull && advFull.ww) || [];
+    var wwTypes = {};
+    if (wwSegs.length) {
+      var wwParts = [];
+      wwSegs.forEach(function (seg) {
+        var st = WW_STYLE[seg.type] ||
+                 { color: "#cfd8e6", label: (seg.type || "Advisory area") };
+        wwTypes[seg.type] = st;
+        var d = (seg.geometry || []).map(function (c, i) {
+          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
+        }).join(" ");
+        if (!d) return;
+        wwParts.push('<path class="ww-cas" d="' + d + '" stroke-width="7"/>');
+        wwParts.push('<path class="ww-lin" d="' + d + '" stroke="' +
+                     st.color + '" stroke-width="4"/>');
+      });
+      parts.push('<g class="ac-ww" id="ac-ww-group"' +
+                 (wwShown ? '' : ' style="display:none"') + '>' +
+                 wwParts.join("") + '</g>');
+    }
+
     // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
     // collision-aware placard layout: alternate sides of the track,
     // push outward on overlap, leader line when pushed far.
@@ -3905,6 +3970,36 @@ HTML_TEMPLATE = r"""<!doctype html>
       " " + fe.vw.toFixed(1) + " " + fe.vh.toFixed(1));
     svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
+
+    // Phase 4: WW legend + toggle - shown only when segments are present.
+    // onchange (not addEventListener) so re-rendering the tab never stacks
+    // duplicate handlers.
+    (function () {
+      var bar = document.getElementById("advcone-ww");
+      var leg = document.getElementById("advcone-ww-legend");
+      var chk = document.getElementById("advcone-ww-chk");
+      if (!bar || !leg || !chk) return;
+      var types = Object.keys(wwTypes);
+      if (!types.length) { bar.hidden = true; leg.innerHTML = ""; return; }
+      var ORDER = ["TS_WATCH", "TS_WARNING", "HU_WATCH", "HU_WARNING",
+                   "SS_WATCH", "SS_WARNING"];
+      types.sort(function (a, b) {
+        var ia = ORDER.indexOf(a), ib = ORDER.indexOf(b);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      leg.innerHTML = types.map(function (t) {
+        var st = wwTypes[t];
+        return '<span class="ww-lg"><span class="ww-sw" style="background:' +
+          st.color + '"></span>' + st.label + '</span>';
+      }).join("");
+      bar.hidden = false;
+      chk.checked = wwShown;
+      chk.onchange = function () {
+        wwShown = chk.checked;
+        var g = document.getElementById("ac-ww-group");
+        if (g) g.style.display = wwShown ? "" : "none";
+      };
+    })();
 
     // re-fit on resize / orientation change (the shared resize handler calls
     // svg._refit): recompute the fill extent + restyle the viewBox, ocean,
