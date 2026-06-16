@@ -42,10 +42,22 @@ class TestStructure(unittest.TestCase):
     def setUp(self):
         self.html = S.render_page(STORM, feed_url=FEED)
 
-    def test_guidance_section_and_nav(self):
-        for m in ('data-sec="guidance"', 'id="sec-guidance"', 'id="gtracks"',
-                  'id="gintensity"', 'id="gships-root"', "function initGuidance"):
+    def test_guidance_merged_into_models_tab(self):
+        # Phase 3b: model guidance lives INSIDE the Models tab now; the
+        # standalone Guidance tab + section are gone.
+        for m in ('id="gtracks"', 'id="gintensity"', 'id="gships-root"',
+                  "function initGuidance"):
             self.assertIn(m, self.html, m)
+        self.assertNotIn('data-sec="guidance"', self.html)
+        self.assertNotIn('id="sec-guidance"', self.html)
+        # the guidance cards are physically inside the Models section
+        i_models = self.html.index('id="sec-models"')
+        i_adv = self.html.index('id="sec-advisories"')
+        i_gtracks = self.html.index('id="gtracks"')
+        self.assertTrue(i_models < i_gtracks < i_adv,
+                        "guidance cards must live inside the Models section")
+        # opening the Models tab hydrates BOTH HAFS and guidance
+        self.assertIn("initModels(); initGuidance();", self.html)
 
     def test_palette_b_locked_no_options_board(self):
         # tracks color = SSHWS category of peak wind (palette B); the guidance BLOCK
@@ -102,7 +114,10 @@ class TestRender(unittest.TestCase):
             pg.route("**/cyclolab/**", route)
             pg.goto(f.as_uri(), wait_until="load", timeout=40000)
             pg.wait_for_timeout(500)
-            pg.click('button[data-sec="guidance"]')
+            # Phase 3b: guidance hydrates when the Models tab opens (HAFS loads
+            # alongside; its external script 404s under file:// and degrades
+            # gracefully via fail(), so it never errors the guidance render).
+            pg.click('button[data-sec="models"]')
             pg.wait_for_timeout(1300)
             out["errs"] = errs
             out["tracks_len"] = pg.eval_on_selector("#gtracks", "e=>e.innerHTML.length")
