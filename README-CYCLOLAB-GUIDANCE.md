@@ -28,11 +28,29 @@ with `Cache-Control: public, max-age=120` so re-writes propagate.
               ri_matrix:{cols,rows}, ahi:{value,verdict} }   |   { available:false }
 
 ## Deploy (Railway)
-New service in this repo using **`railway.guidance.json`** (`python
-cyclolab_guidance_poller.py`) with the existing R2 env (`R2_ENDPOINT`, `R2_BUCKET`,
-`R2_ACCESS_KEY_ID`/`AWS_*`, `R2_SECRET_ACCESS_KEY`). Optional: `GUIDANCE_R2_PREFIX`
-(default `cyclolab`; set `shadow/cyclolab` for a staging dry-run),
-`GUIDANCE_POLL_INTERVAL_S` (default 900).
+Dedicated service in this repo using **`railway.guidance.json`**
+(`. /opt/venv/bin/activate && python cyclolab_guidance_poller.py`) with the existing
+R2 env (`R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`/`AWS_*`,
+`R2_SECRET_ACCESS_KEY`). Optional: `GUIDANCE_R2_PREFIX` (default `cyclolab`; set
+`shadow/cyclolab` for a staging dry-run), `GUIDANCE_POLL_INTERVAL_S` (default 900).
+
+### Slim build (own deps, not the satellite stack)
+The poller only fetches text and writes JSON, so it builds from its OWN minimal deps
+(`requests` + `boto3` only — see `requirements-guidance.txt`) via
+`nixpacks-guidance.toml`, mirroring the HAFS service's `requirements-hafs.txt` /
+`nixpacks-hafs.toml` split. This drops the build from 12+ min (the default
+`requirements.txt` pulls Pillow / pyspectral — the Rayleigh-LUT download alone is
+~9 min — ace-core, and the whole satellite-render stack) to a few seconds.
+
+**Railway step:** `railway.guidance.json` now carries
+`build.nixpacksConfigPath = "nixpacks-guidance.toml"`. The guidance service already
+reads `railway.guidance.json` (that is where its `cyclolab_guidance_poller.py` start
+command lives), so the slim build is picked up **automatically on the next deploy —
+no manual change needed**. Only verify, if in doubt, that the service's
+*Settings → Config-as-code path* is `railway.guidance.json` (it must be already,
+since the service runs the guidance poller and not the default `uvicorn` web start) —
+that is the same one-line per-service setting the HAFS service uses for
+`railway.hafs.json`.
 
 Parsers (`cyclolab_guidance.py`) are pure + unit-tested:
 `python -m unittest tests.test_cyclolab_guidance` (offline, with captured EP932026

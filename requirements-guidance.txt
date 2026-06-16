@@ -1,0 +1,13 @@
+# CycloLab guidance poller (cyclolab_guidance_poller.py, the 5th Railway service) -
+# its OWN minimal build, separate from the shared satellite requirements.txt. The
+# poller only fetches text (a-deck + SHIPS) over HTTP and writes small JSON to R2;
+# it imports the pure parsers in cyclolab_guidance.py (stdlib only). So the ENTIRE
+# third-party footprint is requests + boto3 - NO Pillow / pyspectral / ace-core /
+# xarray / matplotlib / the satellite-render stack. This is what makes the guidance
+# build finish in seconds instead of the 12+ min the full requirements.txt takes
+# (the pyspectral Rayleigh-LUT download alone is ~9 min).
+#
+# Wired via railway.guidance.json -> build.nixpacksConfigPath = nixpacks-guidance.toml,
+# which installs THIS file. Versions mirror requirements-hafs.txt's lean pins.
+requests>=2.31
+boto3>=1.34

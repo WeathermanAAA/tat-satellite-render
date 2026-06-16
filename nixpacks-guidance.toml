@@ -1,0 +1,22 @@
+# nixpacks build for the CycloLab guidance poller service ONLY (the 5th Railway
+# service). Selected by railway.guidance.json's build.nixpacksConfigPath, so it is
+# used ONLY by the guidance service - the web / floater / intensity / HAFS services
+# keep their own configs. Mirrors nixpacks-hafs.toml.
+#
+# The poller is pure-python (requests + boto3, both manylinux wheels) - no native
+# libs, no GRIB/Rayleigh-LUT stack - so the setup is just python311 and the install
+# is a few seconds, versus the 12+ min the default nixpacks.toml + requirements.txt
+# takes (Pillow / pyspectral / ace-core / the whole satellite-render stack).
+
+[phases.setup]
+nixPkgs = ["python311"]
+
+[phases.install]
+cmds = [
+  "python -m venv /opt/venv",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir --upgrade pip",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir -r requirements-guidance.txt",
+]
+
+[start]
+cmd = ". /opt/venv/bin/activate && python cyclolab_guidance_poller.py"
