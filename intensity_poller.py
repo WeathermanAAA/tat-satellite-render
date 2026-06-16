@@ -405,6 +405,57 @@ def _nhc_active_sids() -> "set[str] | None":
         return _nhc_active_cache["sids"]
 
 
+# --- NHC formation chances (Tropical Weather Outlook) -----------------------
+# The genesis-odds pill on the invest/PTC CycloLab page reads
+# cyclolab/{sid}/formation.json. The cyclolab GUIDANCE poller writes it, but
+# ONLY for invests still in the ACTIVE feed — so once a system's invest is
+# dropped from the feed (the 90L->01L handoff hands a PTC its REAL id and drops
+# the invest), its formation.json FREEZES at its last value while the TWO keeps
+# updating (observed: 60% frozen while the live TWO read 70%). The always-on
+# poller refreshes formation.json for EVERY invest the TWO references, every
+# poll, independent of active-feed membership — so the PTC's pill (which reads
+# its spawning invest's formation.json) stays current. Same content + same key
+# as the guidance poller, so the two are idempotent. TTL-cached (the TWO moves
+# slowly; the poll cadence is ~60s). Kill-switch CYCLOLAB_FORMATION (default on).
+_NHC_TWO_BASINS = {"al", "ep", "cp"}
+_FORMATION_PREFIX = (_env("GUIDANCE_R2_PREFIX", "cyclolab") or "cyclolab").strip("/")
+_FORMATION_ON = (_env("CYCLOLAB_FORMATION", "1") or "1").lower() \
+    not in ("0", "false", "no")
+_TWO_TTL_S = float(_env("TWO_TTL_S", "300"))
+_two_cache: dict = {}            # basin -> (monotonic_t, {sid: formation})
+_two_lock = threading.Lock()
+
+
+def _formation_map(session, basin: str, year: int) -> dict:
+    """TTL-cached NHC TWO formation chances for a basin -> {sid: formation}.
+    Empty {} on a quiet outlook OR a transient fetch failure (best-effort)."""
+    key = basin.lower()
+    with _two_lock:
+        cached = _two_cache.get(key)
+        now = time.monotonic()
+        if cached and now - cached[0] < _TWO_TTL_S:
+            return cached[1]
+    from cyclolab_guidance_poller import fetch_two   # light; late import
+    fmap = fetch_two(session, basin, year)
+    with _two_lock:
+        _two_cache[key] = (time.monotonic(), fmap)
+    return fmap
+
+
+def _refresh_formation(sink, session, basin: str, now_naive) -> None:
+    """Write cyclolab/{sid}/formation.json for every TWO-referenced invest in
+    ``basin`` (NHC only). Best-effort; an empty map writes nothing (so a
+    transient TWO outage never blanks an existing pill). Idempotent with the
+    guidance poller (identical key + content)."""
+    if not _FORMATION_ON or basin.lower() not in _NHC_TWO_BASINS:
+        return
+    fmap = _formation_map(session, basin, now_naive.year)
+    for sid, fc in fmap.items():
+        formation = {**fc, "generated_at": ac.iso_z(now_naive),
+                     "source": "nhc-two"}
+        sink.write(f"{_FORMATION_PREFIX}/{sid}/formation.json", formation)
+
+
 class GlobalGeojsonComposer:
     """Holds each basin's latest tracks-feed storms and re-emits the composed
     global geojson (feed_recompute.build_global_geojson_feed -> the shared
@@ -549,6 +600,15 @@ def make_basin_source(basin: str, session: requests.Session,
         # raises); gated by CYCLOLAB_PAGES at engine assembly.
         if pages is not None:
             pages.update(basin, tracks_feed, now=ctx.now)
+        # Keep the formation-chance pill FRESH on the always-on cadence: refresh
+        # formation.json for every invest the NHC TWO references in this basin,
+        # regardless of active-feed membership (the guidance poller only covers
+        # active-feed invests, so a PTC's spawning invest — dropped by the
+        # handoff — would otherwise freeze). Best-effort; never fails the basin.
+        try:
+            _refresh_formation(ctx.sink, session, basin, now_naive)
+        except Exception as e:  # noqa: BLE001 - best-effort, never fail the feed
+            log.warning("formation refresh failed (%s): %s", basin, e)
 
     # restamp=True: re-emit the feeds EVERY cycle so generated_utc ticks on the
     # poll cadence (the "poller alive / last checked" stamp) and staleness_minutes
