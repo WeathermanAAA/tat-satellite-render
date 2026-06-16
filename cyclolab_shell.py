@@ -803,6 +803,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     stroke-linejoin: round; stroke-linecap: round; }
   .ac-border { fill: none; stroke: rgba(255,255,255,0.72);
     stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+  /* state/province boundaries (ne_10m admin_1) - dimmer + thinner than the
+     country border, drawn UNDER it so coast + country read first. */
+  .ac-state { fill: none; stroke: rgba(255,255,255,0.40);
+    stroke-width: 0.8; stroke-linejoin: round; stroke-linecap: round; }
   /* maps-pass R3 #3: a CASING/HALO graticule - a dark hairline UNDER a light
      line - so every line reads over BOTH the light-gray land AND the dark
      ocean (a flat light line vanished over the light land). Labels get the
@@ -1632,6 +1636,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     return '<rect class="ac-ocean-fill" x="0" y="0" width="' + pr.W +
       '" height="' + pr.H + '"/>' +
       '<path class="ac-land" d="' + pathOf(BASEMAP.land, true) + '"/>' +
+      '<path class="ac-state" d="' + pathOf(BASEMAP.states || [], false) + '"/>' +
       '<path class="ac-border" d="' + pathOf(BASEMAP.borders, false) + '"/>' +
       '<path class="ac-coast" d="' + pathOf(BASEMAP.coast, false) + '"/>';
   }
@@ -2572,6 +2577,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
+    // state/province lines UNDER the country borders (dimmer .ac-state).
+    (BASEMAP.states || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
+          pr.Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-state" d="' + d + '"/>');
+    });
     // maps-pass R2: thin white country borders UNDER the thick white coast
     // (both open ne_10m polylines, no trailing Z), over the land fill.
     (BASEMAP.borders || []).forEach(function (line) {
@@ -3405,6 +3418,14 @@ HTML_TEMPLATE = r"""<!doctype html>
           Y(c[1]).toFixed(1);
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
+    });
+    // state/province lines UNDER the country borders (dimmer .ac-state).
+    (BASEMAP.states || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+          Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-state" d="' + d + '"/>');
     });
     (BASEMAP.borders || []).forEach(function (line) {
       var d = line.map(function (c, i) {

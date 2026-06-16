@@ -36,9 +36,15 @@ HERE = Path(__file__).resolve().parent
 #    country borders (no coast duplication - boundary_lines exclude coast).
 LAND_PATH = HERE / "cyclolab_ne_10m_land.geojson"
 BORDER_PATH = HERE / "cyclolab_ne_10m_borders.geojson"
+# ne_10m admin_1 state/province boundary LINES (internal; simplified to ~0.012deg,
+# finer than the bake's TOL_NEAR so nothing is lost) -> a THIN, DIM state-border
+# stroke UNDER the country borders. Adds the landfall detail (US/MX states, etc.)
+# the cone + track maps were missing. Vendored (no CDN), like the others.
+STATE_PATH = HERE / "cyclolab_ne_10m_states.geojson"
 
 _LAND = None
 _BORDER = None
+_STATE = None
 
 OCEAN_NAMES = {"AL": "ATLANTIC OCEAN", "EP": "PACIFIC OCEAN",
                "CP": "PACIFIC OCEAN", "WP": "PACIFIC OCEAN"}
@@ -80,6 +86,30 @@ def _border_lines() -> list[list[list[float]]]:
                 lines.extend(g["coordinates"])
         _BORDER = lines
     return _BORDER
+
+
+def _state_lines() -> list[list[list[float]]]:
+    """Internal STATE/PROVINCE boundary polylines (ne_10m admin_1 lines) as open
+    [[lon, lat], ...] lines, drawn as a THIN DIM stroke UNDER the country
+    borders. Absent file -> [] (graceful: the maps just lack state detail)."""
+    global _STATE
+    if _STATE is None:
+        try:
+            gj = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _STATE = []
+            return _STATE
+        lines = []
+        for f in gj["features"]:
+            g = f["geometry"]
+            if not g:
+                continue
+            if g["type"] == "LineString":
+                lines.append(g["coordinates"])
+            elif g["type"] == "MultiLineString":
+                lines.extend(g["coordinates"])
+        _STATE = lines
+    return _STATE
 
 
 def _clip_ring(ring, lo0, la0, lo1, la1):
@@ -400,7 +430,7 @@ def basemap_for(lat: float, lon: float, basin: str, *,
     # in-window runs -> adaptive DP -> 2dp round -> dedup. `speck` drops a
     # run that collapsed to a sub-pixel dot (coast only; a border segment is
     # never a speck). Drawn as white strokes ON TOP of the land fill.
-    def _proc_lines(lines, speck):
+    def _proc_lines(lines, speck, tol_scale=1.0):
         res = []
         for line in lines:
             norm = []
@@ -424,7 +454,7 @@ def basemap_for(lat: float, lon: float, basin: str, *,
                     p[0] += shift
             for run in _clip_polyline([tuple(p) for p in norm],
                                       lo0, la0, lo1, la1):
-                thin = _simplify(run, _adaptive_tol(run))
+                thin = _simplify(run, _adaptive_tol(run) * tol_scale)
                 if len(thin) < 2:
                     continue
                 rd = [[round(x, 2), round(y, 2)] for x, y in thin]
@@ -444,11 +474,31 @@ def basemap_for(lat: float, lon: float, basin: str, *,
         return res
 
     border_out = _proc_lines(_border_lines(), 0.0)
+    # State/province lines: clipped + simplified the SAME way as country
+    # borders, then rendered UNDER them with a dimmer stroke (the maps draw
+    # BASEMAP.states; an old baked basemap without the key degrades to []).
+    # Baked only NEAR the storm (the cone + typical track extent) - far states
+    # never show on these storm-centered maps and would blow the page-size
+    # budget (the full window covers a whole continent of state lines). State
+    # lines are also coarser (tol_scale) + speck-filtered: they are internal
+    # admin boundaries that read as context, not the crisp coastline.
+    _SLAT, _SLON = 11.0, 14.0
+
+    def _near_storm(line):
+        for x, y in line:
+            if abs(y - lat) <= _SLAT and \
+                    abs(((x - lon + 180.0) % 360.0) - 180.0) <= _SLON:
+                return True
+        return False
+
+    state_out = _proc_lines([ln for ln in _state_lines() if _near_storm(ln)],
+                            0.18, tol_scale=1.8)
     return {
         "window": [round(la0, 2), round(la1, 2),
                    round(lo0, 2), round(lo1, 2)],
         "land": out,
         "coast": coast_out,
         "borders": border_out,
+        "states": state_out,
         "ocean": OCEAN_NAMES.get((basin or "").upper(), "OCEAN"),
     }
