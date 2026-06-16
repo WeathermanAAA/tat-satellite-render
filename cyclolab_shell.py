@@ -252,10 +252,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     margin-top: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
     font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
     border: 1px solid currentColor; width: fit-content; }
-  .formation-pill .fp-eyebrow { font-size: 9px; font-weight: 800;
-    letter-spacing: 0.09em; text-transform: uppercase; opacity: 0.95; }
+  /* "FORMATION" with "chance" stacked beneath it */
+  .formation-pill .fp-eyebrow { display: inline-flex; flex-direction: column;
+    line-height: 1.04; font-size: 9px; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase; opacity: 0.95; }
+  .formation-pill .fp-eyebrow .fp-e2 { font-size: 8px; font-weight: 700; opacity: 0.8; }
+  /* the two windows sit CLOSE together with a thin vertical divider between them */
+  .formation-pill .fp-wins { display: inline-flex; align-items: center; gap: 6px; }
+  .formation-pill .fp-div { flex: 0 0 auto; width: 1px; align-self: stretch;
+    background: currentColor; opacity: 0.5; }
   /* both windows (48h left, 7-day right) styled IDENTICALLY */
-  .formation-pill .fp-win { color: #f3f7fc; font-weight: 700;
+  .formation-pill .fp-win { color: #f3f7fc; font-weight: 700; white-space: nowrap;
     font-variant-numeric: tabular-nums; }
   .formation-pill .fp-win b { font-weight: 800; }
   .formation-pill .fp-dot { flex: 0 0 auto; width: 6px; height: 6px;
@@ -1734,9 +1741,13 @@ HTML_TEMPLATE = r"""<!doctype html>
         var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
         pill.setAttribute("data-level", f.level || "low");
         pill.innerHTML = '<span class="fp-dot"></span>' +
-          '<span class="fp-eyebrow">Formation</span>' +
-          '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
-          '<span class="fp-win">7-day <b>' + p7 + '</b></span>';
+          '<span class="fp-eyebrow"><span>Formation</span>' +
+            '<span class="fp-e2">chance</span></span>' +
+          '<span class="fp-wins">' +
+            '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
+            '<span class="fp-div"></span>' +
+            '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
+          '</span>';
         pill.hidden = false;
       });
   }
