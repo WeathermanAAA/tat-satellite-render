@@ -551,6 +551,36 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-color: var(--cat-accent); font-weight: 700; }
   .hafs-caption { color: var(--muted); font-size: 12px; line-height: 1.5;
     margin: 8px 0 0; }
+  /* --- Model guidance (Stage B) --- */
+  #sec-guidance > .wipe > .card > svg { width: 100%; height: auto; display: block;
+    background: #101a2c; border-radius: 10px; }
+  .g-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 9px;
+    font-size: 11.5px; color: var(--muted); font-weight: 600; align-items: center; }
+  .g-legend .lg { display: inline-flex; align-items: center; gap: 5px; }
+  .g-legend .lg b { color: var(--fg); }
+  .g-legend .sw { width: 15px; height: 3px; border-radius: 2px; display: inline-block; }
+  .g-ships-head { display: flex; flex-wrap: wrap; gap: 7px 10px; margin-bottom: 10px; }
+  .g-chip { background: var(--navy-deep); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 9px; font-size: 12px; color: var(--muted);
+    font-weight: 600; font-variant-numeric: tabular-nums; }
+  .g-chip b { color: var(--fg); font-weight: 800; }
+  .g-chip.ri b { color: var(--cat-accent); }
+  .g-sm-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .g-sm { background: var(--navy-deep); border: 1px solid var(--border);
+    border-radius: 9px; padding: 8px 8px 4px; }
+  .g-sm .t { font-size: 11px; font-weight: 700; color: var(--fg); }
+  .g-sm .v { font-size: 10.5px; color: var(--muted); font-weight: 600; }
+  .g-sm svg { background: none; margin-top: 2px; }
+  .g-ri { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 11.5px;
+    font-variant-numeric: tabular-nums; }
+  .g-ri th, .g-ri td { padding: 5px 6px; text-align: center;
+    border-bottom: 1px solid var(--border); }
+  .g-ri th { color: var(--muted); font-weight: 700; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .03em; }
+  .g-ri td.rn { text-align: left; color: var(--fg); font-weight: 700; }
+  .g-ri caption { text-align: left; font-size: 12px; font-weight: 800;
+    color: var(--fg); padding-bottom: 6px; }
+  @media (max-width: 720px) { .g-sm-grid { grid-template-columns: repeat(2, 1fr); } }
   .hafs-footer { display: flex; align-items: center; gap: 10px;
     flex-wrap: wrap; color: var(--muted); font-size: 11.5px;
     padding-top: 6px; }
@@ -876,8 +906,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     .nav-secs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
       flex-direction: row; background: var(--navy-deep);
       border-top: 1px solid var(--border); padding: 0; }
-    .sec-btn { flex: 1 1 25%; justify-content: center; padding: 12px 4px;
-      min-height: 52px; font-size: 10.5px; border-left: 0;
+    .sec-btn { flex: 1 1 20%; justify-content: center; padding: 12px 3px;
+      min-height: 52px; font-size: 10px; border-left: 0;
       border-top: 3px solid transparent; }
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
     .side-foot { padding: 8px 12px; }
@@ -966,6 +996,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <button class="sec-btn" data-sec="satellite">Satellite</button>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
+      <button class="sec-btn" data-sec="guidance">Guidance</button>
     </nav>
     <div class="side-foot">
       <button type="button" id="settings-btn" class="settings-btn"
@@ -1212,6 +1243,38 @@ HTML_TEMPLATE = r"""<!doctype html>
         <pre id="advtext" class="advtext">(loading advisory data…)</pre>
       </div>
     </div></section>
+    <section class="sec" id="sec-guidance"><div class="wipe">
+      <h2 class="sec-title">Model guidance</h2>
+      <div class="card">
+        <h3>Model forecast tracks</h3>
+        <svg id="gtracks" viewBox="0 0 1000 560"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Model forecast track guidance"></svg>
+        <div class="g-legend" id="gtracks-legend"></div>
+        <p class="hafs-caption">Operational track aids, NHC ATCF aid_public.
+          Colored by each model's peak forecast wind (SSHWS category).
+          Consensus aids (TVCN, HCCA) are drawn heavier.</p>
+        <div id="gtracks-empty" class="stub" style="display:none">No model
+          guidance for this storm yet.</div>
+      </div>
+      <div class="card">
+        <h3>Model forecast intensity</h3>
+        <svg id="gintensity" viewBox="0 0 1000 380"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Model forecast intensity guidance"></svg>
+        <div class="g-legend" id="gintensity-legend"></div>
+        <p class="hafs-caption">Intensity aids vs forecast hour over the SSHWS
+          category bands. Regional hurricane models are emphasized; the global
+          and statistical aids are drawn lighter.</p>
+        <div id="gintensity-empty" class="stub" style="display:none"></div>
+      </div>
+      <div class="card">
+        <h3>SHIPS output diagram</h3>
+        <div id="gships-root"></div>
+        <p class="hafs-caption">Statistical Hurricane Intensity Prediction
+          Scheme: environment, rapid-intensification probabilities, annularity.</p>
+      </div>
+    </div></section>
   </main>
 </div>
 
@@ -1453,6 +1516,162 @@ HTML_TEMPLATE = r"""<!doctype html>
     }, hold);
   })();
 
+  // ===================== Model guidance (Stage B) ==========================
+  // Three renderers hydrating from the live Stage-A JSON (cyclolab/{SID}/
+  // guidance.json + ships.json). REUSE, no forks: fitProjection + graticule
+  // (the cone's projection math), BASEMAP (baked), SSHS + sshsCat (ace_core
+  // single source), the cone basemap classes (.ac-*). Track color = SSHWS
+  // category of each model's PEAK forecast wind (Andrew's pick, palette B).
+  var GDATA = null, SHDATA = null, gDrawn = false;
+  function gPeak(pts) { var m = null; pts.forEach(function (p) {
+    if (p.vmax != null && (m == null || p.vmax > m)) m = p.vmax; }); return m; }
+  function gEsc(s) { return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+  function gBasemap(pr) {
+    function pathOf(rings, close) {
+      return rings.map(function (r) {
+        return "M" + r.map(function (p) {
+          return pr.X(p[0]).toFixed(1) + "," + pr.Y(p[1]).toFixed(1);
+        }).join("L") + (close ? "Z" : "");
+      }).join("");
+    }
+    return '<rect class="ac-ocean-fill" x="0" y="0" width="' + pr.W +
+      '" height="' + pr.H + '"/>' +
+      '<path class="ac-land" d="' + pathOf(BASEMAP.land, true) + '"/>' +
+      '<path class="ac-border" d="' + pathOf(BASEMAP.borders, false) + '"/>' +
+      '<path class="ac-coast" d="' + pathOf(BASEMAP.coast, false) + '"/>';
+  }
+  var G_TAUS = [0, 24, 48, 72, 96, 120];
+  function gTracks() {
+    var svg = document.getElementById("gtracks"),
+        empty = document.getElementById("gtracks-empty"),
+        leg = document.getElementById("gtracks-legend");
+    var taids = (GDATA && GDATA.track_aids) || [], aids = (GDATA && GDATA.aids) || {};
+    var cons = {}; ((GDATA && GDATA.consensus) || []).forEach(function (c) { cons[c] = 1; });
+    var ext = [];
+    taids.forEach(function (t) { (aids[t] || []).forEach(function (p) {
+      if (p.lat != null) ext.push({ lat: p.lat, lon: p.lon }); }); });
+    if (ext.length < 2) {                       // fresh invest / no dynamical tracks
+      svg.innerHTML = ""; if (leg) leg.innerHTML = "";
+      empty.style.display = "block";
+      empty.textContent = GDATA ? "No track aids yet (statistical-only / fresh invest)."
+                                : "No model guidance for this storm yet.";
+      return;
+    }
+    empty.style.display = "none";
+    var lats = ext.map(function (p) { return p.lat; }), lons = ext.map(function (p) { return p.lon; });
+    ext.push({ lat: Math.min.apply(null, lats) - 0.8, lon: Math.min.apply(null, lons) - 0.8 });
+    ext.push({ lat: Math.max.apply(null, lats) + 0.8, lon: Math.max.apply(null, lons) + 0.8 });
+    var pr = fitProjection(ext, 1000, 360, 560, 18), H = pr.H;
+    svg.setAttribute("viewBox", "0 0 1000 " + H);
+    var body = [gBasemap(pr), graticule(pr)];
+    var ordered = taids.slice().sort(function (a, b) { return (cons[a] ? 1 : 0) - (cons[b] ? 1 : 0); });
+    ordered.forEach(function (t) {
+      var pts = (aids[t] || []).filter(function (p) { return p.lat != null; });
+      if (pts.length < 2) return;
+      var col = SSHS[sshsCat(gPeak(pts))] || "#8ea2bd", isC = cons[t];
+      var d = "M" + pts.map(function (p) { return pr.X(p.lon).toFixed(1) + "," + pr.Y(p.lat).toFixed(1); }).join("L");
+      if (isC) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="6" stroke-linejoin="round" stroke-linecap="round" stroke-opacity="0.85"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + (isC ? 3.4 : 1.7) + '" stroke-opacity="' + (isC ? 1 : 0.82) + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function (p) { body.push('<circle cx="' + pr.X(p.lon).toFixed(1) + '" cy="' + pr.Y(p.lat).toFixed(1) + '" r="' + (isC ? 2.4 : 1.5) + '" fill="' + col + '"/>'); });
+    });
+    var spine = aids.TVCN || aids.HCCA || aids[taids[0]] || [];
+    spine.forEach(function (p) {
+      if (p.lat == null || G_TAUS.indexOf(p.tau) < 0) return;
+      var x = pr.X(p.lon), y = pr.Y(p.lat);
+      body.push('<g><rect x="' + (x + 5).toFixed(1) + '" y="' + (y - 8).toFixed(1) + '" width="' + (p.tau >= 100 ? 23 : 17) + '" height="13" rx="3" fill="rgba(7,16,28,0.86)" stroke="rgba(120,140,170,0.4)" stroke-width="0.7"/><text x="' + (x + 7).toFixed(1) + '" y="' + (y + 1.5).toFixed(1) + '" fill="#e8eef5" font-size="9.5" font-weight="700">' + p.tau + '</text></g>');
+    });
+    var c0 = (aids.TVCN || aids[taids[0]] || []).filter(function (p) { return p.tau === 0 && p.lat != null; })[0];
+    if (c0) body.push('<circle cx="' + pr.X(c0.lon).toFixed(1) + '" cy="' + pr.Y(c0.lat).toFixed(1) + '" r="4.5" fill="#fff" stroke="#0a1320" stroke-width="1.5"/>');
+    svg.innerHTML = body.join("");
+    if (leg) leg.innerHTML = taids.map(function (t) {
+      var isC = cons[t]; return '<span class="lg"><span class="sw" style="background:' + (SSHS[sshsCat(gPeak(aids[t] || []))] || "#8ea2bd") + ';height:' + (isC ? 4 : 3) + 'px"></span>' + (isC ? '<b>' + gEsc(t) + '</b> (consensus)' : gEsc(t)) + '</span>'; }).join("");
+  }
+  var G_SSHS_BANDS = [[0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"], [83, 96, "C2"], [96, 113, "C3"], [113, 137, "C4"], [137, 999, "C5"]];
+  function gIntensity() {
+    var svg = document.getElementById("gintensity"),
+        leg = document.getElementById("gintensity-legend"),
+        empty = document.getElementById("gintensity-empty");
+    var iaids = (GDATA && GDATA.intensity_aids) || [], aids = (GDATA && GDATA.aids) || {};
+    var W = 1000, H = 380, mL = 46, mR = 16, mT = 14, mB = 30, pw = W - mL - mR, ph = H - mT - mB;
+    var taus = [], vs = [];
+    iaids.forEach(function (t) { (aids[t] || []).forEach(function (p) { if (p.vmax != null) { taus.push(p.tau); vs.push(p.vmax); } }); });
+    if (!taus.length) { svg.innerHTML = ""; if (leg) leg.innerHTML = ""; empty.style.display = "block"; empty.textContent = GDATA ? "No intensity aids yet." : ""; return; }
+    empty.style.display = "none";
+    var tmax = Math.max(120, Math.max.apply(null, taus)), vmax = Math.max(80, Math.ceil((Math.max.apply(null, vs) + 10) / 20) * 20);
+    function X(t) { return mL + (t / tmax) * pw; } function Y(v) { return mT + ph - (v / vmax) * ph; }
+    var body = ['<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#101a2c"/>'];
+    G_SSHS_BANDS.forEach(function (b) {
+      if (b[0] >= vmax) return;
+      var y1 = Y(Math.min(b[1], vmax)), y0 = Y(b[0]);
+      body.push('<rect x="' + mL + '" y="' + y1.toFixed(1) + '" width="' + pw + '" height="' + (y0 - y1).toFixed(1) + '" fill="' + SSHS[b[2]] + '" fill-opacity="0.12"/>');
+      if (b[0] > 0) body.push('<line x1="' + mL + '" y1="' + y0.toFixed(1) + '" x2="' + (mL + pw) + '" y2="' + y0.toFixed(1) + '" stroke="' + SSHS[b[2]] + '" stroke-opacity="0.3" stroke-width="1"/><text x="' + (mL + pw - 4) + '" y="' + (y0 - 3).toFixed(1) + '" text-anchor="end" fill="' + SSHS[b[2]] + '" font-size="9.5" font-weight="700" opacity="0.85">' + b[2] + '</text>');
+    });
+    for (var v = 0; v <= vmax; v += 20) body.push('<text x="' + (mL - 7) + '" y="' + (Y(v) + 3).toFixed(1) + '" text-anchor="end" fill="#8ea2bd" font-size="10" font-weight="600">' + v + '</text>');
+    body.push('<text x="14" y="' + (mT + 4) + '" fill="#8ea2bd" font-size="10" font-weight="700">kt</text>');
+    for (var t = 0; t <= tmax; t += 24) body.push('<line x1="' + X(t).toFixed(1) + '" y1="' + mT + '" x2="' + X(t).toFixed(1) + '" y2="' + (mT + ph) + '" stroke="rgba(150,170,200,0.12)" stroke-width="1"/><text x="' + X(t).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#8ea2bd" font-size="10" font-weight="600">' + t + '</text>');
+    body.push('<text x="' + (mL + pw / 2) + '" y="' + (H - 0.5) + '" text-anchor="middle" fill="#8ea2bd" font-size="9.5" font-weight="600">forecast hour</text>');
+    var HIRES = { HFAI: "#46c56a", HFBI: "#2bd4c0", HWFI: "#ffe14d", HMNI: "#ff9a2f" };
+    function st(t) {
+      if (t === "IVCN") return { c: "#ffffff", w: 3.2, op: 1, dash: "", cons: 1, tier: "consensus" };
+      if (HIRES[t]) return { c: HIRES[t], w: 2.2, op: 0.95, dash: "", tier: "hi-res" };
+      if (t === "DSHP" || t === "LGEM" || t === "SHIP") return { c: "#8ea2bd", w: 1.4, op: 0.85, dash: "3,3", tier: "statistical" };
+      return { c: "#5d6b80", w: 1.2, op: 0.7, dash: "", tier: "global" };
+    }
+    var ordered = iaids.slice().sort(function (a, b) { return (a === "IVCN" ? 1 : 0) - (b === "IVCN" ? 1 : 0); });
+    ordered.forEach(function (t) {
+      var pts = (aids[t] || []).filter(function (p) { return p.vmax != null; }); if (pts.length < 2) return;
+      var s = st(t), d = "M" + pts.map(function (p) { return X(p.tau).toFixed(1) + "," + Y(p.vmax).toFixed(1); }).join("L");
+      if (s.cons) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="5.4" stroke-linejoin="round" stroke-opacity="0.8"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + s.c + '" stroke-width="' + s.w + '" stroke-opacity="' + s.op + '" stroke-dasharray="' + s.dash + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function (p) { body.push('<circle cx="' + X(p.tau).toFixed(1) + '" cy="' + Y(p.vmax).toFixed(1) + '" r="' + (s.cons ? 2.2 : 1.4) + '" fill="' + s.c + '"/>'); });
+    });
+    body.push('<rect x="' + mL + '" y="' + mT + '" width="' + pw + '" height="' + ph + '" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>');
+    svg.innerHTML = body.join("");
+    if (leg) leg.innerHTML = ordered.slice().reverse().map(function (t) { var s = st(t); return '<span class="lg"><span class="sw" style="background:' + s.c + ';height:' + Math.max(3, s.w) + 'px"></span>' + (s.cons ? '<b>' + gEsc(t) + '</b>' : gEsc(t)) + ' (' + s.tier + ')</span>'; }).join("");
+  }
+  function gSpark(vals, taus, w, h, color) {
+    var ok = []; vals.forEach(function (v, i) { if (v != null) ok.push({ v: v, t: taus[i] }); });
+    if (ok.length < 2) return '<svg viewBox="0 0 ' + w + ' ' + h + '"><text x="' + (w / 2) + '" y="' + (h / 2) + '" text-anchor="middle" fill="#566b80" font-size="9">no data</text></svg>';
+    var vv = ok.map(function (o) { return o.v; }), lo = Math.min.apply(null, vv), hi = Math.max.apply(null, vv);
+    if (hi === lo) { hi += 1; lo -= 1; }
+    var tmax = Math.max.apply(null, taus), mb = 11, mt = 4;
+    function X(t) { return 2 + (t / tmax) * (w - 4); } function Y(v) { return mt + (h - mt - mb) * (1 - (v - lo) / (hi - lo)); }
+    var d = "M" + ok.map(function (o) { return X(o.t).toFixed(1) + "," + Y(o.v).toFixed(1); }).join("L");
+    return '<svg viewBox="0 0 ' + w + ' ' + h + '"><line x1="2" y1="' + (h - mb).toFixed(1) + '" x2="' + (w - 2) + '" y2="' + (h - mb).toFixed(1) + '" stroke="rgba(150,170,200,0.18)"/><path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round"/><circle cx="' + X(ok[0].t).toFixed(1) + '" cy="' + Y(ok[0].v).toFixed(1) + '" r="2" fill="' + color + '"/><text x="2" y="' + (h - 2) + '" fill="#566b80" font-size="8">' + lo.toFixed(0) + '</text><text x="' + (w - 2) + '" y="' + (h - 2) + '" text-anchor="end" fill="#566b80" font-size="8">' + hi.toFixed(0) + '</text></svg>';
+  }
+  function gShips() {
+    var root = document.getElementById("gships-root"); if (!root) return;
+    var s = SHDATA;
+    if (!s || s.available === false) { root.innerHTML = '<div class="stub">SHIPS unavailable for this system' + (s && s.reason ? " (" + gEsc(s.reason) + ")" : "") + ".</div>"; return; }
+    var taus = s.taus || [], env = s.env_series || {}, head = [];
+    head.push('<span class="g-chip"><b>' + gEsc((s.header || {}).id_line || s.sid || "") + '</b></span>');
+    if (s.ahi) head.push('<span class="g-chip">Annularity (AHI) <b>' + gEsc(s.ahi.value) + '</b>' + (s.ahi.verdict ? " &middot; " + gEsc(String(s.ahi.verdict).split(",")[0]) : "") + '</span>');
+    if (s.prelim_ri_prob != null) head.push('<span class="g-chip ri">Prelim RI prob <b>' + gEsc(s.prelim_ri_prob) + '%</b></span>');
+    var stype = (s.storm_type || [])[0]; if (stype) head.push('<span class="g-chip">Storm type <b>' + gEsc(stype) + '</b></span>');
+    var WANT = [["SHEAR (KT)", "#ffd24d"], ["SST (C)", "#ff7a59"], ["700-500 MB RH", "#46c56a"], ["POT. INT. (KT)", "#5aa9ff"], ["HEAT CONTENT", "#ff9a2f"], ["200 MB DIV", "#7aa0ff"], ["STM SPEED (KT)", "#8ea2bd"], ["V (KT) NO LAND", "#e8eef5"], ["TH_E DEV (C)", "#c08bff"]];
+    var cells = WANT.filter(function (p) { return env[p[0]]; }).map(function (p) {
+      var v = env[p[0]], cur = null; for (var i = 0; i < v.length; i++) { if (v[i] != null) { cur = v[i]; break; } }
+      return '<div class="g-sm"><div class="t">' + gEsc(p[0]) + '</div><div class="v">now ' + (cur == null ? "n/a" : cur) + '</div>' + gSpark(v, taus, 200, 60, p[1]) + '</div>';
+    }).join("");
+    var rm = s.ri_matrix || { cols: [], rows: {} }, tbl = "";
+    if (rm.cols && rm.cols.length) {
+      tbl = '<table class="g-ri"><caption>RI probability matrix (% in next, vs threshold/hours)</caption><tr><th>RI (kt/h)</th>' + rm.cols.map(function (c) { return '<th>' + gEsc(c) + '</th>'; }).join("") + '</tr>' +
+        Object.keys(rm.rows).map(function (rn) { return '<tr><td class="rn">' + gEsc(rn) + '</td>' + rm.cols.map(function (c) { var val = rm.rows[rn][c]; return '<td>' + (val == null ? "&middot;" : gEsc(val) + "%") + '</td>'; }).join("") + '</tr>'; }).join("") + '</table>';
+    }
+    root.innerHTML = '<div class="g-ships-head">' + head.join("") + '</div><div class="g-sm-grid">' + cells + '</div>' + tbl;
+  }
+  function gRenderAll() { try { gTracks(); } catch (e) {} try { gIntensity(); } catch (e2) {} try { gShips(); } catch (e3) {} }
+  function initGuidance() {
+    if (gDrawn) return; gDrawn = true;
+    var base = CDN + "/cyclolab/" + encodeURIComponent(SID) + "/";
+    Promise.all([fetchJson(base + "guidance.json"), fetchJson(base + "ships.json")])
+      .then(function (r) { GDATA = r[0]; SHDATA = r[1]; gRenderAll(); })
+      .catch(function () { gRenderAll(); });
+  }
+  // expose for tests/manual re-render
+  window.__gRenderAll = gRenderAll;
+
   // ---- section nav (lazy init on first open) ------------------------------
   var inited = {};
   function openSec(name) {
@@ -1468,6 +1687,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       // Stage 3: nothing is fetched until the tab opens (lazy mounts).
       if (name === "models") initModels();
       else if (name === "satellite") initSatellite();
+      else if (name === "guidance") initGuidance();
     }
     // THE CONE reveal plays once per tab OPEN (not once per session):
     // rebuilding the SVG re-arms every CSS animation naturally.
