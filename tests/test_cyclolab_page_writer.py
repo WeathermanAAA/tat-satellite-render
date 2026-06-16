@@ -95,19 +95,22 @@ class TestPageLifecycle(unittest.TestCase):
         return (dt.datetime.now(dt.timezone.utc)
                 - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def test_invest_skipped_but_recent_inactive_rebirths(self):
-        # invests never get a page; a RECENTLY-ended inactive DESIGNATED storm
-        # gets its frozen archive page re-birthed ("shared links never die").
+    def test_recent_inactive_invest_and_tc_both_rebirth(self):
+        # Stage C: invests ARE page-able. A RECENTLY-ended inactive invest gets
+        # its frozen grey/red-X archive page re-birthed, same as a designated
+        # storm ("shared links never die" - now for invests too).
         invest = {**SYNTH, "sid": "NHC_EP902026", "is_active": False,
                   "latest_fix_valid_utc": self._recent_fix()}
         inactive_recent = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,
                            "latest_fix_valid_utc": self._recent_fix()}
         self.w.update("ep", feed([invest, inactive_recent]))
-        self.assertEqual(len(self.sink.writes), 1)               # only the TC
-        key, html = self.sink.writes[0]
-        self.assertEqual(key, "shadow/cyclolab/NHC_EP072026/index.html")
-        self.assertIn("data-ended", html[html.index("<html"):html.index("<head")])
-        self.assertIn("THIS STORM HAS ENDED", html)
+        self.assertEqual(len(self.sink.writes), 2)
+        by_key = dict(self.sink.writes)
+        self.assertIn("shadow/cyclolab/NHC_EP902026/index.html", by_key)
+        self.assertIn("shadow/cyclolab/NHC_EP072026/index.html", by_key)
+        ih = by_key["shadow/cyclolab/NHC_EP902026/index.html"]
+        self.assertIn("data-invest", ih[ih.index("<html"):ih.index("<head")])
+        self.assertIn("THIS STORM HAS ENDED", ih)
 
     def test_recent_inactive_rebirths_only_once(self):
         inactive = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,

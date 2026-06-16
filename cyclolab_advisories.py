@@ -130,6 +130,8 @@ def _storm_entries(current_storms: dict) -> list[dict]:
             ids = parse_sid(sid)
         except (InvestSidError, ValueError, KeyError):
             continue
+        if ids.is_invest:          # invests have no NHC advisory product (Stage C)
+            continue
         if ids.basin not in _NHC_BASINS:
             continue
         cone = s.get("trackCone") or {}

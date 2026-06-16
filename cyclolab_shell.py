@@ -262,6 +262,26 @@ HTML_TEMPLATE = r"""<!doctype html>
     paint-order: stroke; }
   @keyframes lab-spin { from { transform: rotate(360deg); }
                         to { transform: rotate(0deg); } }
+  /* ---- Stage C: INVEST grey identity + giant red X ----
+     data-invest OVERRIDES the category vars to grey, so the banner ramp,
+     accent, sec-btn, vitals, chips - everything keyed on --cat-* - reads grey
+     with no per-element edits. The red X replaces the spinning cyclone glyph;
+     the cone + advisories + HAFS-models sections (no official invest products)
+     are hidden, along with their nav buttons. */
+  .banner .glyph .invest-x { display: none; }
+  html[data-invest] { --cat-ramp: linear-gradient(180deg,#2a2f3a,#8b95a5,#2a2f3a);
+    --cat-accent: #9aa6b6; --cat-ink: #ffffff; }
+  html[data-invest] .banner .glyph { filter: drop-shadow(0 0 7px rgba(255,59,59,0.55))
+    drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
+  html[data-invest] .banner .glyph .spin,
+  html[data-invest] .banner .glyph #glyph-cat { display: none; }
+  html[data-invest] .banner .glyph .invest-x { display: block; }
+  html[data-invest] [data-sec="models"],
+  html[data-invest] [data-sec="advisories"] { display: none; }
+  html[data-invest] #sec-models,
+  html[data-invest] #sec-advisories { display: none !important; }
+  html[data-invest] #vrow-ace,
+  html[data-invest] #vrow-next { display: none; }
   .banner::after { content: ""; position: absolute; top: 0; bottom: 0;
     width: 55%; left: -60%; transform: skewX(-18deg);
     background: linear-gradient(90deg, transparent,
@@ -957,6 +977,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       <svg class="glyph" viewBox="-44 -44 88 88" aria-hidden="true">
         <g class="spin"><path d="__HPATH__" fill="#ffffff"
           stroke="rgba(0,0,0,0.30)" stroke-width="1"/></g>
+        <!-- Stage C: invests show a GIANT RED X here instead of the spinning
+             cyclone glyph + category label (CSS toggles on html[data-invest]). -->
+        <g class="invest-x"><path d="M -22,-22 L 22,22 M 22,-22 L -22,22"
+          fill="none" stroke="#ff3b3b" stroke-width="11"
+          stroke-linecap="round"/></g>
         <!-- canonical icon label (tracks-map / storm-card canon:
              generate_tracks_plot.py sshs_label + spinnerSvg) - D / S /
              1-5, stationary while only the path spins. Weight 800, not
@@ -1298,6 +1323,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 (function () {
   "use strict";
   var SID = "__SID__";
+  var IS_INVEST = __IS_INVEST__;     // Stage C: grey/red-X subset page
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   // per-storm SST hero layer base (final-gate-2 #1): meta.json +
@@ -1751,6 +1777,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     { id: "next", lbl: "Next advisory", unit: "" },
   ];
   function buildVitals() {
+    // Stage C: an invest has no advisory and no ACE; those rows are HIDDEN via
+    // CSS (html[data-invest] #vrow-ace/#vrow-next) rather than dropped, so
+    // apply()'s odometer writes still find every element.
     document.getElementById("vitals").innerHTML = VITALS.map(function (s) {
       return '<div class="vrow" id="vrow-' + s.id + '">' +
         '<span class="lbl">' + s.lbl + '</span>' +
@@ -4927,6 +4956,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     base of the per-storm SST hero layers (final-gate-2 #1); default =
     the live Worker path."""
     ids = parse_sid(storm["sid"])
+    is_invest = ids.is_invest or bool(storm.get("is_invest"))
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
         cat = "TD"
@@ -4936,7 +4966,10 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     chip = {"TD": "Tropical Depression", "TS": "Tropical Storm",
             "C1": "Category 1", "C2": "Category 2", "C3": "Category 3",
             "C4": "Category 4", "C5": "Category 5"}.get(cat, cat)
-    type_word = _type_word(cat, ids.basin)
+    # Stage C - an invest gets a GREY identity (data-invest CSS overrides the
+    # category vars) + a red-X glyph; "INVEST AREA" not a category type word.
+    type_word = "INVEST AREA" if is_invest else _type_word(cat, ids.basin)
+    chip_hidden = is_invest or cat in ("TD", "TS")
     og_title = f"{name} · {chip} · CycloLab"
     bits = []
     if wind is not None:
@@ -4965,7 +4998,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__TYPE_WORD__", _esc(type_word.upper()))
             .replace("__CHIP__", _esc(chip))
             .replace("__CHIP_STYLE__",
-                     ' style="display:none"' if cat in ("TD", "TS") else "")
+                     ' style="display:none"' if chip_hidden else "")
+            .replace("__IS_INVEST__", "true" if is_invest else "false")
             .replace("__OG_TITLE__", _esc(og_title))
             .replace("__OG_DESC__", _esc(og_desc))
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
@@ -4999,7 +5033,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SSHS_JSON__", json.dumps(SSHS_COLORS))
             .replace("__ENDED__", "true" if ended else "false")
             .replace("__BAKED__", baked))
-    if ended:
+    attrs = ("data-invest " if is_invest else "") + ("data-ended " if ended else "")
+    if attrs:
         html = html.replace("<html lang=\"en\" data-cat=",
-                            "<html lang=\"en\" data-ended data-cat=")
+                            f"<html lang=\"en\" {attrs}data-cat=")
     return html
