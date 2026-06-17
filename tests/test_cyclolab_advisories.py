@@ -280,6 +280,56 @@ class TestTextHealAndVerification(unittest.TestCase):
         # countdown healed along with the TCP
         self.assertIn("next_advisory_utc", p)
 
+    def test_text_urls_absent_at_first_advisory_keep_heal_open(self):
+        # NEGATIVE CONTROL (the PTC first-advisory blank-panel bug): at a
+        # storm's FIRST advisory CurrentStorms can carry the cone/track KMZ a
+        # poll or two BEFORE it populates the publicAdvisory/forecastDiscussion
+        # URLs. TCP+TCD are ALWAYS-EXPECTED for an NHC designated storm, so the
+        # heal debt must stay OPEN (text_done False) and the text must attach as
+        # soon as the URLs appear. Under the OLD vacuous-True behavior the pulse
+        # stopped and the panel stayed blank all cycle - and the poll-2 heal
+        # assertion below fails. This test guards the regression.
+        sink = pf.DictSink()
+        full = json.loads(CURRENT)
+        nourl = json.loads(CURRENT)
+        st = nourl["activeStorms"][0]
+        st["publicAdvisory"] = {"advNum": "013"}     # URLs not yet populated
+        st["forecastDiscussion"] = {"advNum": "013"}
+        state = {"current": json.dumps(nourl)}
+
+        def fetch_text(url):
+            if "TCP" in url:
+                return TCP_SHTML
+            if "TCD" in url:
+                return TCD_BODY
+            return state["current"]
+
+        def fetch_bytes(url):
+            return CONE if "CONE" in url else (
+                TRACK if "TRACK" in url else None)
+
+        src = ca.make_advisories_source(
+            session=None, sink=sink, prefix="shadow/cyclolab",
+            current_storms_url="fixture://CurrentStorms.json",
+            policy=pf.FetchPolicy(), fetch_text=fetch_text,
+            fetch_bytes=fetch_bytes, clock=_clock)
+        eng = pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
+                              stale_after_s=60, clock=_clock)
+
+        eng.poll_once()                          # adv ships; text URLs absent
+        p = self._payload(sink)
+        self.assertNotIn("tcp", p["text"])       # nothing attached yet...
+        self.assertNotIn("tcd", p["text"])
+        self.assertGreaterEqual(len(p["cone"]), 1000)   # ...cone never blocked
+
+        state["current"] = json.dumps(full)      # NHC populates the text URLs
+        eng.poll_once()                          # heal pulse must still fire
+        p = self._payload(sink)
+        self.assertIn("BULLETIN", p["text"]["tcp"])     # healed once URLs exist
+        self.assertIn("TCD DISCUSSION BODY", p["text"]["tcd"])
+        self.assertEqual(p["text"]["tcp_url"],
+                         "https://www.nhc.noaa.gov/text/MIATCPEP1.shtml")
+
     def test_heal_settles_no_rewrites_after_complete(self):
         sink = pf.DictSink()
         eng, avail = self._engine_with_window(sink)

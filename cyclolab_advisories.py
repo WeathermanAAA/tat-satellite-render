@@ -220,9 +220,19 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
         nhc.gov cross-origin. Best-effort PER PRODUCT: missing text never
         blocks the cone, the countdown, or the other product. Idempotent:
         already-attached products are never refetched, so the heal path
-        retries ONLY what is still owed. Returns True iff every product
-        that has a URL is attached (vacuously True when no URLs - e.g. a
-        basin with no NHC text products)."""
+        retries ONLY what is still owed.
+
+        TCP + TCD are ALWAYS-EXPECTED for an NHC designated storm - the only
+        kind this source handles (``_storm_entries`` restricts to AL/EP/CP
+        DESIGNATED, non-invest). So the debt stays OPEN (returns False) until
+        BOTH land, EVEN when a URL has not been populated yet. The bug this
+        closes: at a storm's FIRST advisory CurrentStorms can carry the cone/
+        track KMZ a poll or two BEFORE it populates the publicAdvisory /
+        forecastDiscussion URLs (observed at a PTC's first advisory). The old
+        code skipped a URL-less product and left ``complete`` True, so
+        ``text_done`` went VACUOUSLY true, the heal pulse stopped, and the panel
+        stayed blank for the WHOLE advisory cycle even after the URLs appeared.
+        Returns True iff BOTH TCP and TCD are attached VERIFIED."""
         sid = entry["sid"]
         urls = entry.get("text") or {}
         # Defensive: build_advisory_json always ships the URL dict, but a
@@ -234,14 +244,22 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
         complete = True
         tcp_raw = None
         for kind in ("tcp", "tcd"):
+            if payload["text"].get(kind):
+                continue                      # already attached VERIFIED
             url = urls.get(kind + "_url")
-            if not url or payload["text"].get(kind):
+            if not url:
+                # ALWAYS-EXPECTED: a not-yet-populated URL is owed text, not
+                # "no product" - keep the debt open so the heal pulse retries.
+                complete = False
                 continue
             try:
                 raw = get_text(url)
                 if not raw:
                     raise AdvisoryParseError("product page missing/empty")
                 payload["text"][kind] = _verified_product(kind, raw, adv)
+                # A late-populated URL must also land in the payload so the
+                # panel can link it (the prior poll may have written None).
+                payload["text"][kind + "_url"] = url
                 if kind == "tcp":
                     tcp_raw = raw
             except Exception as tx:  # noqa: BLE001
