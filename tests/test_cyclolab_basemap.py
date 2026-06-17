@@ -54,6 +54,47 @@ class TestBasemapBake(unittest.TestCase):
             self.assertGreaterEqual(area, cb.AREA_MIN - 1e-9,
                                     "near-collinear sliver kept")
 
+    def test_borders_and_states_are_clipped_to_land(self):
+        # v2 #1: the country/state border polylines are clipped to the BAKED
+        # land rings, so NO border vertex is ever out over open water (the old
+        # window-only clip let a coast-following border dangle into the ocean).
+        # Every border/state vertex must be inside land OR on the coast (a
+        # clipped vertex sits exactly on a land edge).
+        def near_land(pt, rings, tol=0.06):
+            if cb._point_in_land(pt, rings):
+                return True
+            x, y = pt
+            for r in rings:
+                for i in range(len(r)):
+                    ax, ay = r[i]
+                    bx, by = r[(i + 1) % len(r)]
+                    dx, dy = bx - ax, by - ay
+                    d2 = dx * dx + dy * dy
+                    t = 0.0 if d2 == 0 else max(0.0, min(
+                        1.0, ((x - ax) * dx + (y - ay) * dy) / d2))
+                    cx, cy = ax + t * dx, ay + t * dy
+                    if (x - cx) ** 2 + (y - cy) ** 2 <= tol * tol:
+                        return True
+            return False
+
+        bm = cb.basemap_for(28.6, -93.6, "AL")   # TX/LA coast - dense borders
+        land = bm["land"]
+        self.assertTrue(land, "near-land bake must have land to clip against")
+        for key in ("borders", "states"):
+            off = [v for line in bm[key] for v in line
+                   if not near_land(v, land)]
+            self.assertEqual(off, [], f"{key}: {len(off)} verts off water")
+
+    def test_clip_line_to_land_keeps_only_inland_part(self):
+        # a unit square of "land"; a horizontal line crossing it keeps only the
+        # inside run, dropping the parts that exit into "water".
+        sq = [[[0, 0], [10, 0], [10, 10], [0, 10]]]
+        runs = cb._clip_line_to_land([[-5, 5], [15, 5]], sq)
+        self.assertEqual(len(runs), 1)
+        (x0, _), (x1, _) = runs[0][0], runs[0][-1]
+        self.assertAlmostEqual(min(x0, x1), 0.0, places=6)
+        self.assertAlmostEqual(max(x0, x1), 10.0, places=6)
+
     def test_coast_lines_have_at_least_two_points(self):
         # coastlines are drawn as open polylines (M..L.., no trailing Z).
         # A mainland-coast segment is open; an ISLAND coast is a naturally

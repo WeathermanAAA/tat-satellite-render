@@ -797,9 +797,12 @@ HTML_TEMPLATE = r"""<!doctype html>
      ne_10m coastline polylines. Land paints OVER the graticule, so the
      graticule only shows on open water. */
   .ac-land { fill: #a7b2c4; stroke: none; }
-  /* maps-pass R2: THICK white coast (was a too-thin 1.1) + a slightly
-     thinner white internal-border stroke (drawn UNDER the coast). */
-  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 2.6;
+  /* coast + borders are FINE HAIRLINES (phase-4 v2 #3), retuned together: the
+     old 2.6 coast / 1.4 border / 0.8 state read as heavy clutter at the cone
+     auto-fit zoom. Now coast 1.3, country 0.7, state 0.5 - clean lines that
+     read without burying the subject. (The borders are clipped to land in the
+     bake so they never run into the water - cyclolab_basemap._clip_lines_to_land.) */
+  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 1.3;
     stroke-linejoin: round; stroke-linecap: round; }
   /* country + state borders are SLATE, not white (phase-4 C): a bright white
      internal border fought the white coast and the subject layer for
@@ -807,11 +810,11 @@ HTML_TEMPLATE = r"""<!doctype html>
      furniture, not subject. ONE shared rule -> every CycloLab map (cone /
      guidance track / overview track+swath) inherits it, no per-map fork. */
   .ac-border { fill: none; stroke: rgba(71,85,105,0.92);
-    stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+    stroke-width: 0.7; stroke-linejoin: round; stroke-linecap: round; }
   /* state/province boundaries (ne_10m admin_1) - dimmer + thinner than the
      country border, drawn UNDER it so coast + country read first. */
   .ac-state { fill: none; stroke: rgba(71,85,105,0.60);
-    stroke-width: 0.8; stroke-linejoin: round; stroke-linecap: round; }
+    stroke-width: 0.5; stroke-linejoin: round; stroke-linecap: round; }
   /* maps-pass R3 #3: a CASING/HALO graticule - a dark hairline UNDER a light
      line - so every line reads over BOTH the light-gray land AND the dark
      ocean (a flat light line vanished over the light land). Labels get the

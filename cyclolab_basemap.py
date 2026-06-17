@@ -336,6 +336,112 @@ def _simplify(pts, tol=None):
     return [pts[i] for i in range(n) if keep[i]]
 
 
+# ---------------------------------------------------------------------------
+# CLIP-TO-LAND (phase-4 v2 #1): the country/state border + the watch/warning
+# zone polylines come from DIFFERENT datasets than the land/coast, so where a
+# border follows a coast/river the two geometries DIVERGE and the border pokes
+# off the land into the ocean. We clip every border/state line to the BAKED
+# land rings (the exact geometry the drawn coast comes from), so no border
+# segment is ever drawn over water and a coast-following border sits ON the
+# drawn coast instead of dangling past it. Pure stdlib (ray-cast PIP + segment
+# intersection) - no shapely.
+# ---------------------------------------------------------------------------
+
+def _point_in_land(pt, rings) -> bool:
+    """Ray-cast: True iff pt is inside ANY land ring. The rings are disjoint
+    landmasses (separate outer polygons), so membership is OR, not even-odd."""
+    x, y = pt
+    for ring in rings:
+        n = len(ring)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = ring[i]
+            xj, yj = ring[j]
+            if ((yi > y) != (yj > y)) and \
+                    (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        if inside:
+            return True
+    return False
+
+
+def _seg_cross_t(a, b, c, d):
+    """Parameter t in (0,1) along a->b where it crosses segment c-d, else None."""
+    rx, ry = b[0] - a[0], b[1] - a[1]
+    sx, sy = d[0] - c[0], d[1] - c[1]
+    den = rx * sy - ry * sx
+    if den == 0.0:
+        return None                     # parallel / collinear
+    qpx, qpy = c[0] - a[0], c[1] - a[1]
+    t = (qpx * sy - qpy * sx) / den
+    u = (qpx * ry - qpy * rx) / den
+    if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+        return t
+    return None
+
+
+def _clip_line_to_land(line, rings):
+    """Keep only the parts of an open polyline that lie inside the land rings.
+    Each segment is split at every crossing with a land-ring edge; a sub-piece
+    is kept iff its MIDPOINT is inside land. Consecutive kept pieces stitch into
+    one run. Returns a list of on-land polylines."""
+    eps = 1e-9
+    runs = []
+    cur = []
+    for i in range(len(line) - 1):
+        a, b = line[i], line[i + 1]
+        ts = [0.0, 1.0]
+        for ring in rings:
+            m = len(ring)
+            for k in range(m):
+                t = _seg_cross_t(a, b, ring[k], ring[(k + 1) % m])
+                if t is not None and eps < t < 1.0 - eps:
+                    ts.append(t)
+        ts = sorted(set(ts))
+        for j in range(len(ts) - 1):
+            t0, t1 = ts[j], ts[j + 1]
+            if t1 - t0 < eps:
+                continue
+            tm = 0.5 * (t0 + t1)
+            mid = (a[0] + (b[0] - a[0]) * tm, a[1] + (b[1] - a[1]) * tm)
+            if not _point_in_land(mid, rings):
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur = []
+                continue
+            p0 = [a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0]
+            p1 = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1]
+            if cur and abs(cur[-1][0] - p0[0]) < eps \
+                    and abs(cur[-1][1] - p0[1]) < eps:
+                cur.append(p1)
+            else:
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur = [p0, p1]
+    if len(cur) >= 2:
+        runs.append(cur)
+    return runs
+
+
+def _clip_lines_to_land(lines, rings, prec=2):
+    """Clip each polyline to land, round to ``prec`` dp, dedup. [] land -> []."""
+    if not rings:
+        return []
+    out = []
+    for line in lines:
+        for run in _clip_line_to_land(line, rings):
+            rd = [[round(x, prec), round(y, prec)] for x, y in run]
+            ded = [rd[0]]
+            for p in rd[1:]:
+                if p != ded[-1]:
+                    ded.append(p)
+            if len(ded) >= 2:
+                out.append(ded)
+    return out
+
+
 def basemap_for(lat: float, lon: float, basin: str, *,
                 dlat: float = 22.0, dlon: float = 30.0) -> dict:
     """The baked basemap dict for a storm at (lat, lon): land rings
@@ -493,6 +599,13 @@ def basemap_for(lat: float, lon: float, basin: str, *,
 
     state_out = _proc_lines([ln for ln in _state_lines() if _near_storm(ln)],
                             0.18, tol_scale=1.8)
+    # CLIP-TO-LAND (v2 #1): bound the border + state polylines to the BAKED land
+    # rings (the exact geometry the drawn coast is derived from), so no border
+    # segment is ever drawn over water and a coast-following border sits ON the
+    # drawn coast. Done LAST, against the final `out` rings, so the clip matches
+    # what is actually painted. Mid-ocean bake (no land) -> empty (correct).
+    border_out = _clip_lines_to_land(border_out, out, prec=2)
+    state_out = _clip_lines_to_land(state_out, out, prec=2)
     return {
         "window": [round(la0, 2), round(la1, 2),
                    round(lo0, 2), round(lo1, 2)],
