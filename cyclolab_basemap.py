@@ -34,7 +34,14 @@ HERE = Path(__file__).resolve().parent
 #    vertices with the fill (no separate-file misalignment slivers).
 #  * BORDER = ne_10m_admin_0_boundary_lines_land -> THIN white internal
 #    country borders (no coast duplication - boundary_lines exclude coast).
-LAND_PATH = HERE / "cyclolab_ne_10m_land.geojson"
+# v3: the LAND + COAST now come from GSHHG (high-res, 'h'), a TRUE high-resolution
+# GLOBAL shoreline - so the rendered coast matches the real terrain (bays / inlets
+# / passes) instead of the generalized ne_10m. Pre-processed once from gshhs_h.b
+# into a compact binary: level-1 (land) + level-2 (lakes), lat [-62,72] (drops the
+# TC-irrelevant poles), each polygon lightly DP-simplified to 0.004 deg (terrain
+# preserved) with a per-polygon bbox for fast window selection. ne_10m is kept ONLY
+# for the admin borders (GSHHG has no borders), re-clipped to the GSHHG land.
+GSHHS_PATH = HERE / "cyclolab_gshhs_coast.bin"
 BORDER_PATH = HERE / "cyclolab_ne_10m_borders.geojson"
 # ne_10m admin_1 state/province boundary LINES (internal; simplified to ~0.012deg,
 # finer than the bake's TOL_NEAR so nothing is lost) -> a THIN, DIM state-border
@@ -42,7 +49,6 @@ BORDER_PATH = HERE / "cyclolab_ne_10m_borders.geojson"
 # the cone + track maps were missing. Vendored (no CDN), like the others.
 STATE_PATH = HERE / "cyclolab_ne_10m_states.geojson"
 
-_LAND = None
 _BORDER = None
 _STATE = None
 
@@ -50,21 +56,74 @@ OCEAN_NAMES = {"AL": "ATLANTIC OCEAN", "EP": "PACIFIC OCEAN",
                "CP": "PACIFIC OCEAN", "WP": "PACIFIC OCEAN"}
 
 
-def _land_rings() -> list[list[list[float]]]:
-    """All land rings as [[lon, lat], ...] lists (outer rings only -
-    holes are inland lakes, irrelevant at this scale)."""
-    global _LAND
-    if _LAND is None:
-        gj = json.loads(LAND_PATH.read_text(encoding="utf-8"))
-        rings = []
-        for f in gj["features"]:
-            g = f["geometry"]
-            if g["type"] == "Polygon":
-                rings.append(g["coordinates"][0])
-            elif g["type"] == "MultiPolygon":
-                rings.extend(p[0] for p in g["coordinates"])
-        _LAND = rings
-    return _LAND
+import struct
+
+# GSHHG compact binary: b'GSH2' + count(uint32 LE); then per polygon a 21-byte
+# header (level uint8, npts uint32, west/south/east/north int32 microdeg) followed
+# by npts * (lon int32, lat int32) microdeg, lon already in -180..180.
+_GSHHS_HDR = struct.Struct("<BIiiii")
+_GSHHS_INDEX = None      # [(byte_offset, level, npts, w, s, e, n)] microdeg bbox
+
+
+def _gshhs_index() -> list:
+    """Scan the compact binary ONCE -> a light per-polygon index (offset + bbox +
+    level + npts), so a bake reads only the polygons overlapping its window."""
+    global _GSHHS_INDEX
+    if _GSHHS_INDEX is None:
+        idx = []
+        with open(GSHHS_PATH, "rb") as f:
+            if f.read(4) != b"GSH2":
+                raise ValueError("bad GSHHG coast file magic")
+            (count,) = struct.unpack("<I", f.read(4))
+            hb = _GSHHS_HDR.size
+            for _ in range(count):
+                level, npts, w, s, e, n = _GSHHS_HDR.unpack(f.read(hb))
+                idx.append((f.tell(), level, npts, w, s, e, n))
+                f.seek(npts * 8, 1)
+        _GSHHS_INDEX = idx
+    return _GSHHS_INDEX
+
+
+def _gshhs_window_rings(lo0, la0, lo1, la1, level=1, *,
+                        lat=None, lon=None):
+    """Read the GSHHG polygons of ``level`` whose bbox overlaps the window box
+    [lo0,lo1]x[la0,la1] (deg) -> a list of rings [[lon,lat],...] (lon -180..180).
+    The lon test is wrap-aware (+/-360) so an antimeridian window still selects.
+    Dateline-spanning polygons (Eurasia) match every window but clip to nothing
+    off-region - correct, only a small read cost.
+
+    When ``lat``/``lon`` are given, a DISTANCE-ADAPTIVE speck filter drops tiny
+    far islands by their INDEX bbox (without reading their points) - GSHHG-high
+    has ~14 k polygons in a Gulf window, almost all sub-km islands that vanish at
+    the window-edge zoom; skipping them at the index is the bake's big speedup."""
+    cosl = max(0.3, math.cos(math.radians(lat))) if lat is not None else 1.0
+    sel = []
+    for (off, lv, npts, w, s, e, n) in _gshhs_index():
+        if lv != level:
+            continue
+        sd, nd = s / 1e6, n / 1e6
+        if nd < la0 or sd > la1:                    # lat reject
+            continue
+        wd, ed = w / 1e6, e / 1e6
+        if not any(not (ed + sh < lo0 or wd + sh > lo1)
+                   for sh in (0.0, 360.0, -360.0)):  # wrap-aware lon reject
+            continue
+        if lat is not None and npts < 6000:          # keep big polygons always
+            span = max(ed - wd, nd - sd)
+            cx = max(wd, min(ed, lon)) if wd <= ed else lon
+            d = math.hypot((cx - lon) * cosl, max(sd, min(nd, lat)) - lat)
+            floor = 0.012 if d < 8 else (0.06 if d < 16 else 0.22)
+            if span < floor:
+                continue
+        sel.append((off, npts))
+    rings = []
+    with open(GSHHS_PATH, "rb") as f:
+        for off, npts in sel:
+            f.seek(off)
+            pts = struct.unpack("<%di" % (2 * npts), f.read(npts * 8))
+            rings.append([[pts[2 * i] / 1e6, pts[2 * i + 1] / 1e6]
+                          for i in range(npts)])
+    return rings
 
 
 def _border_lines() -> list[list[list[float]]]:
@@ -276,12 +335,10 @@ SIMPLIFY_TOL = 0.01
 # and coarsen toward the edges (TOL_FAR) where geometry is rarely shown
 # and, when it is, the cone is large so the zoom is loose. Cuts a near-
 # land bake roughly in half vs uniform-fine with no visible center loss.
-TOL_NEAR = 0.018      # deg ~ 2.0 km (v2 #2: was 0.022/2.4 km - ~18% finer coast
-                      # so a coast-following border sits ON the shore). 0.016
-                      # was crisper but a worst-case Gulf bake (Apalachee Bay,
-                      # 29N 85W) hit 231 KB - 4 KB under the 235 KB budget,
-                      # too fragile; 0.018 keeps ~23 KB headroom at the same
-                      # on-screen crispness (the delta is sub-pixel at cone zoom).
+TOL_NEAR = 0.013      # deg ~ 1.4 km (v3: GSHHG-high source - the near-field coast
+                      # is terrain-accurate at this light simplification, so bays/
+                      # inlets/passes read at the cone auto-fit zoom). The page-
+                      # size budget rises with the higher-fidelity coast.
 TOL_FAR = 0.10        # deg ~ 11 km: rarely-shown window edge
 # Island floors (deg). Tiny / thin near-shore islands, stroked with the
 # THICK white coast, read as spiky white slivers, NOT land - so drop an
@@ -393,15 +450,32 @@ def _clip_line_to_land(line, rings):
     is kept iff its MIDPOINT is inside land. Consecutive kept pieces stitch into
     one run. Returns a list of on-land polylines."""
     eps = 1e-9
+    # per-ring bbox: skip a whole ring whose bbox can't touch this line.
+    rbox = [(min(p[0] for p in r), min(p[1] for p in r),
+             max(p[0] for p in r), max(p[1] for p in r)) for r in rings]
+    lx0 = min(p[0] for p in line); ly0 = min(p[1] for p in line)
+    lx1 = max(p[0] for p in line); ly1 = max(p[1] for p in line)
+    near = [i for i, b in enumerate(rbox)
+            if not (b[2] < lx0 or b[0] > lx1 or b[3] < ly0 or b[1] > ly1)]
     runs = []
     cur = []
     for i in range(len(line) - 1):
         a, b = line[i], line[i + 1]
+        # segment bbox -> reject ring edges that can't cross it (cheap pre-test
+        # before the float-heavy _seg_cross_t; the clip was the bake bottleneck).
+        sx0 = a[0] if a[0] < b[0] else b[0]; sx1 = a[0] if a[0] > b[0] else b[0]
+        sy0 = a[1] if a[1] < b[1] else b[1]; sy1 = a[1] if a[1] > b[1] else b[1]
         ts = [0.0, 1.0]
-        for ring in rings:
+        for ri in near:
+            ring = rings[ri]
             m = len(ring)
             for k in range(m):
-                t = _seg_cross_t(a, b, ring[k], ring[(k + 1) % m])
+                c = ring[k]; d = ring[(k + 1) % m]
+                if (c[0] < sx0 and d[0] < sx0) or (c[0] > sx1 and d[0] > sx1) \
+                        or (c[1] < sy0 and d[1] < sy0) \
+                        or (c[1] > sy1 and d[1] > sy1):
+                    continue
+                t = _seg_cross_t(a, b, c, d)
                 if t is not None and eps < t < 1.0 - eps:
                     ts.append(t)
         ts = sorted(set(ts))
@@ -461,7 +535,6 @@ def basemap_for(lat: float, lon: float, basin: str, *,
     # grazes the cone region stays crisp even if most of it is far). lon
     # deltas are cos-scaled to the storm latitude.
     cosl = max(0.3, math.cos(math.radians(lat)))
-    coast_out = []
 
     def _adaptive_tol(pts):
         d = min(math.hypot((p[0] - lon) * cosl, p[1] - lat) for p in pts)
@@ -471,7 +544,11 @@ def basemap_for(lat: float, lon: float, basin: str, *,
         return TOL_NEAR + (TOL_FAR - TOL_NEAR) * f
 
     out = []
-    for ring in _land_rings():
+    # v3: the land source is the windowed GSHHG high-res reader (the bake reads
+    # only the polygons overlapping this storm's window). A generous lon margin
+    # on the read keeps a continent that grazes the frame whole before unwrap.
+    for ring in _gshhs_window_rings(lo0 - 1.0, la0 - 1.0, lo1 + 1.0, la1 + 1.0,
+                                    lat=lat, lon=lon):
         # CONTIGUOUS unwrap: each vertex shifts by +-360 to stay within
         # 180 deg of the PREVIOUS one (per-vertex normalization tore
         # rings straddling the frame boundary - the clipper turned the
@@ -533,9 +610,10 @@ def basemap_for(lat: float, lon: float, basin: str, *,
         if abs(area) * 0.5 < AREA_MIN:
             continue
         out.append(ded)
-        # COAST = this land ring's boundary MINUS the window-edge segments,
-        # so the thick white coast shares EXACT vertices with the fill.
-        coast_out.extend(_ring_coast(ded, lo0, la0, lo1, la1))
+        # COAST is no longer stored (v3 dedup): it is DERIVED from these land
+        # rings at RENDER time (coast_from_land / the JS coastFromLand mirror) by
+        # dropping the window-edge segments, so the high-res GSHHG coast is not
+        # duplicated in the bake - the land + a derived coast at v2's byte cost.
     # BORDERS are OPEN polylines processed independently (boundary_lines):
     # contiguous-unwrap -> shift-into-frame -> open-polyline clip into the
     # in-window runs -> adaptive DP -> 2dp round -> dedup. `speck` drops a
@@ -607,16 +685,37 @@ def basemap_for(lat: float, lon: float, basin: str, *,
     # CLIP-TO-LAND (v2 #1): bound the border + state polylines to the BAKED land
     # rings (the exact geometry the drawn coast is derived from), so no border
     # segment is ever drawn over water and a coast-following border sits ON the
-    # drawn coast. Done LAST, against the final `out` rings, so the clip matches
-    # what is actually painted. Mid-ocean bake (no land) -> empty (correct).
-    border_out = _clip_lines_to_land(border_out, out, prec=2)
-    state_out = _clip_lines_to_land(state_out, out, prec=2)
+    # drawn coast. Done LAST. v3: clip against a COARSENED copy of the land
+    # (~0.05 deg) rather than the high-res GSHHG rings - a border just needs to be
+    # bounded to land (it never reads sub-5 km coast detail), and clipping the
+    # admin lines against ~20 k high-res land edges was the bake's bottleneck
+    # (40 s -> ~3 s). The drawn COAST stays high-res; only the border-clip
+    # boundary is coarse. Mid-ocean bake (no land) -> empty (correct).
+    _clip_land = []
+    for r in out:
+        cr = _simplify([tuple(p) for p in r], 0.05)
+        if len(cr) >= 3:
+            _clip_land.append([list(p) for p in cr])
+    border_out = _clip_lines_to_land(border_out, _clip_land, prec=2)
+    state_out = _clip_lines_to_land(state_out, _clip_land, prec=2)
     return {
         "window": [round(la0, 2), round(la1, 2),
                    round(lo0, 2), round(lo1, 2)],
         "land": out,
-        "coast": coast_out,
         "borders": border_out,
         "states": state_out,
         "ocean": OCEAN_NAMES.get((basin or "").upper(), "OCEAN"),
     }
+
+
+def coast_from_land(land_rings, window):
+    """Derive the coast polylines from the BAKED land rings + the window box
+    (la0,la1,lo0,lo1) - the land-ring boundary MINUS the window-edge segments, so
+    the white coast shares EXACT vertices with the fill and no spurious stroke
+    runs along the window box. The render-time mirror of this is the JS
+    ``coastFromLand`` (v3 dedup: the coast is no longer stored in the bake)."""
+    la0, la1, lo0, lo1 = window
+    out = []
+    for ring in land_rings:
+        out.extend(_ring_coast([tuple(p) for p in ring], lo0, la0, lo1, la1))
+    return out

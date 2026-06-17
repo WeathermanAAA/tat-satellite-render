@@ -1425,6 +1425,43 @@ HTML_TEMPLATE = r"""<!doctype html>
   // Storm-window basemap (S4-AD1 #2): vendored Natural Earth land,
   // clipped + antimeridian-normalized at bake time. No runtime fetch.
   var BASEMAP = __BASEMAP__;
+  // v3 dedup: the coast is DERIVED from the land rings (their boundary MINUS the
+  // window-edge segments) instead of being stored in the bake - so the GSHHG
+  // high-res coast costs nothing beyond the land it already shares vertices
+  // with. Byte-for-byte mirror of cyclolab_basemap.coast_from_land / _ring_coast.
+  // Computed ONCE here; all three basemap render sites draw BASEMAP_COAST.
+  function coastFromLand(land, win) {
+    if (!win || !land) return [];
+    var la0 = win[0], la1 = win[1], lo0 = win[2], lo1 = win[3], eps = 0.02;
+    function onEdge(a, b) {
+      return (Math.abs(a[0] - lo0) < eps && Math.abs(b[0] - lo0) < eps) ||
+             (Math.abs(a[0] - lo1) < eps && Math.abs(b[0] - lo1) < eps) ||
+             (Math.abs(a[1] - la0) < eps && Math.abs(b[1] - la0) < eps) ||
+             (Math.abs(a[1] - la1) < eps && Math.abs(b[1] - la1) < eps);
+    }
+    var out = [];
+    land.forEach(function (ring) {
+      var n = ring.length, cur = [];
+      for (var i = 0; i < n; i++) {
+        var a = ring[i], b = ring[(i + 1) % n];
+        if (a[0] === b[0] && a[1] === b[1]) continue;
+        if (onEdge(a, b)) {
+          if (cur.length >= 2) out.push(cur);
+          cur = [];
+        } else if (cur.length &&
+                   cur[cur.length - 1][0] === a[0] &&
+                   cur[cur.length - 1][1] === a[1]) {
+          cur.push(b);
+        } else {
+          if (cur.length >= 2) out.push(cur);
+          cur = [a, b];
+        }
+      }
+      if (cur.length >= 2) out.push(cur);
+    });
+    return out;
+  }
+  var BASEMAP_COAST = coastFromLand(BASEMAP.land, BASEMAP.window);
   // Python-derived category ramp tokens (THE approved gloss recipe -
   // same edge/mid/accent stops as the banner ramps and LIVE STATUS
   // chrome; one canon, baked not re-derived).
@@ -1650,7 +1687,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       '<path class="ac-land" d="' + pathOf(BASEMAP.land, true) + '"/>' +
       '<path class="ac-state" d="' + pathOf(BASEMAP.states || [], false) + '"/>' +
       '<path class="ac-border" d="' + pathOf(BASEMAP.borders, false) + '"/>' +
-      '<path class="ac-coast" d="' + pathOf(BASEMAP.coast, false) + '"/>';
+      '<path class="ac-coast" d="' + pathOf(BASEMAP_COAST, false) + '"/>';
   }
   var G_TAUS = [0, 24, 48, 72, 96, 120];
   function gTracks() {
@@ -2620,7 +2657,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-border" d="' + d + '"/>');
     });
-    (BASEMAP.coast || []).forEach(function (line) {
+    (BASEMAP_COAST || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
           pr.Y(c[1]).toFixed(1);
@@ -3460,7 +3497,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-border" d="' + d + '"/>');
     });
-    (BASEMAP.coast || []).forEach(function (line) {
+    (BASEMAP_COAST || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
           Y(c[1]).toFixed(1);

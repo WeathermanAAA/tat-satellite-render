@@ -22,20 +22,24 @@ CASES = [("near-land", 11.2, -87.5, "EP"),
 
 
 class TestBasemapBake(unittest.TestCase):
-    def test_emits_coast_land_borders_keys(self):
+    def test_emits_land_borders_keys(self):
+        # v3 dedup: 'coast' is no longer a bake key - it is derived from 'land'
+        # at render time (coast_from_land / the JS mirror).
         bm = cb.basemap_for(11.2, -87.5, "EP")
-        for k in ("land", "coast", "borders"):
+        for k in ("land", "borders"):
             self.assertIn(k, bm)
             self.assertIsInstance(bm[k], list)
+        self.assertNotIn("coast", bm)
 
-    def test_coast_vertices_are_a_subset_of_land(self):
-        # round-2 #2: the coast is DERIVED from the land-fill rings (minus the
-        # window-edge segments), so every coast vertex is a land vertex - the
-        # thick white coast can NEVER misalign with the fill into a sliver.
+    def test_derived_coast_vertices_are_a_subset_of_land(self):
+        # the coast is DERIVED from the land-fill rings (minus the window-edge
+        # segments), so every coast vertex is a land vertex - the white coast can
+        # NEVER misalign with the fill into a sliver. v3: derived (not stored).
         for nm, lat, lon, basin in CASES:
             bm = cb.basemap_for(lat, lon, basin)
             land = {tuple(p) for r in bm["land"] for p in r}
-            coast = {tuple(p) for r in bm["coast"] for p in r}
+            coast = {tuple(p) for r in cb.coast_from_land(bm["land"], bm["window"])
+                     for p in r}
             self.assertTrue(coast <= land,
                             f"{nm}: {len(coast - land)} coast pts not in land")
 
@@ -102,16 +106,19 @@ class TestBasemapBake(unittest.TestCase):
         # just never appends a Z, so a closed island line still draws as a
         # loop. The contract is only ">= 2 points".
         bm = cb.basemap_for(11.2, -87.5, "EP")
-        self.assertGreater(len(bm["coast"]), 0, "near-land bake has coast")
-        for line in bm["coast"]:
+        coast = cb.coast_from_land(bm["land"], bm["window"])
+        self.assertGreater(len(coast), 0, "near-land bake has coast")
+        for line in coast:
             self.assertGreaterEqual(len(line), 2)
 
     def test_all_geometry_inside_window(self):
         for nm, lat, lon, basin in CASES:
             bm = cb.basemap_for(lat, lon, basin)
             la0, la1, lo0, lo1 = bm["window"]
-            for layer in ("land", "coast"):
-                for ring in bm[layer]:
+            layers = {"land": bm["land"],
+                      "coast": cb.coast_from_land(bm["land"], bm["window"])}
+            for layer, geom in layers.items():
+                for ring in geom:
                     for x, y in ring:
                         self.assertTrue(lo0 - 1 <= x <= lo1 + 1,
                                         f"{nm} {layer} lon {x} out of window")
@@ -124,18 +131,18 @@ class TestBasemapBake(unittest.TestCase):
         # per-storm page). Gulf-of-Mexico landfall is the densest case.
         bm = cb.basemap_for(27.0, -90.0, "AL")
         raw = json.dumps(bm, separators=(",", ":"))
-        # v2 #2: the budget rose 200k -> 225k when TOL_NEAR went 0.022 -> 0.018
-        # (~18% finer coast so coast-following borders sit on the shore). The
-        # worst real Gulf bake (Apalachee Bay) is ~212 KB, so 225 KB both fits and
-        # still catches a regression. A per-storm cone page loaded on demand.
-        self.assertLess(len(raw), 225_000,
+        # v3: the GSHHG terrain-accurate coast at TOL_NEAR 0.013, but the coast is
+        # DERIVED from land at render time (not stored), so the worst real Gulf
+        # bake (~189 KB at Apalachee Bay) is actually SMALLER than the v2 ne_10m
+        # land+coast (225 KB) despite the far higher fidelity. 210 KB fits + guards.
+        self.assertLess(len(raw), 210_000,
                         f"Gulf bake {len(raw)} bytes - DP simplify regressed")
 
     def test_antimeridian_does_not_crash_or_leak(self):
         bm = cb.basemap_for(18.0, 178.0, "WP")
         self.assertEqual(bm["ocean"], "PACIFIC OCEAN")
         # no land/coast band should span the whole window (the torn-ring bug)
-        for ring in bm["land"] + bm["coast"]:
+        for ring in bm["land"] + cb.coast_from_land(bm["land"], bm["window"]):
             xs = [p[0] for p in ring]
             self.assertLess(max(xs) - min(xs), 65,
                             "geometry spans >65 deg lon - antimeridian tear")
