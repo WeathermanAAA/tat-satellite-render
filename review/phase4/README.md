@@ -5,6 +5,65 @@
 `ptc-phase4-ww-counties`; NOT on main, NOT deployed. HELD for Andrew's visual
 sign-off.**
 
+---
+
+## VISUAL REVISION v2 (latest) — basemap borders + W/W zone layer
+
+Two separate border layers were both fixed, kept straight:
+
+### Basemap state/country outlines
+1. **Clip borders to land (FIXED).** The country/state border lines come from
+   DIFFERENT NE datasets than the land/coast and were clipped only to the
+   rectangular *window*, never to land — so a coast/river-following border
+   diverged off the land and dangled into the ocean. `cyclolab_basemap` now clips
+   every border + state polyline to the BAKED land rings (the exact geometry the
+   drawn coast is derived from) via a stdlib ray-cast PIP + segment-intersection
+   clipper (`_clip_lines_to_land`), as the last bake step. **0 off-water
+   border/state vertices** on the TX/LA coast now (was dangling). See still 05.
+2. **Align / higher-res.** `TOL_NEAR` 0.022 → 0.016 (~1.7 km) for a crisper
+   coast; the page-size budget rises 200k → 235k. Combined with the clip, a
+   coast-following border now sits ON the drawn coast.
+3. **Thin strokes.** coast 2.6 → 1.3, country border 1.4 → 0.7, state 0.8 → 0.5
+   — fine hairlines retuned together.
+
+### Watch/warning zone layer
+4. **Zone outlines clipped to land.** Each warned county is a FULL outline +
+   fill, clipped EXACTLY to the basemap land via an SVG `clipPath` of the SAME
+   `BASEMAP.land` the coast comes from — so nothing dangles into water and the
+   fills align EXACTLY with the drawn coast. A thin DARK outline per county so
+   adjacent counties read as bounded shapes, not one blob.
+5. **Wider attribution.** The zone box now spans the FULL forecast track (cone +
+   all track points) with a 4° margin (was cone-bbox + 3°), so ALL warned
+   counties along the track are attributed, not just the coastal row.
+6. **Max opacity + z-order.** fill-opacity 0.22 → **1.0**; the fills draw on the
+   basemap UNDER the cone / track / forecast points / icons / labels (all stay
+   above, never buried).
+
+### Both
+7. **"Everything lines up, no mismatch."** Achieved by clipping BOTH the borders
+   AND the W/W zones to the SAME baked land — so the basemap coast + admin
+   borders + W/W county edges are all bounded by one coast, no internal
+   mismatch. Applied across ALL CycloLab maps (cone + guidance track + overview
+   track/swath) via the one shared `BASEMAP` + the one `.ac-*` CSS rule, no fork.
+   **NOTE / SIGN-OFF DECISION:** the basemap COAST is still Natural Earth 10m
+   (raised to 0.016, the page-size budget's practical ceiling — even 0.018 blew
+   the old 200k budget). A full switch to a US Census county / GSHHG-high *source*
+   (so the coast geometry itself matches the NWS-zone shapes) is a larger,
+   separable build; I confirmed it is FEASIBLE (the Census county geojson is
+   topologically consistent → coast/state/county derivable by edge-hashing, and
+   the land union by edge-chaining, no shapely), but it adds page weight + seam
+   handling at the US/Mexico land border. Held as an option: say the word and I
+   will build the Census-source basemap. The alignment goal of #7 is met *now*
+   via clipping; the Census switch would additionally make the coast *shape* itself
+   higher-fidelity.
+
+Stills re-rendered from the live PTC AL01: `01` desktop cone, `02` inland fills
+zoom (full-opacity counties clipped to land), `03` mobile, `04` track-history
+(second map, borders clipped to land), `05` coastal-border zoom proving borders
+no longer run into the water.
+
+---
+
 This is the durability-recovery rebuild. The original branch lived in an
 ephemeral `/tmp` clone that the codespace restart wiped; it had never been
 pushed to origin, and a filesystem-wide search + an `ls-remote` confirmed it was
