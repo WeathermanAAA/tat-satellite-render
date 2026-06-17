@@ -856,6 +856,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   .ac-ww .ww-cas { fill: none; stroke: rgba(6,12,22,0.72);
     stroke-linecap: round; stroke-linejoin: round; }
   .ac-ww .ww-lin { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  /* phase-4 follow-up: INLAND county/zone FILLS, drawn UNDER the coastal
+     breakpoint lines. Translucent canonical-NHC fill (color set inline per
+     type) + a stronger same-color outline so the watched/warned counties read
+     as shaded areas without burying the cone or the track beneath them. */
+  .ac-ww-zones .ww-zone { fill-opacity: 0.22; stroke-width: 1.4;
+    stroke-opacity: 0.95; stroke-linejoin: round; stroke-linecap: round; }
   .adv-method { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
   .adv-method summary { cursor: pointer; color: #9fc6f5;
     font-weight: 600; font-size: 12px; letter-spacing: 0.4px; }
@@ -3769,14 +3775,36 @@ HTML_TEMPLATE = r"""<!doctype html>
                            lonAt: lonAt, latAt: latAt,
                            x0: fe.x0, y0: fe.y0, x1: fe.x1, y1: fe.y1 }));
 
-    // ---- Phase 4: coastal watches/warnings (official NHC TCWW segments) ----
-    // Drawn ABOVE the cone + graticule (so the colored coastline reads) but
-    // BELOW the forecast icons (added after). Each segment is a dark casing +
-    // a canonical-color line. Outside the cone reveal clip, so it is never
-    // hidden by the reveal. A separate, toggleable group. NHC basins only;
-    // never JTWC/WP (the WW KMZ is absent there -> ww is []).
-    var wwSegs = (advFull && advFull.ww) || [];
+    // ---- Phase 4: watches/warnings overlay (NHC AL/EP/CP only) -------------
+    // TWO layers sharing ONE palette + legend + toggle, drawn ABOVE the cone +
+    // graticule but BELOW the forecast icons: the INLAND county/zone FILLS
+    // (advFull.ww_zones, from the NWS alerts API) drawn UNDER the coastal
+    // breakpoint LINES (advFull.ww, from the NHC TCWW KMZ). Both are separate,
+    // toggleable groups outside the reveal clip. NHC basins only.
     var wwTypes = {};
+    // inland county/zone fills FIRST (so the coastal lines read on top).
+    var wwZones = (advFull && advFull.ww_zones) || [];
+    if (wwZones.length) {
+      var zParts = [];
+      wwZones.forEach(function (z) {
+        var st = WW_STYLE[z.type] ||
+                 { color: "#cfd8e6", label: (z.type || "Advisory area") };
+        wwTypes[z.type] = st;
+        var d = (z.geometry || []).map(function (c, i) {
+          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
+        }).join(" ");
+        if (!d) return;
+        zParts.push('<path class="ww-zone" d="' + d + 'Z" fill="' +
+                    st.color + '" stroke="' + st.color + '"/>');
+      });
+      if (zParts.length) {
+        parts.push('<g class="ac-ww-zones" id="ac-ww-zones-group"' +
+                   (wwShown ? '' : ' style="display:none"') + '>' +
+                   zParts.join("") + '</g>');
+      }
+    }
+    // coastal breakpoint lines ON TOP of the fills.
+    var wwSegs = (advFull && advFull.ww) || [];
     if (wwSegs.length) {
       var wwParts = [];
       wwSegs.forEach(function (seg) {
@@ -4036,8 +4064,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       chk.checked = wwShown;
       chk.onchange = function () {
         wwShown = chk.checked;
-        var g = document.getElementById("ac-ww-group");
-        if (g) g.style.display = wwShown ? "" : "none";
+        // one toggle drives BOTH layers (inland fills + coastal lines).
+        ["ac-ww-group", "ac-ww-zones-group"].forEach(function (id) {
+          var g = document.getElementById(id);
+          if (g) g.style.display = wwShown ? "" : "none";
+        });
       };
     })();
 

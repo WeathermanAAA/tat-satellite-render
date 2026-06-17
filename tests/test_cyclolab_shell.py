@@ -139,6 +139,16 @@ class TestRenderContract(unittest.TestCase):
         self.assertEqual(self.storm["current_category"], "C4")
         self.assertIn('<html lang="en" data-cat="C4">', html)
 
+    def test_ww_zones_inland_fill_render_scaffold(self):
+        # Phase-4 follow-up: the inland county/zone FILL layer (advFull.ww_zones)
+        # drawn UNDER the coastal lines, sharing the one toggle + legend.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn("advFull.ww_zones", html)                 # reads the key
+        self.assertIn('class="ww-zone"', html)                  # fill path
+        self.assertIn('id="ac-ww-zones-group"', html)           # toggleable group
+        self.assertIn(".ac-ww-zones .ww-zone", html)            # translucent CSS
+        self.assertIn("ac-ww-zones-group", html)                # toggle covers it
+
     def test_unknown_category_falls_back_to_TD(self):
         s = copy.deepcopy(self.storm)
         s["current_category"] = "ZZ"
