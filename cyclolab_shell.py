@@ -3789,11 +3789,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       wwZones.forEach(function (z) {
         var st = WW_STYLE[z.type] ||
                  { color: "#cfd8e6", label: (z.type || "Advisory area") };
-        wwTypes[z.type] = st;
         var d = (z.geometry || []).map(function (c, i) {
           return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
         }).join(" ");
         if (!d) return;
+        wwTypes[z.type] = st;   // legend advertises only types that drew a path
         zParts.push('<path class="ww-zone" d="' + d + 'Z" fill="' +
                     st.color + '" stroke="' + st.color + '"/>');
       });
@@ -3810,11 +3810,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       wwSegs.forEach(function (seg) {
         var st = WW_STYLE[seg.type] ||
                  { color: "#cfd8e6", label: (seg.type || "Advisory area") };
-        wwTypes[seg.type] = st;
         var d = (seg.geometry || []).map(function (c, i) {
           return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
         }).join(" ");
         if (!d) return;
+        wwTypes[seg.type] = st;   // legend advertises only types that drew a path
         wwParts.push('<path class="ww-cas" d="' + d + '" stroke-width="7"/>');
         wwParts.push('<path class="ww-lin" d="' + d + '" stroke="' +
                      st.color + '" stroke-width="4"/>');

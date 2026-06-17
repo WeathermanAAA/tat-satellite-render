@@ -463,6 +463,30 @@ class TestWWZones(unittest.TestCase):
         # one storm in the fixture -> exactly one alerts fetch this poll
         self.assertEqual(calls["n"], 1)
 
+    def test_alerts_fetched_once_per_poll_not_per_storm(self):
+        # TWO designated storms active in the SAME poll: the national NWS
+        # /alerts/active endpoint must be hit EXACTLY ONCE per poll (cached by
+        # poll seq), NOT once per storm - a per-storm fetch would hammer the API.
+        two = json.loads(CURRENT)
+        s2 = json.loads(json.dumps(two["activeStorms"][0]))
+        s2["id"] = "al022026"          # a second designated NHC storm, same KMZs
+        s2["name"] = "Two"
+        two["activeStorms"].append(s2)
+        calls = {"n": 0}
+
+        def counting():
+            calls["n"] += 1
+            return {"features": []}
+        sink = pf.DictSink()
+        eng = make_engine(sink, current_text=json.dumps(two),
+                          fetch_alerts=counting)
+        eng.poll_once()
+        # ONE fetch for the whole poll, though TWO storms were processed (a
+        # per-storm fetch would be 2). Both storms got their adv JSON.
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("shadow/cyclolab/adv/NHC_AL022026.json", sink.store)
+        self.assertIn("shadow/cyclolab/adv/NHC_EP012026.json", sink.store)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

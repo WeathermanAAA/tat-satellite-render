@@ -270,6 +270,41 @@ class TestTWO(unittest.TestCase):
         # no spurious invest entry (the (AL90) tag is gone from this TWO)
         self.assertNotIn("NHC_AL902026", out)
 
+    def test_active_systems_block_does_not_bleed_into_disturbances(self):
+        # A combined TWO: the Active-Systems PTC (70/70) FOLLOWED by a numbered
+        # disturbance area (AL91, 20/40) BEFORE the &&. The PTC's block must NOT
+        # absorb the disturbance's chances (last-wins would otherwise emit the
+        # PTC at 20/40). The lone-PTC fixture masked this; this is the guard.
+        combined = (
+            "Active Systems:\nThe National Hurricane Center is issuing "
+            "advisories on Potential Tropical Cyclone One, located over south "
+            "Texas.\n* Formation chance through 48 hours...high...70 percent.\n"
+            "* Formation chance through 7 days...high...70 percent.\n\n"
+            "1. Eastern Tropical Atlantic (AL91):\nA tropical wave.\n"
+            "* Formation chance through 48 hours...low...20 percent.\n"
+            "* Formation chance through 7 days...medium...40 percent.\n\n&&\n"
+            "Public Advisories on Potential Tropical Cyclone One are issued "
+            "under WMO header WTNT31 KNHC and under AWIPS header MIATCPAT1.\n$$")
+        out = cg.parse_two(combined, 2026)
+        self.assertEqual((out["NHC_AL012026"]["p48"],
+                          out["NHC_AL012026"]["p7"]), (70, 70))
+        # the disturbance is still read by the numbered-invest path at its OWN odds
+        self.assertEqual(out["NHC_AL912026"]["p7"], 40)
+
+    def test_active_systems_named_storm_with_trailing_disturbance(self):
+        # A NAMED storm in Active Systems FOLLOWED by a disturbance must still
+        # yield NO formation pill (its block must not absorb the disturbance's
+        # chance and attach a spurious genesis pill to an already-named storm).
+        s = ("Active Systems:\nThe National Hurricane Center is issuing "
+             "advisories on Hurricane Alberto, located over the Gulf.\n\n"
+             "1. Eastern Atlantic (AL92):\nA wave.\n"
+             "* Formation chance through 48 hours...high...80 percent.\n"
+             "* Formation chance through 7 days...high...80 percent.\n\n&&\n"
+             "Public Advisories on Hurricane Alberto are issued under WMO "
+             "header WTNT34 KNHC and under AWIPS header MIATCPAT2.\n$$")
+        out = cg.parse_two(s, 2026)
+        self.assertNotIn("NHC_AL022026", out)
+
     def test_active_systems_named_storm_yields_no_formation(self):
         # A NAMED storm in the Active-Systems narrative carries NO formation
         # chance (it is already a TC) -> no pill entry, even though it has an

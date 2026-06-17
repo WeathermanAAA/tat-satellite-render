@@ -497,6 +497,11 @@ def _rings_from_geojson(geom: dict | None) -> list[list[list[float]]]:
         raw_rings = [coords[0]]
     elif t == "MultiPolygon":
         raw_rings = [poly[0] for poly in coords if poly]
+    elif t == "GeometryCollection":          # defensive: not a known NWS shape
+        out: list = []
+        for g in geom.get("geometries") or []:
+            out.extend(_rings_from_geojson(g))
+        return out
     out: list[list[list[float]]] = []
     for r in raw_rings:
         ring: list[list[float]] = []
@@ -592,6 +597,11 @@ def parse_nws_alert_zones(alerts_obj: dict, *, cone_box: tuple | None = None,
             land_ugcs = [u for u in ugcs if not _ugc_is_marine(u)]
             if not land_ugcs:
                 continue                    # marine-only alert -> not inland
+            # When a land UGC is present the feature's embedded geometry is
+            # trusted to be the land county/zone shape: NWS issues TC alerts
+            # ONE FEATURE PER ZONE (verified on the live 2026-06-16 Gulf event -
+            # land TXZ/LAZ and marine GMZ arrive in separate features), so a
+            # single feature's geometry never mixes land + open water.
             rings = _rings_from_geojson(f.get("geometry"))
             if not rings and resolve_zone:
                 for zurl in (props.get("affectedZones") or []):

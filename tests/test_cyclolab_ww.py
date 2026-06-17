@@ -150,6 +150,18 @@ class ParseZonesTests(unittest.TestCase):
         z = K.parse_nws_alert_zones(bad)
         self.assertEqual(len(z), 1)
 
+    def test_geometrycollection_geometry_handled(self):
+        # Defensive: a GeometryCollection (not a known NWS shape) still yields
+        # its Polygon rings rather than silently dropping the zone.
+        gc = {"features": [{"geometry": {"type": "GeometryCollection",
+              "geometries": [{"type": "Polygon", "coordinates":
+              [[[-92, 29], [-92.1, 29.1], [-92.2, 29], [-92, 29]]]}]},
+              "properties": {"event": "Tropical Storm Warning",
+                             "geocode": {"UGC": ["LAZ252"]}}}]}
+        z = K.parse_nws_alert_zones(gc)
+        self.assertEqual(len(z), 1)
+        self.assertEqual(z[0]["type"], "TS_WARNING")
+
     def test_rdp_simplifies_but_preserves_endpoints(self):
         ring = ([[0.0, 0.0]] +
                 [[i * 0.001, 0.00005 * (i % 2)] for i in range(1, 150)] +

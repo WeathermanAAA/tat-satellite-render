@@ -91,6 +91,11 @@ _PTC_AWIPS = re.compile(
     r"AWIPS\s+header\s+\w{3}TCP([A-Z]{2})(\d{1,2})", re.I)
 # "...is issuing advisories on <NAME>, located ..." (the narrative block head)
 _PTC_NARR = re.compile(r"issuing\s+advisories\s+on\s+(.+?)\s*(?:,|\.|\bloc)", re.I)
+# A numbered disturbance area ("1. Eastern...") or an invest ref ("(AL91)") marks
+# the end of the Active-Systems narrative - a PTC's block must NOT bleed into a
+# trailing disturbance's formation chances (which would overwrite the PTC's own
+# odds, and would attach a spurious chance to a named storm that has none).
+_AREA_BREAK = re.compile(r"(?:(?<=\s)\d{1,2}\.\s+[A-Z]|\([A-Z]{2}\d\d\))")
 
 
 def _norm_name(s: str) -> str:
@@ -124,6 +129,11 @@ def _parse_active_ptc(body: str, year: int) -> Dict[str, dict]:
         start = m.end()
         end = narr[i + 1].start() if i + 1 < len(narr) else narr_end
         end = min(end, narr_end)
+        # Cap the block at the first numbered-disturbance / invest-ref marker so
+        # this system's chances never absorb a trailing disturbance's odds.
+        brk = _AREA_BREAK.search(flat, start, end)
+        if brk:
+            end = brk.start()
         block = flat[start:end]
         p48 = p7 = None
         for fm in _TWO_FC.finditer(block):
