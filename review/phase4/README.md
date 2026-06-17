@@ -250,7 +250,7 @@ via headless chromium (reduced-motion final frame):
   across the Gulf.
 
 ## Suite
-Full repo suite green: **527 passed + 16 subtests, 0 failures** (`python -m pytest
+Full repo suite green: **533 passed + 16 subtests, 0 failures** (`python -m pytest
 tests/`; the slow part is the jsdom CycloLab shell/visual harness — needs `node`,
 present here). New tests added by this batch:
 - `test_cyclolab_ww.py` — `parse_nws_alert_zones`: land-only/marine-excluded,
