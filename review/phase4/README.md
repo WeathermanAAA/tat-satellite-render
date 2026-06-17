@@ -20,8 +20,10 @@ Two separate border layers were both fixed, kept straight:
    drawn coast is derived from) via a stdlib ray-cast PIP + segment-intersection
    clipper (`_clip_lines_to_land`), as the last bake step. **0 off-water
    border/state vertices** on the TX/LA coast now (was dangling). See still 05.
-2. **Align / higher-res.** `TOL_NEAR` 0.022 → 0.016 (~1.7 km) for a crisper
-   coast; the page-size budget rises 200k → 235k. Combined with the clip, a
+2. **Align / higher-res.** `TOL_NEAR` 0.022 → 0.018 (~2.0 km, ~18% finer) for a
+   crisper coast; the page-size budget rises 200k → 225k (0.016 was crisper but a
+   worst-case Gulf bake hit 231k vs the 235k budget — too fragile; 0.018 keeps
+   ~23k headroom at the same on-screen crispness). Combined with the clip, a
    coast-following border now sits ON the drawn coast.
 3. **Thin strokes.** coast 2.6 → 1.3, country border 1.4 → 0.7, state 0.8 → 0.5
    — fine hairlines retuned together.
@@ -46,8 +48,8 @@ Two separate border layers were both fixed, kept straight:
    mismatch. Applied across ALL CycloLab maps (cone + guidance track + overview
    track/swath) via the one shared `BASEMAP` + the one `.ac-*` CSS rule, no fork.
    **NOTE / SIGN-OFF DECISION:** the basemap COAST is still Natural Earth 10m
-   (raised to 0.016, the page-size budget's practical ceiling — even 0.018 blew
-   the old 200k budget). A full switch to a US Census county / GSHHG-high *source*
+   (raised to TOL_NEAR 0.018, near the page-size budget's practical ceiling for a
+   page-embedded basemap). A full switch to a US Census county / GSHHG-high *source*
    (so the coast geometry itself matches the NWS-zone shapes) is a larger,
    separable build; I confirmed it is FEASIBLE (the Census county geojson is
    topologically consistent → coast/state/county derivable by edge-hashing, and

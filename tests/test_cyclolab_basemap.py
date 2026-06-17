@@ -124,10 +124,11 @@ class TestBasemapBake(unittest.TestCase):
         # per-storm page). Gulf-of-Mexico landfall is the densest case.
         bm = cb.basemap_for(27.0, -90.0, "AL")
         raw = json.dumps(bm, separators=(",", ":"))
-        # v2 #2: the budget rose from 200k to 235k when TOL_NEAR went 0.022->0.016
-        # (finer coast so coast-following borders sit on the shore). Still bounded
-        # - a per-storm cone page loaded on demand, not the landing page.
-        self.assertLess(len(raw), 235_000,
+        # v2 #2: the budget rose 200k -> 225k when TOL_NEAR went 0.022 -> 0.018
+        # (~18% finer coast so coast-following borders sit on the shore). The
+        # worst real Gulf bake (Apalachee Bay) is ~212 KB, so 225 KB both fits and
+        # still catches a regression. A per-storm cone page loaded on demand.
+        self.assertLess(len(raw), 225_000,
                         f"Gulf bake {len(raw)} bytes - DP simplify regressed")
 
     def test_antimeridian_does_not_crash_or_leak(self):
