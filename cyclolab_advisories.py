@@ -41,7 +41,8 @@ import poller_framework as pf
 from cyclolab_intensity import basin_entry
 from cyclolab_og import render_intensity_card
 from kml_advisories import (AdvisoryParseError, build_advisory_json,
-                            product_text,
+                            cone_bbox, parse_nws_alert_zones,
+                            product_text, NWS_TC_EVENTS,
                             parse_next_advisory)
 from storm_ids import InvestSidError, parse_sid
 
@@ -99,6 +100,40 @@ def _verified_product(kind: str, raw: str, adv: int) -> str:
 
 def _iso_z(t: dt.datetime) -> str:
     return t.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Inland county/zone WW FILLS (Phase 4 follow-up): the NWS public alerts API.
+# National (not per-storm), so fetched ONCE per poll and attributed to each
+# storm by its cone bbox. Kill-switch CYCLOLAB_WW_ZONES (house idiom, default on).
+NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
+WW_ZONES_ENABLED = (_env("CYCLOLAB_WW_ZONES", "1") or "1").lower() \
+    not in ("0", "false", "no")
+# How far (deg) beyond the cone bbox a watched/warned zone is still "this
+# storm's" - inland zones sit a little outside the over-water cone.
+_WW_ZONES_MARGIN_DEG = 3.0
+
+
+def _default_fetch_alerts(session: requests.Session,
+                          policy: pf.FetchPolicy) -> Optional[dict]:
+    """GET the active TC watches/warnings (the six event types) as a GeoJSON
+    FeatureCollection. NWS requires a descriptive User-Agent. Best-effort:
+    404 -> None, transient -> retried, anything else -> None to the caller (the
+    fills are ADDITIVE - a down alerts API must never block the cone)."""
+    def _do():
+        r = session.get(
+            NWS_ALERTS_URL,
+            params={"status": "actual", "message_type": "alert",
+                    "event": ",".join(NWS_TC_EVENTS)},
+            headers={"User-Agent": "tat-cyclolab/1.0 (triple-a-tropics.com)",
+                     "Accept": "application/geo+json"},
+            timeout=policy.timeout)
+        if r.status_code == 404:
+            return None
+        if r.status_code in (403, 429) or r.status_code >= 500:
+            raise pf.TransientFetchError(f"{r.status_code} alerts")
+        r.raise_for_status()
+        return r.json()
+    return pf.resilient_fetch(_do, policy)
 
 
 def _default_fetch_bytes(session: requests.Session, url: str,
@@ -165,16 +200,22 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                            policy: pf.FetchPolicy = None,
                            fetch_text: Optional[Callable] = None,
                            fetch_bytes: Optional[Callable] = None,
+                           fetch_alerts: Optional[Callable] = None,
                            clock: Callable[[], dt.datetime] = pf.utcnow,
                            ) -> pf.Source:
-    """Build the Source. fetch_text/fetch_bytes are injectable so the
-    offline tests drive the full poll cycle with fixture bytes."""
+    """Build the Source. fetch_text/fetch_bytes/fetch_alerts are injectable so
+    the offline tests drive the full poll cycle with fixture bytes."""
     import intensity_poller as ip   # late import: shared helpers/config
     current_storms_url = current_storms_url or ip.CURRENT_STORMS_URL
     policy = policy or ip.FETCH_POLICY
     get_text = fetch_text or (lambda url: ip._get_text(session, url, policy))
     get_bytes = fetch_bytes or (
         lambda url: _default_fetch_bytes(session, url, policy))
+    get_alerts = fetch_alerts or (
+        lambda: _default_fetch_alerts(session, policy))
+    # National TC alerts fetched ONCE per poll, cached by poll sequence. A
+    # fetch/parse failure caches None -> ww_zones stays [] (never blocks a cone).
+    alerts_cache = {"poll": -1, "raw": None}
 
     # Per-storm ledger: {nhc_sid: {"adv": int, "issued": iso,
     # "text_done": bool, "payload": dict}}. In-memory; a restart simply
@@ -185,6 +226,20 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
     # every text product with a URL was attached VERIFIED.
     ledger: dict[str, dict] = {}
     poll_seq = {"n": 0}
+
+    def _alerts_for_poll() -> Optional[dict]:
+        """The national TC-alert FeatureCollection for THIS poll (fetched once,
+        cached by poll_seq). None when disabled or the fetch failed."""
+        if not WW_ZONES_ENABLED:
+            return None
+        if alerts_cache["poll"] != poll_seq["n"]:
+            alerts_cache["poll"] = poll_seq["n"]
+            try:
+                alerts_cache["raw"] = get_alerts()
+            except Exception as ax:  # noqa: BLE001 - additive, never blocks cone
+                log.warning("cyclolab ww_zones: alerts fetch failed: %s", ax)
+                alerts_cache["raw"] = None
+        return alerts_cache["raw"]
 
     def fetch():
         import json as _json
@@ -339,6 +394,23 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                 payload = build_advisory_json(sid, cone_b, track_b,
                                               text_urls=e["text"],
                                               ww_kmz_bytes=ww_b)
+                # Inland county/zone FILLS (Phase 4 follow-up): attribute the
+                # national NWS TC alerts to THIS storm by its cone bbox. ADDITIVE
+                # + GRACEFUL - any failure leaves ww_zones=[]; the cone is never
+                # blocked. NHC AL/EP/CP US only (this source's scope already).
+                try:
+                    raw_alerts = _alerts_for_poll()
+                    if raw_alerts:
+                        zones = parse_nws_alert_zones(
+                            raw_alerts,
+                            cone_box=cone_bbox(payload["cone"]),
+                            margin_deg=_WW_ZONES_MARGIN_DEG)
+                        if zones:
+                            payload["ww_zones"] = zones
+                            payload["provenance"]["ww_zones_count"] = len(zones)
+                except Exception as zx:  # noqa: BLE001
+                    log.warning("%s adv %d: ww_zones skipped: %s",
+                                sid, adv, zx)
                 text_done = _attach_text(e, adv, payload)
                 # ISSUANCE-REGRESSION GUARD: never replace cached state
                 # with an OLDER advisory (stale mirror / CDN echo).

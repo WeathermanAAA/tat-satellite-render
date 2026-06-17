@@ -309,12 +309,23 @@ class TestBuildAdvisoryJson(unittest.TestCase):
                                        text_urls=TEXT_URLS)
 
     def test_exact_contract_keys(self):
-        # "ww" (Phase 4) is part of the contract now — the coastal
-        # watches/warnings overlay array (empty when no WW KMZ was supplied).
+        # "ww" (Phase 4) + "ww_zones" (Phase 4 follow-up) are part of the
+        # contract now — the coastal watch/warning LINE overlay and the inland
+        # county/zone FILL list (both empty arrays when none were supplied).
         self.assertEqual(
             set(self.adv.keys()),
             {"sid", "advisory", "issued_utc", "source", "method",
-             "cone", "points", "text", "ww", "provenance"})
+             "cone", "points", "text", "ww", "ww_zones", "provenance"})
+
+    def test_ww_zones_empty_by_default_and_populated_when_passed(self):
+        self.assertEqual(self.adv["ww_zones"], [])     # graceful default
+        z = [{"type": "TS_WARNING", "geometry": [[-92.0, 29.5], [-92.1, 29.6],
+              [-92.2, 29.5], [-92.0, 29.5]], "ugc": "LAZ252", "area": "x"}]
+        adv = build_advisory_json(SID, self.cone_b, self.track_b,
+                                  text_urls=TEXT_URLS, ww_zones=z)
+        self.assertEqual(adv["ww_zones"], z)
+        self.assertEqual(adv["provenance"]["ww_zones_count"], 1)
+        self.assertGreaterEqual(len(adv["cone"]), 1000)    # cone never displaced
 
     def test_scalar_fields(self):
         self.assertEqual(self.adv["sid"], SID)

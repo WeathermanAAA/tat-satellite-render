@@ -42,7 +42,7 @@ TCD_BODY = ("<pre>Tropical Storm Amanda Discussion Number  13\n\n"
 
 
 def make_engine(sink, *, current_text=CURRENT, kmz=None, tcp_text=TCP_SHTML,
-                tcd_text=TCD_BODY, text_raises=None):
+                tcd_text=TCD_BODY, text_raises=None, fetch_alerts=None):
     kmz = kmz or {"CONE": CONE, "TRACK": TRACK}
 
     def fetch_text(url):
@@ -66,7 +66,8 @@ def make_engine(sink, *, current_text=CURRENT, kmz=None, tcp_text=TCP_SHTML,
         session=None, sink=sink, prefix="shadow/cyclolab",
         current_storms_url="fixture://CurrentStorms.json",
         policy=pf.FetchPolicy(),
-        fetch_text=fetch_text, fetch_bytes=fetch_bytes, clock=_clock)
+        fetch_text=fetch_text, fetch_bytes=fetch_bytes,
+        fetch_alerts=fetch_alerts or (lambda: None), clock=_clock)
     return pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
                            stale_after_s=60, clock=_clock)
 
@@ -253,7 +254,7 @@ class TestTextHealAndVerification(unittest.TestCase):
             session=None, sink=sink, prefix="shadow/cyclolab",
             current_storms_url="fixture://CurrentStorms.json",
             policy=pf.FetchPolicy(), fetch_text=fetch_text,
-            fetch_bytes=fetch_bytes, clock=_clock)
+            fetch_bytes=fetch_bytes, fetch_alerts=lambda: None, clock=_clock)
         eng = pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
                               stale_after_s=60, clock=_clock)
         return eng, avail
@@ -312,7 +313,7 @@ class TestTextHealAndVerification(unittest.TestCase):
             session=None, sink=sink, prefix="shadow/cyclolab",
             current_storms_url="fixture://CurrentStorms.json",
             policy=pf.FetchPolicy(), fetch_text=fetch_text,
-            fetch_bytes=fetch_bytes, clock=_clock)
+            fetch_bytes=fetch_bytes, fetch_alerts=lambda: None, clock=_clock)
         eng = pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
                               stale_after_s=60, clock=_clock)
 
@@ -399,6 +400,68 @@ class TestTextHealAndVerification(unittest.TestCase):
             eng.poll_once()                   # storm left: debt closed
             eng.poll_once()                   # settled - no process churn
         self.assertEqual([k for k in writes if "/adv/" in k], [])
+
+
+class TestWWZones(unittest.TestCase):
+    """Inland county/zone FILLS (Phase 4 follow-up): the national NWS TC alerts
+    fetched once per poll and attributed to each storm by its cone bbox."""
+
+    def _payload(self, sink):
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        return json.loads(p) if isinstance(p, str) else p
+
+    def test_far_alerts_not_attributed_to_this_storm(self):
+        # Amanda is an EP (Pacific) storm; the captured Gulf TC alerts are far
+        # from its cone, so cone-bbox attribution drops them -> ww_zones=[].
+        alerts = json.loads(
+            (FIX / "nws_tc_alerts_sample.json").read_text())
+        sink = pf.DictSink()
+        make_engine(sink, fetch_alerts=lambda: alerts).poll_once()
+        self.assertEqual(self._payload(sink)["ww_zones"], [])
+
+    def test_alert_inside_cone_attaches_as_fill(self):
+        # An alert whose polygon falls inside the cone bbox attaches as a fill.
+        # The polygon (not the UGC) drives placement; the UGC only gates the
+        # marine exclusion, so a land UGC + an in-cone polygon is the unit here.
+        import kml_advisories as K
+        cone = K.parse_cone_kmz(CONE)
+        xs = [c[0] for c in cone]
+        ys = [c[1] for c in cone]
+        cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+        poly = [[cx - 0.3, cy - 0.3], [cx + 0.3, cy - 0.3],
+                [cx + 0.3, cy + 0.3], [cx - 0.3, cy + 0.3], [cx - 0.3, cy - 0.3]]
+        alerts = {"features": [{"geometry": {"type": "Polygon",
+                  "coordinates": [poly]}, "properties": {
+                      "event": "Hurricane Warning", "areaDesc": "Test County",
+                      "geocode": {"UGC": ["TXZ001"]}}}]}
+        sink = pf.DictSink()
+        make_engine(sink, fetch_alerts=lambda: alerts).poll_once()
+        p = self._payload(sink)
+        self.assertEqual(len(p["ww_zones"]), 1)
+        self.assertEqual(p["ww_zones"][0]["type"], "HU_WARNING")
+        self.assertEqual(p["provenance"]["ww_zones_count"], 1)
+        self.assertGreaterEqual(len(p["cone"]), 1000)   # cone never displaced
+
+    def test_alerts_api_down_never_blocks_cone(self):
+        def boom():
+            raise RuntimeError("alerts api down")
+        sink = pf.DictSink()
+        make_engine(sink, fetch_alerts=boom).poll_once()
+        p = self._payload(sink)
+        self.assertEqual(p["ww_zones"], [])             # graceful empty
+        self.assertGreaterEqual(len(p["cone"]), 1000)   # cone written anyway
+
+    def test_alerts_fetched_once_per_poll(self):
+        calls = {"n": 0}
+
+        def counting():
+            calls["n"] += 1
+            return {"features": []}
+        sink = pf.DictSink()
+        eng = make_engine(sink, fetch_alerts=counting)
+        eng.poll_once()
+        # one storm in the fixture -> exactly one alerts fetch this poll
+        self.assertEqual(calls["n"], 1)
 
 
 if __name__ == "__main__":
