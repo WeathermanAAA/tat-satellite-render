@@ -7,7 +7,45 @@ sign-off.**
 
 ---
 
-## VISUAL REVISION v2 (latest) — basemap borders + W/W zone layer
+## VISUAL REVISION v3 (latest) — terrain-accurate GSHHG coast + bolder states + fills removed
+
+**Headline: the basemap land/coast now come from GSHHG-high, a TRUE
+high-resolution GLOBAL shoreline — so the rendered coast matches the real terrain
+(the Mississippi delta, the TX barrier islands + Laguna Madre, Mobile Bay, the FL
+keys all read correctly) and the yellow/blue coastal W/W lines hug the true coast
+instead of floating off a blocky ne_10m approximation.** Stills 01/02/05.
+
+1. **GSHHG-high, global/uniform** (no US/non-US seam — a single source
+   worldwide). `gshhs_h.b` is pre-processed once into a compact 11.9 MB binary
+   (level-1 land + level-2 lakes, lat [-62,72], DP-simplified to 0.004° with a
+   per-polygon bbox); a stdlib reader builds an index once and each bake reads
+   only the polygons overlapping the storm window. The now-unused
+   `ne_10m_land.geojson` (5.8 MB) is removed → **net +6 MB** vendored. ne_10m is
+   kept ONLY for the admin borders (GSHHG has none), re-clipped to the GSHHG land.
+2. **Coast re-derived + borders re-clipped** to the higher-fidelity GSHHG land, so
+   everything stays aligned on the accurate terrain.
+3. **Sane budget — actually SMALLER than v2.** The coast is no longer stored: it
+   is DERIVED from the land rings (boundary minus window-edge segments) at render
+   time (`coast_from_land` / the byte-identical JS `coastFromLand`). So the worst
+   Gulf bake is **~189 KB — smaller than v2's ne_10m land+coast (225 KB)** despite
+   the far higher fidelity. `TOL_NEAR` 0.013 (~1.4 km); the border clip-to-land was
+   re-optimized (coarsened clip-land + per-segment bbox reject: 40s → ~4s bake).
+4. **Bolder state borders.** The v2 thinning left `.ac-state` too faint → width
+   0.5→0.9, opacity 0.60→0.9, so the landfall state lines read clearly. The
+   country border (0.7) + coast (1.3) stay thin (the "too thick" feedback holds).
+5. **Inland county FILLS removed.** The v2 full-opacity fill layer is gone — the
+   cone's W/W presence is now only the official NHC coastal breakpoint LINES. (The
+   poller still computes `ww_zones`; it is dormant — a render-only re-add if ever
+   wanted.) E (formation 70/70) + F (advisory-text heal-debt) are untouched.
+
+**Known follow-up (not blocking the Gulf verify):** inland LAKES (GSHHG level-2)
+are read but not yet rendered as water, so a wide view far north could show the
+Great Lakes as land — off-canvas for the Gulf/Atlantic storms this targets; a quick
+add (level-2 as ocean-colored fills) when wanted.
+
+---
+
+## VISUAL REVISION v2 — basemap borders + W/W zone layer (superseded in part by v3)
 
 Two separate border layers were both fixed, kept straight:
 
