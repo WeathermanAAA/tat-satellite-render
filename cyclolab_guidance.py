@@ -70,6 +70,80 @@ _TWO_FC = re.compile(
     r"Formation chance through\s+(\d+)\s*(hour|day)s?\b[.\s]*([A-Za-z]+)[.\s]*?(\d+)\s*percent",
     re.IGNORECASE)
 
+# --- Active-Systems PTC narrative ------------------------------------------
+# Once NHC begins issuing advisories on a system, it leaves the numbered-invest
+# list ((AL90) disappears) and moves into the TWO's "Active Systems" narrative
+# - which still carries a FORMATION chance for a Potential Tropical Cyclone (it
+# is "potential", not yet a TC). _TWO_REF can no longer see it, so the genesis
+# pill would FREEZE at the last invest-era odds. We read those too, keyed to the
+# REAL designated sid (e.g. NHC_AL012026), derived AUTHORITATIVELY from the TCP
+# AWIPS header (MIATCPAT1 -> basin AT->AL, storm 1). The storm NAME string is the
+# link between the narrative block (which carries the chances) and the AWIPS
+# header line (which carries the sid), so multiple simultaneous PTCs stay
+# separated without a spelled-ordinal table.
+_AWIPS_BASIN = {"AT": "AL", "EP": "EP", "CP": "CP"}    # AWIPS basin -> feed basin
+# "Public Advisories on <NAME> are issued ... AWIPS header MIATCPAT1". MUST be
+# anchored on "Public Advisories" (the TCP product line) - the bare "advisories
+# on" would otherwise also match the narrative's "issuing advisories on" and the
+# "Forecast/Advisories on" line (whose MIATCM header is not a TCP anyway).
+_PTC_AWIPS = re.compile(
+    r"Public\s+Advisories\s+on\s+(.+?)\s+(?:are|is)\s+issued.*?"
+    r"AWIPS\s+header\s+\w{3}TCP([A-Z]{2})(\d{1,2})", re.I)
+# "...is issuing advisories on <NAME>, located ..." (the narrative block head)
+_PTC_NARR = re.compile(r"issuing\s+advisories\s+on\s+(.+?)\s*(?:,|\.|\bloc)", re.I)
+
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip().lower()
+
+
+def _parse_active_ptc(body: str, year: int) -> Dict[str, dict]:
+    """The Active-Systems PTC formation chances, keyed to the REAL designated
+    sid. ``{}`` when the outlook has no Active-Systems PTC carrying a chance
+    (the common case). Named storms in the narrative carry no formation chance,
+    so they naturally yield no entry."""
+    flat = re.sub(r"\s+", " ", body)
+    # NAME -> (feed_basin, storm_number) from the TCP AWIPS header lines.
+    awips: Dict[str, tuple] = {}
+    for m in _PTC_AWIPS.finditer(flat):
+        bcode = m.group(2).upper()
+        if bcode in _AWIPS_BASIN:
+            awips[_norm_name(m.group(1))] = (_AWIPS_BASIN[bcode], int(m.group(3)))
+    if not awips:
+        return {}
+    out: Dict[str, dict] = {}
+    narr = list(_PTC_NARR.finditer(flat))
+    amp = flat.find("&&")                       # the narrative ends at "&&"
+    narr_end = amp if amp != -1 else len(flat)
+    for i, m in enumerate(narr):
+        if m.start() >= narr_end:               # past the narrative (AWIPS block)
+            continue
+        name = _norm_name(m.group(1))
+        if name not in awips:                   # named storm / unmatched -> skip
+            continue
+        start = m.end()
+        end = narr[i + 1].start() if i + 1 < len(narr) else narr_end
+        end = min(end, narr_end)
+        block = flat[start:end]
+        p48 = p7 = None
+        for fm in _TWO_FC.finditer(block):
+            unit, pct = fm.group(2).lower(), int(fm.group(4))
+            if unit.startswith("hour"):
+                p48 = pct
+            elif unit.startswith("day"):
+                p7 = pct
+        if p48 is None and p7 is None:          # named storm: no chance -> skip
+            continue
+        basin, num = awips[name]
+        sid = f"NHC_{basin}{num:02d}{year}"
+        out[sid] = {
+            "sid": sid, "p48": p48, "p7": p7,
+            "level48": formation_level(p48), "level7": formation_level(p7),
+            "level": formation_level(max(x for x in (p48, p7) if x is not None)),
+            "area": re.sub(r"\s+", " ", m.group(1)).strip() or None,
+        }
+    return out
+
 
 def _two_body(xml_text: str) -> str:
     """The outlook text: the RSS CDATA with <br/> -> newlines (or the raw text
@@ -101,7 +175,8 @@ def parse_two(xml_text: str, year: int) -> Dict[str, dict]:
     yields its 48-hour and 7-day formation percentages + NHC level. Areas with no
     invest number (pre-genesis) are skipped (no sid to attach). Returns {} for an
     outlook with no numbered areas (the common quiet case)."""
-    lines = _two_body(xml_text).splitlines()
+    body = _two_body(xml_text)
+    lines = body.splitlines()
     refs = []
     for li, ln in enumerate(lines):
         m = _TWO_REF.search(ln)
@@ -128,6 +203,10 @@ def parse_two(xml_text: str, year: int) -> Dict[str, dict]:
             "level": formation_level(max(x for x in (p48, p7) if x is not None)),
             "area": area or None,
         }
+    # Active-Systems PTC narrative -> REAL designated sid. A numbered ref (if one
+    # somehow co-exists) is more specific and wins; otherwise the PTC entry adds.
+    for sid, fc in _parse_active_ptc(body, year).items():
+        out.setdefault(sid, fc)
     return out
 
 

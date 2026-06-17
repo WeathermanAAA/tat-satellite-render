@@ -254,6 +254,33 @@ class TestTWO(unittest.TestCase):
     def test_no_numbered_area_is_empty(self):
         self.assertEqual(cg.parse_two("an area of low pressure, no invest yet", 2026), {})
 
+    def test_active_systems_ptc_keyed_to_real_sid(self):
+        # The LIVE TWO (2026-06-16 2336Z) AFTER advisories began: the system has
+        # left the numbered-invest list and lives in the "Active Systems"
+        # narrative as "Potential Tropical Cyclone One" @ 70/70, with the TCP
+        # AWIPS header MIATCPAT1. parse_two must read those odds and key them to
+        # the REAL designated sid NHC_AL012026 (AT->AL, storm 1) - so the pill
+        # shows a live 70/70 instead of freezing at the invest-era value.
+        raw = _read("cyclolab/twoat_active_ptc.xml")
+        out = cg.parse_two(raw, 2026)
+        self.assertIn("NHC_AL012026", out)
+        f = out["NHC_AL012026"]
+        self.assertEqual((f["p48"], f["p7"]), (70, 70))
+        self.assertEqual(f["level"], "high")
+        # no spurious invest entry (the (AL90) tag is gone from this TWO)
+        self.assertNotIn("NHC_AL902026", out)
+
+    def test_active_systems_named_storm_yields_no_formation(self):
+        # A NAMED storm in the Active-Systems narrative carries NO formation
+        # chance (it is already a TC) -> no pill entry, even though it has an
+        # AWIPS header.
+        named = (
+            "Active Systems:\nThe National Hurricane Center is issuing "
+            "advisories on Hurricane Alberto, located over the Gulf.\n\n&&\n"
+            "Public Advisories on Hurricane Alberto are issued under WMO header "
+            "WTNT34 KNHC and under AWIPS header MIATCPAT2.\n$$")
+        self.assertEqual(cg.parse_two(named, 2026), {})
+
 
 class TestFormationWrite(unittest.TestCase):
     def test_invest_gets_formation_json_named_does_not(self):

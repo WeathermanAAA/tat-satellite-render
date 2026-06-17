@@ -801,11 +801,16 @@ HTML_TEMPLATE = r"""<!doctype html>
      thinner white internal-border stroke (drawn UNDER the coast). */
   .ac-coast { fill: none; stroke: #ffffff; stroke-width: 2.6;
     stroke-linejoin: round; stroke-linecap: round; }
-  .ac-border { fill: none; stroke: rgba(255,255,255,0.72);
+  /* country + state borders are SLATE, not white (phase-4 C): a bright white
+     internal border fought the white coast and the subject layer for
+     attention; slate keeps them legible over the light land yet recessive -
+     furniture, not subject. ONE shared rule -> every CycloLab map (cone /
+     guidance track / overview track+swath) inherits it, no per-map fork. */
+  .ac-border { fill: none; stroke: rgba(71,85,105,0.92);
     stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
   /* state/province boundaries (ne_10m admin_1) - dimmer + thinner than the
      country border, drawn UNDER it so coast + country read first. */
-  .ac-state { fill: none; stroke: rgba(255,255,255,0.40);
+  .ac-state { fill: none; stroke: rgba(71,85,105,0.60);
     stroke-width: 0.8; stroke-linejoin: round; stroke-linecap: round; }
   /* maps-pass R3 #3: a CASING/HALO graticule - a dark hairline UNDER a light
      line - so every line reads over BOTH the light-gray land AND the dark
@@ -1782,8 +1787,22 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!IS_INVEST && !IS_PTC) return;
     var pill = document.getElementById("formation-pill");
     if (!pill) return;
+    // Freshness guard: the poller re-stamps formation.json's generated_at every
+    // poll while the system is live, so a PROVABLY-stale timestamp means the
+    // poller stopped (or NHC dropped the system from the TWO) - a genuinely
+    // FROZEN pill must HIDE rather than show stale odds. An ABSENT/unparseable
+    // timestamp cannot disprove freshness, so it stays lenient (shows) - the
+    // poller always writes generated_at, so this only loosens for legacy/edge.
+    var STALE_MS = 12 * 3600 * 1000;   // 2 TWO cycles
+    function fresh(ts) {
+      if (!ts) return true;
+      var t = Date.parse(ts);
+      if (isNaN(t)) return true;
+      return (Date.now() - t) < STALE_MS;
+    }
     function render(f) {
       if (!f || (f.p48 == null && f.p7 == null)) return false;
+      if (!fresh(f.generated_at)) return false;   // frozen pill -> hide, not stale
       var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
       var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
       pill.setAttribute("data-level", f.level || "low");

@@ -204,6 +204,10 @@ class TestRenderContract(unittest.TestCase):
         # NHC formation-chance pill scaffold + eager loader
         self.assertIn('id="formation-pill"', html)
         self.assertIn("function loadFormation", html)
+        # page-side freshness guard: a frozen pill (poller stopped restamping
+        # generated_at) must HIDE rather than show stale odds.
+        self.assertIn("function fresh", html)
+        self.assertIn("f.generated_at", html)
         # named-storm pages must NOT carry the invest attribute on <html>
         # (the data-invest CSS rules are baked into every page; assert the TAG).
         named = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
