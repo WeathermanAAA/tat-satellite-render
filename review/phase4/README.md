@@ -81,21 +81,104 @@ designated, non-invest). `_attach_text` now keeps the heal debt OPEN
 absent this poll, so the heal pulse keeps firing until both land. A
 negative-control test asserts the OLD vacuous-True behavior is gone.
 
-## Items (full detail filled in as each lands)
+## Items
 
-- **A — ww_zones inland fills:** _(pending)_
-- **C — slate borders:** _(pending)_
-- **E — Active-Systems parse + freshness guard:** _(pending)_
-- **F — heal-debt:** _(pending)_
+### A — `ww_zones` inland county/zone FILLS (NEW)
+The coastal `ww` overlay is the NHC TCWW breakpoint **lines** (from the per-storm
+WW KMZ); `ww_zones` is the inland county/zone **fills**, from a different source —
+the NWS public alerts API (`api.weather.gov/alerts/active`).
+
+- **`kml_advisories.parse_nws_alert_zones()`** — pure parser: the `/alerts/active`
+  FeatureCollection → `[{type, geometry, ugc, area}]`. Only the six TC event types
+  (`NWS_TC_EVENTS`); **marine UGC regions excluded** (`_MARINE_UGC_REGIONS` — the
+  fills are inland only). Geometry from the alert Feature's OWN embedded
+  `Polygon`/`MultiPolygon` (the common case — for the live Gulf event, every land
+  TXZ/LAZ feature carried an embedded polygon and only the marine `GMZ` features
+  were null), with a pluggable + caller-cached `resolve_zone` fallback for the
+  rare null-geometry land feature. Rings are Douglas-Peucker-simplified (`_rdp`);
+  per-storm attribution by **cone bbox + margin**.
+- **`build_advisory_json(..., ww_zones=...)`** → new `ww_zones` contract key
+  (empty array by default; `provenance.ww_zones_count` when populated). Additive +
+  graceful — a non-list degrades to `[]`, never blocks the cone.
+- **`cyclolab_advisories`** — fetches the national TC alerts **once per poll**
+  (cached by poll seq; NWS-compliant UA; `404`/transient/down all degrade to `[]`),
+  then attributes to each storm by its cone bbox (`_WW_ZONES_MARGIN_DEG = 3.0`).
+  Kill-switch `CYCLOLAB_WW_ZONES`.
+- **`cyclolab_shell` JS** — renders `advFull.ww_zones` as translucent
+  canonical-NHC fills (`.ww-zone`, `fill-opacity 0.22` + stronger same-color
+  outline) in a toggleable `#ac-ww-zones-group` drawn **UNDER** the coastal lines,
+  sharing the one `WW_STYLE` palette + legend + the single "Watches & warnings"
+  toggle (now covers both layers).
+
+Validated against a REAL `api.weather.gov` capture
+(`tests/fixtures/cyclolab/nws_tc_alerts_sample.json` — a live Gulf TC) and
+rendered live (stills 01/02): the eight Louisiana parish/zone TS-Warning fills.
+
+### C — slate map borders
+`.ac-border` / `.ac-state` strokes go white → slate (`rgba(255,255,255,.72/.40)`
+→ `rgba(71,85,105,.92/.60)`). ONE shared CSS rule, so the cone, the guidance track
+map, and the overview track+swath all inherit it (the "borders on all maps, no
+fork" of item D is already on `main`; the 3-furniture-site count tests confirm it
+and the slate rgba is asserted). Stills 01/04 show the recessive slate borders.
+
+### E — Active-Systems formation parse + page-side freshness guard
+See the bug root-cause above. `parse_two` extension is in `cyclolab_guidance.py`
+(`_PTC_AWIPS` / `_PTC_NARR` / `_parse_active_ptc`); the freshness guard is in
+`cyclolab_shell.loadFormation` (`fresh()` / `STALE_MS = 12h`). No poller change —
+PR #7's `_refresh_formation` and the guidance poller both call `parse_two`, so the
+real-sid `formation.json` is restamped every poll for free.
+
+### F — advisory text heal-debt stays open
+See the bug root-cause above. `_attach_text` in `cyclolab_advisories.py`; the
+negative-control test proves the old vacuous-True behavior is gone.
+
+## Out-of-scope observation (NOT changed here)
+While rendering the stills I hit a PRE-EXISTING, unrelated issue: NHC **intermediate**
+advisories carry a non-numeric `advisoryNum` (`"2A"`), which `parse_track_kmz`'s
+`int(...)` rejects and the change-gate's `int(str(advNum).lstrip("0"))` skips. So
+CycloLab does not refresh on intermediate advisories. This is independent of this
+batch (it predates it) and out of scope; flagging it for a future fix, not touched
+here.
+
+## Stills (`review/phase4/`, force-added past the repo `*.png` ignore)
+Rendered from the LIVE PTC AL01 "One" advisory-2 cone + the LIVE Gulf NWS alerts
+via headless chromium (reduced-motion final frame):
+- `01_cone_desktop_ptc_one.png` — cone: 10m basemap, slate borders, coastal lines
+  + inland fills, shared legend, "POTENTIAL TROPICAL CYCLONE ONE".
+- `02_cone_inland_fills_zoom.png` — the inland Louisiana parish/zone fills close-up.
+- `03_cone_mobile.png` — mobile cone.
+- `04_track_history_slate_borders.png` — a second map: slate state/country borders
+  across the Gulf.
 
 ## Suite
-
-_(filled in at the end)_
+Full repo suite green: **527 passed + 16 subtests, 0 failures** (`python -m pytest
+tests/`; the slow part is the jsdom CycloLab shell/visual harness — needs `node`,
+present here). New tests added by this batch:
+- `test_cyclolab_ww.py` — `parse_nws_alert_zones`: land-only/marine-excluded,
+  event→type map, cone-bbox attribution, zone-resolver fallback,
+  marine-URL-not-resolved, one-bad-feature-survives, RDP, GeometryCollection.
+- `test_kml_advisories.py` — `ww_zones` contract key (empty default + populated).
+- `test_cyclolab_guidance.py` — Active-Systems PTC → real sid @ 70/70;
+  named-storm-yields-nothing; **block-doesn't-bleed-into-disturbances** +
+  **named-storm-with-trailing-disturbance** (the adversarial-review regressions).
+- `test_cyclolab_advisories.py` — F negative-control (text URLs absent at first
+  advisory → heal stays open); ww_zones attach / far-not-attributed /
+  api-down-never-blocks-cone / once-per-poll / once-per-poll-not-per-storm.
+- `test_cyclolab_basemap.py` — slate border rgba (item C).
+- `test_cyclolab_shell.py` — freshness-guard scaffold + ww_zones render scaffold.
 
 ## Adversarial review
+A scoped multi-agent review (4 dimension reviewers — parser / poller / parse_two /
+render — each finding then adversarially verified by a skeptical agent) surfaced 5
+candidates; verification **confirmed 1, rejected 4**:
 
-_(filled in at the end)_
-
-## Stills
-
-_(rendered desktop + mobile; filed under `review/phase4/`)_
+- **CONFIRMED — MAJOR (fixed):** `parse_two`'s Active-Systems block bled into a
+  trailing numbered disturbance's formation chances (PTC One 70/70 → 20/40; a
+  spurious pill on a named storm). The lone-PTC fixture masked it. Fixed with the
+  `_AREA_BREAK` block cap + 2 regression tests (above).
+- **Rejected (verified NOT real bugs, but cheap wins taken anyway):**
+  GeometryCollection silent-drop (not a known NWS shape → added handling + test);
+  mixed land+marine UGC in one feature (NWS issues one feature per zone → documented
+  the assumption); per-poll-cache multi-storm "untested" (code correct → added the
+  pinning test); WW legend swatch with nothing drawn (cosmetic, mirrors the existing
+  coastal block → moved the `wwTypes` assignment after the empty-path guard in both).
