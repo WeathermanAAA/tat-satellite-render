@@ -99,6 +99,11 @@ const scheduledDelays = [];
       // poll/single-ENDED-fetch hydrates the Advisories tab from this.
       // Absent -> a clean fetch failure (the pre-first-advisory window).
       const ADV = Array.isArray(PLAN) ? null : (PLAN.adv || null);
+      // PTC/invest formation-chance pill: plan.formation feeds the
+      // cyclolab/{sid}/formation.json fetch loadFormation() makes (own sid AND
+      // the SPAWN_SID fallback both resolve it). Absent -> !ok -> pill stays
+      // hidden (the genuinely-frozen / no-data path).
+      const FORMATION = Array.isArray(PLAN) ? null : (PLAN.formation || null);
       window.__fetched = [];
       function jsonResponse(body) {
         if (body == null) {
@@ -137,6 +142,9 @@ const scheduledDelays = [];
         }
         if (/\/adv\/[^/]+\.json/.test(url)) {
           return jsonResponse(ADV);
+        }
+        if (/\/cyclolab\/[^/]+\/formation\.json/.test(url)) {
+          return jsonResponse(FORMATION);
         }
         if (FEED == null) {
           return Promise.resolve({
@@ -473,12 +481,37 @@ const scheduledDelays = [];
       overview: overviewProbe(),
       cat: document.documentElement.getAttribute("data-cat"),
       ended: document.documentElement.hasAttribute("data-ended"),
+      // live PTC identity: data-ptc drives the grey/red-X/hidden-ACE dress; the
+      // shell sheds it once the feed shows a named/designated TC (setPtc).
+      ptc: document.documentElement.hasAttribute("data-ptc"),
+      isPtc: (window.__lab && window.__lab.isPtc) ? window.__lab.isPtc() : null,
+      formationShown: (() => {
+        const p = document.getElementById("formation-pill");
+        return !!(p && !p.hidden);
+      })(),
+      formationText: (() => {
+        const p = document.getElementById("formation-pill");
+        return p ? (p.textContent || "") : "";
+      })(),
+      aceRowShown: (() => {
+        // CSS hides #vrow-ace under data-ptc/data-invest; jsdom's computed
+        // style is unreliable for descendant+attr selectors, so fall back to
+        // the attribute contract (same precedent as endedStripVisible).
+        const r = document.getElementById("vrow-ace");
+        if (!r) return false;
+        let disp = "";
+        try { disp = window.getComputedStyle(r).display; } catch (e) { disp = ""; }
+        if (disp) return disp !== "none";
+        return !document.documentElement.hasAttribute("data-ptc")
+          && !document.documentElement.hasAttribute("data-invest");
+      })(),
       chip: text("chip"),
       chipShown: (() => {
         const c = document.getElementById("chip");
         return !!c && c.style.display !== "none";
       })(),
       stormName: text("storm-name"),
+      typeWord: text("storm-type"),
       activeSection: activeSection(),
       activeNav: activeNav(),
       odo: {

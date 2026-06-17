@@ -59,6 +59,33 @@ class TestPageLifecycle(unittest.TestCase):
         self.assertEqual(len(self.sink.writes), 2)
         self.assertIn('data-cat="C5"', self.sink.writes[1][1])
 
+    def test_rebake_on_name_change_same_fix_cat(self):
+        # A pure NAME change (ONE -> ARTHUR) on the SAME fix + category must
+        # re-bake: NHC's CurrentStorms override (restamp) renames without a new
+        # fix, and the static page (no-JS / OG / first-paint) has to follow.
+        self.w.update("ep", feed([SYNTH]))
+        renamed = {**SYNTH, "name": "RENAMED"}      # identical fix + cat
+        self.w.update("ep", feed([renamed]))
+        self.assertEqual(len(self.sink.writes), 2)
+        self.assertIn('id="storm-name">RENAMED', self.sink.writes[1][1])
+
+    def test_rebake_on_ptc_flip_same_fix(self):
+        # The PTC->named upgrade: a designated PTC ("ONE", is_ptc true) is named
+        # ARTHUR and reclassified a TS on the SAME fix. cat + fix are unchanged,
+        # but is_ptc flips and the page must shed the baked PTC dress.
+        ptc = {**SYNTH, "sid": "NHC_AL012026", "name": "ONE",
+               "current_category": "TS", "is_ptc": True}
+        self.w.update("al", feed([ptc], basin="al"))
+        self.assertEqual(len(self.sink.writes), 1)
+        self.assertIn("var IS_PTC = true", self.sink.writes[0][1])
+        named = {**ptc, "name": "ARTHUR", "is_ptc": False}  # same cat + fix
+        self.w.update("al", feed([named], basin="al"))
+        self.assertEqual(len(self.sink.writes), 2)          # re-baked
+        html = self.sink.writes[1][1]
+        self.assertIn("var IS_PTC = false", html)
+        self.assertNotIn('<html lang="en" data-ptc', html)
+        self.assertIn('id="storm-name">ARTHUR', html)
+
     def test_ended_after_debounce_only(self):
         self.w.update("ep", feed([SYNTH]))
         for i in range(ENDED_DEBOUNCE_POLLS - 1):

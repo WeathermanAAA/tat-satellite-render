@@ -186,6 +186,8 @@ class CycloLabPageWriter:
                     self._state[sid] = {
                         "cat": storm.get("current_category") or "TD",
                         "fix": storm.get("latest_fix_valid_utc"),
+                        "name": storm.get("name") or "",
+                        "is_ptc": bool(storm.get("is_ptc")),
                         "missing": ENDED_DEBOUNCE_POLLS, "ended": True,
                         "last": storm}
                     _log.info("cyclolab page ENDED (re-birth): %s", sid)
@@ -193,13 +195,23 @@ class CycloLabPageWriter:
             seen_active.add(sid)
             cat = storm.get("current_category") or "TD"
             fix = storm.get("latest_fix_valid_utc")
+            name = storm.get("name") or ""
+            is_ptc = bool(storm.get("is_ptc"))
             # SST hero layers ride EVERY poll, not just page rewrites:
             # maybe_render self-gates cheaply (state + TTL'd probe) and
             # that lets a partial family (SSTA lagging SST) heal between
             # fixes (adversarial-review find). Best-effort by contract.
             if self._sst is not None:
                 self._sst.maybe_render(sid, storm, basin)
-            if st is None or st["ended"] or st["cat"] != cat or st["fix"] != fix:
+            # Re-bake on any change that alters the BAKED page IDENTITY, not
+            # just a new fix: NHC can NAME a system (ONE -> ARTHUR) or flip it
+            # out of the PTC dress (is_ptc true -> false) on the SAME fix via
+            # the CurrentStorms override (restamp), and the static page (the
+            # no-JS / OG / first-paint render) must follow - the live JS overlay
+            # only fixes the in-browser view.
+            if (st is None or st["ended"]
+                    or st["cat"] != cat or st["fix"] != fix
+                    or st.get("name") != name or st.get("is_ptc") != is_ptc):
                 html = render_page(storm, feed_url=feed_url,
                                    adv_url=self._adv_url(sid),
                                    og_image_url=self._og_url(sid),
@@ -207,7 +219,8 @@ class CycloLabPageWriter:
                 self.sink.write_html(page_key(sid, prefix=self.prefix), html)
                 _log.info("cyclolab page %s: %s (%s, fix %s)",
                           "BIRTH" if st is None else "refresh", sid, cat, fix)
-            self._state[sid] = {"cat": cat, "fix": fix, "missing": 0,
+            self._state[sid] = {"cat": cat, "fix": fix, "name": name,
+                                "is_ptc": is_ptc, "missing": 0,
                                 "ended": False, "last": storm}
         # dissipation sweep: previously-known storms of THIS basin's feed
         # that are no longer active (absent or is_active False).

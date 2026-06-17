@@ -1,4 +1,4 @@
-# CycloLab Phase-4 follow-up batch — inland W/W fills + map polish + 2 bug fixes, HELD for sign-off
+# CycloLab Phase-4 follow-up batch — inland W/W fills + map polish + 3 bug fixes (incl. urgent PTC→named, item G)
 
 **Status: REBUILT from spec after a codespace timeout lost the original
 `ptc-phase4-ww-counties` branch (it was never pushed). On the branch
@@ -231,6 +231,35 @@ real-sid `formation.json` is restamped every poll for free.
 See the bug root-cause above. `_attach_text` in `cyclolab_advisories.py`; the
 negative-control test proves the old vacuous-True behavior is gone.
 
+### G — PTC→named lifecycle: page shed the PTC dress when NHC names the system (URGENT, 2026-06-17)
+PTC One (AL012026) was named **Tropical Storm Arthur**. The SID-stable lifecycle
+correctly kept the page and re-titled the banner, but the page was stuck
+half-transitioned in full PTC dress: red-X glyph, grey scheme, category "PTC",
+the stale invest-era 60/60 formation pill, and panels reading "POTENTIAL TROPICAL
+CYCLONE ONE". Root cause: the PTC identity (`html[data-ptc]` + `IS_PTC` + the
+formation pill) was a value **baked at page birth** that the live hydration never
+revisited, and the poller's page re-bake gate keyed only on `(cat, fix)` — so NHC
+naming the system on the SAME fix (CurrentStorms restamp) never re-baked it.
+
+Three durable fixes, all keyed off the **live** classification:
+- **`cyclolab_shell.py` live JS** — `setPtc()`/`ptcNow()`/`isNamedTC()`: every poll
+  re-derives the PTC state from the feed (`is_ptc` + name + category). On a flip it
+  toggles `data-ptc`, flips the live `IS_PTC`, forces `setCategory()` to re-apply
+  the ramp/glyph-letter/Category-hero/type-word (its no-op guard would otherwise
+  hold the frozen "PTC" because the baked `data-cat` already equals the live one),
+  hides/clears the formation pill, and forces the Overview/SST plots to re-render
+  so their lockups read the live name. A named TS+ system is **never** "potential"
+  — that vetoes any feed lag. `loadFormation`'s render bails if no longer PTC/invest
+  so a late fetch can't re-show the pill.
+- **`cyclolab_shell.py` `render_page`** — the same veto at bake (`_is_named_tc`): a
+  fresh bake follows NHC the instant it names a system, even if ace_core's `is_ptc`
+  lags. Python mirror of the inline JS — keep the two in lock-step.
+- **`cyclolab_pages.py`** — the re-bake gate + persisted state now include `name`
+  and `is_ptc`, so a name change / PTC flip on an unchanged fix re-bakes the static
+  (no-JS / OG / first-paint) page. The poller restart on deploy also BIRTH-re-bakes
+  every active storm from the current feed, so the live Arthur page corrects on
+  redeploy.
+
 ## Out-of-scope observation (NOT changed here)
 While rendering the stills I hit a PRE-EXISTING, unrelated issue: NHC **intermediate**
 advisories carry a non-numeric `advisoryNum` (`"2A"`), which `parse_track_kmz`'s
@@ -250,9 +279,9 @@ via headless chromium (reduced-motion final frame):
   across the Gulf.
 
 ## Suite
-Full repo suite green: **533 passed + 16 subtests, 0 failures** (`python -m pytest
-tests/`; the slow part is the jsdom CycloLab shell/visual harness — needs `node`,
-present here). New tests added by this batch:
+Full repo suite green: **540 collected, 0 failures** (`python -m pytest tests/`;
+`python -m unittest discover tests` = 497 ok; the slow part is the jsdom CycloLab
+shell/visual harness — needs `node`, present here). New tests added by this batch:
 - `test_cyclolab_ww.py` — `parse_nws_alert_zones`: land-only/marine-excluded,
   event→type map, cone-bbox attribution, zone-resolver fallback,
   marine-URL-not-resolved, one-bad-feature-survives, RDP, GeometryCollection.
@@ -264,7 +293,13 @@ present here). New tests added by this batch:
   advisory → heal stays open); ww_zones attach / far-not-attributed /
   api-down-never-blocks-cone / once-per-poll / once-per-poll-not-per-storm.
 - `test_cyclolab_basemap.py` — slate border rgba (item C).
-- `test_cyclolab_shell.py` — freshness-guard scaffold + ww_zones render scaffold.
+- `test_cyclolab_shell.py` — freshness-guard scaffold + ww_zones render scaffold;
+  **item G** — `TestPtcLifecycle` (live shed: PTC→named sheds the grey/red-X/pill
+  dress, keyed off the live feed; named-TS veto over a lagging feed is_ptc;
+  unnamed-PTC-with-TS-winds keeps the dress) + `TestRenderContract` bake-veto
+  (named TS sheds at bake; unnamed PTC with TS winds stays PTC).
+- `test_cyclolab_page_writer.py` — **item G** — re-bake on a name change / is_ptc
+  flip on the SAME fix (CurrentStorms restamp).
 
 ## Adversarial review
 A scoped multi-agent review (4 dimension reviewers — parser / poller / parse_two /

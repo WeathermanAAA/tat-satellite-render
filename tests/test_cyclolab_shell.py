@@ -253,6 +253,39 @@ class TestRenderContract(unittest.TestCase):
         self.assertNotIn('<html lang="en" data-ptc', named)
         self.assertIn("var IS_PTC = false", named)
 
+    def test_ptc_with_ts_winds_but_placeholder_name_stays_ptc(self):
+        # A PTC can carry TS-strength winds (current_category "TS") while still
+        # UNNAMED ("ONE") - it is not yet a tropical storm, so it KEEPS the PTC
+        # dress. The bake veto must not shed on category alone.
+        s = copy.deepcopy(self.storm)
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["name"] = "ONE"
+        s["current_category"] = "TS"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('<html lang="en" data-ptc data-cat=', html)
+        self.assertIn("var IS_PTC = true", html)
+
+    def test_named_ts_vetoes_stale_is_ptc_at_bake(self):
+        # DURABILITY: NHC names the PTC (ONE -> ARTHUR) and it becomes a TS, but
+        # the feed's is_ptc still LAGS true (operational b-deck NATURE trailing
+        # the classification). The bake must follow the LIVE classification and
+        # shed the PTC dress: a named TS+ system is never "potential".
+        s = copy.deepcopy(self.storm)
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True                 # stale flag
+        s["name"] = "ARTHUR"
+        s["current_category"] = "TS"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertNotIn('<html lang="en" data-ptc', html)   # no PTC on <html>
+        self.assertIn("var IS_PTC = false", html)
+        self.assertIn('data-cat="TS"', html)
+        # the baked banner type word is the real classification, not "POTENTIAL
+        # TROPICAL CYCLONE" (the literal still appears in the live-JS branch).
+        self.assertIn('id="storm-type">TROPICAL STORM<', html)
+        self.assertNotIn(
+            'id="storm-type">POTENTIAL TROPICAL CYCLONE<', html)
+
 
 @unittest.skipIf(NODE is None, "node not on PATH")
 class TestIntegratedCard(unittest.TestCase):
@@ -1759,6 +1792,104 @@ class TestOverviewPlots(unittest.TestCase):
         self.assertGreater(st["chartChildCount"], 0)
         self.assertTrue(st["overview"]["trackRendered"])
         self.assertTrue(st["overview"]["swathRendered"])
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestPtcLifecycle(unittest.TestCase):
+    """The PTC dress is LIVE, not baked: a page born as a Potential Tropical
+    Cyclone must SHED the grey/red-X/formation-pill identity the moment the
+    feed shows a named/designated TC (and re-wear it on the reverse). node +
+    jsdom drives the real hydration path (the Arthur 2026-06-17 regression)."""
+
+    def _ptc_one(self):
+        # A PTC born with TS-strength winds but still UNNAMED ("ONE") - exactly
+        # the live AL012026 bake (data-ptc + data-cat="TS"). spawn_sid lets the
+        # formation pill fall back to its spawning invest's odds.
+        s = copy.deepcopy(load_storm())
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["is_active"] = True
+        s["name"] = "ONE"
+        s["current_category"] = "TS"
+        s["spawn_sid"] = "NHC_AL902026"
+        return s
+
+    def _arthur(self, ptc_one, *, stale_is_ptc=False):
+        # NHC names the system: ONE -> ARTHUR, a genuine Tropical Storm.
+        a = copy.deepcopy(ptc_one)
+        a["name"] = "ARTHUR"
+        a["current_category"] = "TS"
+        a["is_ptc"] = stale_is_ptc      # False normally; True exercises the veto
+        return a
+
+    def test_naming_sheds_the_ptc_dress_live(self):
+        ptc = self._ptc_one()
+        html = cyclolab_shell.render_page(ptc, feed_url=FEED_URL)
+        # sanity: born in full PTC dress
+        self.assertIn('<html lang="en" data-ptc', html)
+        recs = run_harness(
+            html,
+            {"feed": {"storms": [ptc]},          # boot keeps it PTC
+             "formation": {"p48": 60, "p7": 60, "level": "medium"},
+             "ops": [
+                 {"op": "snapshot"},                       # boot: PTC
+                 {"op": "apply", "storm": self._arthur(ptc)},  # named -> shed
+             ]})
+        boot, after = (r["state"] for r in recs)
+        # boot: the grey/red-X dress + the stale 60/60 formation pill (the bug)
+        self.assertTrue(boot["ptc"])
+        self.assertTrue(boot["isPtc"])
+        self.assertEqual(boot["glyphCat"], "PTC")
+        self.assertTrue(boot["formationShown"])
+        self.assertIn("60", boot["formationText"])
+        self.assertFalse(boot["aceRowShown"])
+        # after NHC names ARTHUR: the dress is SHED, the real category worn
+        self.assertFalse(after["ptc"])                     # data-ptc cleared (#2)
+        self.assertFalse(after["isPtc"])
+        self.assertEqual(after["stormName"], "ARTHUR")
+        self.assertEqual(after["cat"], "TS")               # SSHWS category (#3)
+        self.assertEqual(after["glyphCat"], "S")           # not "PTC" (#1/#3)
+        self.assertEqual(after["odo"]["cat"], "S")
+        self.assertEqual(after["typeWord"], "TROPICAL STORM")
+        self.assertNotIn("POTENTIAL TROPICAL CYCLONE", after["typeWord"])
+        self.assertFalse(after["formationShown"])          # no chance pill (#5)
+        self.assertEqual(after["formationText"], "")
+        self.assertTrue(after["aceRowShown"])              # ACE row back (#4)
+        # the SST hero subtitle (and, by the same DOM read, the Track/Wind
+        # plot lockups) now read the LIVE name + type (#6)
+        if after["hero"]:
+            self.assertEqual(after["hero"]["sub"], "TROPICAL STORM ARTHUR")
+            self.assertEqual(after["hero"]["glyphLabel"], "S")
+
+    def test_named_storm_sheds_even_when_feed_is_ptc_lags(self):
+        # DURABILITY: the feed's is_ptc still reads true (b-deck NATURE lag), but
+        # the system is a named TS - the page must shed anyway (the veto).
+        ptc = self._ptc_one()
+        html = cyclolab_shell.render_page(ptc, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"feed": {"storms": [ptc]},
+             "ops": [{"op": "apply",
+                      "storm": self._arthur(ptc, stale_is_ptc=True)}]})
+        after = recs[-1]["state"]
+        self.assertFalse(after["ptc"])
+        self.assertFalse(after["isPtc"])
+        self.assertEqual(after["glyphCat"], "S")
+        self.assertFalse(after["formationShown"])
+
+    def test_unnamed_ptc_with_ts_winds_keeps_the_dress(self):
+        # A PTC with TS-strength winds but still UNNAMED ("ONE", is_ptc true)
+        # must KEEP the dress - category alone never sheds it.
+        ptc = self._ptc_one()
+        html = cyclolab_shell.render_page(ptc, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"feed": {"storms": [ptc]},
+             "ops": [{"op": "apply", "storm": ptc}]})
+        after = recs[-1]["state"]
+        self.assertTrue(after["ptc"])
+        self.assertTrue(after["isPtc"])
+        self.assertEqual(after["glyphCat"], "PTC")
 
 
 if __name__ == "__main__":

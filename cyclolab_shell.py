@@ -1408,6 +1408,71 @@ HTML_TEMPLATE = r"""<!doctype html>
                                      // identity but KEEPS cone/advisories/Models
   var SPAWN_SID = "__SPAWN_SID__";   // PTC: sid of the invest it spawned (the
                                      // NHC TWO formation odds live there)
+  // ---- live PTC identity (durable) -----------------------------------------
+  // The PTC "dress" (grey scheme, red-X glyph, formation-chance pill, hidden
+  // ACE row) is a TRANSIENT pre-genesis state, NOT a value frozen at page
+  // birth. NHC designates a disturbance as a Potential Tropical Cyclone, then
+  // NAMES it the moment it becomes a TS+ - at which point the page must SHED
+  // the dress and wear the real category (and, the reverse, re-wear it if a
+  // system ever drops back). We re-evaluate this EVERY poll off the LIVE feed
+  // (is_ptc + name + current_category), never off __IS_PTC__ alone. IS_PTC is
+  // a `var` so setPtc() can flip it live; PTC_BAKED keeps the birth value as a
+  // feed-omitted fallback.
+  var PTC_BAKED = IS_PTC;
+  // NHC's spelled-out designation numbers ("ONE".."FIFTY-NINE") - the
+  // placeholder name a depression/PTC carries before it is named. A real name
+  // (ARTHUR) is none of these.
+  var NUMBER_NAME = (function () {
+    var ones = ["", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN",
+      "EIGHT", "NINE", "TEN", "ELEVEN", "TWELVE", "THIRTEEN", "FOURTEEN",
+      "FIFTEEN", "SIXTEEN", "SEVENTEEN", "EIGHTEEN", "NINETEEN"];
+    var tens = ["", "", "TWENTY", "THIRTY", "FORTY", "FIFTY"];
+    var s = {};
+    for (var n = 1; n < 60; n++) {
+      s[n < 20 ? ones[n]
+        : tens[Math.floor(n / 10)] + (n % 10 ? "-" + ones[n % 10] : "")] = true;
+    }
+    return s;
+  })();
+  function isNamedTC(storm) {
+    // A genuine named/designated TC: TS-or-stronger SSHWS AND a REAL NHC name
+    // (not the "ONE"/"TWO" designation placeholder, an invest, or the raw sid).
+    var cat = (storm && storm.current_category) || "";
+    if (cat !== "TS" && !/^C[1-5]$/.test(cat)) return false;
+    var nm = ((storm && storm.name) || "").trim().toUpperCase();
+    if (!nm || !/^[A-Z][A-Z'\- ]*$/.test(nm)) return false;   // letters -> a name
+    if (NUMBER_NAME[nm]) return false;                        // "ONE".."FIFTY-NINE"
+    return nm !== "INVEST" && nm !== "UNNAMED" && nm !== "NAMELESS";
+  }
+  function ptcNow(storm) {
+    // A named TS+ system is, by definition, no longer "potential" - veto any
+    // feed/bake lag (the operational b-deck NATURE can trail the classification).
+    if (isNamedTC(storm)) return false;
+    // Otherwise trust the LIVE feed's flag; fall back to the page-birth value
+    // only when the feed omits it (older feeds / a fetch gap).
+    return (storm && storm.is_ptc != null) ? !!storm.is_ptc : PTC_BAKED;
+  }
+  function setPtc(on, storm) {
+    // Idempotent: act ONLY on a true transition. Returns whether the identity
+    // flipped, so apply() can force the plots to re-render (their titles/colors
+    // follow the identity, and a name->TC relabel can land on the same fix).
+    if (on === IS_PTC) return false;
+    IS_PTC = on;
+    if (on) document.documentElement.setAttribute("data-ptc", "");
+    else document.documentElement.removeAttribute("data-ptc");
+    // Force setCategory() to FULLY re-apply (ramp + glyph letter + Category
+    // hero + type word): the baked data-cat can already equal the live category
+    // (a PTC with TS winds), so setCategory's no-op guard would otherwise leave
+    // the frozen "PTC" dress. apply() calls setCategory right after us, by which
+    // point IS_PTC is updated and these labels resolve to the real category.
+    curCat = null;
+    var pill = document.getElementById("formation-pill");
+    if (pill) {
+      if (on) { loadFormation(); }       // reverse edge: re-arm the chance pill
+      else { pill.hidden = true; pill.innerHTML = ""; }
+    }
+    return true;
+  }
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   // per-storm SST hero layer base (final-gate-2 #1): meta.json +
@@ -1845,6 +1910,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       return (Date.now() - t) < STALE_MS;
     }
     function render(f) {
+      // Never paint the chance pill once the system is a named/designated TC -
+      // a late-resolving fetch (kicked off while still a PTC) must not re-show
+      // the pill after setPtc() shed the dress. IS_PTC is live.
+      if (!IS_PTC && !IS_INVEST) return false;
       if (!f || (f.p48 == null && f.p7 == null)) return false;
       if (!fresh(f.generated_at)) return false;   // frozen pill -> hide, not stale
       var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
@@ -2039,12 +2108,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       chipEl.style.display = "";
       chipEl.textContent = CHIP_LABEL[cat] || cat;
     }
-    // the canon label rides the corner glyph + the Category hero.
-    document.getElementById("glyph-cat").textContent = sshsLabel(cat);
-    odoSet(document.getElementById("odo-cat"), sshsLabel(cat));
+    // the canon label rides the corner glyph + the Category hero. A PTC shows
+    // "PTC" (no category accrues); a real TC shows its SSHWS letter. IS_PTC is
+    // LIVE (setPtc flips it), so the label follows the identity automatically -
+    // once shed, this re-applies the real category in place of the baked "PTC".
+    var catLbl = IS_PTC ? "PTC" : sshsLabel(cat);
+    document.getElementById("glyph-cat").textContent = catLbl;
+    odoSet(document.getElementById("odo-cat"), catLbl);
     if (!advTypeWord) {
       document.getElementById("storm-type").textContent =
-        catWord(cat).toUpperCase();
+        (IS_PTC ? "POTENTIAL TROPICAL CYCLONE" : catWord(cat).toUpperCase());
     }
     curCat = cat;
     if (reduced) return;
@@ -3230,6 +3303,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   var lastStorm = null;
   function apply(storm) {
     lastStorm = storm;
+    // PTC identity is LIVE (see setPtc): shed the grey/red-X dress the moment
+    // the feed shows a named/designated TC, re-wear it on the reverse. MUST run
+    // before setCategory so the ramp/label/type-word re-apply under the new
+    // identity. A flip forces the Overview/SST plots to re-render below even
+    // when the fix is unchanged (a name->TC relabel can land on the same fix).
+    var ptcFlip = setPtc(ptcNow(storm), storm);
     setCategory(storm.current_category || "TD");
     document.getElementById("storm-name").textContent =
       (storm.name || SID).toUpperCase();
@@ -3247,7 +3326,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     odoSet(document.getElementById("odo-move"), movement(pts));
     odoSet(document.getElementById("odo-fix"),
            fixKey ? fixKey.slice(5, 16).replace("T", " ") : "—");
-    if (fixKey !== lastFixKey) {
+    if (fixKey !== lastFixKey || ptcFlip) {
       // ISOLATED (the final-gate #3 lesson): one renderer's throw must
       // never starve the next.
       try { renderHero(storm); } catch (e) {
@@ -5198,7 +5277,10 @@ HTML_TEMPLATE = r"""<!doctype html>
                    renderTrackPlot: function (s) {
                      return renderTrackPlot(s || lastStorm); },
                    renderSwathPlot: function (s) {
-                     return renderSwathPlot(s || lastStorm); } };
+                     return renderSwathPlot(s || lastStorm); },
+                   // live PTC identity hooks (tests + ops)
+                   isPtc: function () { return IS_PTC; },
+                   ptcNow: function (s) { return ptcNow(s || lastStorm); } };
 })();
 </script>
 </body>
@@ -5216,6 +5298,48 @@ def _type_word(cat: str, basin: str) -> str:
     if cat == "TS":
         return "Tropical Storm"
     return "Typhoon" if basin == "WP" else "Hurricane"
+
+
+_PTC_NUMBER_WORDS = None
+
+
+def _ptc_number_words() -> frozenset:
+    """NHC's spelled-out designation numbers ("ONE".."FIFTY-NINE") - the
+    placeholder name a depression/PTC wears before it is named."""
+    global _PTC_NUMBER_WORDS
+    if _PTC_NUMBER_WORDS is None:
+        ones = ["", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN",
+                "EIGHT", "NINE", "TEN", "ELEVEN", "TWELVE", "THIRTEEN",
+                "FOURTEEN", "FIFTEEN", "SIXTEEN", "SEVENTEEN", "EIGHTEEN",
+                "NINETEEN"]
+        tens = ["", "", "TWENTY", "THIRTY", "FORTY", "FIFTY"]
+        s = set()
+        for n in range(1, 60):
+            s.add(ones[n] if n < 20
+                  else tens[n // 10] + (("-" + ones[n % 10]) if n % 10 else ""))
+        _PTC_NUMBER_WORDS = frozenset(s)
+    return _PTC_NUMBER_WORDS
+
+
+def _is_named_tc(storm: dict) -> bool:
+    """A genuine named/designated tropical cyclone: TS-or-stronger SSHWS AND a
+    REAL NHC name (not the "ONE"/"TWO" designation placeholder, an invest, or
+    the raw sid). VETOES the is_ptc dress - a named TC is never "potential", so
+    a fresh bake follows NHC the moment it names a system even if ace_core's
+    is_ptc lags. Durable mirror of the inline JS isNamedTC() - keep in lock-step."""
+    cat = (storm.get("current_category") or "").upper()
+    if cat != "TS" and not (
+            len(cat) == 2 and cat[0] == "C" and cat[1] in "12345"):
+        return False
+    nm = (storm.get("name") or "").strip().upper()
+    if not nm or not nm[0].isalpha():
+        return False
+    # letters / space / hyphen / apostrophe only -> a real name (the raw sid
+    # carries digits + underscore and is excluded here).
+    if not all(c.isalpha() or c in " -'" for c in nm):
+        return False
+    return (nm not in _ptc_number_words()
+            and nm not in {"INVEST", "UNNAMED", "NAMELESS"})
 
 
 def _sshs_label(cat: str) -> str:
@@ -5254,7 +5378,12 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     # identity (grey + red X + formation pill) under its REAL designation, but —
     # unlike a 90-99 invest — KEEPS its cone + advisories + Models tab, because
     # NHC is actively advising on it. is_invest and is_ptc are mutually exclusive.
-    is_ptc = bool(storm.get("is_ptc")) and not is_invest
+    # is_ptc follows the LIVE classification, never a stale flag: a NAMED TS+
+    # system is never "potential", so the bake sheds the PTC dress the moment
+    # NHC names it - even if the feed's is_ptc still lags (mirror of the inline
+    # JS ptcNow()/isNamedTC()).
+    is_ptc = (bool(storm.get("is_ptc")) and not is_invest
+              and not _is_named_tc(storm))
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
         cat = "TD"
