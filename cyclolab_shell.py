@@ -859,12 +859,13 @@ HTML_TEMPLATE = r"""<!doctype html>
   .ac-ww .ww-cas { fill: none; stroke: rgba(6,12,22,0.72);
     stroke-linecap: round; stroke-linejoin: round; }
   .ac-ww .ww-lin { fill: none; stroke-linecap: round; stroke-linejoin: round; }
-  /* phase-4 follow-up: INLAND county/zone FILLS, drawn UNDER the coastal
-     breakpoint lines. Translucent canonical-NHC fill (color set inline per
-     type) + a stronger same-color outline so the watched/warned counties read
-     as shaded areas without burying the cone or the track beneath them. */
-  .ac-ww-zones .ww-zone { fill-opacity: 0.22; stroke-width: 1.4;
-    stroke-opacity: 0.95; stroke-linejoin: round; stroke-linecap: round; }
+  /* phase-4 v2 #4/#6: INLAND county/zone FILLS - FULL-OPACITY canonical-NHC
+     fill (color set inline per type) + a thin same-color outline, CLIPPED to
+     the land (SVG clipPath) so a warned county reads as a solid block to the
+     shore and nothing dangles into the water. Drawn on the basemap UNDER the
+     cone/track/icons (z-ordered in renderAdvCone), which stay above the fill. */
+  .ac-ww-zones .ww-zone { fill-opacity: 1.0; stroke-width: 1.0;
+    stroke-opacity: 1.0; stroke-linejoin: round; stroke-linecap: round; }
   .adv-method { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
   .adv-method summary { cursor: pointer; color: #9fc6f5;
     font-weight: 600; font-size: 12px; letter-spacing: 0.4px; }
@@ -3469,6 +3470,47 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
+
+    // ---- W/W INLAND county/zone FILLS (phase-4 v2 #4/#6): full-opacity fills +
+    // outlines, drawn HERE on the basemap (UNDER the cone / track / icons /
+    // labels, which all draw later and stay above) and CLIPPED TO THE LAND via
+    // an SVG clipPath of the SAME BASEMAP.land the coast is derived from - so
+    // the fills align EXACTLY with the drawn coast and NOTHING dangles into the
+    // water. wwTypes is shared with the coastal-line block below (same legend). -
+    var wwTypes = {};
+    var wwZones = (advFull && advFull.ww_zones) || [];
+    if (wwZones.length && (BASEMAP.land || []).length) {
+      var landClipD = (BASEMAP.land || []).map(function (ring) {
+        return ring.map(function (c, i) {
+          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+            Y(c[1]).toFixed(1);
+        }).join(" ") + " Z";
+      }).join(" ");
+      var zParts = [];
+      wwZones.forEach(function (z) {
+        var st = WW_STYLE[z.type] ||
+                 { color: "#cfd8e6", label: (z.type || "Advisory area") };
+        var d = (z.geometry || []).map(function (c, i) {
+          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
+        }).join(" ");
+        if (!d) return;
+        wwTypes[z.type] = st;   // legend advertises only types that drew a path
+        // full-opacity fill + a thin DARK outline (#4) so EACH warned county
+        // reads as a bounded shape - a same-color outline vanished on the solid
+        // fill and adjacent counties merged into one blob.
+        zParts.push('<path class="ww-zone" d="' + d + 'Z" fill="' +
+                    st.color + '" stroke="rgba(6,12,22,0.72)"/>');
+      });
+      if (zParts.length) {
+        parts.push('<defs><clipPath id="ac-ww-land-clip" ' +
+                   'clipPathUnits="userSpaceOnUse"><path d="' + landClipD +
+                   '"/></clipPath></defs>');
+        parts.push('<g class="ac-ww-zones" id="ac-ww-zones-group" ' +
+                   'clip-path="url(#ac-ww-land-clip)"' +
+                   (wwShown ? '' : ' style="display:none"') + '>' +
+                   zParts.join("") + '</g>');
+      }
+    }
     // (the graticule is pushed AFTER the cone group below, so it sits ABOVE
     // the cone too - maps-pass R3 #3 top-most layer.)
 
@@ -3778,34 +3820,11 @@ HTML_TEMPLATE = r"""<!doctype html>
                            lonAt: lonAt, latAt: latAt,
                            x0: fe.x0, y0: fe.y0, x1: fe.x1, y1: fe.y1 }));
 
-    // ---- Phase 4: watches/warnings overlay (NHC AL/EP/CP only) -------------
-    // TWO layers sharing ONE palette + legend + toggle, drawn ABOVE the cone +
-    // graticule but BELOW the forecast icons: the INLAND county/zone FILLS
-    // (advFull.ww_zones, from the NWS alerts API) drawn UNDER the coastal
-    // breakpoint LINES (advFull.ww, from the NHC TCWW KMZ). Both are separate,
-    // toggleable groups outside the reveal clip. NHC basins only.
-    var wwTypes = {};
-    // inland county/zone fills FIRST (so the coastal lines read on top).
-    var wwZones = (advFull && advFull.ww_zones) || [];
-    if (wwZones.length) {
-      var zParts = [];
-      wwZones.forEach(function (z) {
-        var st = WW_STYLE[z.type] ||
-                 { color: "#cfd8e6", label: (z.type || "Advisory area") };
-        var d = (z.geometry || []).map(function (c, i) {
-          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
-        }).join(" ");
-        if (!d) return;
-        wwTypes[z.type] = st;   // legend advertises only types that drew a path
-        zParts.push('<path class="ww-zone" d="' + d + 'Z" fill="' +
-                    st.color + '" stroke="' + st.color + '"/>');
-      });
-      if (zParts.length) {
-        parts.push('<g class="ac-ww-zones" id="ac-ww-zones-group"' +
-                   (wwShown ? '' : ' style="display:none"') + '>' +
-                   zParts.join("") + '</g>');
-      }
-    }
+    // ---- Phase 4: coastal watches/warnings breakpoint LINES (NHC AL/EP/CP) --
+    // The official NHC TCWW segments (advFull.ww) drawn ABOVE the cone + the
+    // inland fills (which are on the basemap above), sharing the one palette +
+    // legend + toggle. The fills above already populated wwTypes; the lines add
+    // to it. A separate toggleable group outside the reveal clip.
     // coastal breakpoint lines ON TOP of the fills.
     var wwSegs = (advFull && advFull.ww) || [];
     if (wwSegs.length) {

@@ -276,7 +276,9 @@ SIMPLIFY_TOL = 0.01
 # and coarsen toward the edges (TOL_FAR) where geometry is rarely shown
 # and, when it is, the cone is large so the zoom is loose. Cuts a near-
 # land bake roughly in half vs uniform-fine with no visible center loss.
-TOL_NEAR = 0.022      # deg ~ 2.4 km: ~3 px at a 140 px/deg cone zoom (crisp)
+TOL_NEAR = 0.016      # deg ~ 1.7 km (v2 #2: was 0.022/2.4 km - finer coast so a
+                      # coast-following border sits ON the shore; ~2 px at a 140
+                      # px/deg cone zoom). The page-size budget rises with it.
 TOL_FAR = 0.10        # deg ~ 11 km: rarely-shown window edge
 # Island floors (deg). Tiny / thin near-shore islands, stroked with the
 # THICK white coast, read as spiky white slivers, NOT land - so drop an

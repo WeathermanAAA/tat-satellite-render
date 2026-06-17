@@ -41,7 +41,7 @@ import poller_framework as pf
 from cyclolab_intensity import basin_entry
 from cyclolab_og import render_intensity_card
 from kml_advisories import (AdvisoryParseError, build_advisory_json,
-                            cone_bbox, parse_nws_alert_zones,
+                            parse_nws_alert_zones,
                             product_text, NWS_TC_EVENTS,
                             parse_next_advisory)
 from storm_ids import InvestSidError, parse_sid
@@ -108,9 +108,23 @@ def _iso_z(t: dt.datetime) -> str:
 NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
 WW_ZONES_ENABLED = (_env("CYCLOLAB_WW_ZONES", "1") or "1").lower() \
     not in ("0", "false", "no")
-# How far (deg) beyond the cone bbox a watched/warned zone is still "this
-# storm's" - inland zones sit a little outside the over-water cone.
-_WW_ZONES_MARGIN_DEG = 3.0
+# How far (deg) beyond the storm's cone+track bbox a watched/warned zone is
+# still "this storm's" (v2 #5: widened 3.0 -> 4.0 + the box now spans the FULL
+# forecast track, not just the cone, so ALL warned counties along the track -
+# not just the coastal row - are attributed).
+_WW_ZONES_MARGIN_DEG = 4.0
+
+
+def _storm_extent_box(payload: dict) -> tuple:
+    """The lon/lat bbox spanning the storm's cone AND its full forecast track -
+    the attribution extent for the inland W/W fills (v2 #5)."""
+    xs = [c[0] for c in payload.get("cone") or []]
+    ys = [c[1] for c in payload.get("cone") or []]
+    for p in payload.get("points") or []:
+        if p.get("lon") is not None and p.get("lat") is not None:
+            xs.append(p["lon"])
+            ys.append(p["lat"])
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
 def _default_fetch_alerts(session: requests.Session,
@@ -403,7 +417,7 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
                     if raw_alerts:
                         zones = parse_nws_alert_zones(
                             raw_alerts,
-                            cone_box=cone_bbox(payload["cone"]),
+                            cone_box=_storm_extent_box(payload),
                             margin_deg=_WW_ZONES_MARGIN_DEG)
                         if zones:
                             payload["ww_zones"] = zones
