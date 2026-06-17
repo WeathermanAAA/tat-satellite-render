@@ -139,15 +139,16 @@ class TestRenderContract(unittest.TestCase):
         self.assertEqual(self.storm["current_category"], "C4")
         self.assertIn('<html lang="en" data-cat="C4">', html)
 
-    def test_ww_zones_inland_fill_render_scaffold(self):
-        # Phase-4 follow-up: the inland county/zone FILL layer (advFull.ww_zones)
-        # drawn UNDER the coastal lines, sharing the one toggle + legend.
+    def test_inland_fill_layer_removed_keeps_coastal_lines(self):
+        # v3: the inland county/zone FILL layer was REMOVED - the cone's W/W
+        # presence is now ONLY the coastal breakpoint LINES. No fill render
+        # artifacts should remain, but the coastal-line scaffold stays.
         html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
-        self.assertIn("advFull.ww_zones", html)                 # reads the key
-        self.assertIn('class="ww-zone"', html)                  # fill path
-        self.assertIn('id="ac-ww-zones-group"', html)           # toggleable group
-        self.assertIn(".ac-ww-zones .ww-zone", html)            # translucent CSS
-        self.assertIn("ac-ww-zones-group", html)                # toggle covers it
+        self.assertNotIn('class="ww-zone"', html)               # no fill paths
+        self.assertNotIn('id="ac-ww-zones-group"', html)        # no fill group
+        self.assertNotIn(".ac-ww-zones", html)                  # no fill CSS
+        self.assertIn("advFull.ww", html)                       # coastal lines stay
+        self.assertIn('id="ac-ww-group"', html)                 # coastal-line group
 
     def test_unknown_category_falls_back_to_TD(self):
         s = copy.deepcopy(self.storm)

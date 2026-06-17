@@ -811,10 +811,12 @@ HTML_TEMPLATE = r"""<!doctype html>
      guidance track / overview track+swath) inherits it, no per-map fork. */
   .ac-border { fill: none; stroke: rgba(71,85,105,0.92);
     stroke-width: 0.7; stroke-linejoin: round; stroke-linecap: round; }
-  /* state/province boundaries (ne_10m admin_1) - dimmer + thinner than the
-     country border, drawn UNDER it so coast + country read first. */
-  .ac-state { fill: none; stroke: rgba(71,85,105,0.60);
-    stroke-width: 0.5; stroke-linejoin: round; stroke-linecap: round; }
+  /* state/province boundaries (ne_10m admin_1). v3: the v2 thinning made these
+     too faint - BOLDER now (width 0.5 -> 0.9, opacity 0.60 -> 0.9) so the
+     landfall state lines read clearly. The country border + coast stay thin
+     (the "too thick" feedback still holds for those - this is ONLY the states). */
+  .ac-state { fill: none; stroke: rgba(71,85,105,0.9);
+    stroke-width: 0.9; stroke-linejoin: round; stroke-linecap: round; }
   /* maps-pass R3 #3: a CASING/HALO graticule - a dark hairline UNDER a light
      line - so every line reads over BOTH the light-gray land AND the dark
      ocean (a flat light line vanished over the light land). Labels get the
@@ -859,13 +861,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   .ac-ww .ww-cas { fill: none; stroke: rgba(6,12,22,0.72);
     stroke-linecap: round; stroke-linejoin: round; }
   .ac-ww .ww-lin { fill: none; stroke-linecap: round; stroke-linejoin: round; }
-  /* phase-4 v2 #4/#6: INLAND county/zone FILLS - FULL-OPACITY canonical-NHC
-     fill (color set inline per type) + a thin same-color outline, CLIPPED to
-     the land (SVG clipPath) so a warned county reads as a solid block to the
-     shore and nothing dangles into the water. Drawn on the basemap UNDER the
-     cone/track/icons (z-ordered in renderAdvCone), which stay above the fill. */
-  .ac-ww-zones .ww-zone { fill-opacity: 1.0; stroke-width: 1.0;
-    stroke-opacity: 1.0; stroke-linejoin: round; stroke-linecap: round; }
+  /* (the v2 inland county/zone FILL layer was removed in v3 - the W/W presence
+     is now only the coastal breakpoint lines above.) */
   .adv-method { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
   .adv-method summary { cursor: pointer; color: #9fc6f5;
     font-weight: 600; font-size: 12px; letter-spacing: 0.4px; }
@@ -3471,46 +3468,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
 
-    // ---- W/W INLAND county/zone FILLS (phase-4 v2 #4/#6): full-opacity fills +
-    // outlines, drawn HERE on the basemap (UNDER the cone / track / icons /
-    // labels, which all draw later and stay above) and CLIPPED TO THE LAND via
-    // an SVG clipPath of the SAME BASEMAP.land the coast is derived from - so
-    // the fills align EXACTLY with the drawn coast and NOTHING dangles into the
-    // water. wwTypes is shared with the coastal-line block below (same legend). -
+    // The INLAND county/zone FILL layer was REMOVED in v3 - the W/W presence on
+    // the cone is now ONLY the official NHC coastal breakpoint LINES (the ww
+    // array) below, which hug the terrain-accurate coast. wwTypes is declared
+    // here for the coastal-line block to populate (the legend).
     var wwTypes = {};
-    var wwZones = (advFull && advFull.ww_zones) || [];
-    if (wwZones.length && (BASEMAP.land || []).length) {
-      var landClipD = (BASEMAP.land || []).map(function (ring) {
-        return ring.map(function (c, i) {
-          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
-            Y(c[1]).toFixed(1);
-        }).join(" ") + " Z";
-      }).join(" ");
-      var zParts = [];
-      wwZones.forEach(function (z) {
-        var st = WW_STYLE[z.type] ||
-                 { color: "#cfd8e6", label: (z.type || "Advisory area") };
-        var d = (z.geometry || []).map(function (c, i) {
-          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
-        }).join(" ");
-        if (!d) return;
-        wwTypes[z.type] = st;   // legend advertises only types that drew a path
-        // full-opacity fill + a thin DARK outline (#4) so EACH warned county
-        // reads as a bounded shape - a same-color outline vanished on the solid
-        // fill and adjacent counties merged into one blob.
-        zParts.push('<path class="ww-zone" d="' + d + 'Z" fill="' +
-                    st.color + '" stroke="rgba(6,12,22,0.72)"/>');
-      });
-      if (zParts.length) {
-        parts.push('<defs><clipPath id="ac-ww-land-clip" ' +
-                   'clipPathUnits="userSpaceOnUse"><path d="' + landClipD +
-                   '"/></clipPath></defs>');
-        parts.push('<g class="ac-ww-zones" id="ac-ww-zones-group" ' +
-                   'clip-path="url(#ac-ww-land-clip)"' +
-                   (wwShown ? '' : ' style="display:none"') + '>' +
-                   zParts.join("") + '</g>');
-      }
-    }
     // (the graticule is pushed AFTER the cone group below, so it sits ABOVE
     // the cone too - maps-pass R3 #3 top-most layer.)
 
@@ -4086,11 +4048,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       chk.checked = wwShown;
       chk.onchange = function () {
         wwShown = chk.checked;
-        // one toggle drives BOTH layers (inland fills + coastal lines).
-        ["ac-ww-group", "ac-ww-zones-group"].forEach(function (id) {
-          var g = document.getElementById(id);
-          if (g) g.style.display = wwShown ? "" : "none";
-        });
+        // the toggle drives the coastal-line group (the inland fill layer was
+        // removed in v3).
+        var g = document.getElementById("ac-ww-group");
+        if (g) g.style.display = wwShown ? "" : "none";
       };
     })();
 

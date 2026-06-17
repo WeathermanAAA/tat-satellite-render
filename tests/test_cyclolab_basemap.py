@@ -238,8 +238,10 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         # cone). A dim SLATE .ac-state stroke; the maps degrade gracefully if an
         # old baked basemap lacks the 'states' key.
         self.assertEqual(self.html.count('<path class="ac-state" d="'), 3)
-        self.assertIn(".ac-state { fill: none; stroke: rgba(71,85,105,0.60)",
+        # v3: state borders are BOLDER (the v2 thinning left them too faint).
+        self.assertIn(".ac-state { fill: none; stroke: rgba(71,85,105,0.9)",
                       self.html)
+        self.assertIn("stroke-width: 0.9", self.html)
 
     def test_lockup_is_a_top_left_html_overlay(self):
         # R3 #2: the lockup is an HTML overlay PINNED to the panel's top-left
