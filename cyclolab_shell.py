@@ -4428,10 +4428,19 @@ HTML_TEMPLATE = r"""<!doctype html>
           "automatically within a few minutes)"
         : "(no advisory text product is published for this storm)");
     var host = document.getElementById("advtext-tabs");
+    // Source-aware product labels (CYCLOLAB_DESIGN §8.4): JTWC ships a Warning +
+    // Prognostic Reasoning; NHC a Public Advisory + Discussion. Same tcp/tcd
+    // slots + playback - only the button text differs.
+    var jtwc = !!(advFull && advFull.source === "jtwc");
     for (var i = 0; i < host.children.length; i++) {
       var b = host.children[i];
-      b.classList.toggle("active",
-                         b.getAttribute("data-prod") === advTextProd);
+      var prod = b.getAttribute("data-prod");
+      b.classList.toggle("active", prod === advTextProd);
+      if (prod === "tcp") {
+        b.textContent = jtwc ? "JTWC Warning" : "Public Advisory";
+      } else if (prod === "tcd") {
+        b.textContent = jtwc ? "Prognostic Reasoning" : "Discussion";
+      }
     }
   }
   document.getElementById("advtext-tabs").addEventListener("click",

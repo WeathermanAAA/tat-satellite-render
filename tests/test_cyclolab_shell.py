@@ -150,6 +150,18 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn("advFull.ww", html)                       # coastal lines stay
         self.assertIn('id="ac-ww-group"', html)                 # coastal-line group
 
+    def test_jtwc_source_relabels_advisory_text_buttons(self):
+        # CYCLOLAB_DESIGN §8.4: a JTWC advisory (advFull.source === "jtwc")
+        # relabels the tcp/tcd buttons to "JTWC Warning" / "Prognostic
+        # Reasoning"; NHC keeps "Public Advisory" / "Discussion". Render-time,
+        # off the fetched advFull -- one template serves both sources.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn('advFull.source === "jtwc"', html)        # source-aware switch
+        self.assertIn('"JTWC Warning"', html)
+        self.assertIn('"Prognostic Reasoning"', html)
+        self.assertIn('"Public Advisory"', html)                # NHC label retained
+        self.assertIn('"Discussion"', html)
+
     def test_unknown_category_falls_back_to_TD(self):
         s = copy.deepcopy(self.storm)
         s["current_category"] = "ZZ"
