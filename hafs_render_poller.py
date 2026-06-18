@@ -89,11 +89,14 @@ HAFS_PRODUCTS = _env("HAFS_PRODUCTS")           # None -> generator default (all
 
 # Render-pool width. 8 OOM-KILLED the whole worker on a heavy multi-storm cycle
 # (the 2026-06-17 06Z wedge: container OOM at 154/258 frames, then a
-# Railway-gives-up crash-loop). Lowered to 4 so the peak tree RSS stays inside the
-# container on a strong-storm cycle. Each render worker still holds rendered
-# arrays, but the memory-bound INGEST width below dominates the peak - tune this
-# UP again only after render_summary's mem.peak_tree_rss_mb shows headroom.
-HAFS_JOBS = int(_env("HAFS_JOBS", "4"))
+# Railway-gives-up crash-loop). CAPPED at HAFS_JOBS_MAX=4 so a STALE Railway env
+# (the dashboard still sets HAFS_JOBS=8) cannot push it back into the OOM regime -
+# the worker is self-protecting, not at the mercy of a leftover env var. Each
+# render worker holds rendered arrays, but the memory-bound INGEST width below
+# dominates the peak. To allow a higher width after a memory bump, raise
+# HAFS_JOBS_MAX deliberately (a new env), not HAFS_JOBS.
+HAFS_JOBS_MAX = int(_env("HAFS_JOBS_MAX", "4"))
+HAFS_JOBS = min(int(_env("HAFS_JOBS", "4")), HAFS_JOBS_MAX)
 
 # INGEST runs at a LOWER width than render: each ingest decodes a large
 # multi-field GRIB (parent.atm / hafsb are the heaviest), so this stage is the
@@ -102,8 +105,10 @@ HAFS_JOBS = int(_env("HAFS_JOBS", "4"))
 # lowered to 2 so at most two concurrent heavy decodes are resident. The
 # generator's halving backoff is the in-process safety net; the lower width + the
 # liveness self-kill + the external ens_watchdog cover the cgroup OOM that took the
-# whole worker down. Tune against render_summary mem.peak_tree_rss_mb.
-HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "2"))
+# whole worker down. Tune against render_summary mem.peak_tree_rss_mb. Capped the
+# same way (HAFS_INGEST_JOBS_MAX) so a stale env can't re-open the OOM here either.
+HAFS_INGEST_JOBS_MAX = int(_env("HAFS_INGEST_JOBS_MAX", "2"))
+HAFS_INGEST_JOBS = min(int(_env("HAFS_INGEST_JOBS", "2")), HAFS_INGEST_JOBS_MAX)
 
 # INTRA-CYCLE CATCH-UP. While the rendered cycle is still the newest, each poll
 # re-checks upstream for (model, storm, domain) pairs that were skipped at
@@ -2002,6 +2007,8 @@ def main() -> None:  # pragma: no cover - Railway worker entrypoint
         r2.put_json(f"{HAFS_R2_PREFIX}/worker_config.json", {
             "started_utc": pf.iso_z(pf.utcnow()),
             "jobs": HAFS_JOBS, "ingest_jobs": HAFS_INGEST_JOBS,
+            "jobs_env": _env("HAFS_JOBS"), "jobs_max": HAFS_JOBS_MAX,
+            "ingest_jobs_env": _env("HAFS_INGEST_JOBS"),
             "render_timeout_s": RENDER_TIMEOUT_S,
             "liveness_timeout_s": LIVENESS_TIMEOUT_S,
             "poll_interval_s": POLL_INTERVAL_S,
