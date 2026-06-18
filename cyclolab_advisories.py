@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import logging
 import os
 import re
@@ -40,6 +41,8 @@ import requests
 import poller_framework as pf
 from cyclolab_intensity import basin_entry
 from cyclolab_og import render_intensity_card
+from derived_cone import build_derived_advisory_json
+from jtwc_warning import JtwcParseError, parse_jtwc_warning, parse_warning_number
 from kml_advisories import (AdvisoryParseError, build_advisory_json,
                             parse_nws_alert_zones,
                             product_text, NWS_TC_EVENTS,
@@ -471,5 +474,265 @@ def make_advisories_source(session: requests.Session, sink: pf.Sink, *,
             raise RuntimeError("; ".join(errors)[:1000])
 
     return pf.Source(name="cyclolab-adv", fetch=fetch,
+                     change_key=change_key, process=process,
+                     valid_time=valid_time)
+
+
+# ===========================================================================
+# JTWC / WP derived-cone sub-path (CYCLOLAB_DESIGN.md §8.4)
+# ---------------------------------------------------------------------------
+# A SEPARATE, fully-isolated pf.Source (name="cyclolab-adv-jtwc"). JTWC has no
+# CurrentStorms and no official cone: knackwx is the live DESIGNATION feed (same
+# fix the tracks map uses), and the per-storm JTWC TC Warning text IS the
+# product. We parse the warning's forecast track, buffer it by JTWC's published
+# mean track-forecast error (derived_cone + the method-versioned radii blob) into
+# the SAME {prefix}/adv/{sid}.json contract the NHC path writes, so the existing
+# shell renders a derived cone + two text panels with no rearchitecture.
+#
+# Isolation: a JTWC fetch/parse failure can only flag THIS source (per-source
+# isolation) -- it can never stale ACE/tracks nor break the NHC cones. metoc is
+# primary; a JTWC outage = no cone this poll, never an exception that escapes.
+# Kill-switch CYCLOLAB_ADVISORIES_JTWC (house idiom, default on), INDEPENDENT of
+# the NHC CYCLOLAB_ADVISORIES.
+# ===========================================================================
+CYCLOLAB_JTWC_ENABLED = (_env("CYCLOLAB_ADVISORIES_JTWC", "1") or "1").lower() \
+    not in ("0", "false", "no")
+
+# metoc per-storm products: wp{NN}{YY}web.txt (warning) / ...prog.txt (reasoning).
+JTWC_PRODUCT_BASE = (_env("JTWC_PRODUCT_BASE",
+                          "https://www.metoc.navy.mil/jtwc/products") or "").rstrip("/")
+_LONG_ATCF_RE = re.compile(r"^wp(\d{2})(\d{4})$", re.I)
+
+# The WP mean-error radii blob (method-versioned). Loaded once; a re-pin to a
+# newer verification year is a data edit (the file), not a code edit.
+_JTWC_RADII = json.load(open(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "cyclolab_radii_jtwc_wpac_mean_2015.json"), encoding="utf-8"))
+
+
+def _jtwc_url(nn: int, yy: int, kind: str) -> str:
+    """kind in {'web','prog'} -> the metoc product URL (wp0726web.txt etc.)."""
+    return f"{JTWC_PRODUCT_BASE}/wp{nn:02d}{yy:02d}{kind}.txt"
+
+
+def _jtwc_designated_storms(knack_data, default_year: int) -> list[dict]:
+    """The DESIGNATED WP storms (basin letter 'W', number 1..49 - invests 90-99
+    excluded) from a knackwx ATCF payload. NN + year come from long_atcf_id
+    ('wp072026'); sid = JTWC_WP{NN}{YYYY} (the tracks-feed SID). De-duped."""
+    out: dict[str, dict] = {}
+    for it in knack_data if isinstance(knack_data, list) else []:
+        aid = str(it.get("atcf_id") or "").strip().upper()
+        if not aid.endswith("W"):
+            continue
+        try:
+            num = int(aid[:-1])
+        except (ValueError, IndexError):
+            continue
+        if not (1 <= num <= 49):     # designated only (invests are not our product)
+            continue
+        m = _LONG_ATCF_RE.match(str(it.get("long_atcf_id") or "").strip())
+        if m:
+            nn, year = int(m.group(1)), int(m.group(2))
+        else:
+            nn, year = num, default_year   # rare: long_atcf_id absent
+        yy = year % 100
+        raw = str(it.get("storm_name") or "").strip().upper()
+        name = raw if raw and raw not in {"INVEST", "NAMELESS", "UNNAMED"} \
+            else f"{num:02d}W"
+        sid = f"JTWC_WP{nn:02d}{year}"
+        out[sid] = {"sid": sid, "nn": nn, "yy": yy, "year": year, "name": name,
+                    "web_url": _jtwc_url(nn, yy, "web"),
+                    "prog_url": _jtwc_url(nn, yy, "prog")}
+    return list(out.values())
+
+
+def make_jtwc_advisories_source(session: requests.Session, sink: pf.Sink, *,
+                                prefix: str = CYCLOLAB_PREFIX,
+                                knackwx_url: str = None,
+                                policy: pf.FetchPolicy = None,
+                                fetch_text: Optional[Callable] = None,
+                                clock: Callable[[], dt.datetime] = pf.utcnow,
+                                ) -> pf.Source:
+    """Build the JTWC/WP derived-cone Source. ``fetch_text`` is injectable so the
+    offline tests drive the full poll cycle with fixture text."""
+    import intensity_poller as ip   # late import: shared helpers/config
+    knackwx_url = knackwx_url or ip.KNACKWX_ATCF_URL
+    policy = policy or ip.FETCH_POLICY
+    get_text = fetch_text or (lambda url: ip._get_text(session, url, policy))
+
+    # Per-storm ledger: {sid: {"warning_number": int, "issued": iso,
+    # "text_done": bool, "payload": dict}}. In-memory; a restart re-fetches the
+    # current warning and overwrites the SAME key - idempotent by construction.
+    ledger: dict[str, dict] = {}
+    poll_seq = {"n": 0}
+
+    def fetch():
+        text = get_text(knackwx_url)
+        if not text:
+            raise pf.TransientFetchError("knackwx ATCF unavailable")
+        poll_seq["n"] += 1
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError) as e:
+            raise pf.TransientFetchError(f"knackwx JSON parse: {e}")
+        storms = []
+        for s in _jtwc_designated_storms(data, clock().year):
+            # The warning text is the JTWC 'cheap index': fetch+parse it so the
+            # change-gate keys on (sid, warning_number). PER-STORM ISOLATION - a
+            # single warning fetch/parse failure (metoc 403/down, mid-issue) just
+            # SKIPS that storm this poll; it never fails the whole fetch.
+            try:
+                web = get_text(s["web_url"])
+                if not web:
+                    continue
+                parsed = parse_jtwc_warning(web)
+            except (JtwcParseError, pf.TransientFetchError, pf.PermanentFetchError,
+                    Exception) as ex:  # noqa: BLE001 - graceful per-storm degrade
+                log.warning("JTWC %s: warning fetch/parse skipped this poll: %s",
+                            s["sid"], ex)
+                continue
+            s["parsed"] = parsed
+            s["warning_number"] = parsed["warning_number"]
+            s["web_text"] = web
+            storms.append(s)
+        return {"storms": storms}
+
+    def change_key(data):
+        base = tuple(sorted((s["sid"], s["warning_number"])
+                            for s in data["storms"]))
+        live = {s["sid"] for s in data["storms"]}
+        # Text-heal pulse (mirror NHC): while any live storm still owes its
+        # VERIFIED prog text, every poll gets a distinct key so process() runs
+        # and retries JUST the prog fetch (cheap). Settles once all text lands.
+        if any(not k.get("text_done") for s, k in ledger.items() if s in live):
+            return (base, poll_seq["n"])
+        return (base,)
+
+    def valid_time(data):
+        return None
+
+    def _attach_text(payload: dict, wn: int, web_text: str, web_url: str,
+                     prog_url: str) -> bool:
+        """tcp = the warning body (verified by construction: its own WARNING NR
+        IS ``wn``, parsed in fetch). tcd = the Prognostic Reasoning, attached
+        ONLY when its own WARNING NR matches ``wn`` (cross-product verification,
+        mirror of NHC _verified_product). Missing/mismatched prog -> tcd PENDING,
+        healed next poll; it NEVER blocks the cone. Returns True iff tcd verified."""
+        text = payload.get("text")
+        if not isinstance(text, dict):
+            text = {}
+            payload["text"] = text
+        text["tcp"] = web_text
+        text["tcp_url"] = web_url
+        text["tcd_url"] = prog_url
+        if text.get("tcd"):
+            return True                       # already attached VERIFIED
+        try:
+            prog = get_text(prog_url)
+            if not prog:
+                log.info("JTWC %s wn %d: prog.txt missing - tcd pending",
+                         payload.get("sid"), wn)
+                return False
+            got = parse_warning_number(prog)
+            if got != wn:
+                log.info("JTWC %s: prog warning nr %s != %d - tcd pending",
+                         payload.get("sid"), got, wn)
+                return False
+            text["tcd"] = prog
+            return True
+        except Exception as tx:  # noqa: BLE001 - additive; never blocks the cone
+            log.warning("JTWC %s wn %d: prog fetch pending: %s",
+                        payload.get("sid"), wn, tx)
+            return False
+
+    def _build_payload(s: dict) -> dict:
+        parsed = s["parsed"]
+        wn = s["warning_number"]
+        points = [dict(p) for p in parsed["points"]]
+        for p in points:                      # so build_* reports the advisory
+            p["advisory"] = wn
+        payload = build_derived_advisory_json(s["sid"], points, _JTWC_RADII)
+        # issued_utc := the WARNING issuance (header DTG), not the tau0 valid
+        # time build_* defaulted to - the true monotonic issuance the
+        # regression guard compares.
+        payload["issued_utc"] = parsed["issued_utc"]
+        payload["advisory"] = wn
+        payload["name"] = s["name"]
+        payload["provenance"]["discovery_source"] = knackwx_url
+        payload["provenance"]["warning_text_url"] = s["web_url"]
+        payload["provenance"]["reasoning_text_url"] = s["prog_url"]
+        return payload
+
+    def _heal_text(s: dict, known: dict) -> None:
+        """Same warning, prog text still owed - retry + rewrite if it landed.
+        Cheap (one text GET; the retained payload spares the cone rebuild)."""
+        payload = known["payload"]
+        before = payload.get("text", {}).get("tcd")
+        known["text_done"] = _attach_text(payload, known["warning_number"],
+                                          s["web_text"], s["web_url"], s["prog_url"])
+        if payload.get("text", {}).get("tcd") != before:
+            payload["provenance"]["text_healed_utc"] = _iso_z(clock())
+            sink.write(f"{prefix}/adv/{s['sid']}.json", payload)
+            log.info("JTWC adv text healed: %s wn %d (tcd=%d ch)", s["sid"],
+                     known["warning_number"],
+                     len(payload.get("text", {}).get("tcd") or ""))
+
+    def process(ctx: pf.ProcessContext):
+        errors = []
+        live = set()
+        for s in ctx.data["storms"]:
+            sid, wn = s["sid"], s["warning_number"]
+            live.add(sid)
+            known = ledger.get(sid)
+            if known and known["warning_number"] >= wn:
+                # change-gate: nothing NEW (or a stale-mirror OLDER warning,
+                # rejected by construction). Late prog text still heals in place.
+                if known["warning_number"] == wn and not known.get("text_done"):
+                    try:
+                        _heal_text(s, known)
+                    except Exception as hx:  # noqa: BLE001
+                        log.warning("JTWC %s wn %d: text heal failed: %s",
+                                    sid, wn, hx)
+                continue
+            try:
+                payload = _build_payload(s)
+                text_done = _attach_text(payload, wn, s["web_text"],
+                                         s["web_url"], s["prog_url"])
+                # ISSUANCE-REGRESSION GUARD: never replace cached state with an
+                # OLDER warning (stale mirror / CDN echo) - the 91W lesson.
+                if known and payload["issued_utc"] < known["issued"]:
+                    raise JtwcParseError(
+                        f"{sid}: parsed issuance {payload['issued_utc']} "
+                        f"regresses cached {known['issued']} - rejected")
+                payload["provenance"]["parsed_utc"] = _iso_z(clock())
+                sink.write(f"{prefix}/adv/{sid}.json", payload)
+                # Best-effort OG card (same honesty guard as NHC): no basin
+                # registry entry (WP may have none) or a sink without binary
+                # writes (tests) -> skipped, never a borrowed envelope.
+                try:
+                    ids = parse_sid(sid)
+                    entry = basin_entry(ids.basin)
+                    if entry and hasattr(sink, "write_png"):
+                        png = render_intensity_card(payload, entry,
+                                                    storm_name=s["name"])
+                        sink.write_png(f"{prefix}/og/{sid}.png", png)
+                except Exception as og:  # noqa: BLE001
+                    log.warning("JTWC %s wn %d: OG card skipped: %s", sid, wn, og)
+                ledger[sid] = {"warning_number": wn, "issued": payload["issued_utc"],
+                               "text_done": text_done, "payload": payload}
+                log.info("cyclolab JTWC adv cached: %s wn %d (%d cone vtx, "
+                         "%d points, text %s)", sid, wn, len(payload["cone"]),
+                         len(payload["points"]),
+                         "complete" if text_done else "PENDING-HEAL")
+            except Exception as ex:  # noqa: BLE001 - isolate per storm
+                errors.append(f"{sid} wn {wn}: {type(ex).__name__}: {ex}")
+        # A storm that left knackwx (dissipated) can never heal - close its debt.
+        for sid, k in ledger.items():
+            if sid not in live and not k.get("text_done"):
+                k["text_done"] = True
+        if errors:
+            raise RuntimeError("; ".join(errors)[:1000])
+
+    return pf.Source(name="cyclolab-adv-jtwc", fetch=fetch,
                      change_key=change_key, process=process,
                      valid_time=valid_time)

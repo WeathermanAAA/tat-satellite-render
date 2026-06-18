@@ -716,6 +716,14 @@ def build_engine(sink: pf.Sink, *, basins=BASINS,
     if cyclolab:
         from cyclolab_advisories import make_advisories_source
         sources.append(make_advisories_source(session, sink, clock=clock))
+    # JTWC/WP derived-cone Source (CYCLOLAB_DESIGN.md §8.4) - a SEPARATE,
+    # fully-isolated Source so a JTWC parse/fetch failure can never stale ACE/
+    # tracks NOR break the NHC cones. INDEPENDENT kill-switch
+    # (CYCLOLAB_ADVISORIES_JTWC), not gated by the NHC CYCLOLAB_ADVISORIES flag.
+    from cyclolab_advisories import CYCLOLAB_JTWC_ENABLED
+    if CYCLOLAB_JTWC_ENABLED:
+        from cyclolab_advisories import make_jtwc_advisories_source
+        sources.append(make_jtwc_advisories_source(session, sink, clock=clock))
     return pf.PollerEngine(
         sources, name="intensity-poller", interval_s=interval_s,
         stale_after_s=float(_env("STALE_AFTER_S", "1800")),
