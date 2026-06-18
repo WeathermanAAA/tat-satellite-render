@@ -499,7 +499,13 @@ class S1Ingest:
         h.last_error = None
         for m in msgs:
             self.stats.received += 1
-            self._handle_message(m)
+            try:
+                self._handle_message(m)
+            except Exception as e:  # noqa: BLE001 - per-message isolation: one
+                # malformed message must never drop the rest of the batch
+                # unacked. Not deleted -> redelivers -> DLQ after maxReceiveCount.
+                self.health["sqs"].last_error = f"handle: {type(e).__name__}: {e}"
+                log.warning("message handling error (left for redelivery): %s", e)
         if msgs:
             self._last_progress = time.monotonic()
         return len(msgs)
