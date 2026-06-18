@@ -66,9 +66,11 @@ class RenderStub:
         # unless overridden to simulate the s3fs-listing-not-current case.
         d = dt.datetime.fromisoformat(time_iso)
         stamp = d.astimezone(UTC).strftime(S.STAMP_FMT)
-        xscan = self.xscan_override or d.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return (b"WEBPDATA-" + stamp.encode(),
-                {"Content-Type": "image/webp", "X-Scan-Time": xscan})
+        headers = {"Content-Type": "image/webp"}
+        if self.mode != "no_xscan":   # simulate a render with no X-Scan-Time
+            headers["X-Scan-Time"] = (self.xscan_override
+                                      or d.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        return (b"WEBPDATA-" + stamp.encode(), headers)
 
 
 class FakeR2:
@@ -230,6 +232,16 @@ class S1IngestTest(unittest.TestCase):
         self.assertEqual(w.stats.rendered, 0)
         self.assertNotIn(S.shadow_frame_key("shadow", "20260618T210057Z"), r2.store)
         self.assertEqual(self._q_count(self.q_url), 1)   # NOT acked
+
+    def test_missing_xscan_fails_closed(self):
+        # No X-Scan-Time header -> cannot verify the slot -> must NOT publish/ack.
+        self._send(raw_event(C13_A))
+        r2 = FakeR2()
+        w = self._worker(render=RenderStub(mode="no_xscan"), r2=r2)
+        w.consume_once(wait_s=1)
+        self.assertEqual(w.stats.rendered, 0)
+        self.assertNotIn(S.shadow_frame_key("shadow", "20260618T210057Z"), r2.store)
+        self.assertEqual(self._q_count(self.q_url), 1)   # NOT acked -> retry/DLQ
 
     # -- 422 off-disk -> acked as no-data (not a failure, not a frame) -------
     def test_render_skip_acked_as_no_data(self):

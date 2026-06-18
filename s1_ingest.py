@@ -406,7 +406,8 @@ class S1Ingest:
                  n, prefix, iso_z(self.watermark) if self.watermark else "(none)")
 
     # -- the render path for one COMPLETE slot --------------------------------
-    def process_slot(self, slot: S.Slot, source: str) -> str:
+    def process_slot(self, slot: S.Slot, source: str,
+                     write_manifest: bool = True) -> str:
         """Render a complete S1 slot via the frozen path and publish to R2.
         Returns one of: rendered | duplicate | no-data. Raises on render/PUT
         failure (the caller must NOT ack so SQS redelivers -> DLQ after N)."""
@@ -447,16 +448,21 @@ class S1Ingest:
         # resolve a neighbour; X-Scan-Time != our stamp means "not ready" -> do
         # NOT ack, let SQS redeliver after the visibility timeout (s3fs refreshes).
         scan_hdr = _header(headers, "X-Scan-Time")
-        if scan_hdr:
-            try:
-                got = dt.datetime.fromisoformat(scan_hdr.replace("Z", "+00:00"))
-                got_stamp = got.astimezone(UTC).strftime(S.STAMP_FMT)
-            except (ValueError, TypeError):
-                got_stamp = None
-            if got_stamp and got_stamp != stamp:
-                raise RenderError(
-                    f"render resolved {got_stamp} != requested {stamp} "
-                    f"(s3fs listing not yet current); will retry")
+        if not scan_hdr:
+            # Fail CLOSED: without the header we cannot confirm which scan the
+            # render resolved, so we must not publish a possibly-wrong-slot frame.
+            # Retry (->DLQ after N). The meso-branch render always emits it.
+            raise RenderError("render response missing X-Scan-Time; cannot verify "
+                              "slot -- will retry")
+        try:
+            got = dt.datetime.fromisoformat(scan_hdr.replace("Z", "+00:00"))
+            got_stamp = got.astimezone(UTC).strftime(S.STAMP_FMT)
+        except (ValueError, TypeError):
+            raise RenderError(f"unparseable X-Scan-Time {scan_hdr!r}; will retry")
+        if got_stamp != stamp:
+            raise RenderError(
+                f"render resolved {got_stamp} != requested {stamp} "
+                f"(s3fs listing not yet current); will retry")
 
         digest = hashlib.sha256(png).hexdigest()
         if not self.r2.put_bytes(key, png, "image/webp", CACHE_FRAME):
@@ -470,7 +476,8 @@ class S1Ingest:
         if self.watermark is None or scan > self.watermark:
             self.watermark = scan
         self.stats.rendered += 1
-        self._write_latest_times()
+        if write_manifest:
+            self._write_latest_times()
         log.info("published %s (%d B, %s, src=%s)", key, len(png), digest[:10], source)
         return "rendered"
 
@@ -497,6 +504,10 @@ class S1Ingest:
         h.last_success_utc = self._now()
         h.consecutive_failures = 0
         h.last_error = None
+        # A successful poll IS liveness, even when empty -- otherwise a
+        # legitimately quiet firehose (upstream maintenance) would trip the
+        # watchdog and restart-loop the worker (NOTE-3).
+        self._last_progress = time.monotonic()
         for m in msgs:
             self.stats.received += 1
             try:
@@ -506,8 +517,6 @@ class S1Ingest:
                 # unacked. Not deleted -> redelivers -> DLQ after maxReceiveCount.
                 self.health["sqs"].last_error = f"handle: {type(e).__name__}: {e}"
                 log.warning("message handling error (left for redelivery): %s", e)
-        if msgs:
-            self._last_progress = time.monotonic()
         return len(msgs)
 
     def _handle_message(self, m: dict) -> None:
@@ -532,9 +541,15 @@ class S1Ingest:
                         slot.slot_id, recv_count)
 
         # Completeness gate: clean-IR meso = 1 band; the C13 object completes the
-        # slot immediately. (Generic gate -> S3 true-color accrues 5 bands here.)
-        self.gate.mark(slot.slot_id, slot.band)
-        if not self.gate.is_complete(slot.slot_id):
+        # slot immediately. Key the gate by slot.stamp -- the SAME key
+        # process_slot/cold_start/prune use, so the ledger is consistent and
+        # prune actually reclaims it (keying by slot_id here leaked, since
+        # slot_id embeds the band and prune forgets by stamp). NOTE for S3
+        # multi-band/multi-sector reuse: key by (sat, sector, stamp) without the
+        # band, so all bands of one scan accrue under one slot and M1/M2 stay
+        # distinct -- stamp alone suffices for single-sector single-band S1.
+        self.gate.mark(slot.stamp, slot.band)
+        if not self.gate.is_complete(slot.stamp):
             # Incomplete: ack THIS band's message (it landed; backfill/other-band
             # events will complete it). For S1 this branch never hits (1 band).
             if handle:
@@ -588,7 +603,10 @@ class S1Ingest:
             if slot.stamp in self.published:
                 continue
             try:
-                outcome = self.process_slot(slot, source="backfill")
+                # Defer the manifest write -- a cold-start burst would otherwise
+                # re-PUT latest_times once per slot (NOTE-4); write it once below.
+                outcome = self.process_slot(slot, source="backfill",
+                                            write_manifest=False)
             except RenderSkip:
                 outcome = "no-data"
             except Exception as e:  # noqa: BLE001
@@ -605,6 +623,7 @@ class S1Ingest:
             self.watermark = newest
             h.last_valid_time = newest
         if n:
+            self._write_latest_times()   # once per burst (NOTE-4)
             self._last_progress = time.monotonic()
         return n
 
