@@ -262,3 +262,48 @@ class CompletenessGate:
         """Drop a slot from the ledger (retention/window trimming)."""
         self._slots.pop(slot_key, None)
         self._done.discard(slot_key)
+
+
+# ---------------------------------------------------------------------------
+# Never-miss coverage classification (pure -- shared by the remote audit; §8)
+# ---------------------------------------------------------------------------
+def classify_coverage(noaa_stamps, shadow_stamps, now: dt.datetime,
+                      settle_s: float = 180.0,
+                      first_shadow: "dt.datetime | None" = None) -> dict:
+    """Classify each NOAA ground-truth slot as covered / pending / missed.
+
+    The point: a slot not yet in /shadow/ is only a MISS if the worker was
+    demonstrably up and the slot has had time to ship. Otherwise it is PENDING
+    (in-flight render/PUT, the worker not writing yet, or a backlog drain that
+    has not reached an old slot). This lets the remote gate be run repeatedly
+    during a manual deploy without false failures.
+
+    - covered: a shadow frame exists for the slot.
+    - pending: not shipped yet AND any of: (a) the scan is newer than now-settle_s
+      (render+PUT still in flight); (b) no shadow frame exists at all (worker not
+      writing yet); (c) the scan predates the first shadow frame (the worker came
+      up after it -- backfill may still catch it).
+    - missed: the worker was up (scan >= first_shadow), the slot is settled
+      (scan <= now-settle_s), yet no shadow frame -> a REAL never-miss failure.
+
+    Pure: stamps are STAMP_FMT strings; ``now``/``first_shadow`` are tz-aware.
+    ``first_shadow`` defaults to the earliest shadow stamp when omitted."""
+    shadow_set = set(shadow_stamps)
+    if first_shadow is None and shadow_set:
+        first_shadow = min(dt.datetime.strptime(s, STAMP_FMT).replace(tzinfo=UTC)
+                           for s in shadow_set)
+    settle_cut = now - dt.timedelta(seconds=settle_s)
+    covered, pending, missed = [], [], []
+    for s in sorted(set(noaa_stamps)):
+        scan = dt.datetime.strptime(s, STAMP_FMT).replace(tzinfo=UTC)
+        if s in shadow_set:
+            covered.append(s)
+        elif scan > settle_cut:
+            pending.append(s)            # in-flight render/PUT
+        elif first_shadow is None:
+            pending.append(s)            # worker not writing yet
+        elif scan < first_shadow:
+            pending.append(s)            # pre-worker / backfill not caught up
+        else:
+            missed.append(s)             # worker up + settled + not shipped = MISS
+    return {"covered": covered, "pending": pending, "missed": missed}

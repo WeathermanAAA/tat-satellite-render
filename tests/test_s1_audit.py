@@ -6,7 +6,56 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import datetime as dt  # noqa: E402
 import s1_audit as A  # noqa: E402
+import s1_slots as S  # noqa: E402
+
+UTC = dt.timezone.utc
+
+
+def _stamp(mins_ago, now):
+    return (now - dt.timedelta(minutes=mins_ago)).strftime(S.STAMP_FMT)
+
+
+class TestClassifyCoverage(unittest.TestCase):
+    def setUp(self):
+        self.now = dt.datetime(2026, 6, 18, 22, 0, 0, tzinfo=UTC)
+
+    def test_all_covered(self):
+        gt = [_stamp(m, self.now) for m in (10, 9, 8, 7)]
+        c = S.classify_coverage(gt, gt, self.now, settle_s=180)
+        self.assertEqual(c["missed"], [])
+        self.assertEqual(c["pending"], [])
+        self.assertEqual(len(c["covered"]), 4)
+
+    def test_settled_missing_is_a_miss(self):
+        # worker up (first_shadow=10min ago), slot at 8min ago settled, not shipped
+        gt = [_stamp(10, self.now), _stamp(8, self.now), _stamp(6, self.now)]
+        shadow = [_stamp(10, self.now), _stamp(6, self.now)]   # 8-min slot missing
+        c = S.classify_coverage(gt, shadow, self.now, settle_s=180)
+        self.assertEqual(c["missed"], [_stamp(8, self.now)])
+
+    def test_recent_missing_is_pending(self):
+        # slot 1 min ago (< settle_s=180) not shipped -> in-flight PENDING
+        gt = [_stamp(10, self.now), _stamp(1, self.now)]
+        shadow = [_stamp(10, self.now)]
+        c = S.classify_coverage(gt, shadow, self.now, settle_s=180)
+        self.assertEqual(c["missed"], [])
+        self.assertIn(_stamp(1, self.now), c["pending"])
+
+    def test_empty_shadow_all_pending(self):
+        gt = [_stamp(m, self.now) for m in (10, 8, 6)]
+        c = S.classify_coverage(gt, [], self.now, settle_s=180)
+        self.assertEqual(c["missed"], [])
+        self.assertEqual(len(c["pending"]), 3)
+
+    def test_pre_worker_slot_is_pending(self):
+        # slot older than the first shadow frame -> backfill not caught up -> PENDING
+        gt = [_stamp(30, self.now), _stamp(10, self.now), _stamp(8, self.now)]
+        shadow = [_stamp(10, self.now), _stamp(8, self.now)]   # first_shadow=10min
+        c = S.classify_coverage(gt, shadow, self.now, settle_s=180)
+        self.assertEqual(c["missed"], [])                       # 30-min predates worker
+        self.assertIn(_stamp(30, self.now), c["pending"])
 
 
 class TestAuditCompare(unittest.TestCase):
