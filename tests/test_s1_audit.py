@@ -120,5 +120,69 @@ class TestDiffFrames(unittest.TestCase):
         self.assertFalse(r["shape_match"])
 
 
+class TestDecomposeDiff(unittest.TestCase):
+    """The cross-build-floor vs real-delta decomposition (§7.2/§9)."""
+    def setUp(self):
+        try:
+            import numpy  # noqa: F401
+            from PIL import Image  # noqa: F401
+        except Exception:
+            self.skipTest("numpy/PIL not available")
+
+    def _noise_rgb(self, seed=0, size=(128, 96)):
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        # high-frequency content (like cloud tops) so the lossy floor is non-trivial
+        return rng.integers(0, 256, (size[1], size[0], 3), dtype=np.uint8)
+
+    def _webp(self, rgb):
+        import io
+        from PIL import Image
+        b = io.BytesIO()
+        Image.fromarray(rgb, "RGB").save(b, "WEBP", quality=90, method=6)
+        return b.getvalue()
+
+    def test_real_zero_when_only_encode_floor(self):
+        # prod = a re-encode of the SAME decoded source as shadow -> the only
+        # difference is encode quantization -> REAL must be 0.
+        import io
+        import numpy as np
+        from PIL import Image
+        import s1_pixeldiff as P
+        src = self._noise_rgb(seed=1)
+        shadow = self._webp(src)
+        decoded = np.asarray(Image.open(io.BytesIO(shadow)).convert("RGB"))
+        prod = self._webp(decoded)            # 2nd-gen encode of the same content
+        d = P.decompose_diff(shadow, prod)
+        self.assertTrue(d["shape_match"])
+        self.assertEqual(d["real_frac"], 0.0, f"expected real=0, got {d}")
+
+    def test_real_positive_when_source_differs(self):
+        # prod has a real content block changed far beyond any encode floor.
+        import s1_pixeldiff as P
+        src = self._noise_rgb(seed=2)
+        changed = src.copy()
+        changed[10:60, 10:60, :] = (changed[10:60, 10:60, :].astype(int) ^ 0xFF).astype("uint8")
+        d = P.decompose_diff(self._webp(src), self._webp(changed))
+        self.assertTrue(d["shape_match"])
+        self.assertGreater(d["real_frac"], 0.0)
+        self.assertGreater(d["real_max"], d["floor_ceiling"])
+
+    def test_shape_mismatch_is_all_real(self):
+        import s1_pixeldiff as P
+        a = self._webp(self._noise_rgb(seed=3, size=(64, 48)))
+        b = self._webp(self._noise_rgb(seed=3, size=(32, 24)))
+        d = P.decompose_diff(a, b)
+        self.assertFalse(d["shape_match"])
+        self.assertEqual(d["real_frac"], 1.0)
+
+    def test_identical_bytes(self):
+        import s1_pixeldiff as P
+        w = self._webp(self._noise_rgb(seed=4))
+        d = P.decompose_diff(w, w)
+        self.assertTrue(d["byte_equal"])
+        self.assertEqual(d["real_frac"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

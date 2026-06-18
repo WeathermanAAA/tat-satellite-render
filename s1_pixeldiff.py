@@ -89,27 +89,76 @@ def diff_frames(a: bytes, b: bytes) -> dict:
             "shape_match": True}
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="S1 shadow-vs-prod pixel diff")
-    ap.add_argument("--sample", type=int, default=20)
-    ap.add_argument("--prefix", default=os.environ.get("S1_R2_PREFIX", "shadow"))
-    ap.add_argument("--cdn", action="store_true",
-                    help="read prod meso frames from the public CDN instead of R2")
-    a = ap.parse_args(argv)
+def _reencode_floor(rgb):
+    """Per-pixel max-channel delta induced by ONE q90/method6 WebP re-encode of
+    ``rgb`` -- the encode-quantization noise envelope for THIS content (the same
+    transcode params render uses). Cross-build encoder disagreement on the same
+    source is bounded by this."""
+    import io as _io
+    import numpy as np
+    from PIL import Image
+    buf = _io.BytesIO()
+    Image.fromarray(rgb.astype("uint8"), "RGB").save(buf, "WEBP", quality=90, method=6)
+    rgb2 = np.asarray(Image.open(_io.BytesIO(buf.getvalue())).convert("RGB"),
+                      dtype=np.int16)
+    return np.abs(rgb.astype(np.int16) - rgb2).max(axis=-1)
 
+
+def decompose_diff(shadow: bytes, prod: bytes) -> dict:
+    """Decompose shadow-vs-prod into the lossy-WebP CROSS-BUILD floor vs any REAL
+    (source) pixel delta (SATELLITE-REARCH §7.2/§9 strict-identity tier).
+
+    Method: measure the encode-noise ceiling by re-encoding EACH frame's own
+    decoded source one more q90 round-trip (``_reencode_floor``); the floor
+    ceiling = max self-noise of the two. A pixel whose |shadow-prod| exceeds that
+    ceiling cannot be explained by encoder quantization -> it is a REAL source
+    difference (wrong bbox/palette/coastline/content). REAL must be 0.
+
+    Returns total_diff_frac, floor_frac (artifact), real_frac, floor_ceiling,
+    real_max, shape_match. A shape mismatch is wholly REAL (framing/bbox bug)."""
+    import numpy as np
+    from PIL import Image
+    if shadow == prod:
+        return {"shape_match": True, "byte_equal": True, "total_diff_frac": 0.0,
+                "floor_frac": 0.0, "real_frac": 0.0, "floor_ceiling": 0,
+                "real_max": 0, "real_px": 0, "total_px": 0}
+    a = np.asarray(Image.open(io.BytesIO(shadow)).convert("RGB"), dtype=np.int16)
+    b = np.asarray(Image.open(io.BytesIO(prod)).convert("RGB"), dtype=np.int16)
+    if a.shape != b.shape:
+        return {"shape_match": False, "byte_equal": False, "total_diff_frac": 1.0,
+                "floor_frac": 0.0, "real_frac": 1.0, "floor_ceiling": None,
+                "real_max": None, "shape_a": a.shape, "shape_b": b.shape}
+    d = np.abs(a - b).max(axis=-1)
+    ceiling = int(max(_reencode_floor(a).max(), _reencode_floor(b).max()))
+    total_px = d.size
+    diff_mask = d > 0
+    real_mask = d > ceiling
+    return {
+        "shape_match": True, "byte_equal": False,
+        "total_diff_frac": float(diff_mask.mean()),
+        "floor_frac": float((diff_mask & ~real_mask).mean()),
+        "real_frac": float(real_mask.mean()),
+        "floor_ceiling": ceiling,
+        "real_max": int(d[real_mask].max()) if real_mask.any() else 0,
+        "real_px": int(real_mask.sum()),
+        "total_px": int(total_px),
+    }
+
+
+def _prod_stamps_cdn() -> set:
+    import json
+    band = json.loads(_cdn_get(f"{CDN}/meso/goes19-m2/manifest.json")
+                      ).get("bands", {}).get("ir", {})
+    return {s for s in (S.stamp_from_frame_key(f["key"])
+                        for f in band.get("frames", [])) if s}
+
+
+def run_onbox(a) -> int:
     s3 = _r2()
     bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
     shadow_stamps = _list_stamps(s3, bucket, f"{a.prefix.strip('/')}/{S.S1_PRODUCT_PATH}/")
-
-    if a.cdn:
-        import json
-        band = json.loads(_cdn_get(f"{CDN}/meso/goes19-m2/manifest.json")
-                          ).get("bands", {}).get("ir", {})
-        prod_stamps = {S.stamp_from_frame_key(f["key"]) for f in band.get("frames", [])}
-        prod_stamps = {s for s in prod_stamps if s}
-    else:
-        prod_stamps = _list_stamps(s3, bucket, f"{S.S1_PROD_PRODUCT_PATH}/")
-
+    prod_stamps = (_prod_stamps_cdn() if a.cdn
+                   else _list_stamps(s3, bucket, f"{S.S1_PROD_PRODUCT_PATH}/"))
     common = sorted(shadow_stamps & prod_stamps)[-a.sample:]
     print(f"shadow slots={len(shadow_stamps)} prod slots={len(prod_stamps)} "
           f"common={len(shadow_stamps & prod_stamps)} | diffing {len(common)}")
@@ -133,22 +182,93 @@ def main(argv=None) -> int:
             continue
         r = diff_frames(sb, pb)
         if r["byte_equal"]:
-            n_byte += 1
-            n_pixel += 1
+            n_byte += 1; n_pixel += 1
         elif r["pixel_equal"]:
             n_pixel += 1
         else:
-            n_diff += 1
-            worst.append((st, r))
+            n_diff += 1; worst.append((st, r))
     print(f"  byte-identical : {n_byte}/{len(common)}")
     print(f"  pixel-identical: {n_pixel}/{len(common)}  (decoded array equal)")
     print(f"  differing      : {n_diff}/{len(common)}")
     for st, r in worst[:10]:
-        print(f"    {st}: max_abs_diff={r['max_abs_diff']} "
-              f"diff_frac={r['diff_frac']} shape_match={r['shape_match']}")
+        print(f"    {st}: max_abs_diff={r['max_abs_diff']} diff_frac={r['diff_frac']}")
     ok = n_pixel == len(common)
-    print(f">> PIXEL-DIFF {'PASS (all common slots pixel-identical)' if ok else 'see differing slots (likely bbox-timing, inspect)'}")
+    print(f">> PIXEL-DIFF {'PASS (all pixel-identical)' if ok else 'inspect differing'}")
     return 0 if ok else 2
+
+
+def run_remote(a) -> int:
+    # Shadow stamps: R2 creds if present, else the public CDN manifest (no creds).
+    from s1_audit import _r2_creds_present, list_shadow_cdn, list_shadow_r2
+    use_r2 = _r2_creds_present()
+    shadow_stamps = set((list_shadow_r2(a.prefix) if use_r2
+                         else list_shadow_cdn(a.prefix)).keys())
+    src = "R2 (creds)" if use_r2 else "public CDN (no creds)"
+    if not shadow_stamps:
+        print(f"shadow source: {src} | 0 shadow frames yet -- worker not writing; "
+              f"nothing to diff (PENDING, exit 0).")
+        return 0
+    prod_stamps = _prod_stamps_cdn()
+    common = sorted(shadow_stamps & prod_stamps)[-a.sample:]
+    print(f"shadow src={src} shadow={len(shadow_stamps)} prod(CDN)={len(prod_stamps)} "
+          f"common={len(shadow_stamps & prod_stamps)} | diffing {len(common)}")
+    if not common:
+        print(">> no common slots yet (both pipelines need overlap); PENDING exit 0")
+        return 0
+
+    s3 = _r2() if use_r2 else None
+    bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
+
+    def fetch_shadow(st):
+        if use_r2:
+            return s3.get_object(Bucket=bucket,
+                                 Key=S.shadow_frame_key(a.prefix, st))["Body"].read()
+        return _cdn_get(f"{CDN}/{S.shadow_frame_key(a.prefix, st)}")
+
+    n = real_total = 0
+    floor_fracs, real_fracs = [], []
+    flagged = []
+    for st in common:
+        try:
+            sb = fetch_shadow(st)
+            pb = _cdn_get(f"{CDN}/{S.prod_frame_key(st)}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  {st}: fetch error {e}"); continue
+        d = decompose_diff(sb, pb)
+        n += 1
+        floor_fracs.append(d["floor_frac"])
+        real_fracs.append(d["real_frac"])
+        if d["real_frac"] > 0 or not d["shape_match"]:
+            real_total += d.get("real_px", 1)
+            flagged.append((st, d))
+    if not n:
+        print(">> no slots fetched; PENDING exit 0"); return 0
+    avg_floor = 100 * sum(floor_fracs) / n
+    avg_real = 100 * sum(real_fracs) / n
+    print(f"  slots diffed: {n}")
+    print(f"  cross-build (lossy-WebP) artifact: {avg_floor:.3f}% of pixels (avg)")
+    print(f"  REAL source delta                : {avg_real:.6f}% of pixels (avg)  "
+          f"[must be 0]")
+    for st, d in flagged[:10]:
+        print(f"    REAL on {st}: shape_match={d['shape_match']} "
+              f"real_px={d.get('real_px')} real_max={d.get('real_max')} "
+              f"ceiling={d.get('floor_ceiling')}")
+    ok = real_total == 0
+    print(f">> PIXEL-DIFF {'PASS (real delta = 0; difference is pure cross-build encode floor)' if ok else 'FAIL (real source delta > 0 -- a wrapper/render bug)'}")
+    return 0 if ok else 2
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="S1 shadow-vs-prod pixel diff")
+    ap.add_argument("--remote", action="store_true",
+                    help="evaluate from anywhere (R2 creds OR public CDN); "
+                         "decompose cross-build floor vs real delta")
+    ap.add_argument("--sample", type=int, default=20)
+    ap.add_argument("--prefix", default=os.environ.get("S1_R2_PREFIX", "shadow"))
+    ap.add_argument("--cdn", action="store_true",
+                    help="(on-box) read prod meso frames from the CDN instead of R2")
+    a = ap.parse_args(argv)
+    return run_remote(a) if a.remote else run_onbox(a)
 
 
 if __name__ == "__main__":
