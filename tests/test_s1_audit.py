@@ -81,6 +81,64 @@ class TestAuditCompare(unittest.TestCase):
         self.assertEqual(r["missing"], [])
 
 
+class TestShippedSetParsing(unittest.TestCase):
+    """R2-list + CDN-manifest parsing + empty-/shadow/ tolerance (remote paths)."""
+
+    def test_list_shadow_r2_moto(self):
+        try:
+            import boto3
+            from moto import mock_aws
+        except Exception:
+            self.skipTest("moto not available")
+        os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+        os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+        old_ep = os.environ.pop("R2_ENDPOINT", None)  # None -> moto intercepts
+        try:
+            with mock_aws():
+                s3 = boto3.client("s3", region_name="us-east-1")
+                bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
+                s3.create_bucket(Bucket=bucket)
+                for st in ("20260618T210057Z", "20260618T210157Z"):
+                    s3.put_object(Bucket=bucket,
+                                  Key=S.shadow_frame_key("shadow", st), Body=b"x")
+                s3.put_object(Bucket=bucket,
+                              Key=S.latest_times_key("shadow"), Body=b"{}")  # ignored
+                got = A.list_shadow_r2("shadow")
+                self.assertEqual(set(got),
+                                 {"20260618T210057Z", "20260618T210157Z"})
+                for t in got.values():
+                    self.assertIsNotNone(t)   # LastModified present
+        finally:
+            if old_ep is not None:
+                os.environ["R2_ENDPOINT"] = old_ep
+
+    def test_list_shadow_cdn_parse(self):
+        import json
+        orig = A._cdn_get
+        A._cdn_get = lambda url: json.dumps(
+            {"product": S.S1_PRODUCT_PATH,
+             "times": ["20260618T210057Z", "20260618T210157Z"]}).encode()
+        try:
+            got = A.list_shadow_cdn("shadow")
+            self.assertEqual(set(got),
+                             {"20260618T210057Z", "20260618T210157Z"})
+        finally:
+            A._cdn_get = orig
+
+    def test_list_shadow_cdn_404_empty(self):
+        import urllib.error
+        orig = A._cdn_get
+
+        def boom(url):
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        A._cdn_get = boom
+        try:
+            self.assertEqual(A.list_shadow_cdn("shadow"), {})   # worker not writing yet
+        finally:
+            A._cdn_get = orig
+
+
 class TestDiffFrames(unittest.TestCase):
     def setUp(self):
         try:

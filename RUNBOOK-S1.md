@@ -108,6 +108,22 @@ docker compose -p tat-s1 -f docker-compose.s1.yml run --rm --no-deps \
   s1-ingest python s1_byconstruction_proof.py --render-url http://s1-render:8080
 ```
 
+## 7b. Remote acceptance gate (run from ANYWHERE — no SSH, no box access)
+The §8 gate can be evaluated from the Codespace (or any machine) without touching
+the box: ground truth via the anonymous NOAA bucket, the shipped set via R2 creds
+if present **else the public CDN `latest_times.json`**, prod frames via the CDN.
+Safe to run repeatedly during this manual deploy — an empty/partial `/shadow/`
+reads PENDING, never a false fail.
+```bash
+python3 s1_audit.py     --remote --hours 6      # never-miss: zero missed slots
+python3 s1_pixeldiff.py --remote --sample 30    # byte-id: REAL delta == 0
+./s1_accept.sh --hours 6 --sample 30            # both, single-screen §8 PASS/FAIL
+./s1_accept.sh --watch 300                      # leave running; one line per cycle
+```
+`s1_accept.sh` exits 0=GREEN, 2=FAIL (real miss or real pixel delta), 3=PENDING.
+The pixel-diff explicitly splits the diff into the lossy-WebP cross-build floor
+(allowed) vs any REAL source delta (must be 0).
+
 ## 8. Kill switch (stop writing, keep the containers)
 ```bash
 sed -i 's/^S1_ENABLED=.*/S1_ENABLED=false/' .env
