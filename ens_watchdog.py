@@ -33,10 +33,21 @@ CONFIG (env, all optional except the token):
     ENS_WATCHDOG_INTERVAL_S poll cadence (default 1200 = 20 min)
     ENS_WATCHDOG_REPO       owner/repo (default WeathermanAAA/Triple-A-Tropics)
     ENS_WATCHDOG_DRYRUN     "1" -> decide + log but never dispatch (for staging)
+    HAFS_WATCHDOG_LAG_H / _STUCK_BUILD_S / _COOLDOWN_S
+                            HAFS-watcher knobs (defaults 8 h / 3600 s / 2400 s).
 
 Run as its own tiny Railway service (railway.watchdog.json: ``python
 ens_watchdog.py``) or import ``run_once`` into an existing always-on poller's loop.
 Zero heavy deps - just ``requests``.
+
+ALSO WATCHES HAFS: the /models/ HAFS plots are rendered by the tat-satellite-render
+HAFS render worker (hafs_render_poller.py). When that worker wedges or OOM-crashes,
+Railway's restartPolicy=ON_FAILURE cannot restart a frozen process and gives up
+after maxRetries, so the manifest freezes a cycle behind with no recovery (the
+~30 h staleness this watcher exists to break). Same pattern as the ensemble models:
+``hafs_run_once`` compares the published HAFS cycle to the newest that should exist
+and, if behind/stuck, fires ``update-hafs.yml`` (whose render is gated to ALWAYS run
+on a workflow_dispatch - a render path independent of the wedged worker).
 """
 from __future__ import annotations
 
@@ -70,6 +81,19 @@ COOLDOWN_S = 2400.0   # 40 min: don't re-poke a model while its dispatched run i
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(name)
     return v if v not in (None, "") else default
+
+
+# --- HAFS render watchdog (same pattern; different manifest shape + workflow) ---
+HAFS_MANIFEST_URL = "https://cdn.triple-a-tropics.com/models/hafs/manifest.json"
+HAFS_WORKFLOW = "update-hafs.yml"
+# HAFS runs 00/06/12/18Z, finishes ~6 h after synoptic (cron scheduled ~6 h 53 m
+# after); lag 8 h = poke a touch late rather than mid-upload.
+HAFS_LAG_H = float(_env("HAFS_WATCHDOG_LAG_H", "8"))
+# A cycle legitimately renders for ~20-40 min; in_progress longer than this = a
+# wedged build (a dead worker) -> recover regardless of the cycle id.
+HAFS_STUCK_BUILD_S = float(_env("HAFS_WATCHDOG_STUCK_BUILD_S", "3600"))
+HAFS_COOLDOWN_S = float(_env("HAFS_WATCHDOG_COOLDOWN_S", "2400"))
+HAFS_KEY = "hafs"   # last_dispatch key (never collides with an enscenters slug)
 
 
 # --------------------------------------------------------------------------
@@ -107,6 +131,61 @@ def decide_dispatches(manifest: dict, now: dt.datetime,
             continue                                   # poked recently; let the run finish
         out.append((slug, f"latest={latest} behind expected={exp}"))
     return out
+
+
+def _parse_z(s) -> Optional[dt.datetime]:
+    """Parse an ISO 'YYYY-MM-DDThh:mm:ssZ' into an aware UTC datetime, else None."""
+    if not s:
+        return None
+    try:
+        return dt.datetime.strptime(str(s).replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
+    except (ValueError, TypeError):
+        return None
+
+
+def _hafs_newest_entry(manifest: dict) -> Tuple[Optional[str], dict]:
+    """The newest cycle of the HAFS manifest: the worker's v2 ``cycles`` list if
+    present (else the legacy top-level ``cycle``/``storms``). Returns
+    (cycle_str, entry) where entry carries in_progress/started_utc/storms."""
+    cycles = (manifest or {}).get("cycles") or []
+    if cycles:
+        newest = max(cycles, key=lambda c: str(c.get("cycle") or ""))
+        return newest.get("cycle"), newest
+    return ((manifest or {}).get("cycle"),
+            {"in_progress": False, "storms": (manifest or {}).get("storms") or []})
+
+
+def hafs_manifest_state(manifest: dict) -> Tuple[Optional[str], bool, Optional[dt.datetime], bool]:
+    """(latest_cycle, in_progress, started, has_storms) for the newest HAFS cycle."""
+    latest, e = _hafs_newest_entry(manifest)
+    in_prog = bool(e.get("in_progress"))
+    started = _parse_z(e.get("started_utc")) if in_prog else None
+    return latest, in_prog, started, bool(e.get("storms"))
+
+
+def decide_hafs_dispatch(manifest: dict, now: dt.datetime,
+                         last_dispatch: Dict[str, dt.datetime], *,
+                         lag_h: float = HAFS_LAG_H,
+                         stuck_build_s: float = HAFS_STUCK_BUILD_S,
+                         cooldown_s: float = HAFS_COOLDOWN_S) -> Optional[str]:
+    """Reason string if the HAFS manifest should be re-rendered, else None. Fires when
+    (a) the newest cycle is BEHIND the expected cycle AND storms are active (off-season
+    has nothing to render -> stay quiet), or (b) the newest cycle is stuck in_progress
+    longer than ``stuck_build_s`` (a wedged build = the dead-worker symptom). A
+    cooldown prevents re-poking a dispatched run that's still in flight."""
+    latest, in_prog, started, has_storms = hafs_manifest_state(manifest)
+    exp = expected_latest_cycle(now, lag_h)
+    behind = latest is None or str(latest) < exp
+    stuck = bool(in_prog and started is not None
+                 and (now - started).total_seconds() > stuck_build_s)
+    if not (stuck or (behind and has_storms)):
+        return None
+    last = last_dispatch.get(HAFS_KEY)
+    if last is not None and (now - last).total_seconds() < cooldown_s:
+        return None
+    if stuck:
+        return f"newest cycle {latest} stuck in_progress since {started:%Y-%m-%dT%H:%MZ}"
+    return f"latest={latest} behind expected={exp} (storms active)"
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +249,42 @@ def run_once(session: requests.Session, token: Optional[str], repo: str,
     return fired
 
 
+def hafs_run_once(session: requests.Session, token: Optional[str], repo: str,
+                  last_dispatch: Dict[str, dt.datetime], *,
+                  now: Optional[dt.datetime] = None, dry_run: bool = False,
+                  dispatch: Optional[Callable] = None) -> Optional[Tuple[str, str]]:
+    """One HAFS watchdog pass: fetch the HAFS manifest, decide, dispatch update-hafs.yml
+    if behind/stuck. Mutates ``last_dispatch`` (key HAFS_KEY). Returns (HAFS_KEY, reason)
+    if it fired, else None. Errors logged + swallowed (never crash the host poller)."""
+    now = now or dt.datetime.now(UTC)
+    dispatch = dispatch or (lambda wf: dispatch_workflow(session, token, repo, wf))
+    try:
+        manifest = fetch_manifest(session, HAFS_MANIFEST_URL)
+    except Exception as e:  # noqa: BLE001
+        log.warning("hafs_watchdog: manifest fetch failed (%s); skipping tick", e)
+        return None
+    reason = decide_hafs_dispatch(manifest, now, last_dispatch)
+    if not reason:
+        log.info("hafs_watchdog: HAFS current")
+        return None
+    if dry_run or not token:
+        log.info("hafs_watchdog: WOULD dispatch %s (%s) [%s]", HAFS_WORKFLOW, reason,
+                 "dry-run" if dry_run else "no token")
+        return None
+    try:
+        code = dispatch(HAFS_WORKFLOW)
+        if 200 <= code < 300:
+            last_dispatch[HAFS_KEY] = now
+            log.warning("hafs_watchdog: dispatched %s (%s) -> HTTP %s",
+                        HAFS_WORKFLOW, reason, code)
+            return (HAFS_KEY, reason)
+        log.warning("hafs_watchdog: dispatch %s -> HTTP %s (not retried this tick)",
+                    HAFS_WORKFLOW, code)
+    except Exception as e:  # noqa: BLE001
+        log.warning("hafs_watchdog: dispatch %s failed: %s", HAFS_WORKFLOW, e)
+    return None
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     token = _env("ENS_WATCHDOG_GH_TOKEN")
@@ -181,10 +296,11 @@ def main() -> None:
                     "decisions but NOT dispatch. Set the PAT (actions:write) to arm it.")
     session = requests.Session()
     last_dispatch: Dict[str, dt.datetime] = {}
-    log.info("ens_watchdog: armed (repo=%s interval=%ss dry_run=%s models=%s)",
+    log.info("ens_watchdog: armed (repo=%s interval=%ss dry_run=%s models=%s + hafs)",
              repo, interval, dry_run, ",".join(MODELS))
     while True:
         run_once(session, token, repo, last_dispatch, dry_run=dry_run)
+        hafs_run_once(session, token, repo, last_dispatch, dry_run=dry_run)
         time.sleep(interval)
 
 

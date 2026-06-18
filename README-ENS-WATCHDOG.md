@@ -17,6 +17,24 @@ retries). Idempotent, with a 40-min per-model cooldown so it never re-pokes a ru
 that's still in flight. `workflow_dispatch` is an API trigger, not a scheduled event,
 so it isn't subject to the cron throttling that causes the staleness.
 
+## Also watches HAFS (`hafs_run_once`)
+
+The same service also watches the `/models/` **HAFS** plots, which are rendered by
+the tat-satellite-render HAFS render worker (`hafs_render_poller.py`). When that
+worker wedges or OOM-crashes, Railway's `restartPolicy=ON_FAILURE` cannot restart a
+*frozen* process and gives up after `maxRetries`, so the HAFS manifest freezes a
+cycle behind with **no recovery** (the ~30 h staleness on 2026-06-17 — worker died
+~60% through the 06-17 06Z render and never came back). `hafs_run_once` reads the
+public HAFS manifest each tick and fires `update-hafs.yml` when the newest cycle is
+**behind** the expected cycle (with active storms — off-season is left quiet) **or**
+is **stuck `in_progress`** longer than `HAFS_WATCHDOG_STUCK_BUILD_S` (a wedged build).
+`update-hafs.yml`'s render is gated to **always run on a `workflow_dispatch`** even
+when the scheduled cron is off (`RENDER_HAFS_ON_CRON=false` while the worker is
+primary) — so recovery runs on free Actions, **independent of the wedged worker**,
+and the completed legacy manifest clears any stuck "building" pill. Knobs:
+`HAFS_WATCHDOG_LAG_H` (8), `HAFS_WATCHDOG_STUCK_BUILD_S` (3600),
+`HAFS_WATCHDOG_COOLDOWN_S` (2400). It reuses the same `ENS_WATCHDOG_GH_TOKEN`.
+
 ## Deploy (Railway)
 
 1. New Railway service in this repo using **`railway.watchdog.json`**

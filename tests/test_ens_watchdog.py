@@ -32,6 +32,18 @@ def _manifest(**latests):
     return {"models": [{"slug": s, "latest": c} for s, c in latests.items()]}
 
 
+def _hafs_manifest(cycle, *, in_progress=False, started=None, storms=("01l",), legacy=False):
+    """A HAFS manifest in the worker's v2 shape (``cycles`` list), or legacy
+    (top-level ``cycle``/``storms``) when ``legacy=True``."""
+    storm_list = [{"id": s} for s in storms]
+    if legacy:
+        return {"cycle": cycle, "storms": storm_list}
+    entry = {"cycle": cycle, "in_progress": in_progress, "storms": storm_list}
+    if started:
+        entry["started_utc"] = started
+    return {"cycles": [entry], "cycle": cycle, "storms": storm_list}
+
+
 class _Resp:
     def __init__(self, payload, status=200):
         self._p, self.status_code = payload, status
@@ -156,6 +168,72 @@ class TestDispatchRequest(unittest.TestCase):
             "actions/workflows/update-gefs.yml/dispatches")
         self.assertEqual(p["json"], {"ref": "main", "inputs": {}})   # blank cycle = never-miss
         self.assertEqual(p["headers"]["Authorization"], "Bearer TOK")
+
+
+class TestHafsDecide(unittest.TestCase):
+    # at NOW=2026-06-15 19:30Z, HAFS lag 8 h -> expected cycle 06Z "2026061506"
+    def test_behind_with_storms_fires(self):
+        self.assertTrue(w.decide_hafs_dispatch(_hafs_manifest("2026061418"), NOW, {}))
+
+    def test_current_does_not_fire(self):
+        self.assertIsNone(w.decide_hafs_dispatch(_hafs_manifest("2026061506"), NOW, {}))
+
+    def test_ahead_does_not_fire(self):
+        self.assertIsNone(w.decide_hafs_dispatch(_hafs_manifest("2026061512"), NOW, {}))
+
+    def test_behind_but_offseason_no_storms_stays_quiet(self):
+        # nothing to render off-season -> do not poke (avoids an empty-render loop)
+        self.assertIsNone(w.decide_hafs_dispatch(_hafs_manifest("2026061418", storms=()), NOW, {}))
+
+    def test_stuck_in_progress_fires_even_when_current(self):
+        # the dead-worker symptom: newest cycle is the current one but in_progress > 1 h
+        man = _hafs_manifest("2026061506", in_progress=True,
+                             started=(NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        reason = w.decide_hafs_dispatch(man, NOW, {})
+        self.assertTrue(reason and "stuck" in reason)
+
+    def test_recent_in_progress_does_not_fire(self):
+        man = _hafs_manifest("2026061506", in_progress=True,
+                             started=(NOW - dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertIsNone(w.decide_hafs_dispatch(man, NOW, {}))
+
+    def test_legacy_manifest_behind_fires(self):
+        self.assertTrue(w.decide_hafs_dispatch(_hafs_manifest("2026061418", legacy=True), NOW, {}))
+
+    def test_cooldown_blocks_then_allows(self):
+        man = _hafs_manifest("2026061418")
+        self.assertIsNone(w.decide_hafs_dispatch(man, NOW, {w.HAFS_KEY: NOW - dt.timedelta(minutes=10)}))
+        self.assertTrue(w.decide_hafs_dispatch(man, NOW, {w.HAFS_KEY: NOW - dt.timedelta(minutes=50)}))
+
+
+class TestHafsRunOnce(unittest.TestCase):
+    def test_fires_records_then_idempotent(self):
+        sess = _Session(_hafs_manifest("2026061418"))
+        fired_wfs, last = [], {}
+        out = w.hafs_run_once(sess, "TOK", "o/r", last, now=NOW,
+                              dispatch=lambda wf: (fired_wfs.append(wf) or 204))
+        self.assertEqual(out[0], "hafs")
+        self.assertEqual(fired_wfs, ["update-hafs.yml"])
+        self.assertIn(w.HAFS_KEY, last)              # cooldown armed
+        out2 = w.hafs_run_once(sess, "TOK", "o/r", last, now=NOW + dt.timedelta(minutes=5),
+                               dispatch=lambda wf: (fired_wfs.append(wf) or 204))
+        self.assertIsNone(out2)                      # cooldown blocks re-poke
+        self.assertEqual(fired_wfs, ["update-hafs.yml"])
+
+    def test_no_token_does_not_dispatch(self):
+        sess, calls = _Session(_hafs_manifest("2026061418")), []
+        self.assertIsNone(w.hafs_run_once(sess, None, "o/r", {}, now=NOW,
+                                          dispatch=lambda wf: (calls.append(wf) or 204)))
+        self.assertEqual(calls, [])
+
+    def test_non_2xx_not_recorded(self):
+        last = {}
+        w.hafs_run_once(_Session(_hafs_manifest("2026061418")), "TOK", "o/r", last,
+                        now=NOW, dispatch=lambda wf: 403)
+        self.assertNotIn(w.HAFS_KEY, last)           # failed dispatch -> retry next tick
+
+    def test_manifest_error_swallowed(self):
+        self.assertIsNone(w.hafs_run_once(_Session({}, get_status=500), "TOK", "o/r", {}, now=NOW))
 
 
 if __name__ == "__main__":
