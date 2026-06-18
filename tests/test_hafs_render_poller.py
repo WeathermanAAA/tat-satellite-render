@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1591,6 +1592,39 @@ class TestQuiescenceGate(unittest.TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = mod
+
+
+class TestLiveness(unittest.TestCase):
+    """The self-kill that turns a frozen worker into a restartable non-zero exit."""
+
+    def test_stale_decision(self):
+        self.assertTrue(hp._liveness_stale(last=100.0, now=100.0 + 1300, timeout_s=1200))
+        self.assertFalse(hp._liveness_stale(last=100.0, now=100.0 + 1100, timeout_s=1200))
+
+    def test_mark_progress_advances_clock(self):
+        before = hp._LAST_PROGRESS[0]
+        hp._mark_progress()
+        self.assertGreaterEqual(hp._LAST_PROGRESS[0], before)
+
+    def test_watchdog_fires_on_stall(self):
+        fired = []
+        hp._LAST_PROGRESS[0] = time.monotonic() - 10_000   # force staleness
+        hp.LivenessWatchdog(timeout_s=1.0, check_s=0.01,
+                            on_stall=lambda: fired.append(1)).start()
+        for _ in range(200):                                # wait up to ~2s
+            if fired:
+                break
+            time.sleep(0.01)
+        hp._mark_progress()                                 # re-arm for any later run
+        self.assertEqual(fired, [1])
+
+    def test_watchdog_quiet_when_fresh(self):
+        fired = []
+        hp._mark_progress()                                 # fresh
+        hp.LivenessWatchdog(timeout_s=100.0, check_s=0.01,
+                            on_stall=lambda: fired.append(1)).start()
+        time.sleep(0.15)
+        self.assertEqual(fired, [])
 
 
 if __name__ == "__main__":

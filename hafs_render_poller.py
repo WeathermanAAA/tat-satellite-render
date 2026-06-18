@@ -87,17 +87,23 @@ HAFS_MODELS = _env("HAFS_MODELS", "hafsa,hafsb")
 HAFS_DOMAINS = _env("HAFS_DOMAINS", "storm.atm,parent.atm")
 HAFS_PRODUCTS = _env("HAFS_PRODUCTS")           # None -> generator default (all 11)
 
-# Railway Pro: 8 vCPU for this service -> 8 render workers (2x the 4-core runner).
-HAFS_JOBS = int(_env("HAFS_JOBS", "8"))
+# Render-pool width. 8 OOM-KILLED the whole worker on a heavy multi-storm cycle
+# (the 2026-06-17 06Z wedge: container OOM at 154/258 frames, then a
+# Railway-gives-up crash-loop). Lowered to 4 so the peak tree RSS stays inside the
+# container on a strong-storm cycle. Each render worker still holds rendered
+# arrays, but the memory-bound INGEST width below dominates the peak - tune this
+# UP again only after render_summary's mem.peak_tree_rss_mb shows headroom.
+HAFS_JOBS = int(_env("HAFS_JOBS", "4"))
 
-# INGEST runs at a LOWER width than render. Each ingest decodes a large
-# multi-field GRIB (the parent.atm / hafsb domains are the heaviest) -> the stage
-# is memory-bound, and 8 concurrent heavy decodes OOM'd the pool on this
-# memory-tighter host (BrokenProcessPool), dropping exactly the heavy
-# parent.atm/hafsb frames. 4-wide ingest fits in memory; render stays 8-wide
-# (CPU-bound, reads small cached fields). The generator's halving backoff is the
-# safety net if a cycle is heavy enough to still OOM at 4.
-HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "4"))
+# INGEST runs at a LOWER width than render: each ingest decodes a large
+# multi-field GRIB (parent.atm / hafsb are the heaviest), so this stage is the
+# memory-bound one and SETS the peak tree RSS. 8 OOM'd the pool (BrokenProcessPool)
+# and even 4 OOM-killed the WHOLE worker on the 2026-06-17 06Z multi-storm cycle ->
+# lowered to 2 so at most two concurrent heavy decodes are resident. The
+# generator's halving backoff is the in-process safety net; the lower width + the
+# liveness self-kill + the external ens_watchdog cover the cgroup OOM that took the
+# whole worker down. Tune against render_summary mem.peak_tree_rss_mb.
+HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "2"))
 
 # INTRA-CYCLE CATCH-UP. While the rendered cycle is still the newest, each poll
 # re-checks upstream for (model, storm, domain) pairs that were skipped at
@@ -171,6 +177,18 @@ HAFS_QUIET_AFTER_H = float(_env("HAFS_QUIET_AFTER_H", "30"))
 # heavy cycle is the "does it fit in 24GB" number). Pure observation: ~10
 # /proc reads every 2s, no effect on render behavior.
 MEM_SAMPLE_S = float(_env("MEM_SAMPLE_S", "2.0"))
+
+# Liveness self-kill: a daemon watchdog exits the process NON-ZERO if no progress
+# signal (a poll heartbeat or a render mem-sample) is seen for this long, turning a
+# FROZEN worker into a clean exit that Railway's restartPolicy (ON_FAILURE) can
+# actually cycle. A hang never trips ON_FAILURE on its own - the 2026-06-17 30 h
+# wedge was exactly this: the worker stopped emitting both heartbeats and Railway
+# never restarted it. Set WELL above any healthy gap (a render marks progress every
+# ~MEM_SAMPLE_S=2 s, a poll every ~POLL_INTERVAL_S=120 s), so 1200 s of TOTAL
+# silence is unambiguously wedged - ~90x faster than the wedge, zero false-positive
+# room. The external ens_watchdog is the out-of-box backstop; this is the in-box one.
+LIVENESS_TIMEOUT_S = float(_env("HAFS_LIVENESS_TIMEOUT_S", "1200"))
+LIVENESS_CHECK_S = float(_env("HAFS_LIVENESS_CHECK_S", "60"))
 
 # Which model the cycle is resolved from (the cron uses models[0] = hafsa).
 RESOLVE_MODEL = _env("HAFS_RESOLVE_MODEL", "hafsa")
@@ -405,6 +423,7 @@ def run_render_subprocess(cycle: str, out_dir: str, *,
                     raise
                 tot, big, n = _proc_tree_rss_mb(proc.pid)
                 mem["samples"] += 1
+                _mark_progress()   # a render mem-sample = the worker is alive
                 if tot > mem["peak_tree_rss_mb"]:
                     mem["peak_tree_rss_mb"] = round(tot, 1)
                     mem["peak_procs"] = n
@@ -1879,6 +1898,51 @@ def diagnose_ingest(cycle: str) -> str:
 # ---------------------------------------------------------------------------
 # Engine + Railway entrypoint
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Liveness self-kill - the in-box recovery the external ens_watchdog cannot do
+# from outside Railway: turn a FROZEN worker into a non-zero exit so ON_FAILURE
+# restarts it (a hang is not an exit, so ON_FAILURE never fires on its own).
+# ---------------------------------------------------------------------------
+_LAST_PROGRESS = [0.0]   # monotonic clock of the last progress signal
+
+
+def _mark_progress() -> None:
+    """Record that the worker is alive - called on every poll heartbeat and every
+    render memory-sample (~2 s), so the only thing that stalls it is a real freeze."""
+    _LAST_PROGRESS[0] = time.monotonic()
+
+
+def _liveness_stale(last: float, now: float, timeout_s: float) -> bool:
+    """Pure decision (unit-testable): has progress been silent longer than timeout?"""
+    return (now - last) > timeout_s
+
+
+class LivenessWatchdog(threading.Thread):
+    """Daemon that self-exits the process (os._exit, non-zero) when no progress
+    signal has been seen for ``timeout_s`` - converting a frozen worker (which
+    Railway's ON_FAILURE can NOT restart, because a hang is not an exit) into a
+    clean non-zero exit it CAN cycle. Belt-and-suspenders with the external
+    ens_watchdog (which re-renders via Actions independent of this box)."""
+
+    def __init__(self, timeout_s: float = LIVENESS_TIMEOUT_S,
+                 check_s: float = LIVENESS_CHECK_S,
+                 on_stall: Callable[[], None] = lambda: os._exit(1)):
+        super().__init__(daemon=True, name="hafs-liveness")
+        self.timeout_s = timeout_s
+        self.check_s = check_s
+        self.on_stall = on_stall
+
+    def run(self) -> None:   # pragma: no cover - thread loop
+        while True:
+            time.sleep(self.check_s)
+            if _liveness_stale(_LAST_PROGRESS[0], time.monotonic(), self.timeout_s):
+                log.critical("liveness: no progress for >%ds - self-exiting "
+                             "NON-ZERO so Railway ON_FAILURE restarts the worker",
+                             int(self.timeout_s))
+                self.on_stall()
+                return
+
+
 class _HealthSink(pf.Sink):
     """Adapts the R2 client to the Sink protocol so the engine's health
     heartbeat lands at ``{prefix}/poller_health.json`` (the intensity poller's
@@ -1889,6 +1953,7 @@ class _HealthSink(pf.Sink):
         self.prefix = prefix
 
     def write(self, key: str, payload: dict) -> None:
+        _mark_progress()   # a poll heartbeat = the worker is alive
         self.r2.put_json(f"{self.prefix}/{key}", payload, CC_HEALTH)
 
 
@@ -1928,10 +1993,26 @@ def main() -> None:  # pragma: no cover - Railway worker entrypoint
                          + ", ".join(missing))
     r2 = R2()
     eng = build_engine(r2)
-    log.info("hafs render poller starting | prefix=%s | jobs=%d | interval=%gs "
-             "| watchdog=%ds | stale_after=%gs | mode=%s",
-             HAFS_R2_PREFIX, HAFS_JOBS, POLL_INTERVAL_S, RENDER_TIMEOUT_S,
-             STALE_AFTER_S,
+    _mark_progress()                 # arm the liveness clock before the first poll
+    LivenessWatchdog().start()
+    # One-shot observability artifact so the EFFECTIVE config (after env overrides)
+    # is verifiable on R2 without Railway log access - confirms the lowered jobs
+    # actually took effect on this deploy.
+    try:
+        r2.put_json(f"{HAFS_R2_PREFIX}/worker_config.json", {
+            "started_utc": pf.iso_z(pf.utcnow()),
+            "jobs": HAFS_JOBS, "ingest_jobs": HAFS_INGEST_JOBS,
+            "render_timeout_s": RENDER_TIMEOUT_S,
+            "liveness_timeout_s": LIVENESS_TIMEOUT_S,
+            "poll_interval_s": POLL_INTERVAL_S,
+            "progressive": HAFS_PROGRESSIVE,
+        }, CC_HEALTH)
+    except Exception:  # noqa: BLE001
+        pass
+    log.info("hafs render poller starting | prefix=%s | jobs=%d ingest_jobs=%d "
+             "| interval=%gs | watchdog=%ds | liveness=%ds | stale_after=%gs | mode=%s",
+             HAFS_R2_PREFIX, HAFS_JOBS, HAFS_INGEST_JOBS, POLL_INTERVAL_S,
+             RENDER_TIMEOUT_S, LIVENESS_TIMEOUT_S, STALE_AFTER_S,
              "progressive" if HAFS_PROGRESSIVE else "complete-pair")
     eng.run_forever()
 
