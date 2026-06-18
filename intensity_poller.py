@@ -41,6 +41,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -227,7 +228,16 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
             storm_num = int(atcf_id[:-1])
         except (ValueError, IndexError):
             continue
-        if not (90 <= storm_num <= 99):
+        # JTWC has no CurrentStorms equivalent, so a JUST-designated JTWC TD
+        # (the former invest, before its b-deck BEST file is written) falls
+        # through both the b-deck sweep (file absent) and the 90-99 invest
+        # filter. Treat knackwx as the JTWC live-DESIGNATION source: accept
+        # designated numbers 1..49 too. NHC keeps CurrentStorms authoritative
+        # (no-op here when agency_name != JTWC). Mirror of generate_tracks_plot.
+        is_jtwc = (basin_cfg.get("agency_name") or "").strip().upper() == "JTWC"
+        is_invest_num = 90 <= storm_num <= 99
+        is_designated = is_jtwc and (1 <= storm_num <= 49)
+        if not (is_invest_num or is_designated):
             continue
         ts = it.get("analysis_time")
         if not ts:
@@ -257,12 +267,30 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
         name_raw = (it.get("storm_name") or "").strip()
         name = (name_raw if name_raw and name_raw not in {"INVEST", "NAMELESS", "UNNAMED"}
                 else f"{storm_num}{letter}")
+        # 92W->07W carry (mirror of the cron). knackwx gives the prior invest as
+        # transitioned_from ("92W"); feed its NUMBER as spawn_invest so ace_core's
+        # number-keyed superseding-invest dedup retires it the cycle the
+        # designation appears. FRAME-COINCIDENT (recycle-safe, stateless): carry
+        # only while the SAME payload still lists that 9x invest.
+        spawn_invest = None
+        if is_designated:
+            tf = (it.get("transitioned_from") or "").strip().upper()
+            mtf = re.fullmatch(r"(\d{1,2})[A-Z]", tf)
+            if mtf:
+                tf_num = int(mtf.group(1))
+                tf_letter = tf[-1] if tf[-1:].isalpha() else ""
+                if 90 <= tf_num <= 99 and tf_letter == letter and any(
+                    (str((d.get("atcf_id") or "")).strip().upper())
+                        == f"{tf_num:02d}{letter}"
+                    for d in data):
+                    spawn_invest = tf_num
         rows.append({
             "SID": f"{basin_cfg['agency_name']}_{basin_cfg['short'].upper()}"
                    f"{storm_num:02d}{year}",
             "NAME": name, "season": year, "time": t, "lat": lat, "lon": lon,
             "wind_kt": vmax, "pressure_mb": pres, "nature": nature,
-            "source": "live-knackwx", "storm_num": storm_num,
+            "source": "live-knackwx-designated" if is_designated else "live-knackwx",
+            "storm_num": storm_num, "spawn_invest": spawn_invest,
         })
     return pd.DataFrame(rows)
 
@@ -379,9 +407,26 @@ def apply_live_names(named: pd.DataFrame, live_names: dict[int, str],
 
 
 def _combine(named: pd.DataFrame, invests: pd.DataFrame) -> pd.DataFrame:
-    """named + invests for the TRACKS frame (ace gets named only)."""
+    """named + invests for the TRACKS frame (ace gets named only).
+
+    b-deck PRIMARY: a knackwx-DESIGNATED row (source 'live-knackwx-designated',
+    the JTWC live-designation fill for a fresh TD the b-deck has not yet
+    written) is dropped once the b-deck named frame carries the SAME SID -- the
+    b-deck is the authoritative 6-hourly track when present. 90-99 invests are
+    never JTWC-b-decked here, so they pass through untouched. Mirror of the
+    cron's fetch_live_season b-deck-primary reconciliation."""
     frames = [f for f in (named, invests) if f is not None and not f.empty]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    if named is not None and not named.empty and "source" in out.columns \
+            and "SID" in out.columns:
+        bdeck_sids = set(named["SID"])
+        drop = ((out["source"] == "live-knackwx-designated")
+                & out["SID"].isin(bdeck_sids))
+        if drop.any():
+            out = out[~drop].reset_index(drop=True)
+    return out
 
 
 # NHC CurrentStorms.json — the authoritative final-advisory signal feeding
@@ -588,6 +633,27 @@ def make_basin_source(basin: str, session: requests.Session,
                                                nhc_active_sids=_nhc_active_sids())
         ctx.sink.write(f"feeds/{basin}_ace_data.json", ace_feed)
         ctx.sink.write(f"feeds/{basin}_tracks_data.json", tracks_feed)
+        # Hardening: a system present in a LIVE source (knackwx / b-deck) but
+        # absent from the published feed = the next discovery crack -> WARN
+        # loudly. A handoff legitimately retires the prior 9x invest once its
+        # designation appears (spawn_invest), so suppress those. Best-effort:
+        # a logging bug must NEVER stale the just-written live feed.
+        try:
+            if not tracks_live.empty and "SID" in tracks_live.columns:
+                feed_sids = {s.get("sid") for s in (tracks_feed.get("storms") or [])}
+                cfg = data["tracks_base"]["basin_cfg"]
+                superseded = set()
+                if "spawn_invest" in tracks_live.columns:
+                    for n in tracks_live["spawn_invest"].dropna().unique():
+                        superseded.add(f"{cfg['agency_name']}_"
+                                       f"{cfg['short'].upper()}{int(n):02d}{year}")
+                missing = (set(tracks_live["SID"]) - feed_sids) - superseded
+                if missing:
+                    log.warning("%s: %d system(s) present in a live source but "
+                                "absent from the published feed: %s",
+                                basin, len(missing), sorted(missing))
+        except Exception:  # noqa: BLE001
+            pass
         # Phase 3: feed the global-map composer AFTER the basin feeds are
         # safely written. Best-effort inside (a geojson blip never fails or
         # stales this basin's source); gated by GLOBAL_GEOJSON_KEY (default
