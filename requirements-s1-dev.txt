@@ -1,0 +1,6 @@
+# S1 dev/test-only deps (NOT installed in the worker image -- the worker uses
+# requirements.txt's boto3/requests + s1_slots' stdlib).
+#   pip install -r requirements-s1-dev.txt && python -m pytest tests/test_s1_*.py
+moto[sqs,s3,sns]>=5
+pytest>=8
+# diff_frames (the pixel-diff core) needs Pillow+numpy, already in requirements.txt.

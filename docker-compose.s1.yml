@@ -1,0 +1,101 @@
+# docker-compose.s1.yml -- the STAGE-1 satellite-ingest stack (SATELLITE-REARCH
+# §3 + §8). Event-driven, never-miss ingest of ONE product (GOES-19 meso-2
+# clean-IR) -> R2 /shadow/. SHADOW ONLY: no viewer change, no cutover.
+#
+# Fully ISOLATED from the live meso stack (docker-compose.meso.yml): a distinct
+# image tag (tat-s1) + a distinct compose project (run with `-p tat-s1`) + a
+# distinct R2 prefix (shadow/) + distinct health ports, so bringing S1 up or
+# down NEVER touches the running meso poller/render containers.
+#
+# TWO services share one image (Dockerfile.meso -- BYTE-IDENTICAL render code to
+# the box's meso render, so a shadow frame is pixel-identical to prod by
+# construction):
+#
+#   s1-render  -- the FROZEN /render service (app.py via uvicorn), loopback-only,
+#                 DEDICATED to S1 so its renders never contend with the meso
+#                 hot/cold lanes (§11-M backpressure). Reads NOAA anon S3; writes
+#                 nothing; needs no creds.
+#   s1-ingest  -- s1_ingest.py: SQS long-poll -> completeness gate -> render
+#                 (s1-render over the compose net) -> R2 shadow PUT -> delete SQS
+#                 msg; + watermark/backfill + cold-start + DLQ + heartbeat +
+#                 liveness watchdog. Reads SQS (tat-sat-ingest creds) + writes R2.
+#
+# Bring up:    docker compose -p tat-s1 -f docker-compose.s1.yml up -d --build
+# Kill switch: set S1_ENABLED=false in .env, then the same `up -d`.
+# Status:      docker compose -p tat-s1 -f docker-compose.s1.yml ps
+# Tear down:   docker compose -p tat-s1 -f docker-compose.s1.yml down
+#
+# BYTE-IDENTITY (the §7.2/§9 strict gate): s1-render is byte-identical to the
+# box's meso-render ONLY if built from the same code + same-time git-dep
+# (tat-palettes@main) resolution. So either (a) rebuild the meso stack AND this
+# S1 stack from the SAME current branch together (recommended), or (b) set
+# S1_RENDER_URL in .env to the live meso hot render (the SAME running process
+# prod uses -> guaranteed byte-identity; adds ~1 render/min to the hot lane).
+# Independently-built images leave only a ~0.2% lossy-WebP encode floor (mean
+# diff measured at 0.19%, 99.96% of pixels within +/-8 levels, identical
+# framing/bbox) -- s1_pixeldiff.py reports it; it goes to zero on a shared image.
+
+services:
+  s1-render:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s1:latest
+    command: uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
+    environment:
+      # CORS is irrelevant for the server-to-server worker call; keep localhost
+      # for a manual probe. No NOAA/R2 creds needed (NOAA is anonymous; this
+      # service writes nothing).
+      ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8082"
+    # Loopback host port 8082 for manual probing; compose-internal name
+    # s1-render:8080 is what the ingest worker calls.
+    ports:
+      - "127.0.0.1:8082:8080"
+    restart: always
+    # §5.6 / RAM-5: a hard memory ceiling so a runaway render is OOM-killed in
+    # its OWN container (restart:always recovers it), never the box. S1's
+    # clean-IR meso render is small (~hundreds of MB); 2g is generous headroom.
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  s1-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s1:latest
+    command: python s1_ingest.py
+    depends_on:
+      s1-render:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Reach the render service over the compose network (NOT public). Defaults
+      # to the dedicated s1-render; override in .env to reuse the live meso hot
+      # render for GUARANTEED byte-identity (see the byte-identity note above).
+      S1_RENDER_URL: "${S1_RENDER_URL:-http://s1-render:8080}"
+      S1_HEALTH_PORT: "8091"
+      S1_HEALTH_FILE: "/tmp/s1_health.json"
+    # Expose the worker's health on loopback so the box owner can curl it.
+    ports:
+      - "127.0.0.1:8091:8091"
+    restart: always           # systemd Restart=always equivalent (the HAFS lesson)
+    mem_limit: 512m
+    healthcheck:
+      # 200 = healthy/booting/disabled, 503 = a source stale/failing -> flips the
+      # container unhealthy so `docker compose ps` / an external watcher sees it.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8091/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
