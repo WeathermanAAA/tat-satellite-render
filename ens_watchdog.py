@@ -298,6 +298,12 @@ def main() -> None:
     last_dispatch: Dict[str, dt.datetime] = {}
     log.info("ens_watchdog: armed (repo=%s interval=%ss dry_run=%s models=%s + hafs)",
              repo, interval, dry_run, ",".join(MODELS))
+    # Explicit HAFS-watch confirmation in the logs: the recurring "behind on 00Z
+    # HAFS" is auto-recovered by dispatching update-hafs.yml (which always renders
+    # on a workflow_dispatch) when the render worker wedges or falls a cycle behind.
+    log.info("ens_watchdog: HAFS watch armed -> dispatch %s when behind>lag=%.0fh OR "
+             "in_progress>%.0fm (cooldown %.0fm)", HAFS_WORKFLOW, HAFS_LAG_H,
+             HAFS_STUCK_BUILD_S / 60.0, HAFS_COOLDOWN_S / 60.0)
     while True:
         run_once(session, token, repo, last_dispatch, dry_run=dry_run)
         hafs_run_once(session, token, repo, last_dispatch, dry_run=dry_run)
