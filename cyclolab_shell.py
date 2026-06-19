@@ -240,10 +240,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     letter-spacing: 0.5px; text-transform: uppercase; margin: 2px 0 9px;
     text-shadow: var(--ink-scrim); }
   .chip { display: inline-block; padding: 4px 12px; border-radius: 999px;
-    background: rgba(0,0,0,0.32); color: #ffffff; font-size: 12px;
+    background: rgba(8,13,22,0.55); color: #ffffff; font-size: 12px;
     font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
-    border: 1px solid rgba(255,255,255,0.4);
-    text-shadow: 0 1px 1px rgba(0,0,0,0.5); }
+    border: 1px solid var(--cat-accent);
+    text-shadow: 0 1px 1px rgba(0,0,0,0.5);
+    font-variant-numeric: tabular-nums; }
+  /* The header pill is the live CURRENT INTENSITY: white wind + a category-
+     coloured SSHWS label (the same canonical --cat-accent the corner glyph
+     letter wears). The wind unit reads lowercase ("35 mph", not "35 MPH") so
+     it matches the rest of the UI; the category stays upper-cased. */
+  .chip .chip-wind { text-transform: none; }
+  .chip .chip-cat { color: var(--cat-accent); }
+  .chip .chip-sep { opacity: 0.5; }
   /* ---- Stage C: NHC formation-chance pill (invests) ----
      The KEY invest metric: 48-hour + 7-day genesis odds, colour-coded by the
      canonical NHC low/medium/high scheme (<=30 yellow, 40-60 orange, >=70 red)
@@ -1563,6 +1571,45 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (cls === "TS") return "S";
     return (cls || "").replace("C", "") || "D";
   }
+  // ---- cone forecast-point placard (Treatment B "stat card") helpers -------
+  // UTC weekday + 12-hour label for a forecast point's valid_utc:
+  // "2026-06-24T19:00:00Z" -> "Wed 7 PM". UTC, no localization - the exact
+  // mirror of review/placard-storm-bug/generate_board.py time_label (the
+  // signed-off Treatment B), so the wired cone reads like the approved board.
+  var CONE_DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  function coneTimeLabel(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    var h = d.getUTCHours();
+    var ap = h < 12 ? "AM" : "PM";
+    var h12 = (h % 12) || 12;
+    return CONE_DOW[d.getUTCDay()] + " " + h12 + " " + ap;
+  }
+  // Short eyebrow word for a NON-tropical forecast point (the "white = non-
+  // tropical" emphasis): a post-tropical / remnant / low point accrues no
+  // SSHWS category, so the eyebrow names its development stage instead.
+  function coneDevEyebrow(dev) {
+    var M = { PTC: "POST-TROP", EX: "POST-TROP", PT: "POST-TROP",
+              LO: "LOW", L: "LOW", DB: "REMNANT", WV: "WAVE" };
+    return M[dev] || (dev || "").toUpperCase() || "LOW";
+  }
+  // Treatment B badge glyph: the house cyclone bug (HURRICANE_PATH) spinning
+  // under .ac-spin (cone-icon canon: only the PATH rotates - .ac-spin carries
+  // the CSS animation while its parent carries the scale, so the scale never
+  // gets clobbered by the animated transform), the category letter a STATIONARY
+  // sibling at full size centred on the badge.
+  function conePlacardGlyph(cx, cy, r, fill, letter, letterPx) {
+    var s = (r * 1.78) / 82.0;   // path spans ~+/-41 -> 82; ~0.78 of the disc
+    return '<g transform="translate(' + cx + ',' + cy + ') scale(' +
+      s.toFixed(4) + ')"><g class="ac-spin"><path d="__HPATH__" fill="' +
+      fill + '" stroke="rgba(0,0,0,0.35)" stroke-width="2"/></g></g>' +
+      '<text x="' + cx + '" y="' + (cy + letterPx * 0.34).toFixed(1) +
+      '" text-anchor="middle" font-size="' + letterPx +
+      '" font-weight="800" fill="#fff" stroke="rgba(0,0,0,0.45)" ' +
+      'stroke-width="0.6" paint-order="stroke" ' +
+      'style="font-variant-numeric:tabular-nums">' + letter + '</text>';
+  }
   var reduced = window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -2107,15 +2154,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     var oldRamp = getComputedStyle(document.documentElement)
       .getPropertyValue("--cat-ramp");
     document.documentElement.setAttribute("data-cat", cat);
-    // chip ONLY when it adds information (S4-AD1 #10): CATEGORY 1-5
-    // for hurricanes; at TD/TS it duplicated the type word.
-    var chipEl = document.getElementById("chip");
-    if (cat === "TD" || cat === "TS") {
-      chipEl.style.display = "none";
-    } else {
-      chipEl.style.display = "";
-      chipEl.textContent = CHIP_LABEL[cat] || cat;
-    }
+    // header pill = the CURRENT INTENSITY (wind + SSHWS category), shown for
+    // EVERY real TC including TD/TS, colour-coded by category. (It used to be a
+    // CATEGORY-only chip hidden at TD/TS - which left a TD's banner pill blank.)
+    // A PTC/invest stays blank (handled inside - keeps its grey/red-X identity).
+    updateIntensityChip(cat);
     // the canon label rides the corner glyph + the Category hero. A PTC shows
     // "PTC" (no category accrues); a real TC shows its SSHWS letter. IS_PTC is
     // LIVE (setPtc flips it), so the label follows the identity automatically -
@@ -2132,6 +2175,35 @@ HTML_TEMPLATE = r"""<!doctype html>
     banner.querySelector(".old-ramp").style.setProperty("--old-ramp", oldRamp);
     banner.classList.remove("xfade", "shine"); void banner.offsetWidth;
     banner.classList.add("xfade", "shine");
+  }
+
+  // Compact SSHWS label for the header intensity pill: "TD" / "TS" / "CAT 1".
+  function chipCatLabel(cat) {
+    if (cat === "TD") return "TD";
+    if (cat === "TS") return "TS";
+    return "CAT " + sshsLabel(cat);
+  }
+  // Populate the banner header pill with the live CURRENT intensity - wind
+  // (unit-toggle aware via windDisp/windUnitLabel) + the SSHWS category, the
+  // category portion colour-coded by --cat-accent (the same canonical SSHS hue
+  // the corner glyph label wears). Shown for EVERY real TC incl TD/TS; a
+  // PTC/invest keeps its grey/red-X identity and accrues no category -> blank.
+  // Re-runs each poll (apply) AND on every category change (setCategory), so it
+  // tracks both a wind bump and a category flip.
+  function updateIntensityChip(cat) {
+    var chipEl = document.getElementById("chip");
+    if (!chipEl) return;
+    if (IS_PTC || IS_INVEST) { chipEl.style.display = "none"; return; }
+    cat = cat || curCat || document.documentElement.getAttribute("data-cat");
+    if (!cat || !CHIP_LABEL[cat]) cat = "TD";
+    var pts = (lastStorm && lastStorm.points) || [];
+    var wk = (pts[pts.length - 1] || {}).wind_kt;
+    var windStr = (wk == null) ? "" : (windDisp(wk) + " " + windUnitLabel());
+    chipEl.style.display = "";
+    chipEl.innerHTML =
+      (windStr ? '<span class="chip-wind">' + windStr + '</span>' +
+                 '<span class="chip-sep"> · </span>' : '') +
+      '<span class="chip-cat">' + chipCatLabel(cat) + '</span>';
   }
 
   // ---- map + cone (the home view showstopper) -------------------------------
@@ -3376,6 +3448,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     odoSet(document.getElementById("odo-vmax"), windDisp(last.wind_kt));
     var vu = document.getElementById("vmax-unit");
     if (vu) vu.textContent = windUnitLabel();
+    // header intensity pill rides the live wind too (a TD->TS bump or a wind
+    // change inside the same category both refresh it; category flips refresh
+    // it via setCategory above).
+    updateIntensityChip();
     odoSet(document.getElementById("odo-mslp"),
            last.pressure_mb != null ? String(Math.round(last.pressure_mb)) : "—");
     odoSet(document.getElementById("odo-ace"),
@@ -4034,7 +4110,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     // - the placard stays as close and as radial as the cluster allows.
     var placards = [];
     pts.forEach(function (p, i) {
-      var pw = (i === 0 ? 188 : 152), ph = (i === 0 ? 46 : 40);
+      // Treatment B "stat card" dims (uniform across NOW + forecast, exactly
+      // the signed-off board); the NOW point still dominates via its giant
+      // spinning glyph (scale 1.9), not a bigger card. The collision-aware
+      // placement sweep below is geometry-agnostic and UNCHANGED.
+      var pw = 132, ph = 74;
       // local track direction -> perpendicular placement sides
       var a = tp[Math.max(0, i - 1)], b = tp[Math.min(tp.length - 1, i + 1)];
       var vx = b[0] - a[0], vy = b[1] - a[1];
@@ -4046,9 +4126,20 @@ HTML_TEMPLATE = r"""<!doctype html>
       // The pill sits just clear of the icon EDGE: base gap scales with
       // the glyph so the hero NOW and the small taus hug equally tight.
       var base = iconR[i] + ph / 2 + 6;
-      var offs = [base, base + 14, base + 30, base + 50, base + 74,
-                  base + 102];
-      var nudges = [0, 26, -26, 54, -54];
+      // Perpendicular growth steps + along-track nudges BOTH scale with the
+      // CARD footprint, so the collision-free guarantee (S4-AD1 #7) holds at
+      // any pill size: the Treatment B stat card is taller than the legacy
+      // pill, so it needs proportionally more room AND more along-track escape
+      // slots to pack a tight cluster without ever overlapping. The cost-
+      // ordered, leaderless, perpendicular-FIRST strategy is UNCHANGED - only
+      // the slot set scales (and the last-resort fallback is made overlap-safe).
+      var offs = [];
+      for (var oo = 0; oo < 8; oo++) offs.push(base + oo * (ph * 0.45));
+      var nudges = [0];
+      for (var nn = 1; nn <= 4; nn++) {
+        nudges.push(pw * 0.32 * nn);
+        nudges.push(-pw * 0.32 * nn);
+      }
       // Cost-ordered candidate sweep: smallest perpendicular offset and
       // zero along-track nudge first; growing the offset is cheap, a
       // side flip is cheaper than a big nudge, and along-track sliding
@@ -4074,11 +4165,28 @@ HTML_TEMPLATE = r"""<!doctype html>
         r2.y = Math.max(6, Math.min(H - ph - 6, r2.y));
         if (!overlaps(r2)) placed = r2;
       }
-      if (!placed) {                     // pathological: park it below
-        placed = { x: Math.max(6, Math.min(W - pw - 6,
-                       tp[i][0] - pw / 2)),
-                   y: Math.min(H - ph - 6, 6 + i * (ph + 4)),
-                   w: pw, h: ph };
+      if (!placed) {
+        // last resort (a pathological cluster of big cards exhausts the cost-
+        // ordered sweep): a radial scan outward, kept inside [0,W]x[0,H], takes
+        // the FIRST non-overlapping slot - so placards stay overlap-free even
+        // here, just farther from their glyph. (Only the synthetic bunched
+        // cluster ever reaches this; real cones place within the sweep.)
+        for (var rr = base; rr < Math.hypot(W, H) && !placed; rr += ph * 0.5) {
+          for (var aa = 0; aa < 24 && !placed; aa++) {
+            var ang = aa * Math.PI / 12;
+            var fr = { x: Math.max(6, Math.min(W - pw - 6,
+                         tp[i][0] + Math.cos(ang) * rr - pw / 2)),
+                       y: Math.max(6, Math.min(H - ph - 6,
+                         tp[i][1] + Math.sin(ang) * rr - ph / 2)),
+                       w: pw, h: ph };
+            if (!overlaps(fr)) placed = fr;
+          }
+        }
+        if (!placed) {                   // canvas truly full - park, clamped
+          placed = { x: Math.max(6, Math.min(W - pw - 6, tp[i][0] - pw / 2)),
+                     y: Math.min(H - ph - 6, 6 + i * (ph + 4)),
+                     w: pw, h: ph };
+        }
       }
       var gap = Math.hypot(placed.x + pw / 2 - tp[i][0],
                            placed.y + ph / 2 - tp[i][1]) - iconR[i];
@@ -4119,15 +4227,21 @@ HTML_TEMPLATE = r"""<!doctype html>
             sshsLabel(cat) + "</text>"
           : "") +
         "</g>");
-      // placard (skip none - NOW gets one too). NO leader line: pairing
-      // is positional (the pill hugs its glyph; see the placement sweep).
+      // placard = Treatment B "stat card" (art-gated pick; geometry/spacing/
+      // tokens mirror review/placard-storm-bug/generate_board.py B): dark glass
+      // + an SSHS accent rail/top-bar, the spinning category glyph, a category
+      // eyebrow, the big wind number (unit-toggle aware via windDisp), a muted
+      // UTC time line. NO leader line - the card hugs its glyph by POSITION
+      // (the placement sweep above, unchanged). NOW gets one too.
       var pl = placards[i];
-      var pillGrad = "url(#pillg-" + (tropical ? cat : "NEUTRAL") + ")";
-      var label = (i === 0)
-        ? "NOW \u00b7 " + windDisp(p.intensity_kt || 0) + windUnitLabel()
-        : "+" + tau + "h \u00b7 " + windDisp(p.intensity_kt || 0) +
-          windUnitLabel();
-      var pw2 = pl.rect.w, ph2 = pl.rect.h;
+      var pw2 = pl.rect.w, ph2 = pl.rect.h;        // 132 x 74 (B)
+      var accent = col;                             // SSHS hue / white (non-trop)
+      var glabel = sshsLabel(cat);
+      var eyebrow = tropical
+        ? (cat.charAt(0) === "C" ? "CAT " + glabel : cat)
+        : coneDevEyebrow(p.dev_label);
+      var windTxt = windDisp(p.intensity_kt || 0) + " " + windUnitLabel();
+      var whenTxt = coneTimeLabel(p.valid_utc);
       parts.push('<g data-role="placard" data-i="' + i +
         '" data-gap="' + pl.gap.toFixed(1) +
         '" data-iconr="' + iconR[i] + '" data-x="' +
@@ -4135,17 +4249,32 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" data-w="' + pw2 + '" data-h="' + ph2 +
         '" transform="translate(' + pl.rect.x.toFixed(1) +
         " " + pl.rect.y.toFixed(1) + ')">' +
-        '<rect width="' + pw2 + '" height="' + ph2 + '" rx="' +
-        (ph2 / 2) + '" fill="' + pillGrad +
-        '" stroke="rgba(0,0,0,0.3)"/>' +
-        '<text x="' + (pw2 / 2) + '" y="' + (ph2 / 2) +
-        '" text-anchor="middle" dominant-baseline="central" font-size="' +
-        (i === 0 ? 25 : 21) +
-        '" font-weight="' + (i === 0 ? 800 : 700) +
-        // canon ink rule: ALWAYS light on the category ramps (same
-        // stroke treatment as the icon SS labels)
-        '" fill="#ffffff" stroke="rgba(0,0,0,0.4)" stroke-width="0.8" ' +
-        'paint-order="stroke">' + label + "</text></g>");
+        // dark-glass card (inset 1 for a crisp 1px stroke)
+        '<rect x="1" y="1" width="' + (pw2 - 2) + '" height="' + (ph2 - 2) +
+        '" rx="9" fill="rgba(8,13,22,0.88)" stroke="rgba(44,58,82,0.6)" ' +
+        'stroke-width="1"/>' +
+        // SSHS accent rail (left) + top bar
+        '<rect x="1" y="1" width="4" height="' + (ph2 - 2) +
+        '" rx="2" fill="' + accent + '"/>' +
+        '<rect x="1" y="1" width="' + (pw2 - 2) +
+        '" height="3.5" fill="' + accent + '" opacity="0.85"/>' +
+        // glyph badge + spinning category bug
+        '<circle cx="26" cy="26" r="14" fill="rgba(255,255,255,0.05)"/>' +
+        conePlacardGlyph(26, 26, 14, accent, glabel, 15) +
+        // category eyebrow (SSHS hue)
+        '<text x="48" y="22" font-size="11" font-weight="700" ' +
+        'letter-spacing="1.2" fill="' + accent +
+        '" style="text-transform:uppercase">' + eyebrow + '</text>' +
+        // big wind number - canon light ink (same stroke as the icon labels)
+        '<text x="' + (pw2 / 2) + '" y="51" text-anchor="middle" ' +
+        'font-size="22" font-weight="800" fill="#ffffff" ' +
+        'stroke="rgba(0,0,0,0.42)" stroke-width="0.7" paint-order="stroke" ' +
+        'style="font-variant-numeric:tabular-nums">' + windTxt + '</text>' +
+        // muted UTC valid-time line
+        '<text x="' + (pw2 / 2) + '" y="67" text-anchor="middle" ' +
+        'font-size="11" font-weight="700" letter-spacing="0.5" ' +
+        'fill="#8fa2bd" style="text-transform:uppercase">' + whenTxt +
+        '</text></g>');
       parts.push("</g>");
     });
 
@@ -5470,9 +5599,19 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
         type_word = "INVEST AREA"
     else:
         type_word = _type_word(cat, ids.basin)
-    # No category chip for an invest OR a PTC (a PTC accrues no category), nor
-    # for a plain TD/TS (chip is reserved for hurricanes C1-C5).
-    chip_hidden = is_invest or is_ptc or cat in ("TD", "TS")
+    # The header pill is the CURRENT INTENSITY (wind + SSHWS category), shown
+    # for EVERY real TC including TD/TS, colour-coded by category (the no-JS
+    # bake of the live updateIntensityChip; data-cat drives --cat-accent). An
+    # invest OR a PTC stays blank - it keeps its grey/red-X identity and accrues
+    # no category. Wind is baked in kt (the canonical default unit); hydration
+    # re-renders it under the user's unit toggle.
+    chip_hidden = is_invest or is_ptc
+    chip_cat_label = cat if cat in ("TD", "TS") else "CAT " + _sshs_label(cat)
+    chip_wind = f"{round(float(wind))} kt" if wind is not None else ""
+    chip_html = (
+        (f'<span class="chip-wind">{_esc(chip_wind)}</span>'
+         f'<span class="chip-sep"> · </span>' if chip_wind else "")
+        + f'<span class="chip-cat">{_esc(chip_cat_label)}</span>')
     og_title = f"{name} · {chip} · CycloLab"
     bits = []
     if wind is not None:
@@ -5501,7 +5640,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                 round(float(wind)) if wind is not None else "—"))
             .replace("__NAME__", _esc(name))
             .replace("__TYPE_WORD__", _esc(type_word.upper()))
-            .replace("__CHIP__", _esc(chip))
+            .replace("__CHIP__", chip_html)
             .replace("__CHIP_STYLE__",
                      ' style="display:none"' if chip_hidden else "")
             .replace("__IS_INVEST__", "true" if is_invest else "false")

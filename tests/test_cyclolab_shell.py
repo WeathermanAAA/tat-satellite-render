@@ -467,9 +467,11 @@ class TestIntegratedCardBehavior(unittest.TestCase):
              "ops": [{"op": "setCategory", "cat": "ZZ"}]})
         st = recs[-1]["state"]
         self.assertEqual(st["cat"], "TD")
-        # S4-AD1 #10: at TD the chip is HIDDEN (it would duplicate the
-        # type word); the clamp shows as the hidden chip + TD ramp.
-        self.assertFalse(st["chipShown"])
+        # the header pill is the intensity pill now: SHOWN at TD (a TD must not
+        # leave it blank), carrying the SSHWS "TD" label (the clamp still proves
+        # itself via the TD ramp + "D" glyph/hero below).
+        self.assertTrue(st["chipShown"])
+        self.assertIn("TD", st["chip"])
         self.assertEqual(st["glyphCat"], "D")
         self.assertEqual(st["odo"]["cat"], "D")
 
@@ -529,8 +531,10 @@ class TestCategorySwitch(unittest.TestCase):
              "ops": [{"op": "setCategory", "cat": "C5"}]})
         st = recs[-1]["state"]
         self.assertEqual(st["cat"], "C5")
-        self.assertEqual(st["chip"], "Category 5")
-        self.assertTrue(st["chipShown"])   # C1-5 chips stay (#10)
+        # the intensity pill carries the compact SSHWS label "CAT 5" (it used to
+        # read the long "Category 5"); still shown, still colour-coded.
+        self.assertIn("CAT 5", st["chip"])
+        self.assertTrue(st["chipShown"])
         # the category-change choreography: crossfade + one shine sweep.
         self.assertIn("xfade", st["bannerClasses"])
         self.assertIn("shine", st["bannerClasses"])
@@ -1628,10 +1632,14 @@ class TestNoLeaderLines(unittest.TestCase):
         self.assertTrue(a["conePlacards"])
         self._no_overlaps(a["conePlacards"], "live-official")
         # pairing without lines: every placard's anchor sits within a
-        # tight band of its glyph edge so the eye pairs them by position.
+        # tight band of its glyph edge so the eye pairs them by position. The
+        # band scales with the placard footprint - the Treatment B stat card is
+        # ~85% taller than the legacy pill, so its collision-free clearance is
+        # proportionally larger (on the live ep17 cone 7 of 8 still pair at
+        # <=104; one forced point sits at ~156). Still leaderless (asserted).
         for p in a["conePlacards"]:
             self.assertLessEqual(
-                p["gap"], 120.0,
+                p["gap"], 170.0,
                 f"placard {p['i']} gap {p['gap']:.1f} too far to pair "
                 "without a leader line")
 
@@ -1653,11 +1661,14 @@ class TestNoLeaderLines(unittest.TestCase):
         self.assertEqual(a["coneLeaders"], [], "bunched case drew a line")
         self._no_overlaps(a["conePlacards"], "bunched")
         for p in a["conePlacards"]:
-            # R3 #1 enlarged the forecast placards (~29% wider), so the
-            # collision-free spread of this pathological 6-tau cluster scales
-            # with them; still leader-free (asserted above) + adjacent.
+            # R3 #1 enlarged the forecast placards (~29% wider) and the
+            # intensity-pills pass made them the taller Treatment B stat card,
+            # so the collision-free spread of THIS pathological 6-tau cluster
+            # (six 132x74 cards packed into ~0.25deg - a geometry no real cone
+            # produces) scales with them; still leader-free (asserted above) and
+            # overlap-free, just farther flung than the legacy single-line pill.
             self.assertLessEqual(
-                p["gap"], 205.0,
+                p["gap"], 255.0,
                 f"bunched placard {p['i']} gap {p['gap']:.1f} unpairable")
 
 
@@ -1915,6 +1926,158 @@ class TestPtcLifecycle(unittest.TestCase):
         self.assertTrue(after["ptc"])
         self.assertTrue(after["isPtc"])
         self.assertEqual(after["glyphCat"], "PTC")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestConePlacardsTreatmentB(unittest.TestCase):
+    """PART 1: the cone forecast-point placards are the Treatment B 'stat card'
+    (review/placard-storm-bug, art-gated): dark glass + an SSHS accent rail/top
+    bar, the spinning category glyph, a category eyebrow, the big wind number,
+    and a muted UTC valid-time line (valid_utc -> 'Wed 7 PM'). Leaderless and
+    overlap-free placement is covered by TestNoLeaderLines above."""
+
+    def setUp(self):
+        self.storm = load_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.live_adv = json.loads(
+            (FIXTURE.parent / "live_adv_ep17.json").read_text())
+
+    def _adv_state(self, adv):
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"}]})
+        return recs[-1]["state"]["stage3"]["adv"]
+
+    def test_stat_card_dims_structure_and_spin(self):
+        pls = self._adv_state(self.live_adv)["conePlacards"]
+        self.assertTrue(pls)
+        for p in pls:
+            # Treatment B box (132 x 74), uniform across NOW + forecast.
+            self.assertEqual((p["w"], p["h"]), (132.0, 74.0))
+            # the spinning category glyph + the card/rail/top-bar rects.
+            self.assertTrue(p["spins"], "placard glyph must spin (.ac-spin)")
+            self.assertGreaterEqual(p["rects"], 3, "card + accent rail + bar")
+
+    def test_stat_card_carries_eyebrow_wind_and_valid_time(self):
+        pls = self._adv_state(self.live_adv)["conePlacards"]
+        self.assertTrue(pls)
+        for p in pls:
+            label = p["label"]
+            # a category eyebrow (TD/TS/CAT n) or a non-tropical stage word
+            self.assertRegex(
+                label, r"(TD|TS|CAT \d|POST-TROP|LOW|REMNANT|WAVE)", label)
+            # wind value + unit (default unit is kt; never a bare number)
+            self.assertRegex(label, r"\d+\s*kt", label)
+            # a UTC valid-time line: weekday + 12h + AM/PM
+            self.assertRegex(
+                label, r"(Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d+ (AM|PM)", label)
+
+    def test_valid_utc_time_label_formats(self):
+        # midnight / noon / a Wed 19Z / a weekday-rollover, each its own
+        # forecast point; the placard time line mirrors generate_board.py.
+        pts = [
+            {"tau_h": 0, "lat": 12.0, "lon": -130.0, "intensity_kt": 35,
+             "dev_label": "TS", "valid_utc": "2026-06-24T19:00:00Z"},   # Wed 7 PM
+            {"tau_h": 12, "lat": 13.0, "lon": -131.0, "intensity_kt": 45,
+             "dev_label": "TS", "valid_utc": "2026-06-24T00:00:00Z"},   # Wed 12 AM
+            {"tau_h": 24, "lat": 14.0, "lon": -132.0, "intensity_kt": 65,
+             "dev_label": "HU", "valid_utc": "2026-06-24T12:00:00Z"},   # Wed 12 PM
+            {"tau_h": 36, "lat": 15.0, "lon": -133.0, "intensity_kt": 80,
+             "dev_label": "HU", "valid_utc": "2026-06-25T01:00:00Z"},   # Thu 1 AM
+        ]
+        ring = [[-135.0, 10.0], [-128.0, 10.0], [-128.0, 17.0],
+                [-135.0, 17.0], [-135.0, 10.0]]
+        adv = {"sid": "NHC_EP082026", "advisory": 5, "source": "nhc",
+               "issued_utc": "2026-06-24T19:00:00Z", "method": "official-cone",
+               "cone": ring, "points": pts, "text": {"tcp": "X", "tcd": "Y"}}
+        joined = " || ".join(
+            p["label"] for p in self._adv_state(adv)["conePlacards"])
+        for expect in ("Wed 7 PM", "Wed 12 AM", "Wed 12 PM", "Thu 1 AM"):
+            self.assertIn(expect, joined, joined)
+
+    def test_non_tropical_point_gets_stage_eyebrow_not_category(self):
+        # the live ep17 cone ends with a PTC (post-tropical) point - it must
+        # read a stage eyebrow (POST-TROP / LOW / ...), never a CAT label.
+        pls = self._adv_state(self.live_adv)["conePlacards"]
+        joined = " || ".join(p["label"] for p in pls)
+        self.assertRegex(joined, r"(POST-TROP|LOW|REMNANT)", joined)
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestHeaderIntensityPill(unittest.TestCase):
+    """PART 2: the banner header pill is the live CURRENT INTENSITY (wind +
+    SSHWS category), colour-coded, shown for EVERY real TC including a TD (the
+    old category-only chip left a TD's pill blank). A PTC/invest stays blank -
+    it keeps its grey/red-X identity and accrues no category."""
+
+    def _td(self):
+        s = copy.deepcopy(load_storm())
+        s["current_category"] = "TD"
+        s["points"][-1]["wind_kt"] = 30.0
+        return s
+
+    def test_td_shows_wind_and_category_not_blank(self):
+        s = self._td()
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        st = run_harness(html, {"feed": {"storms": [s]},
+                                "ops": [{"op": "apply", "storm": s}]})[-1]["state"]
+        self.assertTrue(st["chipShown"], "a TD must NOT leave the pill blank")
+        self.assertIn("TD", st["chip"])
+        self.assertIn("30", st["chip"])
+        self.assertIn("kt", st["chip"])     # default unit
+
+    def test_td_pill_is_baked_visible_for_no_js(self):
+        # the static (no-JS) render also carries the intensity pill for a TD -
+        # NOT display:none (the old bake hid it).
+        s = self._td()
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        chip_tag = html.split('id="chip"', 1)[1].split(">", 1)[0]
+        self.assertNotIn("display:none", chip_tag)
+        self.assertIn("chip-cat", html)     # the category span is baked
+
+    def test_hurricane_shows_wind_and_cat_label(self):
+        s = load_storm()                    # synth C4, last fix 120 kt
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        st = run_harness(html, {"feed": {"storms": [s]},
+                                "ops": [{"op": "apply", "storm": s}]})[-1]["state"]
+        self.assertTrue(st["chipShown"])
+        self.assertIn("CAT 4", st["chip"])
+        self.assertIn("120", st["chip"])
+
+    def test_mph_toggle_reconverts_the_pill(self):
+        s = load_storm()
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        st = run_harness(html, {
+            "feed": {"storms": [s]},
+            "ops": [{"op": "apply", "storm": s},
+                    {"op": "setWindUnits", "unit": "mph"}]})[-1]["state"]
+        # 120 kt -> 140 mph (rounded to 5); pill follows the toggle, no bare kt.
+        self.assertIn("140 mph", st["chip"])
+        self.assertNotIn("kt", st["chip"])
+        self.assertIn("CAT 4", st["chip"])
+
+    def test_ptc_keeps_blank_pill(self):
+        s = copy.deepcopy(load_storm())
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["name"] = "ONE"               # a number-word, not a named TC
+        s["current_category"] = "TD"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        st = run_harness(html, {"feed": {"storms": [s]},
+                                "ops": [{"op": "apply", "storm": s}]})[-1]["state"]
+        self.assertFalse(st["chipShown"],
+                         "a PTC keeps its grey identity - no intensity pill")
+
+    def test_invest_keeps_blank_pill(self):
+        s = copy.deepcopy(load_storm())
+        s["sid"] = "NHC_EP902026"
+        s["is_invest"] = True
+        s["name"] = "90E"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        st = run_harness(html, {"feed": {"storms": [s]},
+                                "ops": [{"op": "apply", "storm": s}]})[-1]["state"]
+        self.assertFalse(st["chipShown"],
+                         "an invest keeps its grey/red-X identity - no pill")
 
 
 if __name__ == "__main__":

@@ -321,7 +321,15 @@ const scheduledDelays = [];
           h: parseFloat(g.getAttribute("data-h")),
           gap: parseFloat(g.getAttribute("data-gap")),
           iconr: parseFloat(g.getAttribute("data-iconr")),
-          label: (g.querySelector("text") || {}).textContent || "",
+          // ALL placard text joined (Treatment B is a multi-line stat card:
+          // category eyebrow + wind + valid-time), so unit/time assertions see
+          // the whole card, not just the first <text>.
+          label: Array.prototype.map.call(g.querySelectorAll("text"),
+            function (t) { return t.textContent; }).join(" "),
+          // Treatment B structure probes: a spinning category glyph (.ac-spin)
+          // + the dark-glass card / SSHS accent rail / top bar (>=3 rects).
+          spins: !!g.querySelector(".ac-spin"),
+          rects: g.querySelectorAll("rect").length,
         })) : [],
       // final-gate-3 #1: leader lines are GONE. The probe stays so the
       // invariant ("zero leader lines ever") is directly assertable.
