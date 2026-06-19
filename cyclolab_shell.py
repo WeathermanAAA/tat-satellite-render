@@ -4677,10 +4677,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   function satBlit(bm) {
     var cv = satEl("canvas");
-    if (cv.width !== bm.width || cv.height !== bm.height) {
+    // Pin the canvas to a STABLE size and SCALE each frame to fill it. The
+    // floater occasionally emits frames whose height wobbles by ~1px mid-loop
+    // (a render-extent rounding flip, e.g. 1056x1056 <-> 1056x1055 across a
+    // contiguous block, in every band) -- re-sizing the canvas to each frame's
+    // native dimensions made the live loop visibly resize/reflow + jump on
+    // those boundaries (the "seizure"). Re-fix the size only on a REAL change
+    // (band switch / >2px); a 1px wobble is then absorbed by a sub-pixel scale,
+    // never a layout resize. satFrameToCanvas already scale-fits, so the GIF
+    // export was immune -- this aligns the live loop with it.
+    if (!cv.width || Math.abs(cv.width - bm.width) > 2 ||
+        Math.abs(cv.height - bm.height) > 2) {
       cv.width = bm.width; cv.height = bm.height;
     }
-    cv.getContext("2d").drawImage(bm, 0, 0);
+    cv.getContext("2d").drawImage(bm, 0, 0, cv.width, cv.height);
   }
   function satReadout(i) {
     var f = sat.frames[i];
