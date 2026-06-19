@@ -131,11 +131,12 @@ class TestBasemapBake(unittest.TestCase):
         # per-storm page). Gulf-of-Mexico landfall is the densest case.
         bm = cb.basemap_for(27.0, -90.0, "AL")
         raw = json.dumps(bm, separators=(",", ":"))
-        # v3: the GSHHG terrain-accurate coast at TOL_NEAR 0.013, but the coast is
-        # DERIVED from land at render time (not stored), so the worst real Gulf
-        # bake (~189 KB at Apalachee Bay) is actually SMALLER than the v2 ne_10m
-        # land+coast (225 KB) despite the far higher fidelity. 210 KB fits + guards.
-        self.assertLess(len(raw), 210_000,
+        # The window was widened (+-50 lon / +-26 lat default) so wide / ultrawide
+        # monitors fill with land to the panel edge (the China-cutoff fix); the
+        # dense Gulf bake grows from ~181 KB to ~242 KB. The far periphery is
+        # heavily DP-coarsened (TOL_FAR), so it does not balloon linearly with the
+        # window. 280 KB fits the new default + still guards a DP regression.
+        self.assertLess(len(raw), 280_000,
                         f"Gulf bake {len(raw)} bytes - DP simplify regressed")
 
     def test_antimeridian_does_not_crash_or_leak(self):
