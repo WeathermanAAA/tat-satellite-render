@@ -1008,6 +1008,47 @@ def _ahi_colline_to_latlon(
         np.where(valid, lat_deg, np.nan),
         np.where(valid, lon_deg, np.nan),
     )
+# Number of 10-min FLDK slots to step back when searching for a COMPLETE scan.
+# A just-published slot uploads its segments north->south over several minutes,
+# so a storm in a southern segment 404s ("no AHI segments") off a scan that is
+# still in flight while the prior scan is whole. 6 -> up to 60 min of fallback;
+# FLDK completes within ~10 min so 1-3 steps suffice. Env-tunable.
+AHI_SCAN_BACKOFF_STEPS = int(os.environ.get("AHI_SCAN_BACKOFF_STEPS", "6"))
+
+
+def _latest_complete_ahi_slot(bucket: str, floor: dt.datetime, band: int,
+                              max_steps: int = AHI_SCAN_BACKOFF_STEPS):
+    """Newest 10-min FLDK slot at/<= ``floor`` whose ``band`` segments are ALL
+    present in S3. Returns the slot ``datetime`` or ``None`` when no complete slot
+    is found in the window (the caller then falls back to the snapped slot, which
+    surfaces the existing clear 'no segments' error and retries next poll). A
+    listing hiccup on one slot just advances to the next - never raises. This is
+    what keeps a southern-latitude WPAC floater (verified: 07W at 12.9N) from
+    being starved by a scan that is still uploading its equator-ward segments."""
+    from vendor.ahi_loader import _list_segments, _segment_seq_from_path
+    fs = _get_fs()
+    for step in range(max_steps):
+        slot = floor - dt.timedelta(minutes=10 * step)
+        try:
+            paths = _list_segments(fs, bucket, slot, band)
+        except Exception:  # noqa: BLE001 - a transient listing error: try the next slot
+            continue
+        if not paths:
+            continue
+        seqs: set = set()
+        total = 0
+        for p in paths:
+            try:
+                seq, tot = _segment_seq_from_path(p)
+            except Exception:  # noqa: BLE001 - a stray non-segment key in the prefix
+                continue
+            seqs.add(seq)
+            total = tot
+        if total and len(seqs) >= total:   # every segment of the scan has landed
+            return slot
+    return None
+
+
 class HimawariPacificSatellite(Satellite):
     family = "Himawari-Pacific"
     sensor = "AHI"
@@ -1054,6 +1095,20 @@ class HimawariPacificSatellite(Satellite):
             )
         # AHI cycles every 10 minutes; snap target time to the nearest 10-min slot.
         snapped = self._snap_10min(time, nearest_to_target)
+        # Live "latest": the snapped (floor-minus-10) slot is frequently STILL
+        # UPLOADING its equator-ward segments, which silently starves a southern
+        # storm (no segments for its line band). Step back to the newest COMPLETE
+        # FLDK scan instead. Historical (nearest_to_target) queries are honored as
+        # the exact snapped slot. Falls back to ``snapped`` if nothing complete is
+        # found (graceful: same clear error as before, retried next poll).
+        if not nearest_to_target:
+            base = time.replace(second=0, microsecond=0)
+            floor = base.replace(minute=(base.minute // 10) * 10)
+            complete = await _to_thread(
+                _latest_complete_ahi_slot, self.resolve(floor).bucket, floor,
+                self.generic_to_band[generic_channel])
+            if complete is not None:
+                snapped = complete
         resolved_sat = self.resolve(snapped)
         # ``s3_key`` holds the time-folder prefix; the loader globs band segments
         # off that prefix at open() time so that the same ResolvedFile shape works
