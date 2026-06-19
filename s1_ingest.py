@@ -403,18 +403,32 @@ class S1Ingest:
             log.warning("cold-start R2 list failed (%s); starting empty", e)
             keys = []
         n = 0
+        prod_gap = 0
         for k in keys:
             stamp = S.stamp_from_frame_key(k)
             if stamp is None:
                 continue
+            scan = dt.datetime.strptime(stamp, S.STAMP_FMT).replace(tzinfo=UTC)
+            # Advance the watermark from SHADOW reality regardless, so backfill
+            # stays bounded to the recent window.
+            if self.watermark is None or scan > self.watermark:
+                self.watermark = scan
+            # TARGET-COMPLETE seeding: only mark a slot published when EVERY
+            # target exists. In prod-cutover mode that's the shadow key (listed
+            # here) AND the prod meso key -- otherwise leave it UNSEEDED so the
+            # SQS/backfill path re-evaluates need_prod and writes the missing prod
+            # frame (the ledger short-circuit would otherwise suppress it forever
+            # -> a silent, backfill-unrecoverable prod gap at every cutover/restart).
+            if self.prod_write and not self.r2.head(S.prod_frame_key(stamp)):
+                prod_gap += 1
+                continue
             self.published.setdefault(stamp, "")
             self.gate.seed_complete(stamp)
             n += 1
-            scan = dt.datetime.strptime(stamp, S.STAMP_FMT).replace(tzinfo=UTC)
-            if self.watermark is None or scan > self.watermark:
-                self.watermark = scan
-        log.info("cold start: seeded %d published slots from R2 (%s); watermark=%s",
-                 n, prefix, iso_z(self.watermark) if self.watermark else "(none)")
+        log.info("cold start: seeded %d published slots from R2 (%s); watermark=%s%s",
+                 n, prefix, iso_z(self.watermark) if self.watermark else "(none)",
+                 f"; {prod_gap} shadow slot(s) missing prod -> left for "
+                 f"SQS/backfill to write prod" if prod_gap else "")
 
     # -- the render path for one COMPLETE slot --------------------------------
     def process_slot(self, slot: S.Slot, source: str,

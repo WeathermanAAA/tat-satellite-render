@@ -403,6 +403,36 @@ class S1IngestTest(unittest.TestCase):
                          b"old-shadow")                    # shadow untouched
         self.assertEqual(self._q_count(self.q_url), 0)
 
+    # -- cold-start target-completeness (the cutover/restart prod-gap critical) -
+    def test_cold_start_prod_missing_leaves_unseeded_then_writes_prod(self):
+        # After cutover/restart with prod_write=True, a shadow-present/prod-absent
+        # slot must NOT be seeded into the ledger (else the ledger short-circuit
+        # suppresses its prod PUT forever). It stays re-processable: the next SQS
+        # event writes the missing prod frame.
+        r2 = FakeR2()
+        stamp = "20260618T210057Z"
+        r2.store[S.shadow_frame_key("shadow", stamp)] = b"shadow"   # shadow only
+        render = RenderStub()
+        w = self._worker(render=render, r2=r2, prod_write=True)
+        w.cold_start()
+        self.assertNotIn(stamp, w.published)            # NOT seeded (prod missing)
+        self.assertEqual(w.watermark,                   # watermark still advanced
+                         dt.datetime(2026, 6, 18, 21, 0, 57, tzinfo=UTC))
+        self._send(raw_event(C13_A))
+        w.consume_once(wait_s=1)
+        self.assertIn(S.prod_frame_key(stamp), r2.store)   # prod now written
+        self.assertEqual(w.stats.rendered, 1)
+
+    def test_cold_start_prod_present_seeds_normally(self):
+        r2 = FakeR2()
+        stamp = "20260618T210057Z"
+        r2.store[S.shadow_frame_key("shadow", stamp)] = b"shadow"
+        r2.store[S.prod_frame_key(stamp)] = b"prod"     # BOTH targets present
+        w = self._worker(r2=r2, prod_write=True)
+        w.cold_start()
+        self.assertIn(stamp, w.published)               # seeded (both present)
+        self.assertTrue(w.gate.is_complete(stamp))
+
     # -- stale-slot guard: ancient backlog acked, not rendered ----------------
     def test_stale_slot_acked_not_rendered(self):
         self._send(raw_event(C13_A))                     # scan 2026-06-18 21:00

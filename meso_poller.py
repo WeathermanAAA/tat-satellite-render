@@ -803,6 +803,19 @@ class MesoPoller:
         for sector in MESO_SECTORS:
             for band in BANDS:
                 self.units[(sector.slug, band.key)] = Unit(sector=sector, band=band)
+        # Validate adopt-external against real units: a (slug,band) that matches
+        # NO unit is a typo that would silently do nothing -> drop + log loudly.
+        # (A typo that matches a DIFFERENT real band still freezes that band by
+        # design; the health snapshot surfaces exactly which bands are adopted.)
+        unknown = {p for p in self.adopt_external if p not in self.units}
+        if unknown:
+            log.error("MESO_ADOPT_EXTERNAL has unknown (slug:band) pairs %s -- "
+                      "ignoring (known e.g. %s)", sorted(unknown),
+                      sorted(f"{s}:{b}" for s, b in list(self.units)[:4]))
+            self.adopt_external -= unknown
+        if self.adopt_external:
+            log.info("adopt-external (NOT rendered; frames merged from R2): %s",
+                     sorted(f"{s}:{b}" for s, b in self.adopt_external))
         # STRICT lane isolation (hot = IR/IRBD at the 60 s target; cold =
         # WV/true-color/SWIR on the stretched cadence). Separate threads,
         # sessions, limiters, circuits, and -- via RENDER_BASE_URL_COLD --
@@ -1192,6 +1205,7 @@ class MesoPoller:
         return {
             "poller": "meso",
             "enabled": MESO_ENABLED,
+            "adopt_external": sorted(f"{s}:{b}" for s, b in self.adopt_external),
             "generated_utc": iso_z(now),
             "interval_s": SECTORS_REFRESH_S,
             "stale_after_s": EXTENT_STALE_AFTER_S,
