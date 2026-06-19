@@ -188,6 +188,23 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn('<html lang="en" data-cat="C4">', live)
         self.assertNotIn('<html lang="en" data-ended', live)
 
+    def test_copyable_plots_module_emitted(self):
+        # Right-click-to-copy: the module, the toast CSS, the clipboard + Safari
+        # fallback paths, the @WeathermanAAA mark, cors-safety, and EVERY overview
+        # plot id (the PLOTS wiring list) are present in the emitted page.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn("initPlotCopy", html)
+        self.assertIn("cl-toast", html)
+        self.assertIn("ClipboardItem", html)
+        self.assertIn("@WeathermanAAA", html)
+        self.assertIn("cors=1", html)            # cors-safe (untainted canvas)
+        self.assertIn('"image/png"', html)
+        self.assertIn("Copied", html)
+        self.assertIn("Downloaded", html)        # Safari / no-clipboard fallback
+        for pid in ("advcone", "intensity", "chart", "trackplot", "swathplot",
+                    "sst-hero-img"):
+            self.assertIn('"' + pid + '"', html)  # in the PLOTS wiring array
+
     def test_invest_sid_raises(self):
         # storm_ids contract: invests (90-99) get no page. render_page parses
         # the sid up front, so the guard propagates.

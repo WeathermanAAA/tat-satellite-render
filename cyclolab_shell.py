@@ -914,6 +914,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     .banner .glyph .spin, .loader .eye .spin { animation: none !important; }
     .odo.odo-swap { animation: none !important; }
   }
+
+  /* Right-click "copy as PNG" affordance (overview plots) + the result toast. */
+  svg.cl-copyable, img.cl-copyable { cursor: context-menu; }
+  .cl-toast { position: fixed; left: 50%; bottom: 26px;
+    transform: translateX(-50%) translateY(10px);
+    background: #0d1626; color: #eaf2ff; border: 1px solid #2b3b57;
+    border-radius: 9px; padding: 9px 16px; z-index: 9999;
+    font: 600 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .45); opacity: 0; pointer-events: none;
+    transition: opacity .18s ease, transform .18s ease; }
+  .cl-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  @media (prefers-reduced-motion: reduce) { .cl-toast { transition: opacity .1s; } }
 </style>
 </head>
 <body>
@@ -4658,6 +4670,154 @@ HTML_TEMPLATE = r"""<!doctype html>
                      return renderTrackPlot(s || lastStorm); },
                    renderSwathPlot: function (s) {
                      return renderSwathPlot(s || lastStorm); } };
+})();
+
+// ---- Right-click -> copy an overview plot as a shareable PNG -----------------
+// Every hand-rolled SVG overview plot (cone, intensity, wind & pressure, track,
+// wind swath) + the SST hero image is copyable by RIGHT-CLICK: render to a @2x
+// PNG carrying a title header + the @WeathermanAAA mark, put it on the clipboard
+// as image/png (ClipboardItem), and toast "Copied". Safari (no image clipboard)
+// downloads the PNG + toasts "Downloaded" -- never a silent fail. cors-safe
+// (?cors=1, like the GIF export) so the canvas is not tainted. Only these plots
+// opt in (cl-copyable) -- normal right-click everywhere else is untouched.
+(function initPlotCopy() {
+  var MARK = "@WeathermanAAA";
+  var SITE = "cyclolab.triple-a-tropics.com";
+  var SC = 2;                  // @2x -- it's a shareable
+  var HEAD = 30, FOOT = 26;    // logical-px header/footer bands (x SC on canvas)
+  var FONT = "system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
+  var PLOTS = [["advcone", 0], ["intensity", 0], ["chart", 0],
+               ["trackplot", 0], ["swathplot", 0], ["sst-hero-img", 1]];
+  var STYLE_PROPS = ["fill", "fill-opacity", "stroke", "stroke-width",
+    "stroke-dasharray", "stroke-linecap", "stroke-linejoin", "stroke-opacity",
+    "opacity", "font-family", "font-size", "font-weight", "font-style",
+    "text-anchor", "letter-spacing", "color", "paint-order"];
+
+  function toast(msg) {
+    var t = document.getElementById("cl-toast");
+    if (!t) {
+      t = document.createElement("div"); t.id = "cl-toast";
+      t.className = "cl-toast"; document.body.appendChild(t);
+    }
+    t.textContent = msg; t.classList.add("show");
+    clearTimeout(t._h);
+    t._h = setTimeout(function () { t.classList.remove("show"); }, 1900);
+  }
+  function titleFor(el) {
+    var card = el.closest && (el.closest(".card") ||
+      el.closest(".adv-cone-stage") || el.closest("[id^='card-']"));
+    var h = card && card.querySelector && card.querySelector("h3");
+    if (!h) {
+      var p = el.parentElement;
+      for (var i = 0; i < 4 && p; i++, p = p.parentElement) {
+        h = p.querySelector && p.querySelector("h3"); if (h) break;
+      }
+    }
+    return (h && h.textContent.trim()) || el.getAttribute("aria-label") || "CycloLab";
+  }
+  // Inline the live computed styles onto the clone -- the plots style via page
+  // CSS classes (fills/fonts), which a standalone serialized SVG would lose.
+  function inlineStyles(src, clone) {
+    if (src.nodeType !== 1) return;
+    var cs = window.getComputedStyle(src), st = "";
+    for (var i = 0; i < STYLE_PROPS.length; i++) {
+      var v = cs.getPropertyValue(STYLE_PROPS[i]);
+      if (v) st += STYLE_PROPS[i] + ":" + v + ";";
+    }
+    clone.setAttribute("style", st + (clone.getAttribute("style") || ""));
+    var sc = src.children || [], cc = clone.children || [];
+    for (var j = 0; j < sc.length && j < cc.length; j++) inlineStyles(sc[j], cc[j]);
+  }
+  function svgDims(svg) {
+    var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+    if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) return [vb[2], vb[3]];
+    var r = svg.getBoundingClientRect(); return [r.width || 1000, r.height || 600];
+  }
+  function compose(img, sw, sh, title, done) {
+    var hb = HEAD * SC, fb = FOOT * SC, pw = sw * SC, ph = sh * SC;
+    var cv = document.createElement("canvas");
+    cv.width = pw; cv.height = hb + ph + fb;
+    var ctx = cv.getContext("2d");
+    ctx.fillStyle = "#0b1322"; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#eaf2ff"; ctx.textAlign = "left";
+    ctx.font = "700 " + (15 * SC) + "px " + FONT;
+    ctx.fillText(title, 11 * SC, hb / 2);
+    ctx.fillStyle = "#7fa6d8"; ctx.textAlign = "right";
+    ctx.font = "600 " + (11 * SC) + "px " + FONT;
+    ctx.fillText("CycloLab", pw - 11 * SC, hb / 2);
+    try { ctx.drawImage(img, 0, hb, pw, ph); } catch (e) { done(null); return; }
+    var fy = hb + ph + fb / 2;
+    ctx.fillStyle = "#7fa6d8"; ctx.textAlign = "left";
+    ctx.font = "600 " + (11 * SC) + "px " + FONT;
+    ctx.fillText(SITE, 11 * SC, fy);
+    ctx.fillStyle = "#eaf2ff"; ctx.textAlign = "right";
+    ctx.font = "700 " + (12 * SC) + "px " + FONT;
+    ctx.fillText(MARK, pw - 11 * SC, fy);
+    try { cv.toBlob(function (b) { done(b); }, "image/png"); }
+    catch (e) { done(null); }      // tainted canvas
+  }
+  function deliver(blob, title) {
+    if (!blob) { toast("Copy failed"); return; }
+    var name = "cyclolab_" + String(title).toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") + ".png";
+    function download() {
+      var u = URL.createObjectURL(blob), a = document.createElement("a");
+      a.href = u; a.download = name; document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(u); }, 4000);
+      toast("Downloaded");
+    }
+    if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+      navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
+        .then(function () { toast("Copied"); })
+        .catch(function () { download(); });   // Safari rejects image writes -> download
+    } else { download(); }
+  }
+  function copySvg(svg) {
+    var d = svgDims(svg), sw = d[0], sh = d[1];
+    var clone = svg.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    inlineStyles(svg, clone);
+    if (!clone.getAttribute("viewBox")) clone.setAttribute("viewBox", "0 0 " + sw + " " + sh);
+    clone.setAttribute("width", sw * SC); clone.setAttribute("height", sh * SC);
+    var xml = new XMLSerializer().serializeToString(clone);
+    var url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
+    var img = new Image(), t = titleFor(svg);
+    img.onload = function () { compose(img, sw, sh, t, function (b) { deliver(b, t); }); };
+    img.onerror = function () { toast("Copy failed"); };
+    img.src = url;
+  }
+  function copyImg(el) {
+    var src = el.currentSrc || el.src;
+    if (!src) { toast("Nothing to copy"); return; }
+    var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1", t = titleFor(el);
+    var img = new Image(); img.crossOrigin = "anonymous";
+    img.onload = function () {
+      var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      compose(img, w / SC, h / SC, t, function (b) {
+        if (b) deliver(b, t);
+        else fetch(u, { mode: "cors" }).then(function (r) { return r.blob(); })
+          .then(function (b2) { deliver(b2, t); })   // tainted -> raw PNG blob
+          .catch(function () { toast("Copy failed"); });
+      });
+    };
+    img.onerror = function () { toast("Copy failed"); };
+    img.src = u;
+  }
+  function wire() {
+    PLOTS.forEach(function (p) {
+      var el = document.getElementById(p[0]);
+      if (!el) return;
+      el.classList.add("cl-copyable");
+      el.addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+        try { (p[1] ? copyImg : copySvg)(el); } catch (err) { toast("Copy failed"); }
+      });
+    });
+  }
+  if (document.readyState !== "loading") wire();
+  else document.addEventListener("DOMContentLoaded", wire);
 })();
 </script>
 </body>
