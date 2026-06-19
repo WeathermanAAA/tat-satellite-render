@@ -134,6 +134,23 @@ class TestRenderContract(unittest.TestCase):
         # the page <title> also carries the name.
         self.assertIn(f"<title>{name}", html)
 
+    def test_copyable_plots_module_emitted(self):
+        # Right-click-to-copy: the module, the toast CSS, the clipboard + Safari
+        # fallback paths, the @WeathermanAAA mark, cors-safety, and EVERY overview
+        # plot id (the PLOTS wiring list) are present in the emitted page.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn("initPlotCopy", html)
+        self.assertIn("cl-toast", html)
+        self.assertIn("ClipboardItem", html)
+        self.assertIn("@WeathermanAAA", html)
+        self.assertIn("cors=1", html)            # cors-safe (untainted canvas)
+        self.assertIn('"image/png"', html)
+        self.assertIn("Copied", html)
+        self.assertIn("Downloaded", html)        # Safari / no-clipboard fallback
+        for pid in ("advcone", "intensity", "chart", "trackplot", "swathplot",
+                    "sst-hero-img"):
+            self.assertIn('"' + pid + '"', html)  # in the PLOTS wiring array
+
     def test_data_cat_matches_current_category(self):
         html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
         self.assertEqual(self.storm["current_category"], "C4")
