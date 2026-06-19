@@ -522,11 +522,21 @@ def _clip_lines_to_land(lines, rings, prec=2):
 
 
 def basemap_for(lat: float, lon: float, basin: str, *,
-                dlat: float = 22.0, dlon: float = 30.0) -> dict:
+                dlat: float = 26.0, dlon: float = 50.0) -> dict:
     """The baked basemap dict for a storm at (lat, lon): land rings
     GEOMETRICALLY CLIPPED to the window (a continent bakes to just its
     in-window slab), lons normalized into the window frame so the
-    antimeridian never splits a page, plus the ocean label."""
+    antimeridian never splits a page, plus the ocean label.
+
+    The window is baked GENEROUSLY beyond the cone/track/swath data bbox
+    (default +-50 deg lon, +-26 deg lat) on purpose: the maps-pass
+    ``fillExtent`` widens the rendered viewBox to the CARD aspect, so a wide /
+    ultrawide monitor reveals far more lon than the data bbox. Land is clipped
+    to THIS window, so a window narrower than the filled viewBox leaves a
+    coastless ocean band at the edge (the China-cuts-off-at-~112E bug on a
+    07W-at-143E cone). +-50 deg covers up to a ~21:9 panel with margin; the
+    distance-adaptive DP (TOL_FAR) keeps the far periphery cheap. SST passes its
+    own tight explicit dims, so it is unaffected by these defaults."""
     la0, la1 = lat - dlat, lat + dlat
     lo0, lo1 = lon - dlon, lon + dlon
     # distance-adaptive DP tolerance: a ring/line's tolerance ramps from
