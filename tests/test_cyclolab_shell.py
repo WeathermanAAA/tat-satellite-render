@@ -162,6 +162,19 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn('"Public Advisory"', html)                # NHC label retained
         self.assertIn('"Discussion"', html)
 
+    def test_part_d_graticules_and_sparse_fallback(self):
+        # PART D: track/swath get a sparse-track fallback extent (a 1-fix track
+        # still draws land + graticule), and the SST raster gets a lat/long
+        # lattice OVERLAY reusing the shared graticule() helper (one source).
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn("function ensureMinExtent(", html)
+        # both track + swath route their extent through the fallback
+        self.assertEqual(html.count("fitProjection(ensureMinExtent(extent, 8)"), 2)
+        self.assertIn('id="sst-grat"', html)                     # SST overlay element
+        self.assertIn("function renderSstGraticule(", html)
+        self.assertIn("ac-graticule", html)                      # reuses cone grat style
+        self.assertIn(".sst-grat {", html)
+
     def test_unknown_category_falls_back_to_TD(self):
         s = copy.deepcopy(self.storm)
         s["current_category"] = "ZZ"

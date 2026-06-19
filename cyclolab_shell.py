@@ -757,6 +757,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   .sst-hero img { position: absolute; inset: 0; width: 100%;
     height: 100%; object-fit: cover; user-select: none;
     pointer-events: none; }
+  /* PART D: lat/long lattice over the storm-centered CRW raster. The SST box
+     is exactly 16:9.2 (== the container), so object-fit:cover does not crop and
+     a linear lat/lon->px overlay registers. Reuses the cone graticule styling
+     (.ac-graticule .grat-* below). Sits over the raster, under the title/scrim. */
+  .sst-grat { position: absolute; inset: 0; width: 100%; height: 100%;
+    pointer-events: none; }
   .sst-hero-layers { position: absolute; top: 10px; right: 10px; }
   .sst-hero-layers .hafs-seg { font-size: 10.5px; font-weight: 700;
     padding: 4px 10px; background: rgba(10,16,25,0.78);
@@ -1118,6 +1124,8 @@ HTML_TEMPLATE = r"""<!doctype html>
           <div class="sst-hero" id="sst-hero">
             <img id="sst-hero-img" alt="Sea-surface temperature around the storm"
                  draggable="false">
+            <svg class="sst-grat ac-graticule" id="sst-grat"
+                 preserveAspectRatio="none" aria-hidden="true"></svg>
             <div class="sst-hero-scrim"></div>
             <div class="sst-hero-title">
               <div class="hero-rail"></div>
@@ -2153,6 +2161,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     img.removeAttribute("data-url");
     img.style.display = "none";
     document.getElementById("sst-hero-layers").innerHTML = "";
+    var g = document.getElementById("sst-grat");
+    if (g) g.innerHTML = "";          // PART D: clear the lattice with the raster
     heroNote(msg);
   }
   function heroLayerEntry(slug) {
@@ -2202,6 +2212,33 @@ HTML_TEMPLATE = r"""<!doctype html>
         (L.title || L.label || "Sea surface temperature").toUpperCase();
     }
     heroCaption();
+    renderSstGraticule();
+  }
+  // PART D: lat/long lattice over the storm-centered CRW raster, via the SAME
+  // graticule() helper as the cone/track/swath (one source). The SST meta
+  // carries center + box{hw_lon,hw_lat}; the render is a PlateCarree box
+  // [clon+-hw_lon, clat+-hw_lat] at 16:9.2 == the container, so a linear
+  // lat/lon->px projection adapter registers exactly. Degrades to empty (no
+  // crash) when the meta lacks center/box.
+  function renderSstGraticule() {
+    var el = document.getElementById("sst-grat");
+    if (!el) return;
+    if (!heroMeta || !heroMeta.center || !heroMeta.box) { el.innerHTML = ""; return; }
+    var clon = heroMeta.center.lon, clat = heroMeta.center.lat;
+    var hwLon = heroMeta.box.hw_lon, hwLat = heroMeta.box.hw_lat;
+    if (!(hwLon > 0 && hwLat > 0)) { el.innerHTML = ""; return; }
+    var W = (heroMeta.px && heroMeta.px[0]) || 1000;
+    var H = (heroMeta.px && heroMeta.px[1]) || Math.round(W * hwLat / hwLon);
+    el.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var pr = {
+      W: W, H: H, x0: 0, y0: 0, x1: W, y1: H,
+      X: function (lon) { return (lon - (clon - hwLon)) / (2 * hwLon) * W; },
+      Y: function (lat) { return ((clat + hwLat) - lat) / (2 * hwLat) * H; },
+      lonAt: function (x) { return (clon - hwLon) + x / W * 2 * hwLon; },
+      latAt: function (y) { return (clat + hwLat) - y / H * 2 * hwLat; }
+    };
+    try { el.innerHTML = graticule(pr); }
+    catch (e) { el.innerHTML = ""; }
   }
   function heroBuildPicker() {
     var host = document.getElementById("sst-hero-layers");
@@ -2571,6 +2608,27 @@ HTML_TEMPLATE = r"""<!doctype html>
       lonAt: function (x) { return ((x - offX) / S + x0) / (60 * K); },
       latAt: function (y) { return -((y - offY) / S + y0) / 60; }
     };
+  }
+
+  // Sparse-track fallback (PART D): a single-fix (or near-zero-extent) track
+  // projects to a degenerate sub-degree window - no land, no graticule lines
+  // (the blank Track History a fresh JTWC TD showed). Pad a too-small extent to
+  // >= minDeg around its center so the basemap + graticule always draw. Shared
+  // by the track + swath maps; the data points are unchanged (only the
+  // projection window widens to a sensible storm-centered default).
+  function ensureMinExtent(extent, minDeg) {
+    minDeg = minDeg || 8;
+    if (!extent || !extent.length) return extent;
+    var lats = extent.map(function (p) { return p.lat; });
+    var lons = extent.map(function (p) { return p.lon; });
+    var loLat = Math.min.apply(null, lats), hiLat = Math.max.apply(null, lats);
+    var loLon = Math.min.apply(null, lons), hiLon = Math.max.apply(null, lons);
+    if ((hiLat - loLat) >= minDeg && (hiLon - loLon) >= minDeg) return extent;
+    var cLat = (loLat + hiLat) / 2, cLon = (loLon + hiLon) / 2, h = minDeg / 2;
+    return extent.concat([{ lat: cLat + h, lon: cLon },
+                          { lat: cLat - h, lon: cLon },
+                          { lat: cLat, lon: cLon + h },
+                          { lat: cLat, lon: cLon - h }]);
   }
 
   // 5-deg graticule (maps-pass R3 #3): drawn as the TOP-MOST layer with a
@@ -2973,7 +3031,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         { lat: last.lat, lon: last.lon - pad /
           Math.max(0.2, Math.cos(last.lat * Math.PI / 180)) }]);
     }
-    var pr = fitProjection(extent, 1000, 440, 760, 92);
+    var pr = fitProjection(ensureMinExtent(extent, 8), 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
     // maps-pass R4 #1: aspect-fill - the SHARED basemap rule (same as the
     // cone): expand the viewBox to the card aspect so the basemap + graticule
@@ -3179,7 +3237,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         }
       });
     });
-    var pr = fitProjection(extent, 1000, 440, 760, 92);
+    var pr = fitProjection(ensureMinExtent(extent, 8), 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
     // maps-pass R4 #1: aspect-fill (shared basemap rule) - basemap + graticule
     // full-bleed; the wind swath (in [0,W]x[0,H]) is never cropped.
