@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import feed_recompute as fr  # noqa: E402
 
 
-def _storm(sid, npts, is_invest=False, base_kt=30):
+def _storm(sid, npts, is_invest=False, base_kt=30, is_active=True,
+           name=None, cat="TD"):
     # ascending-time points; intensifying so peak grows with the track.
     pts = [{"t": "2026-06-%02dT%02d:00:00" % (11 + i // 24, i % 24),
             "lat": 12 + i * 0.1, "lon": 145 - i * 0.2,
@@ -20,8 +21,9 @@ def _storm(sid, npts, is_invest=False, base_kt=30):
             "cls": "TD"} for i in range(npts)]
     lf = (pts[-1]["t"] + "Z") if pts else None
     return {"sid": sid, "is_invest": is_invest, "points": pts,
-            "latest_fix_valid_utc": lf, "current_category": "TD",
-            "name": "SEVEN" if "07" in sid else sid}
+            "latest_fix_valid_utc": lf, "current_category": cat,
+            "is_active": is_active,
+            "name": name or ("SEVEN" if "07" in sid else sid)}
 
 
 def _feed(storms):
@@ -82,6 +84,44 @@ class TestNeverRegress(unittest.TestCase):
         f = _feed([_storm("JTWC_WP072026", 1)])   # first sight, sparse, no HWM
         self.assertEqual(fr.apply_never_regress(f, hwm, _designated), 0)
         self.assertEqual(len(f["storms"][0]["points"]), 1)
+
+    def test_review_total_track_loss_absent_storm_re_appended(self):
+        # REVIEW MAJOR: a designated storm that VANISHES from the poll entirely
+        # (total b-deck+knackwx miss) is re-appended from the HWM (debounced),
+        # not silently lost.
+        hwm = {}
+        fr.apply_never_regress(_feed([_storm("JTWC_WP072026", 30)]), hwm, _designated)
+        f = _feed([])                              # storm absent this poll
+        n = fr.apply_never_regress(f, hwm, _designated)
+        self.assertEqual(n, 1)
+        self.assertEqual([s["sid"] for s in f["storms"]], ["JTWC_WP072026"])
+        self.assertEqual(len(f["storms"][0]["points"]), 30)   # full track restored
+
+    def test_review_is_active_retirement_not_resurrected(self):
+        # REVIEW MAJOR: a same-poll dissipation (is_active False) + sparse track
+        # must keep the FRESH is_active=False (don't resurrect the live marker);
+        # only the track geometry is restored.
+        hwm = {}
+        fr.apply_never_regress(_feed([_storm("NHC_AL072026", 30, is_active=True)]),
+                               hwm, _designated)
+        f = _feed([_storm("NHC_AL072026", 1, is_active=False)])   # retired + sparse
+        fr.apply_never_regress(f, hwm, _designated)
+        s = f["storms"][0]
+        self.assertFalse(s["is_active"])                  # fresh retirement kept
+        self.assertEqual(len(s["points"]), 30)            # but full track restored
+
+    def test_review_rename_upgrade_not_masked(self):
+        # REVIEW MINOR: a same-poll rename/upgrade (ONE/TD -> ARTHUR/TS) + sparse
+        # keeps the FRESH name/category, not the stale HWM scalars.
+        hwm = {}
+        fr.apply_never_regress(
+            _feed([_storm("NHC_AL072026", 8, name="ONE", cat="TD")]), hwm, _designated)
+        f = _feed([_storm("NHC_AL072026", 1, name="ARTHUR", cat="TS", base_kt=40)])
+        fr.apply_never_regress(f, hwm, _designated)
+        s = f["storms"][0]
+        self.assertEqual(s["name"], "ARTHUR")             # fresh name kept
+        self.assertEqual(s["current_category"], "TS")     # fresh category kept
+        self.assertEqual(len(s["points"]), 8)             # full track restored
 
     def test_part_c_radii_survive_the_clobber(self):
         # PART C: analyzed wind radii ride on the b-deck points (ace_core's
