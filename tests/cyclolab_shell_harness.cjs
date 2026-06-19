@@ -67,6 +67,20 @@ const scheduledDelays = [];
         };
       };
 
+      // Clipboard recorder: the copy module registers a LAZY ClipboardItem
+      // (Promise<Blob>) inside the gesture and resolves the render async. jsdom
+      // has no canvas, so the blob never resolves -- but write() is CALLED
+      // synchronously in the gesture, which is the mobile contract under test.
+      // Count the calls so a test can prove a long-press fired one (and a tap /
+      // scroll did NOT).
+      window.__clipWrites = 0;
+      window.ClipboardItem = function (items) { this.items = items; };
+      var __clip = { write: function () { window.__clipWrites++; return Promise.resolve(); } };
+      try {
+        Object.defineProperty(window.navigator, "clipboard",
+          { configurable: true, value: __clip });
+      } catch (e) { try { window.navigator.clipboard = __clip; } catch (e2) {} }
+
       // requestAnimationFrame: fire on the next macrotask, deterministically.
       window.requestAnimationFrame = function (cb) {
         return window.setTimeout(function () { cb(Date.now()); }, 0);
@@ -593,6 +607,7 @@ const scheduledDelays = [];
         .children.length,
       endedStripVisible: endedStripVisible(),
       scheduledDelays: scheduledDelays.slice(),
+      clipWrites: window.__clipWrites,
     };
   }
 
@@ -677,6 +692,26 @@ const scheduledDelays = [];
       const r = (typeof f === "function") ? f.apply(null, op.args || []) : null;
       await drain();
       out.push({ op: op.op, fn: op.fn, result: r, state: snapshot() });
+      continue;
+    } else if (op.op === "longPress" || op.op === "tap" || op.op === "scrollPlot") {
+      // Mobile copy gestures. Dispatch a touch sequence on a plot and let the
+      // page's REAL long-press handler decide: a stationary >=450ms hold must
+      // fire doCopy -> clipboard.write; a quick tap or a scroll/pan (touchmove
+      // past the dead-band) must NOT.
+      const tgt = document.getElementById(op.id);
+      if (tgt) {
+        const tev = (type, x, y) => {
+          const e = new dom.window.Event(type, { bubbles: true, cancelable: true });
+          e.touches = (type === "touchend") ? [] : [{ clientX: x, clientY: y }];
+          tgt.dispatchEvent(e);
+        };
+        tev("touchstart", 20, 20);
+        if (op.op === "scrollPlot") tev("touchmove", 120, 20);   // >10px dead-band -> cancel
+        await new Promise((r) => setTimeout(r, op.op === "tap" ? 80 : 500));
+        tev("touchend", 20, 20);
+      }
+      await drain();
+      out.push({ op: op.op, state: snapshot() });
       continue;
     } else {
       out.push({ op: op.op, error: "unknown op" });

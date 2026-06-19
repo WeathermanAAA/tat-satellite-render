@@ -1934,5 +1934,32 @@ class TestPtcLifecycle(unittest.TestCase):
         self.assertEqual(after["glyphCat"], "PTC")
 
 
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestMobileCopyGesture(unittest.TestCase):
+    """Mobile plot copy: a stationary >=450ms long-press fires doCopy ->
+    clipboard.write (the lazy ClipboardItem) -- the touch parallel to the
+    desktop right-click. A quick tap or a scroll/pan (touchmove past the
+    dead-band) must NOT copy, so normal scrolling over a plot is preserved."""
+
+    def setUp(self):
+        self.storm = load_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+
+    def test_long_press_copies_tap_and_scroll_do_not(self):
+        recs = run_harness(self.html, {
+            "feed": {"storms": [self.storm]},
+            "ops": [
+                {"op": "longPress", "id": "intensity"},    # svg plot, direct listener
+                {"op": "tap", "id": "intensity"},          # <450ms -> no copy
+                {"op": "scrollPlot", "id": "intensity"},   # touchmove -> cancelled
+                {"op": "longPress", "id": "trackplot"},     # stage plot -> bubbles to .map-stage
+            ]})
+        writes = [r["state"]["clipWrites"] for r in recs]
+        # cumulative: press=1, tap=+0, scroll=+0, stage-press=+1
+        self.assertEqual(
+            writes, [1, 1, 1, 2],
+            f"long-press must copy; tap/scroll must not (clipWrites={writes})")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

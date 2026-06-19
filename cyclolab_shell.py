@@ -1045,7 +1045,9 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   /* Right-click "copy as PNG" affordance (overview plots) + the result toast. */
-  .cl-copyable { cursor: context-menu; }  /* svg, img, AND the stage divs */
+  .cl-copyable { cursor: context-menu; -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none; }  /* svg, img, stage divs;
+    callout:none suppresses the iOS image menu during a long-press copy */
   .cl-toast { position: fixed; left: 50%; bottom: 26px;
     transform: translateX(-50%) translateY(10px);
     background: #0d1626; color: #eaf2ff; border: 1px solid #2b3b57;
@@ -5493,24 +5495,51 @@ HTML_TEMPLATE = r"""<!doctype html>
     try { cv.toBlob(function (b) { done(b); }, "image/png"); }
     catch (e) { done(null); }      // tainted canvas
   }
-  function deliver(blob, title) {
+  function download(blob, title) {
     if (!blob) { toast("Copy failed"); return; }
     var name = "cyclolab_" + String(title).toLowerCase()
       .replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") + ".png";
-    function download() {
-      var u = URL.createObjectURL(blob), a = document.createElement("a");
-      a.href = u; a.download = name; document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(u); }, 4000);
-      toast("Downloaded");
-    }
-    if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
-      navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
-        .then(function () { toast("Copied"); })
-        .catch(function () { download(); });   // Safari rejects image writes -> download
-    } else { download(); }
+    var u = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = u; a.download = name; document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(u); }, 4000);
+    toast("Downloaded");
   }
-  function copySvg(svg) {
+  // One copy path for desktop right-click AND mobile long-press. The clipboard
+  // write is registered SYNCHRONOUSLY in the gesture with a Promise<Blob> (a lazy
+  // ClipboardItem): the render resolves async WITHOUT losing the user gesture,
+  // which is what makes image-copy work on iOS Safari + Android (and hardens
+  // desktop Safari). Where image-clipboard is unsupported, or it rejects, the
+  // same blob is downloaded -- so mobile always lands on copy OR download.
+  function doCopy(el, kind, stage) {
+    var title = titleFor(el), p;
+    try { p = pngBlob(el, kind, stage); } catch (e) { toast("Copy failed"); return; }
+    function dl() { p.then(function (b) { download(b, title); })
+      .catch(function () { toast("Copy failed"); }); }
+    if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+      navigator.clipboard.write([new ClipboardItem({ "image/png": p })])
+        .then(function () { toast("Copied"); })
+        .catch(dl);                       // unsupported/denied image write -> download
+    } else { dl(); }
+  }
+  // Produce the plot PNG as a Promise<Blob>: the rich foreignObject capture for
+  // overlay/hero plots, the self-contained SVG for the rest; on FO failure it
+  // falls back to the prior SVG-only / bare-img render so a copy is never WORSE
+  // than before. Rejects only on total failure.
+  function pngBlob(el, kind, stage) {
+    var title = titleFor(el);
+    return new Promise(function (resolve, reject) {
+      function ok(b) { if (b) resolve(b); else reject(new Error("copy failed")); }
+      if (kind === "hero")
+        heroBlob(stage || el, el, title, function (b) { if (b) resolve(b); else imgBlob(el, title, ok); });
+      else if (kind === "stage" && stage)
+        stageBlob(stage, title, null, function (b) { if (b) resolve(b); else svgBlob(el, title, ok); });
+      else
+        svgBlob(el, title, ok);
+    });
+  }
+  // --- blob producers: render the plot, then call done(blob|null). ---
+  function svgBlob(svg, title, done) {
     var d = svgDims(svg), sw = d[0], sh = d[1];
     var clone = svg.cloneNode(true);
     clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
@@ -5518,40 +5547,39 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!clone.getAttribute("viewBox")) clone.setAttribute("viewBox", "0 0 " + sw + " " + sh);
     clone.setAttribute("width", sw * SC); clone.setAttribute("height", sh * SC);
     var xml = new XMLSerializer().serializeToString(clone);
-    var url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
-    var img = new Image(), t = titleFor(svg);
-    img.onload = function () { compose(img, sw, sh, t, function (b) { deliver(b, t); }); };
-    img.onerror = function () { toast("Copy failed"); };
-    img.src = url;
+    var img = new Image();
+    img.onload = function () { compose(img, sw, sh, title, done); };
+    img.onerror = function () { done(null); };
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
   }
-  function copyImg(el) {
+  function imgBlob(el, title, done) {
     var src = el.currentSrc || el.src;
-    if (!src) { toast("Nothing to copy"); return; }
-    var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1", t = titleFor(el);
+    if (!src) { done(null); return; }
+    var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1";
     var img = new Image(); img.crossOrigin = "anonymous";
     img.onload = function () {
       var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
-      compose(img, w / SC, h / SC, t, function (b) {
-        if (b) deliver(b, t);
+      compose(img, w / SC, h / SC, title, function (b) {
+        if (b) done(b);
         else fetch(u, { mode: "cors" }).then(function (r) { return r.blob(); })
-          .then(function (b2) { deliver(b2, t); })   // tainted -> raw PNG blob
-          .catch(function () { toast("Copy failed"); });
+          .then(function (b2) { done(b2); })   // tainted -> raw PNG blob
+          .catch(function () { done(null); });
       });
     };
-    img.onerror = function () { toast("Copy failed"); };
+    img.onerror = function () { done(null); };
     img.src = u;
   }
   // Capture the WHOLE stage (SVG + the positioned HTML overlays -- title lockup,
   // wind-key/SSHS legend, stat box, marker glyphs) via a foreignObject clone, so
   // the copied PNG matches what's on screen. prep(clone) may mutate the clone
   // (the SST hero inlines its <img> as a data-URL). On ANY failure (Safari's
-  // foreignObject->canvas is unreliable; a taint; an empty stage) fall back to
-  // `fallback()` -- the prior SVG-only / bare-img path, so the copy is never
-  // WORSE than before, only better.
-  function renderStage(stage, title, fallback, prep) {
+  // foreignObject->canvas is unreliable; a taint; an empty stage) it calls
+  // done(null) so the caller can fall back to the prior SVG-only / bare-img path
+  // -- the copy is never WORSE than before, only better.
+  function stageBlob(stage, title, prep, done) {
     var r = stage.getBoundingClientRect();
     var W = Math.max(1, Math.round(r.width)), H = Math.max(1, Math.round(r.height));
-    if (W < 4 || H < 4) { fallback(); return; }
+    if (W < 4 || H < 4) { done(null); return; }
     var clone = stage.cloneNode(true);
     if (prep) prep(clone);
     // Pin the inner plot SVG to the stage box: #trackplot/#swathplot are sized in
@@ -5584,22 +5612,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       '</foreignObject></svg>';
     var img = new Image();
     img.onload = function () {
-      if (!img.naturalWidth || !img.naturalHeight) { fallback(); return; }  // Safari blank-load
-      compose(img, W, H, title, function (b) { if (b) deliver(b, title); else fallback(); }, true);
+      if (!img.naturalWidth || !img.naturalHeight) { done(null); return; }  // Safari blank-load
+      compose(img, W, H, title, done, true);
     };
-    img.onerror = function () { fallback(); };
+    img.onerror = function () { done(null); };
     img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
   }
-  function copyStage(stage, svg, title) {
-    renderStage(stage, title, function () { copySvg(svg); });  // fallback: SVG only
-  }
-  function copyHero(stage, imgEl, title) {
+  // Hero (SST): inline the PNG as a data-URL so the foreignObject has no external
+  // fetch (a cross-origin <img> inside a foreignObject taints the canvas), then
+  // capture the stage. On any failure done(null) -> caller falls back to imgBlob.
+  function heroBlob(stage, imgEl, title, done) {
     var src = imgEl.currentSrc || imgEl.src || "";
-    var fb = function () { copyImg(imgEl); };                  // fallback: bare raster
-    if (!src) { fb(); return; }
+    if (!src) { done(null); return; }
     var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1";
-    // Inline the hero PNG as a data-URL so the foreignObject has no external
-    // fetch (a cross-origin <img> in a foreignObject taints the canvas).
     fetch(u, { mode: "cors" }).then(function (r) {
       if (!r.ok) throw new Error("hero fetch " + r.status);
       return r.blob();
@@ -5607,18 +5632,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       var fr = new FileReader();
       fr.onload = function () {
         var dataUrl = fr.result;
-        renderStage(stage, title, fb, function (clone) {
+        stageBlob(stage, title, function (clone) {
           var imgs = clone.querySelectorAll ? clone.querySelectorAll("img") : [];
           for (var i = 0; i < imgs.length; i++) {
             imgs[i].setAttribute("src", dataUrl);
             imgs[i].removeAttribute("srcset");
             imgs[i].removeAttribute("crossorigin");
           }
-        });
+        }, done);
       };
-      fr.onerror = fb;
+      fr.onerror = function () { done(null); };
       fr.readAsDataURL(blob);
-    }).catch(fb);
+    }).catch(function () { done(null); });
   }
   function wire() {
     PLOTS.forEach(function (p) {
@@ -5630,15 +5655,36 @@ HTML_TEMPLATE = r"""<!doctype html>
       // pointer-events:none SST img); on the SVG itself for self-contained plots.
       var target = (kind === "svg" || !stage) ? el : stage;
       target.classList.add("cl-copyable");
+      // Desktop: right-click.
       target.addEventListener("contextmenu", function (e) {
         e.preventDefault();
-        var title = titleFor(el);
-        try {
-          if (kind === "hero") copyHero(stage || el, el, title);
-          else if (kind === "stage" && stage) copyStage(stage, el, title);
-          else copySvg(el);
-        } catch (err) { toast("Copy failed"); }
+        doCopy(el, kind, stage);
       });
+      // Mobile: long-press (parallels right-click; no on-plot UI). Fire on
+      // touchend after a stationary >=450ms hold, so the clipboard write lands
+      // in a real user-gesture event -- a setTimeout fire would NOT count as
+      // one. A touchmove past a few px = a scroll/pan -> cancel. CSS
+      // (-webkit-touch-callout:none on .cl-copyable) hides the iOS image-callout
+      // during the hold.
+      var t0 = 0, x0 = 0, y0 = 0, moved = false;
+      target.addEventListener("touchstart", function (e) {
+        if (!e.touches || e.touches.length !== 1) { t0 = 0; return; }
+        moved = false; t0 = Date.now();
+        x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+      }, { passive: true });
+      target.addEventListener("touchmove", function (e) {
+        if (!t0 || !e.touches || !e.touches.length) return;
+        if (Math.abs(e.touches[0].clientX - x0) > 10 ||
+            Math.abs(e.touches[0].clientY - y0) > 10) { moved = true; t0 = 0; }
+      }, { passive: true });
+      target.addEventListener("touchend", function (e) {
+        var held = t0 && !moved && (Date.now() - t0) >= 450;
+        t0 = 0;
+        if (!held) return;
+        e.preventDefault();          // swallow the trailing click / ghost-tap
+        doCopy(el, kind, stage);
+      });
+      target.addEventListener("touchcancel", function () { t0 = 0; moved = false; });
     });
   }
   if (document.readyState !== "loading") wire();
