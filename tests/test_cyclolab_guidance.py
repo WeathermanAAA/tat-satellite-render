@@ -34,6 +34,11 @@ def _row(tech, tau, lat="120N", lon="800W", vmax=40, mslp=1000, init="2026061512
     return ["AL", "90", init, "01", tech, tau, lat, lon, vmax, mslp, ty, rad]
 
 
+# a WPAC DTC adecks_open row (global / ensemble model): BASIN=WP, CY=07, 143E
+def _wp_row(tech, tau, lat="129N", lon="1431E", vmax=30, mslp=1005, init="2026061818"):
+    return ["WP", "07", init, "01", tech, tau, lat, lon, vmax, mslp, "TS", 34]
+
+
 class TestAdeck(unittest.TestCase):
     def test_dedupe_on_tech_tau(self):
         # 34/50/64 wind-radii rows for the SAME (TECH,TAU) -> ONE point
@@ -151,6 +156,11 @@ class _Session:
                 if sub in url:
                     return _Resp(content=gzip.compress(raw.encode()))
             return _Resp(status=404)
+        if "adecks_open" in url:        # DTC WPAC a-deck: plain .dat, NOT gzipped
+            for sub, raw in self.adecks.items():
+                if sub in url:
+                    return _Resp(content=raw.encode())
+            return _Resp(status=404)
         if "stext" in url:
             for sub, txt in self.ships.items():
                 if sub in url:
@@ -167,16 +177,19 @@ class TestPoller(unittest.TestCase):
     def test_sid_parts(self):
         self.assertEqual(gp.sid_parts("NHC_EP932026"), ("EP", "93", "2026"))
         self.assertEqual(gp.sid_parts("NHC_AL012026"), ("AL", "01", "2026"))
-        self.assertIsNone(gp.sid_parts("JTWC_WP922026"))   # not NHC AL/EP/CP
+        self.assertEqual(gp.sid_parts("JTWC_WP072026"), ("WP", "07", "2026"))  # JTWC WP now accepted
+        self.assertEqual(gp.sid_parts("JTWC_WP922026"), ("WP", "92", "2026"))  # WP invest too
+        self.assertIsNone(gp.sid_parts("JTWC_IO012026"))   # IO not yet a guidance basin
         self.assertIsNone(gp.sid_parts("garbage"))
 
-    def test_discover_filters_to_active_nhc(self):
+    def test_discover_keeps_active_guidance_basins(self):
         feed = {"features": [
             {"properties": {"kind": "active_marker", "storm_id": "NHC_EP932026"}},
-            {"properties": {"kind": "active_marker", "storm_id": "JTWC_WP922026"}},   # non-NHC
+            {"properties": {"kind": "active_marker", "storm_id": "JTWC_WP072026"}},   # WP designated -> kept
+            {"properties": {"kind": "active_marker", "storm_id": "JTWC_IO012026"}},   # non-guidance basin -> dropped
             {"properties": {"kind": "observation", "storm_id": "NHC_AL012026"}},       # not active_marker
         ]}
-        self.assertEqual(gp.discover_entities(feed), ["NHC_EP932026"])
+        self.assertEqual(gp.discover_entities(feed), ["NHC_EP932026", "JTWC_WP072026"])
 
     def test_run_once_writes_and_isolates(self):
         adeck = _adeck([_row("AVNI", 0), _row("AVNI", 12, lat="130N"), _row("DSHP", 0)])
@@ -205,6 +218,69 @@ class TestPoller(unittest.TestCase):
             def get(self, *a, **k):
                 raise RuntimeError("net down")
         self.assertEqual(gp.run_once(Boom(), lambda k, o: True), [])   # heartbeat skip, no crash
+
+
+class TestWPGuidance(unittest.TestCase):
+    """JTWC/WP guidance: DTC adecks_open a-deck, WP curated aids, SHIPS stub,
+    NHC isolation. NHC paths must be untouched."""
+
+    def test_adeck_url_routes_wp_to_dtc(self):
+        u = gp.adeck_url("WP", "07", "2026")
+        self.assertIn("adecks_open", u)
+        self.assertTrue(u.endswith("awp072026.dat"))   # plain .dat, not .gz
+        self.assertIn("aid_public", gp.adeck_url("EP", "93", "2026"))   # NHC unchanged
+        self.assertTrue(gp.adeck_url("EP", "93", "2026").endswith(".dat.gz"))
+
+    def test_parse_adeck_wp_curated_set(self):
+        # WP keeps ensemble means + global determ; DROPS the GEFS spaghetti (AP##)
+        # and the NHC interpolated aids (AVNI) that never appear in a WPAC a-deck.
+        a = _adeck([_wp_row("AEMN", 0), _wp_row("AEMN", 12, lat="135N"),
+                    _wp_row("CEMN", 0), _wp_row("NGX", 0), _wp_row("AC00", 0),
+                    _wp_row("AP05", 0), _wp_row("AVNI", 0)])
+        g = cg.parse_adeck(a, basin="WP")
+        self.assertEqual(set(g["present_aids"]), {"AEMN", "CEMN", "NGX", "AC00"})
+        self.assertEqual(set(g["consensus"]), {"AEMN", "CEMN"})   # ensemble means
+        self.assertNotIn("AP05", g["aids"])                       # spaghetti dropped
+        self.assertNotIn("AVNI", g["aids"])                       # NHC aid absent
+
+    def test_parse_adeck_wp_picks_latest_init_with_aids(self):
+        # newest synoptic is a CARQ-only analysis (no model aids) -> guidance must
+        # fall back to the prior init that actually carries the ensemble mean.
+        a = _adeck([_wp_row("AEMN", 0, init="2026061818"),
+                    _wp_row("CARQ", 0, init="2026061900")])   # CARQ non-curated, newest
+        g = cg.parse_adeck(a, basin="WP")
+        self.assertEqual(g["init_cycle"], "2026061818")
+        self.assertIn("AEMN", g["present_aids"])
+
+    def test_parse_adeck_nhc_byte_identical_with_basin_arg(self):
+        a = _adeck([_row("AVNI", 0), _row("TVCN", 0), _row("AEMN", 0)])  # AEMN ignored for NHC
+        self.assertEqual(cg.parse_adeck(a), cg.parse_adeck(a, basin="AL"))
+        self.assertNotIn("AEMN", cg.parse_adeck(a)["aids"])
+
+    def test_run_once_wp_guidance_and_ships_stub(self):
+        wp = _adeck([_wp_row("AEMN", 0), _wp_row("AEMN", 12, lat="135N"), _wp_row("CEMN", 0)])
+        sess = _Session(_feed("JTWC_WP072026"), {"awp072026": wp}, {})
+        written = {}
+        st = gp.run_once(sess, lambda k, o: (written.__setitem__(k, o) or True))
+        self.assertEqual(len(st), 1)
+        gj = written[f"{gp.R2_PREFIX}/JTWC_WP072026/guidance.json"]
+        self.assertIn("AEMN", gj["present_aids"])
+        self.assertEqual(gj["source"], "dtc-atcf-adecks_open")
+        sj = written[f"{gp.R2_PREFIX}/JTWC_WP072026/ships.json"]
+        self.assertFalse(sj["available"])
+        self.assertEqual(sj["reason"], "SHIPS not published for WPAC")
+        # NO formation.json for WP (no NHC TWO) and the run still reports ok.
+        self.assertNotIn(f"{gp.R2_PREFIX}/JTWC_WP072026/formation.json", written)
+        self.assertTrue(st[0]["ok"])
+
+    def test_wp_failure_isolated_from_nhc(self):
+        ep = _adeck([_row("AVNI", 0)])
+        sess = _Session(_feed("NHC_EP932026", "JTWC_WP072026"),
+                        {"aep932026": ep}, {})   # no awp072026 -> WP a-deck 404s
+        st = {s["sid"]: s for s in gp.run_once(sess, lambda k, o: True)}
+        self.assertTrue(st["NHC_EP932026"]["ok"])            # NHC fully processed
+        self.assertFalse(st["JTWC_WP072026"]["ok"])          # WP degrades, no crash
+        self.assertEqual(st["JTWC_WP072026"].get("reason"), "a-deck unavailable")
 
 
 _TWO_EP = (

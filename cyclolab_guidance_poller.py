@@ -44,7 +44,17 @@ POLL_INTERVAL_S = float(_env("GUIDANCE_POLL_INTERVAL_S", "900"))   # 15 min
 R2_PREFIX = (_env("GUIDANCE_R2_PREFIX", "cyclolab") or "cyclolab").strip("/")
 GLOBAL_FEED_URL = _env("GLOBAL_GEOJSON_URL", "https://cdn.triple-a-tropics.com/global_storms.geojson")
 NHC_BASINS = {"AL", "EP", "CP"}
+# JTWC basins we publish guidance for. WPAC (07W et al.) — the a-deck comes from
+# the DTC open mirror, NOT NHC aid_public (which is AL/EP/CP only), and there is
+# no public WPAC SHIPS text. A WP failure is per-entity isolated (run_once), so it
+# can never stale/break the NHC guidance.
+JTWC_BASINS = {"WP"}
+GUIDANCE_BASINS = NHC_BASINS | JTWC_BASINS
 ADECK_BASE = "https://ftp.nhc.noaa.gov/atcf/aid_public"
+# DTC open a-deck mirror — the only clean PUBLIC source carrying WPAC model aids
+# (the JTWC operational a-deck is restricted/403s from cloud; the b-deck proxy
+# chain serves btk only). Plain .dat (not gzipped); fetch_adeck handles both.
+ADECK_WP_BASE = "https://hurricanes.ral.ucar.edu/repository/data/adecks_open"
 SHIPS_BASE = "https://ftp.nhc.noaa.gov/atcf/stext"
 CACHE_CONTROL = "public, max-age=120"
 UA = {"User-Agent": "triple-a-tropics-cyclolab-guidance/1.0 (+triple-a-tropics.com)"}
@@ -61,18 +71,20 @@ def _iso_now() -> str:
 # linger after an invest dies, so file-existence is NOT a liveness signal).
 # --------------------------------------------------------------------------
 def sid_parts(sid: str) -> Optional[Tuple[str, str, str]]:
-    """'NHC_EP932026' -> ('EP','93','2026'); None if not an NHC AL/EP/CP sid."""
+    """'NHC_EP932026' -> ('EP','93','2026'), 'JTWC_WP072026' -> ('WP','07','2026');
+    None if not a guidance basin (NHC AL/EP/CP or JTWC WP)."""
     if not sid or "_" not in sid:
         return None
     rest = sid.split("_", 1)[1]
     if len(rest) != 8 or not rest[2:].isdigit():
         return None
     basin, nn, year = rest[:2], rest[2:4], rest[4:]
-    return (basin, nn, year) if basin in NHC_BASINS else None
+    return (basin, nn, year) if basin in GUIDANCE_BASINS else None
 
 
 def discover_entities(feed: dict) -> List[str]:
-    """Active NHC AL/EP/CP sids from the global feed (kind == active_marker)."""
+    """Active guidance sids (NHC AL/EP/CP + JTWC WP) from the global feed
+    (kind == active_marker)."""
     out: List[str] = []
     for f in (feed or {}).get("features", []):
         p = f.get("properties", {})
@@ -88,6 +100,9 @@ def discover_entities(feed: dict) -> List[str]:
 # Fetch
 # --------------------------------------------------------------------------
 def adeck_url(basin: str, nn: str, year: str) -> str:
+    # WPAC: DTC open mirror, plain .dat (awp{nn}{year}.dat). NHC: aid_public, gzipped.
+    if basin.upper() in JTWC_BASINS:
+        return f"{ADECK_WP_BASE}/a{basin.lower()}{nn}{year}.dat"
     return f"{ADECK_BASE}/a{basin.lower()}{nn}{year}.dat.gz"
 
 
@@ -101,7 +116,10 @@ def fetch_adeck(session: requests.Session, url: str) -> Optional[str]:
         r = session.get(url, headers=UA, timeout=_TIMEOUT)
         if r.status_code != 200 or not r.content:
             return None
-        return gzip.decompress(r.content).decode("latin-1", "ignore")
+        data = r.content
+        if data[:2] == b"\x1f\x8b":      # gzip magic (NHC .dat.gz); WPAC DTC is plain .dat
+            data = gzip.decompress(data)
+        return data.decode("latin-1", "ignore")
     except Exception as e:  # noqa: BLE001
         log.warning("a-deck fetch %s failed: %s", url, e)
         return None
@@ -184,12 +202,14 @@ def process_entity(sid: str, session: requests.Session,
     if not parts:
         return {"sid": sid, "ok": False, "reason": "bad sid"}
     basin, nn, year = parts
+    is_wp = basin.upper() in JTWC_BASINS
     status: dict = {"sid": sid, "ok": False, "guidance": False, "ships": False, "warns": []}
 
     # NHC formation chance (INVESTS only) - the genesis odds for the banner pill.
     # Written even when the TWO has no area for this invest (nulls -> pill hides),
-    # so the eager fetch is a clean 200 rather than a 404.
-    if int(nn) >= 90:
+    # so the eager fetch is a clean 200 rather than a 404. JTWC/WP has no NHC TWO,
+    # so WP invests get no formation.json (the pill simply never shows).
+    if int(nn) >= 90 and not is_wp:
         fc = (formation_map or {}).get(sid)
         formation = dict(fc) if fc else {"sid": sid, "p48": None, "p7": None,
                                          "level": None, "area": None}
@@ -201,9 +221,9 @@ def process_entity(sid: str, session: requests.Session,
     if raw is None:
         status["reason"] = "a-deck unavailable"
         return status
-    guidance = cg.parse_adeck(raw)
+    guidance = cg.parse_adeck(raw, basin=basin)
     guidance.update({"sid": sid, "basin": basin, "generated_at": _iso_now(),
-                     "source": "nhc-atcf-aid_public"})
+                     "source": "dtc-atcf-adecks_open" if is_wp else "nhc-atcf-aid_public"})
     status["warns"] = _qc_guidance(guidance)
     status["guidance"] = put_json(f"{R2_PREFIX}/{sid}/guidance.json", guidance)
     status["init"] = guidance.get("init_cycle")
@@ -211,15 +231,22 @@ def process_entity(sid: str, session: requests.Session,
 
     cycle = guidance.get("init_cycle")
     ships_obj: dict
-    txt = fetch_ships(session, cycle, basin, nn, year) if cycle else None
-    if txt is None:
-        ships_obj = {"available": False, "reason": "unavailable", "sid": sid,
-                     "generated_at": _iso_now()}
+    if is_wp:
+        # No public WPAC SHIPS text is published (NHC stext is AL/EP/CP only;
+        # JTWC runs STIPS, not a redistributable SHIPS product). Honest stub -
+        # never fabricate, and SHIPS-absent never blocks the track/intensity plots.
+        ships_obj = {"available": False, "reason": "SHIPS not published for WPAC",
+                     "sid": sid, "generated_at": _iso_now()}
     else:
-        ships_obj = cg.parse_ships(txt)
-        ships_obj.update({"sid": sid, "basin": basin, "init_cycle": cycle,
-                          "init_time": cg.init_to_iso(cycle), "generated_at": _iso_now(),
-                          "source": "nhc-atcf-stext"})
+        txt = fetch_ships(session, cycle, basin, nn, year) if cycle else None
+        if txt is None:
+            ships_obj = {"available": False, "reason": "unavailable", "sid": sid,
+                         "generated_at": _iso_now()}
+        else:
+            ships_obj = cg.parse_ships(txt)
+            ships_obj.update({"sid": sid, "basin": basin, "init_cycle": cycle,
+                              "init_time": cg.init_to_iso(cycle), "generated_at": _iso_now(),
+                              "source": "nhc-atcf-stext"})
     status["ships"] = put_json(f"{R2_PREFIX}/{sid}/ships.json", ships_obj)
     status["ships_available"] = ships_obj.get("available", False)
     status["ok"] = bool(status["guidance"] and status["ships"])
@@ -241,7 +268,8 @@ def run_once(session: requests.Session, put_json: Callable[[str, dict], bool],
     year = dt.datetime.now(UTC).year
     formation_map: Dict[str, dict] = {}
     for b in {sid_parts(s)[0] for s in sids
-              if sid_parts(s) and int(sid_parts(s)[1]) >= 90}:
+              if sid_parts(s) and int(sid_parts(s)[1]) >= 90
+              and sid_parts(s)[0] in NHC_BASINS}:   # WP has no NHC TWO
         formation_map.update(fetch_two(session, b, year))
     statuses: List[dict] = []
     for sid in sids:
