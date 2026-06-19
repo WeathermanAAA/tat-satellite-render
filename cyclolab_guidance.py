@@ -29,6 +29,22 @@ INTENSITY_AIDS = ["AVNI", "HFAI", "HFBI", "HWFI", "HMNI", "DSHP", "LGEM", "SHIP"
 CONSENSUS_AIDS = {"TVCN", "HCCA", "IVCN"}
 CURATED_AIDS = list(dict.fromkeys(TRACK_AIDS + INTENSITY_AIDS))   # union, order preserved
 
+# --- WP (JTWC) curated aids -------------------------------------------------
+# The NHC operational aid package (OFCL/GFS/ECMWF/HWRF/HMON/TVCN/SHIP) is NOT
+# redistributed for the West Pacific; the only clean PUBLIC WPAC a-deck is the
+# DTC ``adecks_open`` mirror, which carries the global ENSEMBLE-MEAN tracks +
+# the deterministic global models. So WPAC guidance curates the named ensemble
+# means + deterministic globals (clean, interpretable tracks) and deliberately
+# DROPS the 30-member GEFS/CMC/NAVGEM spaghetti (AP##/CP##/NP##) - restrained,
+# scientific, not a firework. Whatever of these is present in the a-deck is
+# kept; a fresh TD that only the GEFS has touched shows just AEMN+AC00.
+#   AEMN/CEMN/NEMN  GEFS / CMC / NAVGEM ensemble MEANS  (consensus-like)
+#   CMC / UKM / NGX deterministic CMC / UKMET / NAVGEM-GX
+#   AC00            GEFS control (a single clean track)
+WP_TRACK_AIDS = ["AEMN", "CEMN", "NEMN", "CMC", "UKM", "NGX", "AC00"]
+WP_INTENSITY_AIDS = ["AEMN", "CEMN", "NEMN", "CMC", "UKM", "NGX"]
+WP_CONSENSUS_AIDS = {"AEMN", "CEMN", "NEMN"}   # the ensemble means stand in for TVCN/HCCA
+
 
 # ===========================================================================
 # A-DECK
@@ -220,13 +236,28 @@ def parse_two(xml_text: str, year: int) -> Dict[str, dict]:
     return out
 
 
-def parse_adeck(text: str) -> dict:
+def parse_adeck(text: str, basin: Optional[str] = None) -> dict:
     """Parse the public a-deck into model guidance for the CURRENT synoptic init.
 
     Keeps only the curated aids, time-aligned to the LATEST init present (early aids
     land first; re-polling picks up the rest). DEDUPES on (TECH, TAU) - the 34/50/64
     wind-radii rows repeat each fix and would otherwise triple-count points (the
-    first row, RAD=34, is kept). vmax/mslp 0 = missing -> null."""
+    first row, RAD=34, is kept). vmax/mslp 0 = missing -> null.
+
+    ``basin`` selects the curated aid set. ``WP`` (JTWC) uses the global-model /
+    ensemble-mean set (WP_*), since the NHC operational aids never appear in the
+    public WPAC a-deck; every other value (incl. None) keeps the NHC sets EXACTLY
+    as before (the NHC path is byte-identical). For WP the latest init is the
+    newest one that actually carries a curated MODEL aid - the DTC mirror posts a
+    CARQ-only analysis record at the freshest synoptic while the ensemble lands a
+    cycle behind, so ``max(init)`` alone would yield an empty (statistical-only)
+    plot for a storm that in fact has guidance one cycle back."""
+    is_wp = (basin or "").upper() == "WP"
+    track_set = WP_TRACK_AIDS if is_wp else TRACK_AIDS
+    intensity_set = WP_INTENSITY_AIDS if is_wp else INTENSITY_AIDS
+    consensus_set = WP_CONSENSUS_AIDS if is_wp else CONSENSUS_AIDS
+    curated = list(dict.fromkeys(track_set + intensity_set))   # union, order preserved
+
     rows: List[List[str]] = []
     for ln in text.splitlines():
         f = [x.strip() for x in ln.split(",")]
@@ -236,14 +267,21 @@ def parse_adeck(text: str) -> dict:
     if not inits:
         return {"init_time": None, "init_cycle": None, "aids": {}, "consensus": [],
                 "present_aids": [], "track_aids": [], "intensity_aids": []}
-    latest = max(inits)
+    if is_wp:
+        # newest init that carries a forecast (tau>=0) curated aid, else newest
+        # init at all (so init_cycle/init_time stay set -> graceful empty plot).
+        aid_inits = [r[2] for r in rows if r[4] in curated
+                     and r[5].lstrip("-").isdigit() and int(r[5]) >= 0]
+        latest = max(aid_inits) if aid_inits else max(inits)
+    else:
+        latest = max(inits)
     aids: Dict[str, List[dict]] = {}
     seen: set = set()
     for r in rows:
         if r[2] != latest:
             continue
         tech = r[4]
-        if tech not in CURATED_AIDS:
+        if tech not in curated:
             continue
         try:
             tau = int(r[5])
@@ -261,15 +299,15 @@ def parse_adeck(text: str) -> dict:
         })
     for pts in aids.values():
         pts.sort(key=lambda p: p["tau"])
-    present = [t for t in CURATED_AIDS if t in aids]
+    present = [t for t in curated if t in aids]
     return {
         "init_time": init_to_iso(latest),
         "init_cycle": latest,
         "aids": aids,
         "present_aids": present,
-        "track_aids": [t for t in TRACK_AIDS if t in aids],
-        "intensity_aids": [t for t in INTENSITY_AIDS if t in aids],
-        "consensus": [t for t in present if t in CONSENSUS_AIDS],
+        "track_aids": [t for t in track_set if t in aids],
+        "intensity_aids": [t for t in intensity_set if t in aids],
+        "consensus": [t for t in present if t in consensus_set],
     }
 
 
