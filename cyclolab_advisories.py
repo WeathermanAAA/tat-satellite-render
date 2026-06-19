@@ -515,6 +515,41 @@ def _jtwc_url(nn: int, yy: int, kind: str) -> str:
     return f"{JTWC_PRODUCT_BASE}/wp{nn:02d}{yy:02d}{kind}.txt"
 
 
+# PART A: NHC forecast-point contract parity. The shell reads forecast wind from
+# p.intensity_kt + the development label from p.dev_label (kml_advisories' NHC
+# schema); JTWC points must use the SAME keys or placards read "0 mph", every
+# glyph is "D", and the Intensity Forecast panel is empty.
+def _jtwc_dev_label(intensity_kt) -> str:
+    """Development-stage label from intensity via the CANONICAL SSHS class
+    (ace_core.sshs_class - one source, no fork). TD/TS pass through (they are
+    SSHS keys, so the shell glyphs them D/S directly); C1-C5 -> "TY" (WPAC
+    typhoon) which is NOT an SSHS key (so the shell glyphs by intensity via
+    catForKt -> 1..5) and IS in the shell's TROPICAL_DEV set (so the icon stays
+    category-colored, never the white non-tropical marker)."""
+    import ace_core
+    cls = ace_core.sshs_class(intensity_kt)
+    return cls if cls in ("TD", "TS") else "TY"
+
+
+def _jtwc_nhc_points(parser_points) -> list[dict]:
+    """Map JTWC warning-parser points (wind_kt) to the EXACT NHC forecast-point
+    key set (kml_advisories: tau_h, valid_utc, lat, lon, intensity_kt,
+    dev_label). No extra keys -> byte-parity with the NHC contract."""
+    out = []
+    for p in parser_points:
+        kt = p.get("wind_kt")
+        ikt = int(round(kt)) if kt is not None else None
+        out.append({
+            "tau_h": p["tau_h"],
+            "valid_utc": p["valid_utc"],
+            "lat": p["lat"],
+            "lon": p["lon"],
+            "intensity_kt": ikt,
+            "dev_label": _jtwc_dev_label(ikt),
+        })
+    return out
+
+
 def _jtwc_designated_storms(knack_data, default_year: int) -> list[dict]:
     """The DESIGNATED WP storms (basin letter 'W', number 1..49 - invests 90-99
     excluded) from a knackwx ATCF payload. NN + year come from long_atcf_id
@@ -648,9 +683,12 @@ def make_jtwc_advisories_source(session: requests.Session, sink: pf.Sink, *,
     def _build_payload(s: dict) -> dict:
         parsed = s["parsed"]
         wn = s["warning_number"]
-        points = [dict(p) for p in parsed["points"]]
-        for p in points:                      # so build_* reports the advisory
-            p["advisory"] = wn
+        # PART A: emit forecast points with the EXACT NHC forecast-point key set
+        # (intensity_kt + dev_label), so the shell renders JTWC forecast wind,
+        # glyphs, and the Intensity Forecast panel identically to NHC. advisory +
+        # issued_utc are set on the PAYLOAD below (not per point), keeping the
+        # point key set byte-parity with NHC (no extra keys).
+        points = _jtwc_nhc_points(parsed["points"])
         payload = build_derived_advisory_json(s["sid"], points, _JTWC_RADII)
         # issued_utc := the WARNING issuance (header DTG), not the tau0 valid
         # time build_* defaulted to - the true monotonic issuance the

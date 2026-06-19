@@ -49,6 +49,59 @@ def _fetch_map(web=WEB, prog=PROG, knack=KNACK):
     return f
 
 
+def _build_07w_payload():
+    sink = pf.DictSink()
+    src = _src(sink, _fetch_map())
+    src.process(_ctx(src, src.fetch(), sink))
+    return sink.store[ADV]
+
+
+def _glyph(p):
+    """Replica of the shell's pointCat -> SSHS glyph letter."""
+    SSHS = ("TD", "TS", "C1", "C2", "C3", "C4", "C5")
+    dl = p.get("dev_label")
+    cat = dl if dl in SSHS else None
+    if cat is None:
+        kt = p.get("intensity_kt")
+        cat = ("TD" if kt is None or kt < 34 else "TS" if kt < 64 else "C1"
+               if kt < 83 else "C2" if kt < 96 else "C3" if kt < 113 else "C4"
+               if kt < 137 else "C5")
+    return "D" if cat == "TD" else "S" if cat == "TS" else cat[-1]
+
+
+class TestContractParityA(unittest.TestCase):
+    """PART A: JTWC forecast points carry the EXACT NHC forecast-point key set,
+    so the shell renders forecast wind/glyphs/Intensity-Forecast identically."""
+
+    def test_key_set_matches_real_nhc_point(self):
+        import kml_advisories as K
+        cone = open(os.path.join(FIX, "EP012026_013adv_CONE.kmz"), "rb").read()
+        track = open(os.path.join(FIX, "EP012026_013adv_TRACK.kmz"), "rb").read()
+        nhc = K.build_advisory_json("NHC_EP012026", cone, track)
+        nhc_keys = set(nhc["points"][0].keys())
+        pts = _build_07w_payload()["points"]
+        self.assertTrue(pts)
+        for p in pts:
+            self.assertEqual(set(p.keys()), nhc_keys)   # byte-parity with NHC
+            self.assertNotIn("wind_kt", p)               # the old key is gone
+
+    def test_intensity_and_glyphs_on_07w(self):
+        pts = _build_07w_payload()["points"]
+        self.assertEqual([p["intensity_kt"] for p in pts],
+                         [30, 35, 40, 45, 60, 85, 110, 120, 105])
+        self.assertEqual([_glyph(p) for p in pts],
+                         ["D", "S", "S", "S", "S", "2", "3", "4", "3"])
+        self.assertEqual([p["dev_label"] for p in pts],
+                         ["TD", "TS", "TS", "TS", "TS", "TY", "TY", "TY", "TY"])
+
+    def test_dev_label_from_canonical_sshs(self):
+        # one source: dev_label derives from ace_core.sshs_class.
+        self.assertEqual(C._jtwc_dev_label(30), "TD")
+        self.assertEqual(C._jtwc_dev_label(50), "TS")
+        self.assertEqual(C._jtwc_dev_label(85), "TY")   # C2 -> TY (tropical, not SSHS key)
+        self.assertEqual(C._jtwc_dev_label(140), "TY")
+
+
 class TestDiscovery(unittest.TestCase):
     def test_selects_designated_wp_only(self):
         got = C._jtwc_designated_storms(KNACK, 2026)
