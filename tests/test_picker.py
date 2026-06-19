@@ -30,6 +30,7 @@ from satellites import (  # noqa: E402
     UnsupportedTimeError,
     _bbox_inside,
     _conus_footprint,
+    _latest_complete_ahi_slot,
     antimeridian_safe_center_lon,
     goes_band_to_generic,
     pick_buckets_for_time,
@@ -459,6 +460,42 @@ def test_himawari_generic_to_band():
     print("ok himawari_generic_to_band")
 
 
+def test_ahi_latest_complete_slot_steps_back_over_incomplete():
+    """The fix for the starved WPAC floater: find_file must skip a still-uploading
+    FLDK scan and resolve to the newest COMPLETE one (verified live on 07W @12.9N,
+    which sits in a southern segment that lands last). Mocks the S3 listing so the
+    completeness step-back is deterministic."""
+    import satellites as _sat
+    import vendor.ahi_loader as _ahi
+
+    floor = dt.datetime(2026, 6, 19, 5, 20, tzinfo=dt.timezone.utc)
+
+    def _segs(n):   # n FLDK segments (S0110..Sn10), total 10 - parseable by the real fn
+        return [f"s3://b/AHI-L1b-FLDK/.../HS_H09_B13_FLDK_S{i:02d}10.DAT.bz2"
+                for i in range(1, n + 1)]
+
+    def fake_list(fs, bucket, slot, band):
+        return {20: _segs(0),    # current slot: nothing uploaded yet
+                10: _segs(6),    # prior slot: still uploading (northern half only)
+                0:  _segs(10)}.get(slot.minute, _segs(0))   # 05:00: complete
+
+    orig_list, orig_fs = _ahi._list_segments, _sat._get_fs
+    _ahi._list_segments, _sat._get_fs = fake_list, (lambda: object())
+    try:
+        slot = _latest_complete_ahi_slot("noaa-himawari9", floor, 13)
+        assert slot is not None and slot.minute == 0, (
+            f"expected step-back to the complete 05:00 scan, got {slot}")
+        # a complete FLOOR scan is used as-is (no needless staleness)
+        _ahi._list_segments = lambda fs, b, s, band: _segs(10)
+        assert _latest_complete_ahi_slot("noaa-himawari9", floor, 13) == floor
+        # nothing complete in the window -> None (caller falls back gracefully)
+        _ahi._list_segments = lambda fs, b, s, band: _segs(3)
+        assert _latest_complete_ahi_slot("noaa-himawari9", floor, 13, max_steps=4) is None
+    finally:
+        _ahi._list_segments, _sat._get_fs = orig_list, orig_fs
+    print("ok: ahi latest-complete-slot steps back over an incomplete scan")
+
+
 def test_antimeridian_safe_center_lon():
     """Bboxes that cross ±180° must have center near the antimeridian, not 0."""
     # Crosses ±180°: from 170°E to 190°E (= -170°E). Center should be ±180°.
@@ -566,6 +603,7 @@ def main():
     test_himawari_can_see_caribbean_false()
     test_himawari_can_see_antimeridian_crossing()
     test_himawari_generic_to_band()
+    test_ahi_latest_complete_slot_steps_back_over_incomplete()
     test_antimeridian_safe_center_lon()
     test_generic_channel_to_band()
     test_normalize_channel_back_compat()
