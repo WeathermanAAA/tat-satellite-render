@@ -55,6 +55,7 @@ import requests
 from botocore.config import Config as BotoConfig
 
 import s1_slots as S
+import s1_sources as SRC
 from poller_framework import FAILING, FRESH, SourceHealth, process_mem_mb
 
 UTC = dt.timezone.utc
@@ -88,6 +89,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 S1_ENABLED = _env_bool("S1_ENABLED", True)
+
+# Which satellite source this worker ingests (STAGE A multi-sat): goes19 (the
+# GREEN baseline), goes18, or himawari9. One worker == one source == one queue,
+# so a new-sat failure can never stale another source (per-source isolation).
+S1_SOURCE = _env("S1_SOURCE", "goes19")
+SOURCE = SRC.get_source(S1_SOURCE)
 
 # SQS (the worker's own AWS creds -- tat-sat-ingest -- come from the env via the
 # boto3 default chain: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / region).
@@ -241,18 +248,15 @@ def _header(headers: dict, name: str) -> Optional[str]:
     return next((v for k, v in headers.items() if k.lower() == ln), None)
 
 
-def call_render_slot(session: requests.Session, bbox: list[float],
-                     time_iso: str, url: str = RENDER_URL) -> tuple[bytes, dict]:
-    """POST the FROZEN /render exactly as the meso lane does, but for a SPECIFIC
-    slot time (not "latest"): channel clean_ir, enhancement rainbow_ir, format
-    webp, product meso, satellite GOES-East. Byte-identical to the prod meso
-    frame for the slot. Raises RenderSkip on 422, RenderError after retries."""
-    body = {
-        "bbox": bbox, "time": time_iso,
-        "channel": S.S1_RENDER_CHANNEL, "enhancement": S.S1_RENDER_ENHANCEMENT,
-        "format": "webp", "product": S.S1_RENDER_PRODUCT_HINT,
-        "satellite": S.S1_RENDER_SAT_HINT,
-    }
+def call_render_slot(session: requests.Session, source: SRC.SatSource,
+                     bbox: list[float], time_iso: str,
+                     url: str = RENDER_URL) -> tuple[bytes, dict]:
+    """POST the FROZEN /render exactly as the meso/floater lane does, but for a
+    SPECIFIC slot time (not "latest"), with the source's render params (channel
+    clean_ir, enhancement rainbow_ir, format webp + the source's satellite hint /
+    product). Byte-identical to the prod frame for the slot. Raises RenderSkip on
+    422, RenderError after retries."""
+    body = SRC.render_body(source, bbox, time_iso)
     last: Optional[Exception] = None
     for attempt in range(RENDER_MAX_RETRIES):
         try:
@@ -277,16 +281,17 @@ def call_render_slot(session: requests.Session, bbox: list[float],
 # Real extent reader + ground-truth lister (lazy heavy imports; injectable so
 # the worker's never-miss logic is unit-tested with stubs -- no xarray/s3fs).
 # ---------------------------------------------------------------------------
-def read_object_extent(s3_key: str) -> list[float]:
+def read_object_extent(s3_key: str, bucket: str = S.S1_BUCKET) -> list[float]:
     """Read a CMIPM object's live geographic extent -> [lon_w, lat_s, lon_e,
     lat_n] (rounded 3dp, lon normalized), the SAME bbox the meso poller derives
     (meso_poller.discover_goes_extent / satellites._goes_meso_extent_from_ds), so
     the render crop is identical. Opens the object directly by key (no listing),
-    attrs-only (h5netcdf, no array load)."""
+    attrs-only (h5netcdf, no array load). ABI sources only (the GOES meso extent
+    is per-scan discovered); AHI FLDK uses a fixed extent, not this reader."""
     import xarray as xr
     import satellites
     fs = satellites._get_fs()
-    with fs.open(f"{S.S1_BUCKET}/{s3_key}" if not s3_key.startswith(S.S1_BUCKET)
+    with fs.open(f"{bucket}/{s3_key}" if not s3_key.startswith(bucket)
                  else s3_key, mode="rb") as f:
         ds = xr.open_dataset(f, decode_cf=False, engine="h5netcdf")
         try:
@@ -304,32 +309,27 @@ def read_object_extent(s3_key: str) -> list[float]:
             round(norm_lon(lon_e), 3), round(lat_n, 3)]
 
 
-def list_ground_truth(lookback_min: int) -> list[S.Slot]:
-    """List the recent NOAA CMIPM prefix and return the CMIPM2-C13 Slots over
-    the lookback window, NEWEST-FIRST (§3.3 H). Anonymous LIST on the NODD bucket
-    is free. Uses the SAME s3fs handle/tuning the render service uses."""
+def list_ground_truth(source: SRC.SatSource, lookback_min: int) -> list[S.Slot]:
+    """List the recent NOAA prefixes for ``source`` and return its COMPLETE slots
+    over the lookback window, NEWEST-FIRST (§3.3 H). For AHI this groups segments
+    and returns only fully-segmented scans (never a half-scan -- the
+    southern-segment lesson). Anonymous LIST on the NODD bucket is free; uses the
+    SAME s3fs handle/tuning the render service uses."""
     import satellites
     fs = satellites._get_fs()
     now = utcnow()
-    slots: dict[str, S.Slot] = {}
-    # current + previous hour(s) covering the lookback window.
-    hours = max(1, (lookback_min // 60) + 2)
-    for h in range(hours):
-        t = now - dt.timedelta(hours=h)
-        prefix = (f"{S.S1_BUCKET}/ABI-L2-CMIPM/{t.year}/{t.strftime('%j')}/"
-                  f"{t.hour:02d}/")
+    keys: list[str] = []
+    for prefix in SRC.noaa_prefixes(source, now, lookback_min):
         try:
-            listing = fs.ls(prefix)
+            listing = fs.ls(f"{source.bucket}/{prefix}")
         except (FileNotFoundError, OSError):
             continue
         for full in listing:
             # s3fs keys are "bucket/Key"; strip the bucket to match SNS keys.
-            key = full.split("/", 1)[1] if "/" in full else full
-            slot = S.parse_goes_key(key)
-            if S.is_s1_slot(slot):
-                slots[slot.stamp] = slot
+            keys.append(full.split("/", 1)[1] if "/" in full else full)
+    complete = SRC.complete_scans(source, keys)   # {stamp: Slot}, all-segments
     cutoff = now - dt.timedelta(minutes=lookback_min)
-    out = [s for s in slots.values() if s.scan_start >= cutoff]
+    out = [s for s in complete.values() if s.scan_start >= cutoff]
     out.sort(key=lambda s: s.scan_start, reverse=True)  # newest-first
     return out
 
@@ -359,15 +359,19 @@ class S1Ingest:
 
     def __init__(self, *, r2, sqs, render_fn: Callable, extent_fn: Callable,
                  ground_truth_fn: Callable, prefix: str = R2_PREFIX,
-                 clock: Callable[[], dt.datetime] = utcnow) -> None:
+                 clock: Callable[[], dt.datetime] = utcnow,
+                 source: SRC.SatSource = SOURCE) -> None:
         self.r2 = r2
         self.sqs = sqs
         self.render_fn = render_fn
         self.extent_fn = extent_fn
         self.ground_truth_fn = ground_truth_fn
         self.prefix = prefix
+        self.source = source
         self._now = clock
-        self.gate = S.CompletenessGate(S.S1_REQUIRED_BANDS)
+        # The completeness gate's required-set is the source's (ABI: the single
+        # native band; AHI FLDK: all 10 segments -- the southern-segment lesson).
+        self.gate = S.CompletenessGate(SRC.gate_required(source))
         # The ledger of published slots (a cache; R2 is truth -- reseeded on cold
         # start). Maps stamp -> sha256 of the published frame.
         self.published: dict[str, str] = {}
@@ -385,7 +389,7 @@ class S1Ingest:
         """Seed the ledger + watermark from R2 REALITY: list the shadow frames
         and recover their stamps. On an empty bucket the watermark stays unset
         and the first backfill seeds it from ground truth."""
-        prefix = f"{self.prefix}/{S.S1_PRODUCT_PATH}/"
+        prefix = f"{self.prefix}/{self.source.product_path}/"
         try:
             keys = self.r2.list_keys(prefix)
         except Exception as e:  # noqa: BLE001
@@ -412,7 +416,7 @@ class S1Ingest:
         Returns one of: rendered | duplicate | no-data. Raises on render/PUT
         failure (the caller must NOT ack so SQS redelivers -> DLQ after N)."""
         stamp = slot.stamp
-        key = S.shadow_frame_key(self.prefix, stamp)
+        key = S.shadow_frame_key(self.prefix, stamp, self.source.product_path)
         # Stale-slot guard: a slot older than the retained window would be pruned
         # immediately anyway, so ack it without rendering. Bounds a deploy-day
         # thundering herd if the queue accreted a long backlog while the box was
@@ -421,7 +425,7 @@ class S1Ingest:
         if slot.scan_start < self._now() - dt.timedelta(hours=RETAIN_H):
             self.stats.duplicates += 1   # counted as covered (acked, not rendered)
             log.info("stale slot %s older than %.0fh -- acked, not rendered",
-                     slot.slot_id, RETAIN_H)
+                     SRC.slot_label(self.source, slot), RETAIN_H)
             return "stale"
         # Idempotency: already published (in-ledger) OR already in R2 -> no-op.
         if stamp in self.published or self.r2.head(key):
@@ -440,7 +444,8 @@ class S1Ingest:
             self.gate.seed_complete(stamp)
             self.published.setdefault(stamp, "SKIP")
             self.stats.no_data += 1
-            log.info("no-data slot %s (%s): %s", slot.slot_id, source, e)
+            log.info("no-data slot %s (%s): %s",
+                     SRC.slot_label(self.source, slot), source, e)
             return "no-data"
 
         # Verify the render resolved the SLOT WE ASKED FOR. The render service's
@@ -482,8 +487,9 @@ class S1Ingest:
         return "rendered"
 
     def _write_latest_times(self) -> None:
-        lt = S.build_latest_times(self.published.keys(), self.prefix, self._now())
-        self.r2.put_json(S.latest_times_key(self.prefix), lt, CACHE_MANIFEST)
+        pp = self.source.product_path
+        lt = S.build_latest_times(self.published.keys(), self.prefix, self._now(), pp)
+        self.r2.put_json(S.latest_times_key(self.prefix, pp), lt, CACHE_MANIFEST)
 
     # -- SQS consume (primary path) ------------------------------------------
     def consume_once(self, wait_s: int = SQS_WAIT_S) -> int:
@@ -524,34 +530,31 @@ class S1Ingest:
         handle = m.get("ReceiptHandle")
         recv_count = int(m.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
         key = S.extract_object_key(body)
-        slot = S.parse_goes_key(key) if key else None
+        slot = SRC.parse(self.source, key) if key else None
 
         # Not our product (parsed-key filter, INDEPENDENT of the SNS filter):
         # ack it (it is not ours and never will be) and move on.
-        if not S.is_s1_slot(slot):
+        if not SRC.is_ours(self.source, slot):
             self.stats.not_ours += 1
             if handle:
                 self._safe_delete(handle)
-            log.debug("drop non-S1 message key=%s", key)
+            log.debug("drop non-%s message key=%s", self.source.key, key)
             return
 
         # Surface a slot climbing toward the DLQ BEFORE it gets there (§3.5).
         if recv_count >= RECEIVE_COUNT_WARN:
             log.warning("slot %s nearing DLQ (ApproximateReceiveCount=%d)",
-                        slot.slot_id, recv_count)
+                        SRC.slot_label(self.source, slot), recv_count)
 
-        # Completeness gate: clean-IR meso = 1 band; the C13 object completes the
-        # slot immediately. Key the gate by slot.stamp -- the SAME key
-        # process_slot/cold_start/prune use, so the ledger is consistent and
-        # prune actually reclaims it (keying by slot_id here leaked, since
-        # slot_id embeds the band and prune forgets by stamp). NOTE for S3
-        # multi-band/multi-sector reuse: key by (sat, sector, stamp) without the
-        # band, so all bands of one scan accrue under one slot and M1/M2 stay
-        # distinct -- stamp alone suffices for single-sector single-band S1.
-        self.gate.mark(slot.stamp, slot.band)
-        if not self.gate.is_complete(slot.stamp):
-            # Incomplete: ack THIS band's message (it landed; backfill/other-band
-            # events will complete it). For S1 this branch never hits (1 band).
+        # Completeness gate, keyed by slot.stamp (the SAME key process_slot/
+        # cold_start/prune use). ABI: 1 band -> the C13 object completes the slot
+        # immediately. AHI FLDK: 10 segments -> complete ONLY when the last
+        # segment lands (the southern-segment lesson -- never a half-scan). An
+        # incomplete segment is acked (it landed); a restart gap or an SNS-dropped
+        # segment is re-detected by the backfill, which renders a scan only once
+        # all its segments are on NOAA.
+        self.gate.mark(SRC.gate_key(slot), SRC.gate_item(self.source, slot))
+        if not self.gate.is_complete(SRC.gate_key(slot)):
             if handle:
                 self._safe_delete(handle)
             return
@@ -563,7 +566,7 @@ class S1Ingest:
             self.stats.render_fail += 1
             self.health["sqs"].last_error = f"process: {type(e).__name__}: {e}"
             log.warning("process slot %s FAILED (recv=%d, will redeliver->DLQ@5): %s",
-                        slot.slot_id, recv_count, e)
+                        SRC.slot_label(self.source, slot), recv_count, e)
             return  # do NOT delete -> SQS redelivers -> DLQ after maxReceiveCount
         # rendered / duplicate / no-data / stale -> delete (PUT done or N/A).
         if handle:
@@ -611,12 +614,14 @@ class S1Ingest:
                 outcome = "no-data"
             except Exception as e:  # noqa: BLE001
                 self.stats.render_fail += 1
-                log.warning("backfill render %s FAILED: %s", slot.slot_id, e)
+                log.warning("backfill render %s FAILED: %s",
+                            SRC.slot_label(self.source, slot), e)
                 continue
             if outcome == "rendered":
                 self.stats.backfilled += 1
                 n += 1
-                log.info("backfilled slot %s (SQS never delivered)", slot.slot_id)
+                log.info("backfilled slot %s (SQS never delivered)",
+                         SRC.slot_label(self.source, slot))
             if newest is None or slot.scan_start > newest:
                 newest = slot.scan_start
         if newest is not None:
@@ -636,7 +641,8 @@ class S1Ingest:
                        if dt.datetime.strptime(s, S.STAMP_FMT).replace(tzinfo=UTC) < cutoff]
         if not dead_stamps:
             return 0
-        self.r2.delete([S.shadow_frame_key(self.prefix, s) for s in dead_stamps])
+        self.r2.delete([S.shadow_frame_key(self.prefix, s, self.source.product_path)
+                        for s in dead_stamps])
         for s in dead_stamps:
             self.published.pop(s, None)
             self.gate.forget(s)
@@ -657,7 +663,8 @@ class S1Ingest:
         return {
             "poller": "s1-ingest",
             "enabled": S1_ENABLED,
-            "product": S.S1_PRODUCT_PATH,
+            "source": self.source.key,
+            "product": self.source.product_path,
             "prefix": self.prefix,
             "generated_utc": iso_z(now),
             "stale_after_s": STALE_AFTER_S,
@@ -718,7 +725,9 @@ def _emit_health(worker: S1Ingest) -> None:
     except OSError as e:
         log.warning("health file write failed: %s", e)
     try:
-        worker.r2.put_json(S.health_key(worker.prefix), snap, CACHE_MANIFEST)
+        worker.r2.put_json(
+            S.health_key(worker.prefix, worker.source.product_path),
+            snap, CACHE_MANIFEST)
     except Exception as e:  # noqa: BLE001
         log.warning("health R2 write failed: %s", e)
 
@@ -739,13 +748,22 @@ def _watchdog(worker: S1Ingest) -> None:
 
 def _build_worker() -> S1Ingest:
     session = requests.Session()
-    session.headers["User-Agent"] = "tat-s1-ingest/1.0"
+    session.headers["User-Agent"] = f"tat-s1-ingest/1.0 ({SOURCE.key})"
+    src = SOURCE
+    # Extent: ABI discovers each scan's geo extent from the object; AHI FLDK uses
+    # a fixed WPAC extent (the full disk doesn't move).
+    if src.extent_mode == "fixed":
+        fixed = list(src.fixed_bbox)
+        extent_fn = lambda s3_key: list(fixed)            # noqa: E731
+    else:
+        extent_fn = lambda s3_key: read_object_extent(s3_key, src.bucket)  # noqa: E731
     return S1Ingest(
         r2=R2(),
         sqs=SQS(S1_QUEUE_URL),
-        render_fn=lambda bbox, time_iso: call_render_slot(session, bbox, time_iso),
-        extent_fn=read_object_extent,
-        ground_truth_fn=list_ground_truth,
+        render_fn=lambda bbox, time_iso: call_render_slot(session, src, bbox, time_iso),
+        extent_fn=extent_fn,
+        ground_truth_fn=lambda lookback: list_ground_truth(src, lookback),
+        source=src,
     )
 
 
@@ -764,9 +782,10 @@ def run() -> None:
         raise SystemExit(1)
 
     worker = _build_worker()
-    log.info("s1 ingest starting | queue=%s | render=%s | bucket=%s prefix=%s | "
-             "product=%s", S1_QUEUE_URL, RENDER_URL, R2_BUCKET, R2_PREFIX,
-             S.S1_PRODUCT_PATH)
+    log.info("s1 ingest starting | source=%s | queue=%s | render=%s | "
+             "bucket=%s prefix=%s | product=%s | completeness=%d", SOURCE.key,
+             S1_QUEUE_URL, RENDER_URL, SOURCE.bucket, R2_PREFIX,
+             SOURCE.product_path, SOURCE.required_segments)
     worker.cold_start()
     threading.Thread(target=_watchdog, args=(worker,), name="s1-watchdog",
                      daemon=True).start()

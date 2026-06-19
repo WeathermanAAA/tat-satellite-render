@@ -110,10 +110,11 @@ class Slot:
     """One parsed GOES CMIPM object: its product/sector/band/satellite + the
     canonical s-slot scan-start. ``stamp`` keys the R2 frame + the ledger."""
     s3_key: str
-    sector_token: str       # "CMIPM1" | "CMIPM2"
-    band: int               # ABI band number (e.g. 13)
-    sat: str                # "19"
+    sector_token: str       # ABI: "CMIPM1"/"CMIPM2"; AHI: "FLDK"
+    band: int               # ABI band number / AHI band number (e.g. 13)
+    sat: str                # "19" / "18" / "H09"
     scan_start: dt.datetime
+    segment: Optional[int] = None   # AHI HSD segment number (None for ABI single-object)
 
     @property
     def stamp(self) -> str:
@@ -163,18 +164,21 @@ def is_s1_slot(slot: Optional[Slot]) -> bool:
 # Deterministic R2 keys (idempotency: a re-delivered event or a racing backfill
 # resolves to the SAME key -> overwrite/skip is a no-op; §3.3)
 # ---------------------------------------------------------------------------
-def shadow_frame_key(prefix: str, stamp: str) -> str:
-    """shadow/sat/goes19/meso2/ir/{stamp}.webp"""
-    return f"{prefix.strip('/')}/{S1_PRODUCT_PATH}/{stamp}.webp"
+def shadow_frame_key(prefix: str, stamp: str,
+                     product_path: str = S1_PRODUCT_PATH) -> str:
+    """{prefix}/{product_path}/{stamp}.webp (e.g. shadow/sat/goes19/meso2/ir/...).
+    ``product_path`` lets the multi-sat layer (s1_sources) key goes18/himawari9
+    products without changing this proven helper; default keeps GOES-19 exact."""
+    return f"{prefix.strip('/')}/{product_path}/{stamp}.webp"
 
 
-def latest_times_key(prefix: str) -> str:
-    """shadow/sat/goes19/meso2/ir/latest_times.json (the §4.1 SSOT)."""
-    return f"{prefix.strip('/')}/{S1_PRODUCT_PATH}/latest_times.json"
+def latest_times_key(prefix: str, product_path: str = S1_PRODUCT_PATH) -> str:
+    """{prefix}/{product_path}/latest_times.json (the §4.1 SSOT)."""
+    return f"{prefix.strip('/')}/{product_path}/latest_times.json"
 
 
-def health_key(prefix: str) -> str:
-    return f"{prefix.strip('/')}/sat/{S1_SAT_KEY}/{S1_SECTOR_KEY}/{S1_BAND_KEY}/health.json"
+def health_key(prefix: str, product_path: str = S1_PRODUCT_PATH) -> str:
+    return f"{prefix.strip('/')}/{product_path}/health.json"
 
 
 def prod_frame_key(stamp: str) -> str:
@@ -200,14 +204,15 @@ def stamp_from_frame_key(key: str) -> Optional[str]:
 
 
 def build_latest_times(stamps: Iterable[str], prefix: str,
-                       as_of: dt.datetime) -> dict:
+                       as_of: dt.datetime,
+                       product_path: str = S1_PRODUCT_PATH) -> dict:
     """The §4.1 manifest-SSOT for a single-frame product: a path template + the
     sorted time list + latest + as_of. The viewer derives every URL from the
     template; no per-frame key list, no bucket listing."""
     times = sorted(set(stamps))
     return {
-        "product": S1_PRODUCT_PATH,
-        "path": f"{S1_PRODUCT_PATH}/{{t}}.webp",
+        "product": product_path,
+        "path": f"{product_path}/{{t}}.webp",
         "tile": None,
         "times": times,
         "latest": times[-1] if times else None,
