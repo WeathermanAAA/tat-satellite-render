@@ -1045,7 +1045,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   /* Right-click "copy as PNG" affordance (overview plots) + the result toast. */
-  svg.cl-copyable, img.cl-copyable { cursor: context-menu; }
+  .cl-copyable { cursor: context-menu; }  /* svg, img, AND the stage divs */
   .cl-toast { position: fixed; left: 50%; bottom: 26px;
     transform: translateX(-50%) translateY(10px);
     background: #0d1626; color: #eaf2ff; border: 1px solid #2b3b57;
@@ -5376,8 +5376,16 @@ HTML_TEMPLATE = r"""<!doctype html>
   var SC = 2;                  // @2x -- it's a shareable
   var HEAD = 30, FOOT = 26;    // logical-px header/footer bands (x SC on canvas)
   var FONT = "system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
-  var PLOTS = [["advcone", 0], ["intensity", 0], ["chart", 0],
-               ["trackplot", 0], ["swathplot", 0], ["sst-hero-img", 1]];
+  // kind: "stage" = SVG + positioned HTML overlays (capture the whole stage so
+  // the title lockup / legends / stat box come along); "svg" = self-contained
+  // SVG (all chrome is in-SVG); "hero" = the SST hero (a baked <img> + overlays).
+  var PLOTS = [["advcone", "stage"], ["trackplot", "stage"], ["swathplot", "stage"],
+               ["intensity", "svg"], ["chart", "svg"], ["sst-hero-img", "hero"]];
+  // Clean section titles for the header band (track/swath have no card <h3> --
+  // their head lives in the in-stage lockup, which the band must not duplicate).
+  var TITLES = {advcone: "Forecast cone", intensity: "Intensity forecast",
+    chart: "Wind & pressure", trackplot: "Track history",
+    swathplot: "Wind swath", "sst-hero-img": "Sea surface temperature"};
   var STYLE_PROPS = ["fill", "fill-opacity", "stroke", "stroke-width",
     "stroke-dasharray", "stroke-linecap", "stroke-linejoin", "stroke-opacity",
     "opacity", "font-family", "font-size", "font-weight", "font-style",
@@ -5394,16 +5402,38 @@ HTML_TEMPLATE = r"""<!doctype html>
     t._h = setTimeout(function () { t.classList.remove("show"); }, 1900);
   }
   function titleFor(el) {
-    var card = el.closest && (el.closest(".card") ||
-      el.closest(".adv-cone-stage") || el.closest("[id^='card-']"));
-    var h = card && card.querySelector && card.querySelector("h3");
-    if (!h) {
-      var p = el.parentElement;
-      for (var i = 0; i < 4 && p; i++, p = p.parentElement) {
-        h = p.querySelector && p.querySelector("h3"); if (h) break;
+    return TITLES[el.id] || el.getAttribute("aria-label") || "CycloLab";
+  }
+  function stageFor(el) {
+    return (el.closest && (el.closest(".adv-cone-stage") ||
+      el.closest(".map-stage") || el.closest(".sst-hero"))) || null;
+  }
+  // The page CSS, MINUS @font-face + @media (brace-balanced): no external font
+  // fetch (-> no canvas taint) and no responsive reflow inside the foreignObject.
+  function stripAt(css, at) {
+    var out = "", i = 0;
+    while (i < css.length) {
+      var idx = css.indexOf(at, i);
+      if (idx < 0) { out += css.slice(i); break; }
+      out += css.slice(i, idx);
+      var b = css.indexOf("{", idx);
+      if (b < 0) { i = idx + at.length; continue; }
+      var depth = 1, j = b + 1;
+      while (j < css.length && depth > 0) {
+        if (css[j] === "{") depth++; else if (css[j] === "}") depth--;
+        j++;
       }
+      i = j;
     }
-    return (h && h.textContent.trim()) || el.getAttribute("aria-label") || "CycloLab";
+    return out;
+  }
+  var _css = null;
+  function pageCss() {
+    if (_css != null) return _css;
+    var raw = "", ss = document.querySelectorAll("style");
+    for (var i = 0; i < ss.length; i++) raw += ss[i].textContent + "\n";
+    _css = stripAt(stripAt(raw, "@font-face"), "@media");
+    return _css;
   }
   // Inline the live computed styles onto the clone -- the plots style via page
   // CSS classes (fills/fonts), which a standalone serialized SVG would lose.
@@ -5423,7 +5453,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) return [vb[2], vb[3]];
     var r = svg.getBoundingClientRect(); return [r.width || 1000, r.height || 600];
   }
-  function compose(img, sw, sh, title, done) {
+  function compose(img, sw, sh, title, done, guard) {
     var hb = HEAD * SC, fb = FOOT * SC, pw = sw * SC, ph = sh * SC;
     var cv = document.createElement("canvas");
     cv.width = pw; cv.height = hb + ph + fb;
@@ -5437,6 +5467,22 @@ HTML_TEMPLATE = r"""<!doctype html>
     ctx.font = "600 " + (11 * SC) + "px " + FONT;
     ctx.fillText("CycloLab", pw - 11 * SC, hb / 2);
     try { ctx.drawImage(img, 0, hb, pw, ph); } catch (e) { done(null); return; }
+    // guard (foreignObject path only): a Safari blank-render or a taint must NOT
+    // silently deliver a blank/failed PNG -- bail to the caller's fallback.
+    // getImageData throws on a tainted canvas; a uniform mid-strip = a blank
+    // render (a real plot's middle always crosses content).
+    if (guard) {
+      try {
+        var mid = ctx.getImageData(0, hb + Math.floor(ph / 2), pw, 2).data;
+        var uniform = true;
+        for (var k = 4; k < mid.length; k += 4) {
+          if (mid[k] !== mid[0] || mid[k + 1] !== mid[1] || mid[k + 2] !== mid[2]) {
+            uniform = false; break;
+          }
+        }
+        if (uniform) { done(null); return; }
+      } catch (e) { done(null); return; }
+    }
     var fy = hb + ph + fb / 2;
     ctx.fillStyle = "#7fa6d8"; ctx.textAlign = "left";
     ctx.font = "600 " + (11 * SC) + "px " + FONT;
@@ -5495,14 +5541,103 @@ HTML_TEMPLATE = r"""<!doctype html>
     img.onerror = function () { toast("Copy failed"); };
     img.src = u;
   }
+  // Capture the WHOLE stage (SVG + the positioned HTML overlays -- title lockup,
+  // wind-key/SSHS legend, stat box, marker glyphs) via a foreignObject clone, so
+  // the copied PNG matches what's on screen. prep(clone) may mutate the clone
+  // (the SST hero inlines its <img> as a data-URL). On ANY failure (Safari's
+  // foreignObject->canvas is unreliable; a taint; an empty stage) fall back to
+  // `fallback()` -- the prior SVG-only / bare-img path, so the copy is never
+  // WORSE than before, only better.
+  function renderStage(stage, title, fallback, prep) {
+    var r = stage.getBoundingClientRect();
+    var W = Math.max(1, Math.round(r.width)), H = Math.max(1, Math.round(r.height));
+    if (W < 4 || H < 4) { fallback(); return; }
+    var clone = stage.cloneNode(true);
+    if (prep) prep(clone);
+    // Pin the inner plot SVG to the stage box: #trackplot/#swathplot are sized in
+    // vh (clamp(...,56vh,...)), which re-resolves against the FO viewport (not the
+    // page) and would shrink the map away from its overlays. 100% tracks the
+    // pinned stage. (advcone is already height:100%; the SST hero has no inner svg.)
+    var isvg = clone.querySelector && clone.querySelector("svg");
+    if (isvg) isvg.style.cssText = "width:100%;height:100%;display:block;" + (isvg.style.cssText || "");
+    // Pin exact px so the foreignObject doesn't reflow on vh/clamp/% rules.
+    clone.style.cssText = "position:relative;width:" + W + "px;height:" + H +
+      "px;margin:0;overflow:hidden;" + (clone.style.cssText || "");
+    // Carry the live per-category custom props onto the wrapper: the cloned
+    // overlays use var(--cat-accent)/--ac-rail etc. (set on <html data-cat=...>),
+    // which would otherwise fall back to the :root default inside the FO.
+    var ds = window.getComputedStyle(document.documentElement), vars = "";
+    ["--cat-accent", "--cat-ink", "--cat-ramp", "--ac-rail"].forEach(function (k) {
+      var v = ds.getPropertyValue(k); if (v) vars += k + ":" + v.trim() + ";";
+    });
+    // Suppress animations/transitions: a data:-URL SVG renders CSS animations
+    // FROZEN at t=0, so entrance anims (.ac-icon ac-pop -> scale(0)/opacity(0))
+    // would capture INVISIBLE; the reduced-motion escape lives in a stripped
+    // @media. animation:none -> each element renders at its settled base.
+    var settle = "*{animation:none!important;transition:none!important}";
+    var body = '<div xmlns="http://www.w3.org/1999/xhtml" style="width:' + W +
+      'px;height:' + H + 'px;overflow:hidden;background:#101a2c;' + vars + '"><style>' +
+      pageCss() + settle + '</style>' + new XMLSerializer().serializeToString(clone) + '</div>';
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (W * SC) +
+      '" height="' + (H * SC) + '" viewBox="0 0 ' + W + ' ' + H +
+      '"><foreignObject width="' + W + '" height="' + H + '">' + body +
+      '</foreignObject></svg>';
+    var img = new Image();
+    img.onload = function () {
+      if (!img.naturalWidth || !img.naturalHeight) { fallback(); return; }  // Safari blank-load
+      compose(img, W, H, title, function (b) { if (b) deliver(b, title); else fallback(); }, true);
+    };
+    img.onerror = function () { fallback(); };
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  }
+  function copyStage(stage, svg, title) {
+    renderStage(stage, title, function () { copySvg(svg); });  // fallback: SVG only
+  }
+  function copyHero(stage, imgEl, title) {
+    var src = imgEl.currentSrc || imgEl.src || "";
+    var fb = function () { copyImg(imgEl); };                  // fallback: bare raster
+    if (!src) { fb(); return; }
+    var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1";
+    // Inline the hero PNG as a data-URL so the foreignObject has no external
+    // fetch (a cross-origin <img> in a foreignObject taints the canvas).
+    fetch(u, { mode: "cors" }).then(function (r) {
+      if (!r.ok) throw new Error("hero fetch " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      var fr = new FileReader();
+      fr.onload = function () {
+        var dataUrl = fr.result;
+        renderStage(stage, title, fb, function (clone) {
+          var imgs = clone.querySelectorAll ? clone.querySelectorAll("img") : [];
+          for (var i = 0; i < imgs.length; i++) {
+            imgs[i].setAttribute("src", dataUrl);
+            imgs[i].removeAttribute("srcset");
+            imgs[i].removeAttribute("crossorigin");
+          }
+        });
+      };
+      fr.onerror = fb;
+      fr.readAsDataURL(blob);
+    }).catch(fb);
+  }
   function wire() {
     PLOTS.forEach(function (p) {
       var el = document.getElementById(p[0]);
       if (!el) return;
-      el.classList.add("cl-copyable");
-      el.addEventListener("contextmenu", function (e) {
+      var kind = p[1], stage = stageFor(el);
+      // Wire the gesture on the STAGE for overlay/hero plots (it catches a
+      // right-click anywhere in the stage, incl. one that falls THROUGH the
+      // pointer-events:none SST img); on the SVG itself for self-contained plots.
+      var target = (kind === "svg" || !stage) ? el : stage;
+      target.classList.add("cl-copyable");
+      target.addEventListener("contextmenu", function (e) {
         e.preventDefault();
-        try { (p[1] ? copyImg : copySvg)(el); } catch (err) { toast("Copy failed"); }
+        var title = titleFor(el);
+        try {
+          if (kind === "hero") copyHero(stage || el, el, title);
+          else if (kind === "stage" && stage) copyStage(stage, el, title);
+          else copySvg(el);
+        } catch (err) { toast("Copy failed"); }
       });
     });
   }
