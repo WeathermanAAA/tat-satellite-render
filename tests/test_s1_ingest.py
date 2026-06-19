@@ -105,6 +105,15 @@ class FailingPutR2(FakeR2):
         return super().put_bytes(key, data, content_type, cache)
 
 
+class FailingProdPutR2(FakeR2):
+    """Shadow PUTs succeed; the PROD meso key PUT fails (the cutover never-miss
+    edge: prod failure must NOT ack the slot)."""
+    def put_bytes(self, key, data, content_type, cache):
+        if key.startswith(S.S1_PROD_PRODUCT_PATH):
+            return False
+        return super().put_bytes(key, data, content_type, cache)
+
+
 @mock_aws
 class S1IngestTest(unittest.TestCase):
     def setUp(self):
@@ -131,7 +140,7 @@ class S1IngestTest(unittest.TestCase):
         return int(a["Attributes"]["ApproximateNumberOfMessages"])
 
     def _worker(self, render=None, r2=None, ground_truth=None, extent=None,
-                clock=None):
+                clock=None, prod_write=False):
         return W.S1Ingest(
             r2=r2 or FakeR2(),
             sqs=W.SQS(self.q_url),
@@ -140,6 +149,7 @@ class S1IngestTest(unittest.TestCase):
             ground_truth_fn=ground_truth or (lambda lookback: []),
             prefix="shadow",
             clock=clock or W.utcnow,
+            prod_write=prod_write,
         )
 
     # -- happy path: render + publish + delete -------------------------------
@@ -335,6 +345,63 @@ class S1IngestTest(unittest.TestCase):
         w.consume_once(wait_s=1)
         self.assertEqual(render.calls, [])               # idempotent post-cold-start
         self.assertEqual(w.stats.duplicates, 1)
+
+    # -- prod cutover (S1_PROD_WRITE): dual-write shadow + prod meso key -------
+    def test_prod_write_dual_writes_both_keys(self):
+        self._send(raw_event(C13_A))
+        r2 = FakeR2()
+        render = RenderStub()
+        w = self._worker(render=render, r2=r2, prod_write=True)
+        w.consume_once(wait_s=1)
+        self.assertEqual(w.stats.rendered, 1)
+        self.assertEqual(len(render.calls), 1)             # rendered ONCE
+        shadow_key = S.shadow_frame_key("shadow", "20260618T210057Z")
+        prod_key = S.prod_frame_key("20260618T210057Z")
+        self.assertIn(shadow_key, r2.store)                # shadow frame
+        self.assertIn(prod_key, r2.store)                  # prod meso frame
+        self.assertEqual(prod_key, "meso/goes19-m2/ir/20260618T210057Z.webp")
+        self.assertEqual(r2.store[shadow_key], r2.store[prod_key])  # identical bytes
+        self.assertIn(S.latest_times_key("shadow"), r2.store)       # SSOT still shadow
+        self.assertEqual(self._q_count(self.q_url), 0)     # acked (both PUTs ok)
+
+    def test_prod_put_failure_does_not_ack(self):
+        # Shadow PUT ok, PROD PUT fails -> raise -> message NOT acked (redeliver).
+        self._send(raw_event(C13_A))
+        r2 = FailingProdPutR2()
+        w = self._worker(r2=r2, prod_write=True)
+        w.consume_once(wait_s=1)
+        self.assertEqual(w.stats.rendered, 0)
+        self.assertGreaterEqual(w.stats.put_fail, 1)
+        self.assertNotIn(S.prod_frame_key("20260618T210057Z"), r2.store)
+        self.assertNotIn("20260618T210057Z", w.published)  # not marked published
+        self.assertEqual(self._q_count(self.q_url), 1)     # NOT acked -> retry/DLQ
+
+    def test_prod_idempotent_when_both_present(self):
+        r2 = FakeR2()
+        r2.store[S.shadow_frame_key("shadow", "20260618T210057Z")] = b"x"
+        r2.store[S.prod_frame_key("20260618T210057Z")] = b"x"
+        self._send(raw_event(C13_A))
+        render = RenderStub()
+        w = self._worker(render=render, r2=r2, prod_write=True)
+        w.consume_once(wait_s=1)
+        self.assertEqual(render.calls, [])                 # both present -> no render
+        self.assertEqual(w.stats.duplicates, 1)
+        self.assertEqual(self._q_count(self.q_url), 0)     # acked
+
+    def test_prod_backfills_missing_prod_when_shadow_present(self):
+        # Cutover just enabled: shadow exists (from before), prod missing -> render
+        # and write ONLY the missing prod key (shadow not re-PUT).
+        r2 = FakeR2()
+        r2.store[S.shadow_frame_key("shadow", "20260618T210057Z")] = b"old-shadow"
+        self._send(raw_event(C13_A))
+        render = RenderStub()
+        w = self._worker(render=render, r2=r2, prod_write=True)
+        w.consume_once(wait_s=1)
+        self.assertEqual(len(render.calls), 1)             # re-rendered for prod
+        self.assertIn(S.prod_frame_key("20260618T210057Z"), r2.store)
+        self.assertEqual(r2.store[S.shadow_frame_key("shadow", "20260618T210057Z")],
+                         b"old-shadow")                    # shadow untouched
+        self.assertEqual(self._q_count(self.q_url), 0)
 
     # -- stale-slot guard: ancient backlog acked, not rendered ----------------
     def test_stale_slot_acked_not_rendered(self):

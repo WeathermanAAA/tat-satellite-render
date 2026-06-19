@@ -116,6 +116,31 @@ def _env_bool(name: str, default: bool) -> bool:
 # Global kill switch. False -> idle, write nothing.
 MESO_ENABLED = _env_bool("MESO_ENABLED", True)
 
+
+def _parse_adopt(spec: str | None) -> set[tuple[str, str]]:
+    """Parse a MESO_ADOPT_EXTERNAL spec ("goes19-m2:ir,goes18-m2:ir") into a set
+    of (slug, band_key) pairs whose FRAMES are produced by an external writer
+    (the S1 event-driven ingest), not this poller's own /render."""
+    out: set[tuple[str, str]] = set()
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if ":" in tok:
+            slug, band = tok.split(":", 1)
+            slug, band = slug.strip(), band.strip()
+            if slug and band:
+                out.add((slug, band))
+    return out
+
+
+# Adopt-external (the S1 shadow->prod cutover): (sector,band) units whose frames
+# the S1 ingest writes to meso/<slug>/<band>/ instead of this poller. For those
+# units the poller STOPS rendering and instead ADOPTS the R2-present frames into
+# its memory-authoritative manifest each hot cycle (~60 s), so the manifest stays
+# the single writer's own + hot-fresh; the periodic reconcile is the slow
+# backstop. Default empty -> no change (the poller renders every band as before).
+# Reverse the cutover by clearing this var (the poller resumes rendering).
+MESO_ADOPT_EXTERNAL = _parse_adopt(_env("MESO_ADOPT_EXTERNAL", ""))
+
 # /render base. Prefer Railway private networking, e.g.
 #   http://tat-satellite-render.railway.internal:8080
 # Falls back to the public URL (then set RATE_MIN_SPACING_S=7).
@@ -748,6 +773,10 @@ class Lane:
 class MesoPoller:
     def __init__(self) -> None:
         self.r2 = R2()
+        # (slug,band) units adopted from an external writer (S1 prod cutover):
+        # not rendered, their frames are merged from R2 each cycle. Instance copy
+        # so tests can set it without the module env.
+        self.adopt_external = set(MESO_ADOPT_EXTERNAL)
         self.units: dict[tuple[str, str], Unit] = {}
         # Per-sector last-known-good extent (preserved on a discovery failure).
         # Written by the main (discovery) thread, read by the lane threads --
@@ -982,8 +1011,63 @@ class MesoPoller:
 
     # ---- one unit -------------------------------------------------------
 
+    def adopt_unit(self, u: Unit) -> None:
+        """Adopt externally-produced frames (the S1 ingest writing
+        meso/<slug>/<band>/) into the memory-authoritative manifest: list R2 for
+        this (sector,band), merge any frames not already in the manifest, prune,
+        and write. The poller stays the SOLE manifest writer -- it just SOURCES
+        these frames from R2 instead of /render -- and owns their retention (S1
+        does not prune the prod keys). A listing failure is a no-op (the next
+        cycle / the periodic reconcile re-grounds it); no new frames -> no write,
+        so an idle external band never churns the manifest."""
+        sector, band = u.sector, u.band
+        prefix = f"{R2_PREFIX}/{sector.slug}/{band.key}/"
+        try:
+            keys = self.r2.list_keys(prefix)
+        except Exception as e:  # noqa: BLE001 - transient list -> skip this cycle
+            log.warning("adopt list %s/%s failed: %s -- skipping cycle",
+                        sector.slug, band.key, e)
+            return
+        with self._manifest_lock:
+            man = self.manifests.get(sector.slug)
+            if man is None:
+                man = {"slug": sector.slug, "satellite": sector.satellite,
+                       "sector": sector.sector, "label": sector.label, "bands": {}}
+                self.manifests[sector.slug] = man
+            b = man.setdefault("bands", {}).setdefault(
+                band.key, {"label": band.label, "frames": []})
+            known = {f["key"] for f in b["frames"]}
+            added = 0
+            for k in keys:
+                if k in known:
+                    continue
+                t = frame_ts_from_key(k)
+                if t is None:
+                    continue
+                b["frames"].append({"t": iso_z(t), "key": k})
+                added += 1
+            if not added:
+                return  # nothing new -> no manifest churn
+            b["frames"].sort(key=lambda f: f["t"])
+            kept, deleted = prune_frames(b["frames"], utcnow())
+            b["frames"] = kept
+            b["label"] = band.label
+            b["latest"] = kept[-1]["key"] if kept else b.get("latest")
+            b["updated_utc"] = iso_z(utcnow())
+            man["generated_utc"] = iso_z(utcnow())
+            if self.r2.put_json(sector_manifest_key(sector.slug), man,
+                                CACHE_MANIFEST) and deleted:
+                self.r2.delete(deleted)
+        log.info("[adopt] %s/%s merged %d new external frame(s)",
+                 sector.slug, band.key, added)
+
     def process_unit(self, u: Unit, lane: Lane) -> None:
         sector, band = u.sector, u.band
+        # Adopted units are produced by an external writer (S1 prod cutover):
+        # never render them -- merge their R2 frames into the manifest instead.
+        if (sector.slug, band.key) in self.adopt_external:
+            self.adopt_unit(u)
+            return
         ext = self.extents.get(sector.slug)
         if ext is None:
             return  # sector has no discovered extent yet -> nothing to render

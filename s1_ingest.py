@@ -105,6 +105,15 @@ R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY") or _env("AWS_SECRET_ACCESS_KEY")
 R2_PREFIX = (_env("S1_R2_PREFIX", "shadow") or "shadow").strip("/")
 
+# Prod cutover (shadow -> prod): when true, every frame is ALSO written to the
+# prod meso key (S.prod_frame_key -> meso/goes19-m2/ir/{stamp}.webp) so the meso
+# poller can ADOPT S1's frames and retire its own goes19-m2/ir render lane. The
+# prod PUT is inside the never-miss success gate (a failed prod PUT does NOT ack
+# the SQS message -> redelivers -> idempotent retry), so the cutover is
+# never-miss too. Default OFF -> pure shadow, zero prod effect until the cutover
+# flips it on (paired with the meso poller's MESO_ADOPT_EXTERNAL).
+S1_PROD_WRITE = _env_bool("S1_PROD_WRITE", False)
+
 # Render service (dedicated s1-render container, byte-identical to the box's meso
 # render -- same image; isolated so S1 never contends with the meso hot/cold lanes).
 RENDER_URL = (_env("S1_RENDER_URL", "http://s1-render:8080") or "").rstrip("/") + "/render"
@@ -359,13 +368,15 @@ class S1Ingest:
 
     def __init__(self, *, r2, sqs, render_fn: Callable, extent_fn: Callable,
                  ground_truth_fn: Callable, prefix: str = R2_PREFIX,
-                 clock: Callable[[], dt.datetime] = utcnow) -> None:
+                 clock: Callable[[], dt.datetime] = utcnow,
+                 prod_write: bool = S1_PROD_WRITE) -> None:
         self.r2 = r2
         self.sqs = sqs
         self.render_fn = render_fn
         self.extent_fn = extent_fn
         self.ground_truth_fn = ground_truth_fn
         self.prefix = prefix
+        self.prod_write = prod_write
         self._now = clock
         self.gate = S.CompletenessGate(S.S1_REQUIRED_BANDS)
         # The ledger of published slots (a cache; R2 is truth -- reseeded on cold
@@ -412,7 +423,8 @@ class S1Ingest:
         Returns one of: rendered | duplicate | no-data. Raises on render/PUT
         failure (the caller must NOT ack so SQS redelivers -> DLQ after N)."""
         stamp = slot.stamp
-        key = S.shadow_frame_key(self.prefix, stamp)
+        shadow_key = S.shadow_frame_key(self.prefix, stamp)
+        prod_key = S.prod_frame_key(stamp) if self.prod_write else None
         # Stale-slot guard: a slot older than the retained window would be pruned
         # immediately anyway, so ack it without rendering. Bounds a deploy-day
         # thundering herd if the queue accreted a long backlog while the box was
@@ -423,8 +435,18 @@ class S1Ingest:
             log.info("stale slot %s older than %.0fh -- acked, not rendered",
                      slot.slot_id, RETAIN_H)
             return "stale"
-        # Idempotency: already published (in-ledger) OR already in R2 -> no-op.
-        if stamp in self.published or self.r2.head(key):
+        # Idempotency: a slot is fully published only when EVERY target key
+        # exists -- in prod-cutover mode that is the shadow key AND the prod meso
+        # key. In the ledger -> both already done. Otherwise head-check each
+        # target and render only if something is still missing (a re-delivered
+        # event / racing backfill re-PUTs nothing).
+        if stamp in self.published:
+            self.gate.seed_complete(stamp)
+            self.stats.duplicates += 1
+            return "duplicate"
+        need_shadow = not self.r2.head(shadow_key)
+        need_prod = bool(prod_key) and not self.r2.head(prod_key)
+        if not need_shadow and not need_prod:
             self.published.setdefault(stamp, "")
             self.gate.seed_complete(stamp)
             self.stats.duplicates += 1
@@ -465,11 +487,19 @@ class S1Ingest:
                 f"(s3fs listing not yet current); will retry")
 
         digest = hashlib.sha256(png).hexdigest()
-        if not self.r2.put_bytes(key, png, "image/webp", CACHE_FRAME):
+        # Write every MISSING target. ANY PUT failure -> raise (do NOT ack); SQS
+        # redelivers and the idempotent retry re-PUTs only what is still missing.
+        # The prod PUT inside this gate is what makes the cutover never-miss.
+        if need_shadow and not self.r2.put_bytes(shadow_key, png, "image/webp",
+                                                 CACHE_FRAME):
             self.stats.put_fail += 1
-            raise RenderError(f"R2 PUT failed for {key}")
+            raise RenderError(f"R2 PUT failed for {shadow_key}")
+        if need_prod and not self.r2.put_bytes(prod_key, png, "image/webp",
+                                               CACHE_FRAME):
+            self.stats.put_fail += 1
+            raise RenderError(f"R2 PUT failed for {prod_key}")
 
-        # PUT succeeded -> the slot is published. Update ledger + watermark + SSOT.
+        # PUTs succeeded -> the slot is published. Update ledger + watermark + SSOT.
         self.published[stamp] = digest
         self.gate.seed_complete(stamp)
         scan = slot.scan_start
@@ -478,7 +508,9 @@ class S1Ingest:
         self.stats.rendered += 1
         if write_manifest:
             self._write_latest_times()
-        log.info("published %s (%d B, %s, src=%s)", key, len(png), digest[:10], source)
+        log.info("published %s%s (%d B, %s, src=%s)", shadow_key,
+                 f" +prod {prod_key}" if need_prod else "",
+                 len(png), digest[:10], source)
         return "rendered"
 
     def _write_latest_times(self) -> None:
@@ -659,6 +691,7 @@ class S1Ingest:
             "enabled": S1_ENABLED,
             "product": S.S1_PRODUCT_PATH,
             "prefix": self.prefix,
+            "prod_write": self.prod_write,
             "generated_utc": iso_z(now),
             "stale_after_s": STALE_AFTER_S,
             "healthy": healthy,
@@ -765,8 +798,9 @@ def run() -> None:
 
     worker = _build_worker()
     log.info("s1 ingest starting | queue=%s | render=%s | bucket=%s prefix=%s | "
-             "product=%s", S1_QUEUE_URL, RENDER_URL, R2_BUCKET, R2_PREFIX,
-             S.S1_PRODUCT_PATH)
+             "product=%s | prod_write=%s%s", S1_QUEUE_URL, RENDER_URL, R2_BUCKET,
+             R2_PREFIX, S.S1_PRODUCT_PATH, S1_PROD_WRITE,
+             f" -> {S.S1_PROD_PRODUCT_PATH}" if S1_PROD_WRITE else "")
     worker.cold_start()
     threading.Thread(target=_watchdog, args=(worker,), name="s1-watchdog",
                      daemon=True).start()

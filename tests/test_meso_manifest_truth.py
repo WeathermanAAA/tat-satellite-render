@@ -176,5 +176,87 @@ class AppendFrameMemoryAuthorityTests(unittest.TestCase):
         self.assertEqual(man["bands"][band.key]["last_hash"], "h-new")
 
 
+class AdoptExternalTests(unittest.TestCase):
+    """The S1 shadow->prod cutover: the poller stops rendering goes19-m2/ir and
+    ADOPTS S1's externally-written frames into its memory-authoritative manifest.
+    """
+    def setUp(self):
+        self.sector = next(s for s in mp.MESO_SECTORS if s.slug == "goes19-m2")
+        self.band = next(b for b in mp.BANDS if b.key == "ir")
+        self.slug = self.sector.slug
+        self.now = mp.utcnow()
+        self.unit = mp.Unit(sector=self.sector, band=self.band)
+
+    def _ext_key(self, t):
+        # the key shape S1 prod-writes: meso/goes19-m2/ir/<stamp>.webp
+        return f"{mp.R2_PREFIX}/{self.slug}/{self.band.key}/{_stamp(t)}.webp"
+
+    def test_parse_adopt_spec(self):
+        self.assertEqual(mp._parse_adopt("goes19-m2:ir"), {("goes19-m2", "ir")})
+        self.assertEqual(mp._parse_adopt("goes19-m2:ir, goes18-m2:ir"),
+                         {("goes19-m2", "ir"), ("goes18-m2", "ir")})
+        self.assertEqual(mp._parse_adopt(""), set())
+        self.assertEqual(mp._parse_adopt(None), set())
+        self.assertEqual(mp._parse_adopt("garbage,:,x:"), set())
+
+    def test_adopt_merges_external_frames(self):
+        times = [self.now - dt.timedelta(minutes=m) for m in (3, 2, 1)]
+        stored = [self._ext_key(t) for t in times]
+        fake = FakeR2(storage=stored)
+        p = _bare_poller(fake)
+        p.adopt_unit(self.unit)
+        man = fake.put[mp.sector_manifest_key(self.slug)]
+        keys = [f["key"] for f in man["bands"][self.band.key]["frames"]]
+        self.assertEqual(keys, sorted(stored))
+        self.assertEqual(man["bands"][self.band.key]["latest"], sorted(stored)[-1])
+        self.assertEqual(p.manifests[self.slug], man)     # memory-authoritative
+
+    def test_adopt_idempotent_no_churn(self):
+        stored = [self._ext_key(self.now - dt.timedelta(minutes=1))]
+        fake = FakeR2(storage=stored)
+        p = _bare_poller(fake)
+        p.adopt_unit(self.unit)
+        fake.put.clear()                                  # forget the first write
+        p.adopt_unit(self.unit)                           # nothing new arrived
+        self.assertEqual(fake.put, {})                    # no manifest re-write
+
+    def test_adopt_prunes_out_of_retention(self):
+        old = self.now - dt.timedelta(hours=mp.HISTORY_WINDOW_H + 2)
+        fresh = self.now - dt.timedelta(minutes=2)
+        k_old, k_new = self._ext_key(old), self._ext_key(fresh)
+        fake = FakeR2(storage=[k_old, k_new])
+        p = _bare_poller(fake)
+        p.adopt_unit(self.unit)
+        man = fake.put[mp.sector_manifest_key(self.slug)]
+        keys = [f["key"] for f in man["bands"][self.band.key]["frames"]]
+        self.assertEqual(keys, [k_new])
+        self.assertIn(k_old, fake.deleted)                # poller owns prod retention
+
+    def test_adopt_list_failure_is_noop(self):
+        fake = FakeR2(storage=[], fail_prefixes=(
+            f"{mp.R2_PREFIX}/{self.slug}/{self.band.key}/",))
+        p = _bare_poller(fake)
+        p.adopt_unit(self.unit)                           # must not raise
+        self.assertEqual(fake.put, {})
+
+    def test_process_unit_routes_adopted_band(self):
+        p = _bare_poller(FakeR2())
+        p.adopt_external = {(self.slug, self.band.key)}
+        p.extents = {}                                    # render path would early-return
+        called = []
+        p.adopt_unit = lambda u: called.append(u)
+        p.process_unit(self.unit, lane=None)
+        self.assertEqual(called, [self.unit])             # routed to adopt, not render
+
+    def test_process_unit_non_adopted_not_routed(self):
+        p = _bare_poller(FakeR2())
+        p.adopt_external = set()
+        p.extents = {}
+        called = []
+        p.adopt_unit = lambda u: called.append(u)
+        p.process_unit(self.unit, lane=None)              # render path: no extent -> return
+        self.assertEqual(called, [])                      # adopt NOT called
+
+
 if __name__ == "__main__":
     unittest.main()
