@@ -34,6 +34,7 @@ from botocore import UNSIGNED
 from botocore.config import Config as BotoConfig
 
 import s1_slots as S
+import s1_sources as SRC
 
 UTC = dt.timezone.utc
 CDN = "https://cdn.triple-a-tropics.com"
@@ -61,39 +62,44 @@ def audit_compare(ground_truth_stamps, published_stamps, no_data_stamps=()):
 # ---------------------------------------------------------------------------
 # NOAA ground truth (anonymous, no creds)
 # ---------------------------------------------------------------------------
-def list_noaa_ground_truth_detailed(start: dt.datetime, end: dt.datetime):
-    """ListObjectsV2 the NOAA CMIPM prefix (anonymous) across the window's hour
-    partitions; return [(stamp, noaa_lastmodified)] for CMIPM2-C13 in [start,end].
-    LastModified is the object's S3 publish time -> the latency baseline."""
+def list_noaa_ground_truth_detailed(src: SRC.SatSource, start: dt.datetime,
+                                    end: dt.datetime):
+    """ListObjectsV2 the source's NOAA prefixes (anonymous) across [start,end];
+    return [(stamp, noaa_lastmodified)] for its COMPLETE slots. ABI: each accepted
+    object is a complete slot. AHI FLDK: a stamp counts only when all 10 segments
+    are present (never a half-scan), and its LastModified is the NEWEST segment's
+    (when the scan became complete) -> the latency baseline."""
     s3 = boto3.client("s3", config=BotoConfig(signature_version=UNSIGNED))
-    out: dict[str, dt.datetime] = {}
-    h = start.replace(minute=0, second=0, microsecond=0)
-    while h <= end:
-        prefix = f"ABI-L2-CMIPM/{h.year}/{h.strftime('%j')}/{h.hour:02d}/"
+    # stamp -> {item: lastmodified}; complete when required.issubset(items).
+    acc: dict[str, dict] = {}
+    lookback_min = int((end - start).total_seconds() // 60) + 15
+    for prefix in SRC.noaa_prefixes(src, end, lookback_min):
         token = None
         while True:
-            kw = dict(Bucket=S.S1_BUCKET, Prefix=prefix)
+            kw = dict(Bucket=src.bucket, Prefix=prefix)
             if token:
                 kw["ContinuationToken"] = token
             resp = s3.list_objects_v2(**kw)
             for o in resp.get("Contents", []):
-                slot = S.parse_goes_key(o["Key"])
-                if S.is_s1_slot(slot) and start <= slot.scan_start <= end:
+                slot = SRC.parse(src, o["Key"])
+                if SRC.is_ours(src, slot) and start <= slot.scan_start <= end:
                     lm = o["LastModified"]
-                    if lm.tzinfo is None:
-                        lm = lm.replace(tzinfo=UTC)
-                    out[slot.stamp] = lm.astimezone(UTC)
+                    lm = (lm if lm.tzinfo else lm.replace(tzinfo=UTC)).astimezone(UTC)
+                    acc.setdefault(slot.stamp, {})[SRC.gate_item(src, slot)] = lm
             if resp.get("IsTruncated"):
                 token = resp.get("NextContinuationToken")
             else:
                 break
-        h += dt.timedelta(hours=1)
+    required = SRC.gate_required(src)
+    out = {st: max(items.values()) for st, items in acc.items()
+           if required.issubset(items.keys())}   # complete scans only
     return sorted(out.items())
 
 
-def list_noaa_ground_truth(start: dt.datetime, end: dt.datetime) -> list[str]:
+def list_noaa_ground_truth(src: SRC.SatSource, start: dt.datetime,
+                           end: dt.datetime) -> list[str]:
     """Just the stamps (on-box path)."""
-    return [s for s, _ in list_noaa_ground_truth_detailed(start, end)]
+    return [s for s, _ in list_noaa_ground_truth_detailed(src, start, end)]
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +131,14 @@ def _cdn_head_lastmod(url: str):
         return None
 
 
-def list_shadow_r2(prefix: str):
+def list_shadow_r2(prefix: str, product_path: str = S.S1_PRODUCT_PATH):
     """R2 ListObjectsV2 of the shadow product -> {stamp: put_time}."""
     s3 = boto3.client(
         "s3", endpoint_url=os.environ.get("R2_ENDPOINT"),
         aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"))
     bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
-    key_prefix = f"{prefix.strip('/')}/{S.S1_PRODUCT_PATH}/"
+    key_prefix = f"{prefix.strip('/')}/{product_path}/"
     out: dict[str, dt.datetime] = {}
     token = None
     while True:
@@ -152,11 +158,11 @@ def list_shadow_r2(prefix: str):
     return out
 
 
-def list_shadow_cdn(prefix: str):
+def list_shadow_cdn(prefix: str, product_path: str = S.S1_PRODUCT_PATH):
     """Public CDN latest_times.json -> {stamp: None} (no creds). Returns {} if the
     manifest is absent (worker not writing yet). PUT times are filled lazily via
     CDN HEAD by the caller (latency on a sample)."""
-    url = f"{CDN}/{S.latest_times_key(prefix)}"
+    url = f"{CDN}/{S.latest_times_key(prefix, product_path)}"
     try:
         body = _cdn_get(url)
     except urllib.error.HTTPError as e:
@@ -167,18 +173,19 @@ def list_shadow_cdn(prefix: str):
     return {st: None for st in times}
 
 
-def list_shadow_remote(prefix: str, latency_sample: int = 50):
+def list_shadow_remote(prefix: str, product_path: str = S.S1_PRODUCT_PATH,
+                       latency_sample: int = 50):
     """Shipped set for --remote: R2 creds if present (authoritative + per-frame
     PUT time), else the public CDN manifest (+ CDN HEAD latency on a sample).
     Returns ({stamp: put_time_or_None}, source_label)."""
     if _r2_creds_present():
-        return list_shadow_r2(prefix), "R2 ListObjectsV2 (creds)"
-    shipped = list_shadow_cdn(prefix)
+        return list_shadow_r2(prefix, product_path), "R2 ListObjectsV2 (creds)"
+    shipped = list_shadow_cdn(prefix, product_path)
     # Fill PUT times for the most-recent `latency_sample` covered frames via HEAD.
     for st in sorted(shipped)[-latency_sample:]:
         try:
             shipped[st] = _cdn_head_lastmod(
-                f"{CDN}/{S.shadow_frame_key(prefix, st)}")
+                f"{CDN}/{S.shadow_frame_key(prefix, st, product_path)}")
         except Exception:  # noqa: BLE001 - latency is best-effort
             pass
     return shipped, "public CDN latest_times.json (no creds)"
@@ -206,13 +213,14 @@ def _window(a):
 
 
 def run_onbox(a) -> int:
+    src = SRC.get_source(a.source)
     start, end = _window(a)
-    print(f"S1 never-miss audit (on-box) | {start.isoformat()} .. {end.isoformat()} "
-          f"| prefix={a.prefix}")
-    gt = [s for s in list_noaa_ground_truth(start, end)
+    print(f"S1 never-miss audit (on-box) | source={src.key} | {start.isoformat()} "
+          f".. {end.isoformat()} | prefix={a.prefix}")
+    gt = [s for s in list_noaa_ground_truth(src, start, end)
           if dt.datetime.strptime(s, S.STAMP_FMT).replace(tzinfo=UTC) <= end]
     # on-box shipped set via R2 (creds required here)
-    pub = list(list_shadow_r2(a.prefix).keys())
+    pub = list(list_shadow_r2(a.prefix, src.product_path).keys())
     pub_in = [s for s in pub
               if start <= dt.datetime.strptime(s, S.STAMP_FMT).replace(tzinfo=UTC) <= end]
     r = audit_compare(gt, pub_in)
@@ -226,14 +234,15 @@ def run_onbox(a) -> int:
 
 
 def run_remote(a) -> int:
+    src = SRC.get_source(a.source)
     start, end = _window(a)
-    print(f"S1 never-miss audit (REMOTE) | {start.isoformat()} .. {end.isoformat()} "
-          f"(lag guard {a.lag_min} min) | prefix={a.prefix}")
-    gt = [(s, lm) for s, lm in list_noaa_ground_truth_detailed(start, end)
+    print(f"S1 never-miss audit (REMOTE) | source={src.key} | {start.isoformat()} "
+          f".. {end.isoformat()} (lag guard {a.lag_min} min) | prefix={a.prefix}")
+    gt = [(s, lm) for s, lm in list_noaa_ground_truth_detailed(src, start, end)
           if dt.datetime.strptime(s, S.STAMP_FMT).replace(tzinfo=UTC) <= end]
     gt_times = {s: lm for s, lm in gt}
     gt_stamps = list(gt_times)
-    shipped, source = list_shadow_remote(a.prefix)
+    shipped, source = list_shadow_remote(a.prefix, src.product_path)
     print(f"  shipped-set source: {source}")
     shadow_in = {s: t for s, t in shipped.items()
                  if start <= dt.datetime.strptime(s, S.STAMP_FMT).replace(tzinfo=UTC) <= end}
@@ -283,6 +292,8 @@ def main(argv=None) -> int:
     ap.add_argument("--start", help="ISO start (overrides --hours)")
     ap.add_argument("--end", help="ISO end (default now)")
     ap.add_argument("--prefix", default=os.environ.get("S1_R2_PREFIX", "shadow"))
+    ap.add_argument("--source", default=os.environ.get("S1_SOURCE", "goes19"),
+                    help="goes19 | goes18 | himawari9 (the satellite to audit)")
     ap.add_argument("--lag-min", type=float, default=3.0,
                     help="ignore slots newer than this many minutes (in-flight edge)")
     ap.add_argument("--settle-s", type=float, default=180.0,

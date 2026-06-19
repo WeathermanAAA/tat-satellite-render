@@ -99,3 +99,68 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "5" }
+
+  # STAGE A: GOES-18 (GOES-West ABI twin) + Himawari-9 (AHI FLDK, segmented).
+  # Each is a SEPARATE worker (its own queue + S1_SOURCE) sharing the one
+  # s1-render -> PER-SOURCE ISOLATION: a new-sat parse/render failure or a wedge
+  # restarts only THAT container; GOES-19 (s1-ingest above), meso, the floater,
+  # and ACE/tracks are untouched. Distinct health ports + health files.
+  s1-ingest-goes18:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s1:latest
+    command: python s1_ingest.py
+    depends_on:
+      s1-render:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      S1_SOURCE: "goes18"
+      S1_QUEUE_URL: "${S1_QUEUE_URL_GOES18}"
+      S1_RENDER_URL: "${S1_RENDER_URL:-http://s1-render:8080}"
+      S1_HEALTH_PORT: "8092"
+      S1_HEALTH_FILE: "/tmp/s1_health_goes18.json"
+    ports:
+      - "127.0.0.1:8092:8092"
+    restart: always
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8092/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  s1-ingest-himawari9:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s1:latest
+    command: python s1_ingest.py
+    depends_on:
+      s1-render:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      S1_SOURCE: "himawari9"
+      S1_QUEUE_URL: "${S1_QUEUE_URL_HIMAWARI9}"
+      S1_RENDER_URL: "${S1_RENDER_URL:-http://s1-render:8080}"
+      S1_HEALTH_PORT: "8093"
+      S1_HEALTH_FILE: "/tmp/s1_health_himawari9.json"
+    ports:
+      - "127.0.0.1:8093:8093"
+    restart: always
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8093/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }

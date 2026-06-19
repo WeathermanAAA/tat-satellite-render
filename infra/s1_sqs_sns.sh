@@ -44,9 +44,13 @@ RETENTION="${S1_RETENTION:-1209600}"
 LONGPOLL_WAIT="${S1_LONGPOLL_WAIT:-20}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FILTER_POLICY_FILE="${HERE}/s1_filter_policy.json"
+# Body-path prefix the SNS filter matches (Records[].s3.object.key). Per-sat:
+# ABI -> ABI-L2-CMIPM/ (GOES-19/18); AHI -> AHI-L1b-FLDK/ (Himawari-9). The
+# worker re-filters by PARSED key regardless (INGEST-1), so this only trims the
+# firehose -- it must include the product but need not be band-tight.
+FILTER_PREFIX="${S1_FILTER_PREFIX:-ABI-L2-CMIPM/}"
 
-echo ">> region=${REGION}  topic=${TOPIC_ARN}"
+echo ">> region=${REGION}  topic=${TOPIC_ARN}  filter_prefix=${FILTER_PREFIX}"
 echo ">> main_queue=${QUEUE_NAME}  dlq=${DLQ_NAME}  maxReceiveCount=${MAX_RECEIVE}"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 echo ">> account=${ACCOUNT_ID}"
@@ -124,9 +128,11 @@ echo "   subscription_arn=${SUB_ARN}"
 # must be a STRING (FilterPolicy is a stringified JSON). RawMessageDelivery=true
 # so SQS receives the bare S3 event the worker parses (no SNS envelope to unwrap).
 SUB_ATTRS_FILE="$(mktmp)"
-python3 - "${FILTER_POLICY_FILE}" > "${SUB_ATTRS_FILE}" <<'PY'
+python3 - "${FILTER_PREFIX}" > "${SUB_ATTRS_FILE}" <<'PY'
 import json, sys
-policy = json.load(open(sys.argv[1]))
+# Generate the body-path prefix policy from S1_FILTER_PREFIX (per-sat), so the
+# ONE IaC script subscribes ABI (ABI-L2-CMIPM/) or AHI (AHI-L1b-FLDK/) products.
+policy = {"Records": {"s3": {"object": {"key": [{"prefix": sys.argv[1]}]}}}}
 # ORDER MATTERS: FilterPolicyScope MUST be set to MessageBody BEFORE FilterPolicy.
 # AWS rejects a nested body policy while the scope is still the default
 # MessageAttributes ("Filter policy scope MessageAttributes does not support
@@ -163,7 +169,7 @@ S1 ingest infra ready.
   DLQ_URL          = ${DLQ_URL}
   DLQ_ARN          = ${DLQ_ARN}
   SUBSCRIPTION_ARN = ${SUB_ARN}
-  FilterPolicyScope= MessageBody   (body-path Records[].s3.object.key prefix ABI-L2-CMIPM/)
+  FilterPolicyScope= MessageBody   (body-path Records[].s3.object.key prefix ${FILTER_PREFIX})
   maxReceiveCount  = ${MAX_RECEIVE}  -> DLQ
 
 Next: prove the filter is not a silent no-op:
