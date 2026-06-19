@@ -436,6 +436,17 @@ def transcode_frame(png: bytes, width: int, quality: int) -> bytes:
     im = Image.open(io.BytesIO(png)).convert("RGB")
     if width < im.width:
         height = max(1, round(im.height * width / im.width))
+        # Loop frames are square-by-design products (the 12deg storm floater, the
+        # square meso sectors). The upstream cartopy figure height occasionally
+        # rounds 1px off (a sub-0.1% bbox-aspect wobble as the storm drifts),
+        # flipping a frame between e.g. 1056x1056 and 1056x1055 for a multi-hour
+        # block. With the live player resizing its <canvas> to each frame's
+        # native size, that made the loop visibly jump every cycle (the
+        # "seizure"). Snap a near-square result to EXACTLY square so every frame
+        # of a loop matches: a <=3px nudge is sub-0.3% (imperceptible), while a
+        # genuinely non-square product (>3px off) is left untouched.
+        if abs(height - width) <= 3:
+            height = width
         im = im.resize((width, height), Image.LANCZOS)
     out = io.BytesIO()
     im.save(out, "WEBP", quality=quality, method=6)

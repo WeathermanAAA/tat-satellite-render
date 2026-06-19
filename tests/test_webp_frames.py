@@ -68,6 +68,24 @@ class TestTranscodeFrame(unittest.TestCase):
         self.assertEqual(_dims(out), (800, 600))
         self.assertEqual(out[8:12], b"WEBP")
 
+    def test_near_square_snaps_to_uniform_square(self):
+        # The "seizure" root cause: the cartopy floater render occasionally
+        # emits a 1px-short height (1320x1319), which downscales to 1056x1055
+        # (round(1319*1056/1320)=1055) and made the loop resize the canvas mid
+        # cycle. A near-square result must snap to a UNIFORM 1056x1056 so every
+        # frame of the loop matches.
+        self.assertEqual(_dims(transcode_frame(_png_bytes(1320, 1320), 1056, 90)),
+                         (1056, 1056))
+        self.assertEqual(_dims(transcode_frame(_png_bytes(1320, 1319), 1056, 90)),
+                         (1056, 1056))            # the actual flip seen live
+        self.assertEqual(_dims(transcode_frame(_png_bytes(1320, 1316), 1056, 90)),
+                         (1056, 1056))            # within the +/-3px snap band
+
+    def test_non_square_aspect_is_not_snapped(self):
+        # A genuinely non-square frame (>3px off square) keeps its true aspect.
+        self.assertEqual(_dims(transcode_frame(_png_bytes(1320, 1101), 1056, 90)),
+                         (1056, round(1101 * 1056 / 1320)))
+
     def test_quality_knob_orders_sizes(self):
         src = _png_bytes(1320, 1101)
         lo = transcode_frame(src, 1056, 60)
