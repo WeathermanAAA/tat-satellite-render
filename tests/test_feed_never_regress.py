@@ -83,6 +83,24 @@ class TestNeverRegress(unittest.TestCase):
         self.assertEqual(fr.apply_never_regress(f, hwm, _designated), 0)
         self.assertEqual(len(f["storms"][0]["points"]), 1)
 
+    def test_part_c_radii_survive_the_clobber(self):
+        # PART C: analyzed wind radii ride on the b-deck points (ace_core's
+        # _fix_radii serializer). A b-deck-absent clobber drops them; the
+        # never-regress republishes the full radii-bearing storm so the Wind
+        # Swath + current-fix quadrant rings render (no new radii code needed --
+        # the swath is fed by the preserved full track).
+        hwm = {}
+        full = _storm("JTWC_WP072026", 12, base_kt=40)
+        for p in full["points"]:                       # the b-deck radii a TS+ carries
+            p["radii"] = {"34": [90, 80, 70, 80]}
+        fr.apply_never_regress(_feed([full]), hwm, _designated)
+        clob = _feed([_storm("JTWC_WP072026", 1, base_kt=40)])   # b-deck gone -> no radii
+        self.assertNotIn("radii", clob["storms"][0]["points"][0])
+        fr.apply_never_regress(clob, hwm, _designated)            # republish full
+        kept = clob["storms"][0]["points"]
+        self.assertEqual(len(kept), 12)
+        self.assertTrue(any("radii" in p for p in kept))          # radii restored
+
 
 class TestAceUntouched(unittest.TestCase):
     """GATE #1: the never-regress guard touches ONLY the tracks feed; the ACE
