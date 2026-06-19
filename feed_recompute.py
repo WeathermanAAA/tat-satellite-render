@@ -23,8 +23,9 @@ designated storm + NaN-safe NATURE).
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
@@ -230,3 +231,69 @@ def recompute_tracks_feed(tracks_base: dict, live: Optional[pd.DataFrame],
         "vocab": tracks_base["vocab"],
         "storms": storms,
     }
+
+
+def apply_never_regress(tracks_feed: dict, hwm: dict,
+                        is_designated: Callable[[dict], bool],
+                        max_misses: int = 12) -> int:
+    """NEVER-REGRESS guard (CycloLab cluster, the cure for the clobbered JTWC
+    Track History + Wind&Pressure). A transient JTWC b-deck/mirror failure (the
+    WP natyphoon mirror is SSL-fragile) collapses a fresh DESIGNATED storm to the
+    single live knackwx fix; published as-is that 1-point track CLOBBERS the full
+    track the per-basin map + CycloLab Track History/Wind&Pressure render (the
+    poller and cron share the wp_tracks_data.json key). This guard keeps the
+    track from regressing.
+
+    Per DESIGNATED storm (invests are left untouched -- Part E owns recycle-safe
+    invest accumulation): if this poll's track has FEWER points than its
+    last-known-good (the high-water-mark ``hwm``) and we have not exceeded
+    ``max_misses`` consecutive degraded polls, REPUBLISH the last-known-good full
+    storm (a coherent prior ace_core computation -- no field/point mixing);
+    otherwise adopt the fresh storm and reset the high-water-mark (so a genuine
+    shrink/end is not masked forever). Mutates ``tracks_feed['storms']`` and, when
+    anything was republished, re-derives the header + latest_fix from the
+    corrected set so the feed stays coherent.
+
+    ACE IS NOT TOUCHED: the ACE feed is a separate recompute_ace_feed() call off
+    the canon frame -- it never reads the tracks feed -- so this is ACE
+    byte-identical by construction. Returns the number of republished storms.
+
+    ``hwm`` is the caller's per-basin state: {sid: {"storm": dict, "n": int,
+    "miss": int}}. ``is_designated(storm)`` -> True for designated (non-invest)."""
+    storms = tracks_feed.get("storms") or []
+    out, regressed = [], 0
+    for s in storms:
+        sid = s.get("sid") or ""
+        try:
+            designated = bool(is_designated(s))
+        except Exception:  # noqa: BLE001 - on doubt, never regress it
+            designated = False
+        if not designated:
+            out.append(s)
+            continue
+        cur_n = len(s.get("points") or [])
+        prev = hwm.get(sid)
+        if prev is not None and cur_n < prev["n"] and prev["miss"] < max_misses:
+            out.append(copy.deepcopy(prev["storm"]))   # last-known-good full storm
+            prev["miss"] += 1
+            regressed += 1
+        else:
+            hwm[sid] = {"storm": copy.deepcopy(s), "n": cur_n, "miss": 0}
+            out.append(s)
+    tracks_feed["storms"] = out
+    if regressed:
+        # Re-derive the coherent header + latest_fix from the corrected set.
+        # Best-effort: a header-recompute hiccup keeps the fresh header rather
+        # than failing the feed (the storms themselves are already corrected).
+        try:
+            tracks_feed["header"] = ac.compute_header_stats(out)
+        except Exception:  # noqa: BLE001
+            pass
+        fix_times = [x["latest_fix_valid_utc"] for x in out
+                     if x.get("latest_fix_valid_utc")]
+        lf = max(fix_times) if fix_times else None
+        tracks_feed["latest_fix_valid_utc"] = lf
+        tracks_feed["staleness_minutes"] = (
+            ac.staleness_minutes(_parse_naive(lf), pf.utcnow().replace(tzinfo=None))
+            if lf else None)
+    return regressed

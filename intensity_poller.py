@@ -581,6 +581,24 @@ def make_basin_source(basin: str, session: requests.Session,
     of waiting for NHC to backfill the b-deck name column. ``invests`` = knackwx
     90-99 -> the TRACKS feed only (invests never enter ACE)."""
     year = clock().year
+    # NEVER-REGRESS high-water-mark (CycloLab cluster): per-basin, per-storm
+    # last-known-good full track, so a transient JTWC b-deck/mirror failure can
+    # never clobber a designated storm's track down to the lone live fix. In the
+    # Source closure (one per basin) -> no cross-basin leakage. ACE is untouched
+    # (the ACE feed is a separate recompute_ace_feed call).
+    _track_hwm: dict = {}
+
+    def _is_designated(storm: dict) -> bool:
+        """Designated (non-invest) storms get the never-regress guard; invests
+        are left as the live knackwx snapshot (Part E owns recycle-safe invest
+        accumulation). Uses ace_core's own is_invest flag, with a storm-number
+        backstop (90-99 = invest)."""
+        if storm.get("is_invest"):
+            return False
+        try:
+            return not (90 <= int(str(storm.get("sid") or "")[-6:-4]) <= 99)
+        except (ValueError, IndexError):
+            return not storm.get("is_invest", False)
 
     def _read_base(kind: str) -> dict:
         if base_reader is not None:
@@ -631,6 +649,19 @@ def make_basin_source(basin: str, session: requests.Session,
         tracks_feed = fr.recompute_tracks_feed(data["tracks_base"], tracks_live,
                                                build_now=now_naive,
                                                nhc_active_sids=_nhc_active_sids())
+        # NEVER-REGRESS (the cure for the clobbered JTWC Track History/Wind&Press
+        # + the sparse per-basin map): a transient b-deck/mirror miss must not
+        # collapse a designated storm's track to the lone live fix. ACE-safe by
+        # construction -- ace_feed above is already computed off the canon frame
+        # and is NOT touched here. Best-effort: a guard hiccup never blocks the
+        # feed write.
+        try:
+            n_rg = fr.apply_never_regress(tracks_feed, _track_hwm, _is_designated)
+            if n_rg:
+                log.info("%s: never-regress republished %d designated storm(s) "
+                         "(transient sparse track preserved)", basin, n_rg)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: never-regress skipped (%s)", basin, e)
         ctx.sink.write(f"feeds/{basin}_ace_data.json", ace_feed)
         ctx.sink.write(f"feeds/{basin}_tracks_data.json", tracks_feed)
         # Hardening: a system present in a LIVE source (knackwx / b-deck) but
