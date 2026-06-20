@@ -112,7 +112,13 @@ def render_png(
     enhancement: str,
     downsample: int = 1,
     storm: Optional[dict] = None,
+    coastlines: bool = True,
+    gridlines: bool = True,
 ) -> bytes:
+    # ``coastlines`` draws coastlines + political borders; ``gridlines`` draws the
+    # labeled lat/lon graticule. Both default True (the standard look); the custom-
+    # zoom page can switch either off for clean imagery. (The floater/meso loop
+    # frames never pass them -> always on, unchanged.)
     # True-color composites carry an H×W×3 RGB array in ``cmi`` (units="rgb")
     # and don't go through the scalar normalize/cmap path.
     is_rgb = data.units == "rgb"
@@ -291,32 +297,34 @@ def render_png(
     # Coastlines + borders. Resolution scales with bbox; zorder explicitly
     # above pcolormesh (which defaults to ~1.5 in cartopy) so cyan coast
     # never gets painted over by hot cloud tops; full alpha for legibility.
-    coast_scale = _coast_resolution(max(lon_span, lat_span))
-    ax.add_feature(
-        cfeature.COASTLINE.with_scale(coast_scale),
-        linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
-    )
-    ax.add_feature(
-        cfeature.BORDERS.with_scale(coast_scale),
-        linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
-    )
+    if coastlines:
+        coast_scale = _coast_resolution(max(lon_span, lat_span))
+        ax.add_feature(
+            cfeature.COASTLINE.with_scale(coast_scale),
+            linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
+        )
+        ax.add_feature(
+            cfeature.BORDERS.with_scale(coast_scale),
+            linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
+        )
 
     # Dashed gridlines auto-spaced
-    step = _gridline_step(max(lon_span, lat_span))
-    gl = ax.gridlines(
-        crs=ccrs.PlateCarree(),
-        draw_labels=True,
-        linewidth=0.5,
-        linestyle="--",
-        color=GRID_COLOR,
-        alpha=0.7,
-        xlocs=np.arange(np.floor(lon_min / step) * step, lon_max + step, step),
-        ylocs=np.arange(np.floor(lat_min / step) * step, lat_max + step, step),
-    )
-    gl.top_labels = False
-    gl.right_labels = False
-    gl.xlabel_style = {"color": TEXT_COLOR, "size": 8}
-    gl.ylabel_style = {"color": TEXT_COLOR, "size": 8}
+    if gridlines:
+        step = _gridline_step(max(lon_span, lat_span))
+        gl = ax.gridlines(
+            crs=ccrs.PlateCarree(),
+            draw_labels=True,
+            linewidth=0.5,
+            linestyle="--",
+            color=GRID_COLOR,
+            alpha=0.7,
+            xlocs=np.arange(np.floor(lon_min / step) * step, lon_max + step, step),
+            ylocs=np.arange(np.floor(lat_min / step) * step, lat_max + step, step),
+        )
+        gl.top_labels = False
+        gl.right_labels = False
+        gl.xlabel_style = {"color": TEXT_COLOR, "size": 8}
+        gl.ylabel_style = {"color": TEXT_COLOR, "size": 8}
 
     # Right-side colorbar (every scalar product). Lives in the reserved right
     # margin; physical °C ticks for IR/WV, reflectance % for visible.

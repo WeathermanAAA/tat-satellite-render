@@ -111,6 +111,22 @@ cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
 PIXEL_BUDGET = 16_000_000
 DEG_TO_KM = 111.0  # flat conversion; geos pixel stretch at high lat partially cancels lon shrink
 
+# Custom-zoom (draw-a-box) output RESOLUTION TIERS. Each tier is the pixel budget
+# the downsample factor targets, so the output dimension scales with it (a bbox is
+# never upscaled — a small zoom already under the budget renders native). "low"
+# additionally re-encodes the already-small render as lossy WebP for the smallest /
+# fastest download; "default" and "high" stay lossless PNG so text + coastlines stay
+# crisp. The webp LOOP path (format=webp, the floater/meso pollers) is unaffected —
+# it always uses the full PIXEL_BUDGET + the fixed WEBP_FRAME_WIDTH frame.
+QUALITY_BUDGETS = {
+    "low": 250_000,         # ~500 x 500   — compressed, fastest to load, softer
+    "default": 2_250_000,   # ~1500 x 1500 — balanced (the page default)
+    "high": PIXEL_BUDGET,   # ~4000 x 4000 — cleanest, slower to render + load
+}
+DEFAULT_QUALITY = "default"
+LOWRES_WEBP_WIDTH = 500     # px width the "low" tier re-encodes to
+LOWRES_WEBP_QUALITY = 82    # lossy-WebP quality for the "low" tier
+
 
 def _native_km_per_pixel_generic(generic_channel: str) -> float:
     spec = GENERIC_CHANNELS.get(generic_channel)
@@ -127,11 +143,13 @@ def _native_km_per_pixel(channel) -> float:
     return _native_km_per_pixel_generic(channel)
 
 
-def compute_downsample_factor(bbox: list[float], channel) -> int:
-    """Integer factor N such that requested_pixels / N**2 <= PIXEL_BUDGET.
+def compute_downsample_factor(bbox: list[float], channel, budget: int = PIXEL_BUDGET) -> int:
+    """Integer factor N such that requested_pixels / N**2 <= ``budget``.
 
     Returns 1 when the request already fits. Caller passes N to render_png
     which strides the cmi/lats/lons arrays by [::N, ::N] before pcolormesh.
+    ``budget`` defaults to the full PIXEL_BUDGET; the custom-zoom resolution
+    tiers pass a smaller budget (QUALITY_BUDGETS) to cap the output dimension.
     """
     lon_w_deg = bbox[2] - bbox[0]
     lat_h_deg = bbox[3] - bbox[1]
@@ -139,9 +157,23 @@ def compute_downsample_factor(bbox: list[float], channel) -> int:
     px_w = (lon_w_deg * DEG_TO_KM) / km_per_px
     px_h = (lat_h_deg * DEG_TO_KM) / km_per_px
     requested = px_w * px_h
-    if requested <= PIXEL_BUDGET:
+    if requested <= budget:
         return 1
-    return math.ceil(math.sqrt(requested / PIXEL_BUDGET))
+    return math.ceil(math.sqrt(requested / budget))
+
+
+def resolve_quality(fmt: str, quality: str) -> tuple[int, str]:
+    """Map (output format, resolution tier) -> (pixel_budget, output_format).
+
+    The webp LOOP path (format=="webp", the floater/meso pollers) is unchanged:
+    full budget + a webp frame. The png/custom-zoom path honors the tier — low/
+    default/high budgets, with "low" re-encoded as lossy WebP for the smallest,
+    fastest download. Unknown tiers fall back to the default.
+    """
+    if fmt == "webp":
+        return PIXEL_BUDGET, "webp"
+    q = quality if quality in QUALITY_BUDGETS else DEFAULT_QUALITY
+    return QUALITY_BUDGETS[q], ("webp" if q == "low" else "png")
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +315,22 @@ class RenderRequest(BaseModel):
     # they got. "webp" is the loop-frame path used by the floater + meso
     # pollers: WEBP_FRAME_WIDTH px, lossy WebP (see transcode_frame).
     format: str = "png"
+    # Custom-zoom RESOLUTION tier (png path only): "low" (~500px, compressed
+    # WebP), "default" (~1500px PNG), "high" (~4000px PNG). Ignored on the webp
+    # loop path. Unknown values coerce to "default" so legacy/odd callers stay safe.
+    quality: str = "default"
+    # Map-overlay toggles (custom-zoom). Default True = the existing look (bold
+    # coastlines + political borders, labeled lat/lon gridlines); set False for
+    # clean imagery with no overlay. Legacy callers + the pollers omit them ->
+    # default True -> unchanged.
+    coastlines: bool = True   # coastlines + political borders
+    gridlines: bool = True    # labeled lat/lon graticule
+
+    @field_validator("quality")
+    @classmethod
+    def _v_quality(cls, v):
+        v = (v or "default").strip().lower()
+        return v if v in ("low", "default", "high") else "default"
 
     @field_validator("bbox")
     @classmethod
@@ -352,7 +400,8 @@ async def health():
     }
 
 
-def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bucket: str) -> str:
+def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bucket: str,
+                 quality: str = DEFAULT_QUALITY) -> str:
     # Bucket included so an algorithm tweak (e.g. moving the goes19/goes16
     # boundary date) cleanly invalidates entries that would now resolve
     # differently. Same scan_start in goes19 and goes16 still produces
@@ -375,7 +424,18 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     # png key stays byte-identical (cache continuity across the deploy); png
     # and webp variants of the same scan cache as distinct entries.
     fmt_part = "" if body.format == "png" else f"|fmt={body.format}"
-    raw = f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}|{bucket}{storm_part}{fmt_part}"
+    # Resolution tier keys the custom-zoom (png) path so the three tiers cache
+    # separately; the webp LOOP path (poller frames) is unaffected -> frame-cache
+    # continuity. Coastline / gridline toggles join the key ONLY when turned OFF,
+    # so every default-on render keeps its existing key (cache continuity).
+    q_part = "" if body.format == "webp" else f"|q={quality}"
+    overlay_part = ""
+    if not body.coastlines:
+        overlay_part += "|nocoast"
+    if not body.gridlines:
+        overlay_part += "|nogrid"
+    raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
+           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -396,8 +456,12 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # surface the factor on every response (HIT and MISS) so the frontend
     # can show the "auto-downsampled Nx" badge. True color is gated by its
     # 0.5 km red band, so size it off visible_red.
+    # Resolution tier -> pixel budget + output format. The webp LOOP path
+    # (pollers) keeps the full budget + webp frame; the custom-zoom png path
+    # honors low/default/high (low re-encodes to lossy WebP).
+    budget, out_format = resolve_quality(body.format, body.quality)
     downsample = compute_downsample_factor(
-        body.bbox, "visible_red" if is_true_color else generic_channel
+        body.bbox, "visible_red" if is_true_color else generic_channel, budget
     )
 
     # Pick the satellite that can see this bbox at this time. CoverageError
@@ -431,7 +495,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     else:
         snapped = resolved.scan_start.isoformat()
 
-    cache_key = _request_key(body, generic_channel, snapped, resolved.bucket)
+    cache_key = _request_key(body, generic_channel, snapped, resolved.bucket, body.quality)
     native_band = (
         satellite.truecolor_bands["red"] if is_true_color
         else satellite.generic_to_band[generic_channel]
@@ -450,10 +514,13 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             "X-Sub-Sat-Lon": f"{resolved.sub_sat_lon:g}",
             "X-Generic-Channel": generic_channel,
             "X-Native-Band": str(native_band),
+            # Resolution tier the frontend echoes in the result meta (and uses,
+            # with the media type, to pick the .png/.webp download extension).
+            "X-Quality": body.quality if body.format != "webp" else "loop",
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
-        media_type = "image/webp" if body.format == "webp" else "image/png"
+        media_type = "image/webp" if out_format == "webp" else "image/png"
         return Response(content=content, media_type=media_type, headers=headers)
 
     cached = cache.get(cache_key)
@@ -483,12 +550,18 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     body.enhancement,
                     downsample,
                     storm=body.storm.model_dump() if body.storm is not None else None,
+                    coastlines=body.coastlines,
+                    gridlines=body.gridlines,
                 )
                 # webp loop frames transcode inside the same executor job so
                 # the render semaphore covers the whole CPU burst and the
-                # cache below stores the final (already-encoded) bytes.
+                # cache below stores the final (already-encoded) bytes. The
+                # custom-zoom "low" tier re-encodes the already-small render as
+                # lossy WebP (out_format=="webp") for the smallest download.
                 if body.format == "webp":
                     out = transcode_frame(out, WEBP_FRAME_WIDTH, WEBP_QUALITY)
+                elif out_format == "webp":   # quality == "low"
+                    out = transcode_frame(out, LOWRES_WEBP_WIDTH, LOWRES_WEBP_QUALITY)
                 return out
 
             frame_bytes = await asyncio.get_event_loop().run_in_executor(
