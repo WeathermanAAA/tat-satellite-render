@@ -477,6 +477,23 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _valid_time_label(scan_start, product) -> str:
+    """Burned-in valid-time for the plot title strip.
+
+    Meso sectors (the meso poller is the only caller that sends
+    ``product="meso"``) show SECONDS so the ~2.5-min Himawari Target
+    sub-scan timing is legible at the live edge — successive sub-scans
+    in a 10-min slot differ only at :00 / :02:30 / :05 / :07:30, which a
+    minute-precision label flattens into ambiguous pairs. The floater and
+    legacy draw-a-box renders (``product is None``) stay at minute
+    precision, so their burned-in labels are byte-identical to before —
+    no visual change anywhere outside meso. Note this label does NOT enter
+    the cache key (see ``_request_key``), so it never re-keys a frame.
+    """
+    fmt = "%Y-%m-%d %H:%M:%S" if product == "meso" else "%Y-%m-%d %H:%M"
+    return scan_start.strftime(fmt)
+
+
 @app.post("/render")
 async def render(request: Request, body: RenderRequest = Body(...)):
     t0 = time.perf_counter()
@@ -588,7 +605,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     data,
                     body.bbox,
                     native_band,
-                    resolved.scan_start.strftime("%Y-%m-%d %H:%M"),
+                    _valid_time_label(resolved.scan_start, body.product),
                     body.enhancement,
                     downsample,
                     storm=body.storm.model_dump() if body.storm is not None else None,
