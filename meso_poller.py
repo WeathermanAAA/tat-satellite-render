@@ -130,13 +130,19 @@ R2_PREFIX = _env("R2_PREFIX", "meso").strip("/")
 # Cadence + geometry. No BBOX_DEG here -- the bbox comes from the discovered
 # sector extent, not a fixed storm crop.
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))         # hot-band target (native GOES meso)
-COLD_CADENCE_TARGET_S = float(_env("COLD_CADENCE_TARGET_S", "300"))  # cold-band target (stretched)
+COLD_CADENCE_TARGET_S = float(_env("COLD_CADENCE_TARGET_S", "300"))  # GOES cold-band target (stretched)
+# Himawari cold bands ride the ~2.5-min AHI Target sub-scan cadence (the SAME
+# 150 s the hot ir/irbd already land at under the Target product), so wv/swir
+# /true-color refresh at 150 s instead of the GOES 300 s stretch. GOES stays at
+# COLD_CADENCE_TARGET_S. Set per-family so one knob can't slow the other.
+COLD_CADENCE_TARGET_HIMA_S = float(_env("COLD_CADENCE_TARGET_HIMA_S", "150"))
 SECTORS_REFRESH_S = float(_env("SECTORS_REFRESH_S", "120"))      # re-discover extents
 # Himawari render product: "target" -> the ~2.5-min AHI Target sub-scans
-# (R301..R304) for the 5 scalar bands; "fldk" -> the 10-min full disk. Flip to
-# fldk to revert Himawari to the old cadence WITHOUT a rebuild (env + restart).
-# True-color always uses FLDK (the compositor can't mix a Target red with FLDK
-# greens). GOES is unaffected (it always uses the CMIPM meso product).
+# (R301..R304) for ALL six bands incl. true-color; "fldk" -> the 10-min full
+# disk. Flip to fldk to revert Himawari to the old cadence WITHOUT a rebuild
+# (env + restart). True-color rides Target by default now; MESO_TC_FLDK=true on
+# the render service reverts JUST true-color to FLDK if B03 0.5 km bandwidth is
+# tight. GOES is unaffected (it always uses the CMIPM meso product).
 MESO_HIMAWARI_PRODUCT = (_env("MESO_HIMAWARI_PRODUCT", "target")
                          or "target").strip().lower()
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))    # min gap between /render calls
@@ -825,9 +831,10 @@ class MesoPoller:
         bbox = list(ext.bbox)
         # All meso sectors render from their rapid-scan product via the "meso"
         # hint: GOES -> CMIPM (find_file forces _pick_meso past the 12° span gate),
-        # Himawari -> the ~2.5-min Target sub-scans. MESO_HIMAWARI_PRODUCT=fldk
-        # reverts Himawari to the 10-min full disk (true-color is always FLDK,
-        # guarded in find_file). GOES is unaffected by the flag.
+        # Himawari -> the ~2.5-min Target sub-scans (ALL six bands incl. true-color,
+        # which now composites entirely off one Target sub-scan). MESO_HIMAWARI_PRODUCT
+        # =fldk reverts Himawari to the 10-min full disk; MESO_TC_FLDK=true on the
+        # render service reverts JUST true-color to FLDK. GOES is unaffected.
         product = "meso"
         if sector.family == "himawari" and MESO_HIMAWARI_PRODUCT == "fldk":
             product = None
@@ -871,14 +878,19 @@ class MesoPoller:
 
     # ---- cadence --------------------------------------------------------
 
-    def cold_cadence(self) -> float:
-        """Cold-band per-unit cadence -- DELIBERATELY stretched well past the hot
-        target so the cold bands (WV / true-color / SWIR) never flood the single
-        render pipeline and starve the hot IR/IRBD lane. Floors at
-        COLD_CADENCE_TARGET_S (default 300 s vs the 60 s hot target) and still
-        widens with the rate budget on the public URL."""
+    def cold_cadence(self, family: str = "goes") -> float:
+        """Cold-band per-unit cadence -- stretched past the hot target so the cold
+        bands (WV / true-color / SWIR) never flood the single render pipeline and
+        starve the hot IR/IRBD lane. Per-family floor: GOES at
+        COLD_CADENCE_TARGET_S (default 300 s vs the 60 s hot target); Himawari at
+        COLD_CADENCE_TARGET_HIMA_S (default 150 s) so its cold bands track the
+        Target sub-scan cadence its hot bands already ride. Still widens with the
+        rate budget on the public URL. The hot lane drains first every tick, so a
+        faster cold floor can never delay a due hot unit."""
+        floor = (COLD_CADENCE_TARGET_HIMA_S if family == "himawari"
+                 else COLD_CADENCE_TARGET_S)
         n_cold = sum(1 for u in self.units.values() if not u.band.hot)
-        return max(COLD_CADENCE_TARGET_S, n_cold * self.limiter.min_spacing)
+        return max(floor, n_cold * self.limiter.min_spacing)
 
     def tick(self) -> None:
         # HOT lane first: drain EVERY due hot unit (the 10-unit IR/IRBD fleet
@@ -909,7 +921,7 @@ class MesoPoller:
         if cold_due:
             u = min(cold_due, key=lambda u: u.next_due)
             self.process_unit(u)
-            u.next_due = time.monotonic() + self.cold_cadence()
+            u.next_due = time.monotonic() + self.cold_cadence(u.sector.family)
 
     # ---- health ---------------------------------------------------------
 

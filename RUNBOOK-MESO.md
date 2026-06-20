@@ -162,7 +162,20 @@ fresh `uploaded …/ir/…` lines), and step 6 (the `goes>600s hima>900s` line +
 - Health:   `meso/health.json` (`max-age=30`)
 
 Slugs: `goes19-m1`, `goes19-m2`, `goes18-m1`, `goes18-m2`, `himawari9-meso`.
-Bands: `ir`, `irbd` (hot, 60 s), `wv_up`, `wv_low`, `truecolor`, `swir` (cold).
+Bands: `ir`, `irbd` (hot), `wv_up`, `wv_low`, `truecolor`, `swir` (cold).
+
+### Cadence (per family)
+- **GOES** (CMIPM, 60 s native): hot `ir`/`irbd` at 60 s; cold bands stretched to
+  `COLD_CADENCE_TARGET_S` (300 s) so they never starve the hot lane.
+- **Himawari** (AHI Target sub-scans, ~2.5 min): **all six bands at ~150 s.** Hot
+  `ir`/`irbd` ride the Target sub-scan natively; cold `wv_up`/`wv_low`/`swir`/
+  `truecolor` floor at `COLD_CADENCE_TARGET_HIMA_S` (150 s). True-color composites
+  every sub-band off one Target sub-scan (B03 0.5 km red is a single ~3 MB regional
+  segment, not the FLDK full disk), so it stays co-temporal and cheap.
+- **Reverts (no rebuild, env + restart):** `MESO_HIMAWARI_PRODUCT=fldk` returns the
+  WHOLE Himawari sector to 10-min FLDK; `MESO_TC_FLDK=true` (render service) returns
+  JUST true-color to 10-min FLDK if its bandwidth is ever a problem;
+  `COLD_CADENCE_TARGET_HIMA_S=300` returns Himawari cold bands to the old stretch.
 
 ## Notes
 - The render port (8080) and poller health port (8090) bind to `127.0.0.1` only
