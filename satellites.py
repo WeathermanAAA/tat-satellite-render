@@ -1173,11 +1173,17 @@ class HimawariPacificSatellite(Satellite):
             )
         # Mesoscale "Target" path: the AHI Target sector (Region 3) scans ~every
         # 2.5 min (sub-scans R301..R304 per 10-min slot) vs FLDK's 10 min. When the
-        # caller hints product=="target" (the meso poller), resolve the latest
-        # Target sub-scan. Visible/true-color stays on FLDK -- the true-color
-        # compositor pulls all sub-bands off the resolved red file, so we never mix
-        # a Target red with FLDK greens. Falls back to FLDK if no Target slot lands.
-        if product_hint == "meso" and generic_channel != "visible_red":
+        # caller hints product=="meso" (the meso poller), resolve the latest Target
+        # sub-scan. True-color rides Target too (visible_red pins the composite's
+        # product, and _compose_true_color_sync loads EVERY sub-band off that same
+        # Target sub-scan -- no Target/FLDK mix), so it refreshes at ~2.5 min like
+        # the IR/WV bands. Set MESO_TC_FLDK=true to keep JUST true-color on the
+        # 10-min FLDK full disk if the B03 0.5 km Target bandwidth is tight. Falls
+        # back to FLDK if no Target slot lands.
+        tc_fldk = os.environ.get("MESO_TC_FLDK", "").strip().lower() in (
+            "1", "true", "yes", "on")
+        if product_hint == "meso" and not (generic_channel == "visible_red"
+                                           and tc_fldk):
             band = self.generic_to_band[generic_channel]
             resolved = await _to_thread(
                 self._resolve_target_sync, time, band, nearest_to_target)
@@ -1320,6 +1326,21 @@ class HimawariPacificSatellite(Satellite):
         raise NotImplementedError("HimawariPacificSatellite uses _fetch_sync directly")
     def project_to_latlon(self, ds, bbox, resolved, generic_channel):
         raise NotImplementedError("HimawariPacificSatellite uses _fetch_sync directly")
+    @staticmethod
+    def _target_slot_sub(resolved: ResolvedFile):
+        """If ``resolved`` is an AHI Target sub-scan (product 'Target<sub>'),
+        return (sub:int, slot:datetime): ``slot`` is the 10-min folder the Target
+        segments live in (``scan_start`` is the sub-scan obs time, floored back to
+        its slot). Returns None for an FLDK (or any non-Target) resolution, so the
+        caller falls back to the FLDK loader. Shared by the single-band fetch and
+        the true-color compositor so both recover the slot/sub identically."""
+        if not resolved.product.startswith("Target"):
+            return None
+        sub = int(resolved.product[len("Target"):])
+        slot = resolved.scan_start.replace(second=0, microsecond=0)
+        slot = slot.replace(minute=(slot.minute // 10) * 10)
+        return sub, slot
+
     def _fetch_sync(
         self,
         resolved: ResolvedFile,
@@ -1329,14 +1350,12 @@ class HimawariPacificSatellite(Satellite):
         from vendor.ahi_loader import load_band_sync, load_target_band_sync
         band = self.generic_to_band[generic_channel]
         fs = _get_fs()
-        # Pass bbox so the loader can drop irrelevant segments before download
-        # — critical for B03 (0.5 km visible), where each segment is ~300 MB.
-        if resolved.product.startswith("Target"):
-            sub = int(resolved.product[len("Target"):])
-            # scan_start is the sub-scan obs time; floor back to its 10-min slot
-            # folder (where the Target segments live).
-            slot = resolved.scan_start.replace(second=0, microsecond=0)
-            slot = slot.replace(minute=(slot.minute // 10) * 10)
+        # Pass bbox so the loader can drop irrelevant FLDK segments before download
+        # (a Target sub-scan is a single small regional segment -- B03 0.5 km is
+        # ~3 MB -- so the filter is a no-op there but matters for FLDK full disk).
+        ts = self._target_slot_sub(resolved)
+        if ts is not None:
+            sub, slot = ts
             disk = load_target_band_sync(
                 fs, resolved.bucket, slot, band, sub, bbox=tuple(bbox)
             )
@@ -1410,13 +1429,14 @@ class HimawariPacificSatellite(Satellite):
         self, bbox: list[float], red_resolved: ResolvedFile
     ) -> FetchResult:
         """AHI true color: native green (band 2), no synthesis. ``red_resolved``
-        carries the snapped 10-min slot + bucket; all bands load from it."""
+        pins the product (FLDK 10-min slot or a Target sub-scan) + bucket; every
+        band loads from that same product so the composite is co-temporal."""
         return await _to_thread(self._compose_true_color_sync, bbox, red_resolved)
     def _compose_true_color_sync(
         self, bbox: list[float], red_resolved: ResolvedFile
     ) -> FetchResult:
         from concurrent.futures import ThreadPoolExecutor
-        from vendor.ahi_loader import load_band_sync
+        from vendor.ahi_loader import load_band_sync, load_target_band_sync
         from scipy.interpolate import RegularGridInterpolator
         import truecolor
         fs = _get_fs()
@@ -1424,16 +1444,27 @@ class HimawariPacificSatellite(Satellite):
         # the bbox's line band so B03's 0.5 km segments don't blow memory).
         # The five sequential loads were the single biggest cost of a
         # true-color frame; bz2 decompression releases the GIL, so threads
-        # genuinely overlap download + decompress.
+        # genuinely overlap download + decompress. EVERY band loads off the same
+        # product the red file resolved to -- a Target sub-scan red pairs with
+        # Target green/blue/veggie/IR (never an FLDK mix at a different scan
+        # time); mirrors the single-band dispatch in _fetch_sync.
+        ts = self._target_slot_sub(red_resolved)
+        if ts is not None:
+            sub, slot = ts
+
+        def _load_tc(band: int):
+            if ts is not None:
+                return load_target_band_sync(
+                    fs, red_resolved.bucket, slot, band, sub, bbox=tuple(bbox))
+            return load_band_sync(
+                fs, red_resolved.bucket, red_resolved.scan_start, band,
+                bbox=tuple(bbox))
+
         roles = dict(self.truecolor_bands)
         roles["ir"] = self.generic_to_band["clean_ir"]  # GeoColor-lite night fade
         with ThreadPoolExecutor(max_workers=len(roles)) as pool:
-            futures = {
-                role: pool.submit(
-                    load_band_sync, fs, red_resolved.bucket,
-                    red_resolved.scan_start, band, bbox=tuple(bbox))
-                for role, band in roles.items()
-            }
+            futures = {role: pool.submit(_load_tc, band)
+                       for role, band in roles.items()}
             disks: dict[str, object] = {r: f.result() for r, f in futures.items()}
         # Regular lat/lon target grid (same scheme as GOES); antimeridian
         # unwrap keeps target longitudes monotonic for the AHI disk (centered

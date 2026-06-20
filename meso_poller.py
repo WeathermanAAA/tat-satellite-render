@@ -140,13 +140,19 @@ R2_PREFIX = _env("R2_PREFIX", "meso").strip("/")
 # Cadence + geometry. No BBOX_DEG here -- the bbox comes from the discovered
 # sector extent, not a fixed storm crop.
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))         # hot-band target (native GOES meso)
-COLD_CADENCE_TARGET_S = float(_env("COLD_CADENCE_TARGET_S", "300"))  # cold-band target (stretched)
+COLD_CADENCE_TARGET_S = float(_env("COLD_CADENCE_TARGET_S", "300"))  # GOES cold-band target (stretched)
+# Himawari cold bands ride the ~2.5-min AHI Target sub-scan cadence (the SAME
+# 150 s the hot ir/irbd already land at under the Target product), so wv/swir
+# /true-color refresh at 150 s instead of the GOES 300 s stretch. GOES stays at
+# COLD_CADENCE_TARGET_S. Set per-family so one knob can't slow the other.
+COLD_CADENCE_TARGET_HIMA_S = float(_env("COLD_CADENCE_TARGET_HIMA_S", "150"))
 SECTORS_REFRESH_S = float(_env("SECTORS_REFRESH_S", "120"))      # re-discover extents
 # Himawari render product: "target" -> the ~2.5-min AHI Target sub-scans
-# (R301..R304) for the 5 scalar bands; "fldk" -> the 10-min full disk. Flip to
-# fldk to revert Himawari to the old cadence WITHOUT a rebuild (env + restart).
-# True-color always uses FLDK (the compositor can't mix a Target red with FLDK
-# greens). GOES is unaffected (it always uses the CMIPM meso product).
+# (R301..R304) for ALL six bands incl. true-color; "fldk" -> the 10-min full
+# disk. Flip to fldk to revert Himawari to the old cadence WITHOUT a rebuild
+# (env + restart). True-color rides Target by default now; MESO_TC_FLDK=true on
+# the render service reverts JUST true-color to FLDK if B03 0.5 km bandwidth is
+# tight. GOES is unaffected (it always uses the CMIPM meso product).
 MESO_HIMAWARI_PRODUCT = (_env("MESO_HIMAWARI_PRODUCT", "target")
                          or "target").strip().lower()
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))    # min gap between /render calls
@@ -183,6 +189,36 @@ FAIL_THRESHOLD = int(_env("FAIL_THRESHOLD", "3"))
 # Tiny health HTTP server (a compose healthcheck curls this).
 HEALTH_PORT = int(_env("HEALTH_PORT", "8090"))
 HEALTH_FILE = _env("HEALTH_FILE", "/tmp/meso_health.json")
+
+# Self-heal watchdog (never-stale). The 503 healthcheck only makes a freeze
+# DETECTABLE -- and only while the loop still runs to recompute it. A true WEDGE
+# (the loop frozen in a hung call -- the same never-stale disease as HAFS/S1)
+# freezes the stored health snapshot at "healthy", and docker `restart: always`
+# fires on EXIT, not on "unhealthy", so a frozen poller would sit forever. A
+# daemon thread INDEPENDENT of the (possibly wedged) main loop watches the
+# per-sector last SUCCESSFUL frame-upload time against the CURRENT clock -- the
+# actual "no fresh frame produced/uploaded" signal -- so a freeze is caught even
+# while the loop is stuck. When EVERY producing sector is stale past its
+# PER-SOURCE threshold (the whole poller has stopped producing) it force-EXITS
+# and `restart: always` recovers it clean.
+#
+# Frame-upload (not discovery) is the signal on purpose: discovery hits NOAA
+# directly, independent of the render service, so a render-side wedge would leave
+# discovery "fresh" while frames silently went stale forever -- the 503's
+# discovery-only signal misses that. Frame-upload staleness is a SUPERSET of the
+# 503's condition (a discovery stall also stalls uploads), so the watchdog still
+# makes the 503 alarm self-resolving AND covers the render-down hole. A sector
+# that has not produced since (re)start is None -> ignored, so a cold start (or a
+# restart while the render service is still down) never trips -- no futile loop.
+#
+# Thresholds clear the worst HEALTHY upload gap with margin so a single late scan
+# never trips: GOES hot IR uploads ~60 s (a missed scan ~120 s), Himawari ~150 s
+# (a missed slot ~300 s).
+SELFHEAL_ENABLED = _env_bool("MESO_SELFHEAL", True)
+SELFHEAL_STALE_GOES_S = float(_env("SELFHEAL_STALE_GOES_S", "600"))  # ~10x the 60s GOES upload; >3x the ~180s healthy max
+SELFHEAL_STALE_HIMA_S = float(_env("SELFHEAL_STALE_HIMA_S", "900"))  # ~6x the 150s Himawari upload; >3x the ~300s healthy max
+SELFHEAL_GRACE_S = float(_env("SELFHEAL_GRACE_S", "300"))            # cold-start grace (> compose start_period 120s)
+SELFHEAL_CHECK_S = float(_env("SELFHEAL_CHECK_S", "30"))             # watchdog poll cadence
 
 CACHE_FRAME = "public, max-age=31536000, immutable"
 CACHE_MANIFEST = "max-age=30"
@@ -708,6 +744,45 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
 
 
 # ---------------------------------------------------------------------------
+# Self-heal decision (shared by the watchdog thread + its tests)
+# ---------------------------------------------------------------------------
+
+def selfheal_stale_threshold_s(sector: MesoSector) -> float:
+    """Per-source stale threshold (seconds) for the self-heal watchdog."""
+    return (SELFHEAL_STALE_HIMA_S if sector.family == "himawari"
+            else SELFHEAL_STALE_GOES_S)
+
+
+def selfheal_decide(last_frame_utc: dict[str, dt.datetime],
+                    now: dt.datetime) -> tuple[bool, str]:
+    """WEDGE decision -> (should_exit, reason).
+
+    Judges the per-sector last SUCCESSFUL frame-upload time (the "fresh frame
+    produced/uploaded" signal) against the CURRENT clock. True ONLY when EVERY
+    sector that has EVER produced is now stale past its per-source threshold --
+    i.e. NO sector is producing and the whole poller has stopped (a real freeze:
+    a loop wedge OR a render-side stall). A sector that has not produced since
+    (re)start is None -> ignored, so a cold start (or a restart while the render
+    service is still down) never trips -- no futile restart loop. A single stale
+    source while another is fresh does NOT fire (the poller is alive)."""
+    stale: list[str] = []
+    fresh = 0
+    for sector in MESO_SECTORS:
+        lf = last_frame_utc.get(sector.slug)
+        if lf is None:
+            continue                       # never produced since (re)start -> boot
+        age = (now - lf).total_seconds()
+        thr = selfheal_stale_threshold_s(sector)
+        if age > thr:
+            stale.append(f"{sector.slug} {age:.0f}s>{thr:.0f}s")
+        else:
+            fresh += 1
+    if fresh == 0 and stale:               # producing sectors exist, ALL stale
+        return True, "; ".join(stale)
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
 # Poller
 # ---------------------------------------------------------------------------
 
@@ -757,6 +832,11 @@ class MesoPoller:
         self.health: dict[str, SourceHealth] = {
             s.slug: SourceHealth(name=s.slug) for s in MESO_SECTORS
         }
+        # Per-sector wall-clock of the last SUCCESSFUL frame upload -- the
+        # "fresh frame produced/uploaded" signal the self-heal watchdog watches.
+        # Empty until a sector first produces (cold start -> the watchdog ignores
+        # it, so a restart while the render service is down never loops).
+        self._last_frame_utc: dict[str, dt.datetime] = {}
         self._last_sectors_refresh = 0.0
         self._last_reconcile = 0.0
         # MEMORY-AUTHORITATIVE per-sector manifests (seeded by
@@ -990,9 +1070,10 @@ class MesoPoller:
         bbox = list(ext.bbox)
         # All meso sectors render from their rapid-scan product via the "meso"
         # hint: GOES -> CMIPM (find_file forces _pick_meso past the 12° span gate),
-        # Himawari -> the ~2.5-min Target sub-scans. MESO_HIMAWARI_PRODUCT=fldk
-        # reverts Himawari to the 10-min full disk (true-color is always FLDK,
-        # guarded in find_file). GOES is unaffected by the flag.
+        # Himawari -> the ~2.5-min Target sub-scans (ALL six bands incl. true-color,
+        # which now composites entirely off one Target sub-scan). MESO_HIMAWARI_PRODUCT
+        # =fldk reverts Himawari to the 10-min full disk; MESO_TC_FLDK=true on the
+        # render service reverts JUST true-color to FLDK. GOES is unaffected.
         product = "meso"
         if sector.family == "himawari" and MESO_HIMAWARI_PRODUCT == "fldk":
             product = None
@@ -1040,22 +1121,30 @@ class MesoPoller:
             return  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(sector, band, key, ts, h)
         u.last_hash = h
+        self._last_frame_utc[sector.slug] = utcnow()   # self-heal freshness signal
         log.info("[%s] uploaded %s (%d B, %s, render %.1fs)", lane.name, key,
                  len(png), header_get(headers, "X-Satellite") or "?",
                  time.monotonic() - _t_render)
 
     # ---- cadence --------------------------------------------------------
 
-    def lane_cadence(self, lane: Lane) -> float:
+    def lane_cadence(self, lane: Lane, unit: "Unit | None" = None) -> float:
         """Per-unit cadence for a lane. Hot = the native 60 s GOES meso scan
-        target. Cold is DELIBERATELY stretched well past that so the cold
-        bands (WV / true-color / SWIR) self-pace: floors at
-        COLD_CADENCE_TARGET_S (default 300 s) and still widens with the rate
-        budget when the lane is pointed at the public URL."""
+        target. Cold is DELIBERATELY stretched well past that so the cold bands
+        (WV / true-color / SWIR) self-pace. Per-family cold floor: Himawari
+        floors at COLD_CADENCE_TARGET_HIMA_S (default 150 s) so its cold bands
+        track the ~2.5-min Target sub-scan cadence its hot bands already ride;
+        GOES floors at COLD_CADENCE_TARGET_S (default 300 s). Both still widen
+        with the rate budget (unit count x min spacing) when the lane is pointed
+        at the public URL. The cold lane takes only the most-overdue unit per
+        pass, so a Himawari unit due every 150 s is simply picked more often than
+        a GOES unit due every 300 s -- the hot lane is never touched."""
         if lane.drain_all:
             return CADENCE_TARGET_S
-        return max(COLD_CADENCE_TARGET_S,
-                   len(lane.units) * lane.limiter.min_spacing)
+        floor = (COLD_CADENCE_TARGET_HIMA_S
+                 if unit is not None and unit.sector.family == "himawari"
+                 else COLD_CADENCE_TARGET_S)
+        return max(floor, len(lane.units) * lane.limiter.min_spacing)
 
     def _lane_loop(self, lane: Lane) -> None:
         """The lane's scheduler thread. Hot drains EVERY due unit per pass (the
@@ -1084,7 +1173,7 @@ class MesoPoller:
                     if time.monotonic() < lane.circuit_open_until:
                         break
                     self.process_unit(u, lane)
-                    u.next_due = time.monotonic() + self.lane_cadence(lane)
+                    u.next_due = time.monotonic() + self.lane_cadence(lane, u)
             except Exception as e:  # noqa: BLE001 - a lane must never die
                 log.exception("[%s] lane error (continuing): %s", lane.name, e)
                 time.sleep(5)
@@ -1148,6 +1237,39 @@ class MesoPoller:
         except Exception as e:  # noqa: BLE001
             log.warning("health R2 write failed: %s", e)
 
+    # ---- self-heal watchdog --------------------------------------------
+
+    def _selfheal_step(self) -> bool:
+        """One watchdog decision + action; split out so it's unit-testable.
+        Returns True if it triggered the exit (in production os._exit never
+        returns -- the tests patch it to assert the call)."""
+        wedged, why = selfheal_decide(self._last_frame_utc, utcnow())
+        if not wedged:
+            return False
+        log.error("SELF-HEAL: meso poller WEDGED -- no fresh scan on ANY sector "
+                  "(%s); force-exiting so `restart: always` recovers it clean", why)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(1)
+        return True  # unreachable in production
+
+    def _selfheal_loop(self) -> None:
+        """Daemon watchdog. Runs in its OWN thread so a freeze inside the main
+        loop's hung call is still caught (the 503's stored snapshot would stay
+        frozen at healthy). A boot grace keeps cold start from tripping."""
+        start = time.monotonic()
+        while True:
+            time.sleep(SELFHEAL_CHECK_S)
+            if time.monotonic() - start < SELFHEAL_GRACE_S:
+                continue
+            try:
+                self._selfheal_step()
+            except Exception as e:  # noqa: BLE001 - the watchdog must never die
+                log.warning("self-heal watchdog error (continuing): %s", e)
+
     # ---- main loop ------------------------------------------------------
 
     def run(self) -> None:
@@ -1164,6 +1286,12 @@ class MesoPoller:
                  "prefix=%s | sectors=%d | spacing=%gs | reconcile=%gs",
                  RENDER_URL, RENDER_URL_COLD, R2_BUCKET, R2_PREFIX,
                  len(MESO_SECTORS), RATE_MIN_SPACING_S, RECONCILE_S)
+        if SELFHEAL_ENABLED:
+            threading.Thread(target=self._selfheal_loop,
+                             name="meso-selfheal", daemon=True).start()
+            log.info("self-heal watchdog ON | goes>%gs hima>%gs grace=%gs every=%gs",
+                     SELFHEAL_STALE_GOES_S, SELFHEAL_STALE_HIMA_S,
+                     SELFHEAL_GRACE_S, SELFHEAL_CHECK_S)
         # Storage-truth sync BEFORE any frame work: rebuild every manifest
         # from an R2 listing (drops phantom entries the viewer 404s on), then
         # seed the per-unit dedup hashes from the reconciled state.
