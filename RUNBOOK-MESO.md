@@ -80,17 +80,21 @@ docker compose -f docker-compose.meso.yml ps        # both services -> healthy
 
 ## 9. Self-heal watchdog (never-stale)
 `restart: always` only recovers a CRASH (process exit). A silent WEDGE -- the
-loop frozen in a hung call -- leaves the container "running" but producing
-nothing, and the 503 healthcheck can only DETECT it (it reads a stored snapshot
-the frozen loop can no longer refresh). A daemon thread in `meso_poller.py`, run
-independently of the main loop, reads the SAME per-sector freshness the 503 uses
-against the current clock; when EVERY sector has gone stale past its per-source
-threshold (GOES 600 s, Himawari 900 s) it force-exits so `restart: always` brings
-it back clean. Tunables + kill switch (`MESO_SELFHEAL`) live in `.env.meso.example`.
+loop frozen in a hung call, OR the render service stalled so no frames upload --
+leaves the container "running" but producing nothing, and the 503 healthcheck can
+only DETECT it (it reads a stored snapshot the frozen loop can no longer refresh).
+A daemon thread in `meso_poller.py`, run independently of the main loop, watches
+the per-sector last SUCCESSFUL frame-upload time against the current clock; when
+EVERY producing sector has gone stale past its per-source threshold (GOES 600 s,
+Himawari 900 s) it force-exits so `restart: always` brings it back clean. A sector
+that has not produced since (re)start is ignored, so a restart while the render
+service is still down never loops. Tunables + kill switch (`MESO_SELFHEAL`) live
+in `.env.meso.example`.
 
-Confirm it is armed after deploy:
+Confirm it is armed after deploy (and at the REAL thresholds):
 ```bash
 docker compose -f docker-compose.meso.yml logs meso-poller | grep "self-heal watchdog ON"
+#   expect: ... goes>600s hima>900s grace=300s every=30s
 ```
 Confirm cadence is HOLDING (hot IR ~60 s, Himawari ~2.5 min) via consecutive
 frame gaps in the live manifest:
@@ -98,20 +102,58 @@ frame gaps in the live manifest:
 curl -s https://cdn.triple-a-tropics.com/meso/goes19-m1/manifest.json \
   | python3 -c "import sys,json,datetime as d;f=[x['t'] for x in json.load(sys.stdin)['bands']['ir']['frames'][-12:]];p=lambda s:d.datetime.fromisoformat(s.replace('Z','+00:00'));print('gaps(s):',[int((p(f[i])-p(f[i-1])).total_seconds()) for i in range(1,len(f))])"
 ```
-LIVE kill/recover proof (fast variant -- tiny thresholds, then revert):
+
+### LIVE kill/recover proof (fast variant -- lower thresholds, induce, REVERT)
 ```bash
-# 1. tighten thresholds so the wedge is provable in minutes, then apply:
-#    in .env add:  SELFHEAL_STALE_GOES_S=120  SELFHEAL_STALE_HIMA_S=120  SELFHEAL_GRACE_S=60
-docker compose -f docker-compose.meso.yml up -d
-# 2. starve discovery to force a full stall (simulates a wedge):
-docker compose -f docker-compose.meso.yml stop meso-render
-sleep 200                                              # > 120s threshold + 60s grace
-docker compose -f docker-compose.meso.yml logs --since 10m meso-poller | grep "SELF-HEAL"   # the auto-exit line
-# 3. restore + watch the poller auto-restart back to healthy with NO manual touch:
-docker compose -f docker-compose.meso.yml start meso-render
-docker compose -f docker-compose.meso.yml ps          # meso-poller restarted -> healthy
-# 4. REVERT the test thresholds (remove the three SELFHEAL_* lines) and: up -d
+# 0) baseline: both healthy + watchdog armed at the REAL thresholds
+docker compose -f docker-compose.meso.yml ps
+docker compose -f docker-compose.meso.yml logs --since 5m meso-poller | grep "self-heal watchdog ON"
+#    expect: ... goes>600s hima>900s grace=300s every=30s
+
+# 1) TEMP: lower thresholds so a wedge trips in minutes (REVERTED in step 5)
+cat >> .env <<'EOF'
+# --- TEMP self-heal proof: DELETE these 4 lines in step 5 ---
+SELFHEAL_STALE_GOES_S=120
+SELFHEAL_STALE_HIMA_S=120
+SELFHEAL_GRACE_S=60
+SELFHEAL_CHECK_S=15
+EOF
+docker compose -f docker-compose.meso.yml up -d meso-poller
+docker compose -f docker-compose.meso.yml logs --since 1m meso-poller | grep "self-heal watchdog ON"
+#    expect TEST values now: ... goes>120s hima>120s grace=60s every=15s
+sleep 90    # let it upload a few fresh frames so last_frame_utc is populated
+
+# 2) induce the wedge: stop the render service -> frames stop uploading -> stale
+docker compose -f docker-compose.meso.yml stop meso-render ; date -u
+
+# 3) RECOVERY proof: stale detected -> force-exit(1) -> restart:always restarts it
+sleep 210   # > 120s threshold + 60s grace + a 15s check
+docker compose -f docker-compose.meso.yml logs --since 6m meso-poller | grep "SELF-HEAL"
+#    expect: SELF-HEAL: meso poller WEDGED -- no fresh scan on ANY sector (...>120s...); force-exiting ...
+docker compose -f docker-compose.meso.yml ps
+#    expect: meso-poller "Up <a few> seconds" (it auto-restarted). It will sit
+#    quietly (no loop) while meso-render is down -- that is the None-skip working.
+
+# 4) restore the render service -> fresh frames resume with NO manual touch
+docker compose -f docker-compose.meso.yml start meso-render ; sleep 90
+docker compose -f docker-compose.meso.yml logs --since 2m meso-poller | grep -E "uploaded meso/.*/ir/"
+#    expect: fresh "uploaded meso/<sector>/ir/..." lines = production resumed
+
+# 5) REVERT (CRITICAL -- leaving the tiny values would false-trip in normal ops):
+#    delete the 4 TEMP lines added in step 1 from .env, then recreate the poller
+${EDITOR:-nano} .env        # remove the "TEMP self-heal proof" block
+docker compose -f docker-compose.meso.yml up -d meso-poller
+
+# 6) REVERT proof -- live thresholds back at 600/900 AND no TEMP overrides linger:
+docker compose -f docker-compose.meso.yml logs --since 1m meso-poller | grep "self-heal watchdog ON"
+#    MUST show: ... goes>600s hima>900s grace=300s every=30s
+docker compose -f docker-compose.meso.yml exec meso-poller sh -lc 'env | grep SELFHEAL_ || echo "OK: no SELFHEAL_ overrides -> defaults 600/900"'
+#    MUST show: OK: no SELFHEAL_ overrides -> defaults 600/900
+curl -s localhost:8090/health | python3 -m json.tool | grep '"healthy"'   # -> true
 ```
+Paste back: step 3 (the `SELF-HEAL` line + `ps` showing the restart), step 4 (the
+fresh `uploaded …/ir/…` lines), and step 6 (the `goes>600s hima>900s` line + the
+`OK: no SELFHEAL_ overrides` line) -- that proves BOTH the recovery and the revert.
 
 ## What it writes to R2 (prefix `meso/`)
 - Frames:  `meso/{slug}/{band}/{YYYYMMDDTHHMMZ}.png` (immutable, 1-yr cache)

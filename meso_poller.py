@@ -166,18 +166,28 @@ HEALTH_FILE = _env("HEALTH_FILE", "/tmp/meso_health.json")
 # (the loop frozen in a hung call -- the same never-stale disease as HAFS/S1)
 # freezes the stored health snapshot at "healthy", and docker `restart: always`
 # fires on EXIT, not on "unhealthy", so a frozen poller would sit forever. A
-# daemon thread INDEPENDENT of the (possibly wedged) main loop reads the SAME
-# per-sector freshness the 503 uses -- SourceHealth.last_valid_time, the latest
-# discovered scan -- against the CURRENT clock, so a frozen timestamp is caught.
-# When EVERY discovered sector is stale past its PER-SOURCE threshold (the whole
-# poller has stopped progressing) it force-EXITS and `restart: always` recovers
-# it clean. Thresholds clear the worst HEALTHY staleness with >3x margin so a
-# single late scan never trips: last_valid_time only refreshes every
-# SECTORS_REFRESH_S (120 s), so a fresh GOES sector ages up to ~180 s and a
-# Himawari sector up to ~270 s between refreshes.
+# daemon thread INDEPENDENT of the (possibly wedged) main loop watches the
+# per-sector last SUCCESSFUL frame-upload time against the CURRENT clock -- the
+# actual "no fresh frame produced/uploaded" signal -- so a freeze is caught even
+# while the loop is stuck. When EVERY producing sector is stale past its
+# PER-SOURCE threshold (the whole poller has stopped producing) it force-EXITS
+# and `restart: always` recovers it clean.
+#
+# Frame-upload (not discovery) is the signal on purpose: discovery hits NOAA
+# directly, independent of the render service, so a render-side wedge would leave
+# discovery "fresh" while frames silently went stale forever -- the 503's
+# discovery-only signal misses that. Frame-upload staleness is a SUPERSET of the
+# 503's condition (a discovery stall also stalls uploads), so the watchdog still
+# makes the 503 alarm self-resolving AND covers the render-down hole. A sector
+# that has not produced since (re)start is None -> ignored, so a cold start (or a
+# restart while the render service is still down) never trips -- no futile loop.
+#
+# Thresholds clear the worst HEALTHY upload gap with margin so a single late scan
+# never trips: GOES hot IR uploads ~60 s (a missed scan ~120 s), Himawari ~150 s
+# (a missed slot ~300 s).
 SELFHEAL_ENABLED = _env_bool("MESO_SELFHEAL", True)
-SELFHEAL_STALE_GOES_S = float(_env("SELFHEAL_STALE_GOES_S", "600"))  # ~10x the 60s GOES scan; >3x the ~180s healthy max
-SELFHEAL_STALE_HIMA_S = float(_env("SELFHEAL_STALE_HIMA_S", "900"))  # ~6x the 150s Himawari Target; >3x the ~270s healthy max
+SELFHEAL_STALE_GOES_S = float(_env("SELFHEAL_STALE_GOES_S", "600"))  # ~10x the 60s GOES upload; >3x the ~180s healthy max
+SELFHEAL_STALE_HIMA_S = float(_env("SELFHEAL_STALE_HIMA_S", "900"))  # ~6x the 150s Himawari upload; >3x the ~300s healthy max
 SELFHEAL_GRACE_S = float(_env("SELFHEAL_GRACE_S", "300"))            # cold-start grace (> compose start_period 120s)
 SELFHEAL_CHECK_S = float(_env("SELFHEAL_CHECK_S", "30"))             # watchdog poll cadence
 
@@ -633,32 +643,31 @@ def selfheal_stale_threshold_s(sector: MesoSector) -> float:
             else SELFHEAL_STALE_GOES_S)
 
 
-def selfheal_decide(health: dict[str, SourceHealth],
+def selfheal_decide(last_frame_utc: dict[str, dt.datetime],
                     now: dt.datetime) -> tuple[bool, str]:
     """WEDGE decision -> (should_exit, reason).
 
-    Reuses the SAME per-sector freshness the 503 healthcheck computes
-    (SourceHealth.last_valid_time = the latest discovered scan) but judged
-    against the CURRENT clock. True ONLY when EVERY already-discovered sector's
-    latest scan is older than its per-source threshold -- i.e. NO sector is
-    producing and the whole poller has stopped (a real freeze). A sector never
-    yet discovered (last_valid_time None) is ignored so a cold start never trips;
-    a single stale source while another is fresh does NOT fire (the loop is
-    alive, and a restart wouldn't help that one source anyway)."""
+    Judges the per-sector last SUCCESSFUL frame-upload time (the "fresh frame
+    produced/uploaded" signal) against the CURRENT clock. True ONLY when EVERY
+    sector that has EVER produced is now stale past its per-source threshold --
+    i.e. NO sector is producing and the whole poller has stopped (a real freeze:
+    a loop wedge OR a render-side stall). A sector that has not produced since
+    (re)start is None -> ignored, so a cold start (or a restart while the render
+    service is still down) never trips -- no futile restart loop. A single stale
+    source while another is fresh does NOT fire (the poller is alive)."""
     stale: list[str] = []
     fresh = 0
     for sector in MESO_SECTORS:
-        h = health.get(sector.slug)
-        lvt = h.last_valid_time if h else None
-        if lvt is None:
-            continue                       # never discovered yet -> boot
-        age = (now - lvt).total_seconds()
+        lf = last_frame_utc.get(sector.slug)
+        if lf is None:
+            continue                       # never produced since (re)start -> boot
+        age = (now - lf).total_seconds()
         thr = selfheal_stale_threshold_s(sector)
         if age > thr:
             stale.append(f"{sector.slug} {age:.0f}s>{thr:.0f}s")
         else:
             fresh += 1
-    if fresh == 0 and stale:               # discovered sectors exist, ALL stale
+    if fresh == 0 and stale:               # producing sectors exist, ALL stale
         return True, "; ".join(stale)
     return False, ""
 
@@ -689,6 +698,11 @@ class MesoPoller:
         self.health: dict[str, SourceHealth] = {
             s.slug: SourceHealth(name=s.slug) for s in MESO_SECTORS
         }
+        # Per-sector wall-clock of the last SUCCESSFUL frame upload -- the
+        # "fresh frame produced/uploaded" signal the self-heal watchdog watches.
+        # Empty until a sector first produces (cold start -> the watchdog ignores
+        # it, so a restart while the render service is down never loops).
+        self._last_frame_utc: dict[str, dt.datetime] = {}
         self._last_sectors_refresh = 0.0
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
@@ -851,6 +865,7 @@ class MesoPoller:
             return  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(sector, band, key, ts, h)
         u.last_hash = h
+        self._last_frame_utc[sector.slug] = utcnow()   # self-heal freshness signal
         log.info("uploaded %s (%d B, %s, render %.1fs)", key, len(png),
                  headers.get("X-Satellite", "?"), time.monotonic() - _t_render)
 
@@ -945,7 +960,7 @@ class MesoPoller:
         """One watchdog decision + action; split out so it's unit-testable.
         Returns True if it triggered the exit (in production os._exit never
         returns -- the tests patch it to assert the call)."""
-        wedged, why = selfheal_decide(self.health, utcnow())
+        wedged, why = selfheal_decide(self._last_frame_utc, utcnow())
         if not wedged:
             return False
         log.error("SELF-HEAL: meso poller WEDGED -- no fresh scan on ANY sector "
