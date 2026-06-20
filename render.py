@@ -114,11 +114,16 @@ def render_png(
     storm: Optional[dict] = None,
     coastlines: bool = True,
     gridlines: bool = True,
+    target_px: Optional[int] = None,
 ) -> bytes:
     # ``coastlines`` draws coastlines + political borders; ``gridlines`` draws the
     # labeled lat/lon graticule. Both default True (the standard look); the custom-
     # zoom page can switch either off for clean imagery. (The floater/meso loop
     # frames never pass them -> always on, unchanged.)
+    # ``target_px`` is the custom-zoom RESOLUTION knob: the desired LONG-axis output
+    # size in pixels (the savefig dpi is derived from it below so the figure is
+    # actually rendered at that size, not just data-strided). None keeps the legacy
+    # dpi=110 (~1320 px) render so the floater/meso loop path is byte-identical.
     # True-color composites carry an H×W×3 RGB array in ``cmi`` (units="rgb")
     # and don't go through the scalar normalize/cmap path.
     is_rgb = data.units == "rgb"
@@ -211,9 +216,13 @@ def render_png(
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
-    # Figure size: target ~1400 px wide, height by aspect, dpi=110
+    # Figure size: fixed 12 in wide, height by aspect. Output PIXELS = inches * dpi.
+    # Legacy dpi=110 -> ~1320 px (the loop/poller render). The custom-zoom tiers set
+    # target_px (long-axis px) and derive the dpi so the LONGER figure axis lands at
+    # ~target_px (bounding total output to ~target_px^2).
     fig_w = 12.0
     fig_h = max(4.0, fig_w / max(aspect, 0.3))
+    out_dpi = 110 if not target_px else max(24, round(target_px / max(fig_w, fig_h)))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
 
     # Layout: title strip on top (~6%), main map fills the rest with a small
@@ -423,7 +432,7 @@ def render_png(
         )
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, facecolor=DARK_BG, edgecolor="none")
+    fig.savefig(buf, format="png", dpi=out_dpi, facecolor=DARK_BG, edgecolor="none")
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()

@@ -463,6 +463,11 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     downsample = compute_downsample_factor(
         body.bbox, "visible_red" if is_true_color else generic_channel, budget
     )
+    # Output pixel size for the custom-zoom tiers: render the figure at a dpi that
+    # lands the long axis near sqrt(budget) (~500 / 1500 / 4000 px). The webp LOOP
+    # path keeps the legacy ~1320 px render (target_px=None) then downscales to the
+    # fixed frame width, so the poller path is byte-identical.
+    target_px = None if body.format == "webp" else round(budget ** 0.5)
 
     # Pick the satellite that can see this bbox at this time. CoverageError
     # surfaces as 422 with a message that names the right satellite for the
@@ -552,6 +557,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     storm=body.storm.model_dump() if body.storm is not None else None,
                     coastlines=body.coastlines,
                     gridlines=body.gridlines,
+                    target_px=target_px,
                 )
                 # webp loop frames transcode inside the same executor job so
                 # the render semaphore covers the whole CPU burst and the

@@ -121,5 +121,37 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(wkey("default"), wkey("low"))
 
 
+class RenderTargetPxTests(unittest.TestCase):
+    def test_target_px_derived_from_budget(self):
+        # sqrt(budget) is the long-axis output target the tiers render at.
+        self.assertEqual(round(app.QUALITY_BUDGETS["low"] ** 0.5), 500)
+        self.assertEqual(round(app.QUALITY_BUDGETS["default"] ** 0.5), 1500)
+        self.assertEqual(round(app.QUALITY_BUDGETS["high"] ** 0.5), 4000)
+
+    def test_render_png_output_size_tracks_target_px(self):
+        # The real fix: target_px sets the savefig dpi so the OUTPUT pixels scale
+        # (not just the data stride). None keeps the legacy ~1320 px loop render.
+        import datetime as dt
+        import io
+        import numpy as np
+        from PIL import Image
+        from satellites import FetchResult
+        from render import render_png
+        lat = np.linspace(20, 24, 60); lon = np.linspace(-64, -60, 60)
+        lons, lats = np.meshgrid(lon, lat)
+        cmi = 250.0 + 10.0 * np.sin(lats)
+        fr = FetchResult(cmi=cmi, lats=lats, lons=lons, channel=13,
+                         generic_channel="clean_ir", scan_start=dt.datetime(2026, 6, 20, 12, 0),
+                         product="P", bucket="noaa-goes19", sat_name="GOES-19",
+                         sub_sat_lon=-75.2, units="K")
+        b = [-64.0, 20.0, -60.0, 24.0]   # square-ish
+        small = Image.open(io.BytesIO(
+            render_png(fr, b, 13, "t", "rainbow_ir", 1, target_px=256))).size
+        legacy = Image.open(io.BytesIO(
+            render_png(fr, b, 13, "t", "rainbow_ir", 1, target_px=None))).size
+        self.assertLess(max(small), 420)        # ~256 long axis
+        self.assertGreater(max(legacy), 1200)   # ~1320 legacy (loop path unchanged)
+
+
 if __name__ == "__main__":
     unittest.main()
