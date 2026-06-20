@@ -155,10 +155,57 @@ Paste back: step 3 (the `SELF-HEAL` line + `ps` showing the restart), step 4 (th
 fresh `uploaded …/ir/…` lines), and step 6 (the `goes>600s hima>900s` line + the
 `OK: no SELFHEAL_ overrides` line) -- that proves BOTH the recovery and the revert.
 
+## 10. Stable common-extent ("anchor") -- the loop-jitter cure
+
+The operators steer the sectors around, so the source extent moves: GOES M1/M2 is
+byte-stable WITHIN a position but jumps 1-2x/day on a genuine reposition; the
+Himawari Target is re-steered CONTINUOUSLY to keep an active storm centred, so it
+crept every slot. Rendering each frame to the live per-scan box bled that motion
+straight into the loop -> it wandered. The poller now pins each sector's loop to
+ONE stable **anchor** extent, HELD pixel-locked until the live box no longer
+covers it (drift/reposition) or its span changes (zoom), then SNAPS. Within an
+era every frame is geo-aligned AND pixel-identical, so the loop is locked; a
+handful of deliberate re-centres/day follow genuine relocation.
+
+Deploy is the SAME as section 8 (a `git pull && docker compose -f
+docker-compose.meso.yml up -d --build`) -- the change is poller-only
+(`meso_poller.py` + new `meso_anchor.py`); no render-service change, so it works
+even if only `meso-poller` is rebuilt.
+
+Verify after the rebuild:
+```bash
+docker logs --since 5m meso-poller | grep -E "anchor|re-anchor"
+#   expect at startup: "anchor goes19-m1 (init) -> [...]" for each sector (or
+#   "loaded anchor ..." if a prior anchor.json existed); then mostly silence
+#   (HOLD = locked, logs nothing) with an occasional "re-anchor himawari9-meso
+#   (recenter): center moved 0.7 deg" every few hours -- those are the snaps.
+# Confirm the loop is locked: scrub cdn .../meso/himawari9-meso/manifest.json
+# frames -- consecutive frames share the same geographic framing (the storm moves
+# WITHIN a fixed view, not the view crawling).
+curl -s https://cdn.triple-a-tropics.com/meso/himawari9-meso/anchor.json | python3 -m json.tool
+```
+
+Knobs (env on the **poller**; reverts need only a restart, no rebuild):
+- `MESO_ANCHOR=false` -- KILL SWITCH: render the live per-scan box (the old,
+  wandering behaviour). Instant rollback.
+- `MESO_ANCHOR_MARGIN_HIMA_DEG` (0.6) -- Himawari inset margin. Larger = fewer
+  re-centres but more trimmed coverage; smaller = tighter coverage, more snaps.
+- `MESO_ANCHOR_MARGIN_GOES_DEG` (0.0) -- GOES margin. 0 = anchor == the operator
+  box exactly (snap only on a genuine move) == the pre-anchor behaviour.
+- `MESO_ANCHOR_DRIFT_LIMIT_MULT` (1.5), `MESO_ANCHOR_SPAN_TOL` (0.12),
+  `MESO_ANCHOR_COVER_BUFFER_DEG` (0.003) -- drift-vs-reposition split, zoom
+  threshold, and the (sub-pixel) max blank-strip bound. Defaults are tuned to the
+  measured drift (~0.1-0.3 deg/h); leave them unless you have a reason.
+
+GOES is effectively unchanged (margin 0); the visible win is on the
+continuously-steered Himawari Target.
+
 ## What it writes to R2 (prefix `meso/`)
 - Frames:  `meso/{slug}/{band}/{YYYYMMDDTHHMMZ}.png` (immutable, 1-yr cache)
 - Per-sector manifest: `meso/{slug}/manifest.json` (`max-age=30`)
-- Top index: `meso/manifest.json` (`max-age=30`)
+- Per-sector anchor: `meso/{slug}/anchor.json` (the persisted stable extent;
+  reloaded on restart so a deploy/self-heal bounce doesn't snap a locked loop)
+- Top index: `meso/manifest.json` (`max-age=30`, `bbox` = the anchor box)
 - Health:   `meso/health.json` (`max-age=30`)
 
 Slugs: `goes19-m1`, `goes19-m2`, `goes18-m1`, `goes18-m2`, `himawari9-meso`.
