@@ -70,6 +70,49 @@ Re-enable by flipping it back to `true` and running the same `up -d`.
 docker compose -f docker-compose.meso.yml down
 ```
 
+## 8. Deploying an update (already-cloned box, on the `meso` branch)
+```bash
+cd <repo>                                    # the dir cloned with --branch meso
+git pull                                     # fast-forward to the latest meso commit
+docker compose -f docker-compose.meso.yml up -d --build
+docker compose -f docker-compose.meso.yml ps        # both services -> healthy
+```
+
+## 9. Self-heal watchdog (never-stale)
+`restart: always` only recovers a CRASH (process exit). A silent WEDGE -- the
+loop frozen in a hung call -- leaves the container "running" but producing
+nothing, and the 503 healthcheck can only DETECT it (it reads a stored snapshot
+the frozen loop can no longer refresh). A daemon thread in `meso_poller.py`, run
+independently of the main loop, reads the SAME per-sector freshness the 503 uses
+against the current clock; when EVERY sector has gone stale past its per-source
+threshold (GOES 600 s, Himawari 900 s) it force-exits so `restart: always` brings
+it back clean. Tunables + kill switch (`MESO_SELFHEAL`) live in `.env.meso.example`.
+
+Confirm it is armed after deploy:
+```bash
+docker compose -f docker-compose.meso.yml logs meso-poller | grep "self-heal watchdog ON"
+```
+Confirm cadence is HOLDING (hot IR ~60 s, Himawari ~2.5 min) via consecutive
+frame gaps in the live manifest:
+```bash
+curl -s https://cdn.triple-a-tropics.com/meso/goes19-m1/manifest.json \
+  | python3 -c "import sys,json,datetime as d;f=[x['t'] for x in json.load(sys.stdin)['bands']['ir']['frames'][-12:]];p=lambda s:d.datetime.fromisoformat(s.replace('Z','+00:00'));print('gaps(s):',[int((p(f[i])-p(f[i-1])).total_seconds()) for i in range(1,len(f))])"
+```
+LIVE kill/recover proof (fast variant -- tiny thresholds, then revert):
+```bash
+# 1. tighten thresholds so the wedge is provable in minutes, then apply:
+#    in .env add:  SELFHEAL_STALE_GOES_S=120  SELFHEAL_STALE_HIMA_S=120  SELFHEAL_GRACE_S=60
+docker compose -f docker-compose.meso.yml up -d
+# 2. starve discovery to force a full stall (simulates a wedge):
+docker compose -f docker-compose.meso.yml stop meso-render
+sleep 200                                              # > 120s threshold + 60s grace
+docker compose -f docker-compose.meso.yml logs --since 10m meso-poller | grep "SELF-HEAL"   # the auto-exit line
+# 3. restore + watch the poller auto-restart back to healthy with NO manual touch:
+docker compose -f docker-compose.meso.yml start meso-render
+docker compose -f docker-compose.meso.yml ps          # meso-poller restarted -> healthy
+# 4. REVERT the test thresholds (remove the three SELFHEAL_* lines) and: up -d
+```
+
 ## What it writes to R2 (prefix `meso/`)
 - Frames:  `meso/{slug}/{band}/{YYYYMMDDTHHMMZ}.png` (immutable, 1-yr cache)
 - Per-sector manifest: `meso/{slug}/manifest.json` (`max-age=30`)
