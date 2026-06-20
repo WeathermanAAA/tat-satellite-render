@@ -7,9 +7,11 @@ The contract under test, end to end:
   REQUEST    - RenderRequest accepts format png|webp, defaults png, rejects
                anything else (the draw-a-box panel and legacy callers are
                untouched by construction).
-  CACHE      - _request_key for a png request is BYTE-IDENTICAL to the
-               pre-format-param key (cache continuity across the deploy);
-               the webp variant of the same request keys separately.
+  CACHE      - _request_key for the WEBP LOOP path is byte-identical to its
+               pre-resolution-tier key (poller frame-cache continuity); the png
+               /custom-zoom path keys on the resolution tier so the tiers cache
+               separately (the default tier's size changed, so it must NOT reuse
+               the old tier-less key).
   POLLER     - floater_poller derives the uploaded extension + content-type
                from the /render RESPONSE, case-insensitively, falling back to
                .png for an old service that ignored the format param.
@@ -113,16 +115,30 @@ class TestRenderRequestFormat(unittest.TestCase):
         with self.assertRaises(Exception):
             self._req(format="gif")
 
-    def test_png_cache_key_is_byte_identical_to_legacy(self):
-        body = self._req()
+    def test_webp_loop_cache_key_is_byte_identical_to_legacy(self):
+        # The WEBP loop path (the floater/meso poller frames) MUST keep its
+        # pre-resolution-tier key so the durable frame cache stays continuous
+        # across this deploy. quality is irrelevant there (no q-part).
+        body = self._req(format="webp")
         key = self.app._request_key(body, "clean_ir", "2026-06-12T06:00:00", "noaa-goes19")
-        # The exact raw string _request_key built BEFORE the format param
-        # existed. A png request must keep hashing to this -- that is the
-        # cache-continuity guarantee for the deploy.
+        legacy_raw = (
+            f"{body.bbox}|2026-06-12T06:00:00|clean_ir|{body.enhancement}|noaa-goes19|fmt=webp"
+        )
+        self.assertEqual(key, hashlib.sha256(legacy_raw.encode()).hexdigest())
+
+    def test_png_cache_key_carries_resolution_tier(self):
+        # The png/custom-zoom path now keys on the resolution tier so the three
+        # tiers cache separately. The default tier's output size changed
+        # (full-res -> ~1500px), so it INTENTIONALLY no longer matches the old
+        # tier-less key -- the in-memory cache must not serve a stale full-res
+        # frame as the new default.
+        body = self._req()  # default png
+        key = self.app._request_key(body, "clean_ir", "2026-06-12T06:00:00", "noaa-goes19")
         legacy_raw = (
             f"{body.bbox}|2026-06-12T06:00:00|clean_ir|{body.enhancement}|noaa-goes19"
         )
-        self.assertEqual(key, hashlib.sha256(legacy_raw.encode()).hexdigest())
+        self.assertNotEqual(key, hashlib.sha256(legacy_raw.encode()).hexdigest())
+        self.assertEqual(key, hashlib.sha256((legacy_raw + "|q=default").encode()).hexdigest())
 
     def test_webp_keys_separately_from_png(self):
         png_key = self.app._request_key(
