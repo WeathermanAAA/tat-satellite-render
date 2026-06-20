@@ -161,6 +161,26 @@ FAIL_THRESHOLD = int(_env("FAIL_THRESHOLD", "3"))
 HEALTH_PORT = int(_env("HEALTH_PORT", "8090"))
 HEALTH_FILE = _env("HEALTH_FILE", "/tmp/meso_health.json")
 
+# Self-heal watchdog (never-stale). The 503 healthcheck only makes a freeze
+# DETECTABLE -- and only while the loop still runs to recompute it. A true WEDGE
+# (the loop frozen in a hung call -- the same never-stale disease as HAFS/S1)
+# freezes the stored health snapshot at "healthy", and docker `restart: always`
+# fires on EXIT, not on "unhealthy", so a frozen poller would sit forever. A
+# daemon thread INDEPENDENT of the (possibly wedged) main loop reads the SAME
+# per-sector freshness the 503 uses -- SourceHealth.last_valid_time, the latest
+# discovered scan -- against the CURRENT clock, so a frozen timestamp is caught.
+# When EVERY discovered sector is stale past its PER-SOURCE threshold (the whole
+# poller has stopped progressing) it force-EXITS and `restart: always` recovers
+# it clean. Thresholds clear the worst HEALTHY staleness with >3x margin so a
+# single late scan never trips: last_valid_time only refreshes every
+# SECTORS_REFRESH_S (120 s), so a fresh GOES sector ages up to ~180 s and a
+# Himawari sector up to ~270 s between refreshes.
+SELFHEAL_ENABLED = _env_bool("MESO_SELFHEAL", True)
+SELFHEAL_STALE_GOES_S = float(_env("SELFHEAL_STALE_GOES_S", "600"))  # ~10x the 60s GOES scan; >3x the ~180s healthy max
+SELFHEAL_STALE_HIMA_S = float(_env("SELFHEAL_STALE_HIMA_S", "900"))  # ~6x the 150s Himawari Target; >3x the ~270s healthy max
+SELFHEAL_GRACE_S = float(_env("SELFHEAL_GRACE_S", "300"))            # cold-start grace (> compose start_period 120s)
+SELFHEAL_CHECK_S = float(_env("SELFHEAL_CHECK_S", "30"))             # watchdog poll cadence
+
 CACHE_FRAME = "public, max-age=31536000, immutable"
 CACHE_MANIFEST = "max-age=30"
 
@@ -604,6 +624,46 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
 
 
 # ---------------------------------------------------------------------------
+# Self-heal decision (shared by the watchdog thread + its tests)
+# ---------------------------------------------------------------------------
+
+def selfheal_stale_threshold_s(sector: MesoSector) -> float:
+    """Per-source stale threshold (seconds) for the self-heal watchdog."""
+    return (SELFHEAL_STALE_HIMA_S if sector.family == "himawari"
+            else SELFHEAL_STALE_GOES_S)
+
+
+def selfheal_decide(health: dict[str, SourceHealth],
+                    now: dt.datetime) -> tuple[bool, str]:
+    """WEDGE decision -> (should_exit, reason).
+
+    Reuses the SAME per-sector freshness the 503 healthcheck computes
+    (SourceHealth.last_valid_time = the latest discovered scan) but judged
+    against the CURRENT clock. True ONLY when EVERY already-discovered sector's
+    latest scan is older than its per-source threshold -- i.e. NO sector is
+    producing and the whole poller has stopped (a real freeze). A sector never
+    yet discovered (last_valid_time None) is ignored so a cold start never trips;
+    a single stale source while another is fresh does NOT fire (the loop is
+    alive, and a restart wouldn't help that one source anyway)."""
+    stale: list[str] = []
+    fresh = 0
+    for sector in MESO_SECTORS:
+        h = health.get(sector.slug)
+        lvt = h.last_valid_time if h else None
+        if lvt is None:
+            continue                       # never discovered yet -> boot
+        age = (now - lvt).total_seconds()
+        thr = selfheal_stale_threshold_s(sector)
+        if age > thr:
+            stale.append(f"{sector.slug} {age:.0f}s>{thr:.0f}s")
+        else:
+            fresh += 1
+    if fresh == 0 and stale:               # discovered sectors exist, ALL stale
+        return True, "; ".join(stale)
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
 # Poller
 # ---------------------------------------------------------------------------
 
@@ -879,6 +939,39 @@ class MesoPoller:
         except Exception as e:  # noqa: BLE001
             log.warning("health R2 write failed: %s", e)
 
+    # ---- self-heal watchdog --------------------------------------------
+
+    def _selfheal_step(self) -> bool:
+        """One watchdog decision + action; split out so it's unit-testable.
+        Returns True if it triggered the exit (in production os._exit never
+        returns -- the tests patch it to assert the call)."""
+        wedged, why = selfheal_decide(self.health, utcnow())
+        if not wedged:
+            return False
+        log.error("SELF-HEAL: meso poller WEDGED -- no fresh scan on ANY sector "
+                  "(%s); force-exiting so `restart: always` recovers it clean", why)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(1)
+        return True  # unreachable in production
+
+    def _selfheal_loop(self) -> None:
+        """Daemon watchdog. Runs in its OWN thread so a freeze inside the main
+        loop's hung call is still caught (the 503's stored snapshot would stay
+        frozen at healthy). A boot grace keeps cold start from tripping."""
+        start = time.monotonic()
+        while True:
+            time.sleep(SELFHEAL_CHECK_S)
+            if time.monotonic() - start < SELFHEAL_GRACE_S:
+                continue
+            try:
+                self._selfheal_step()
+            except Exception as e:  # noqa: BLE001 - the watchdog must never die
+                log.warning("self-heal watchdog error (continuing): %s", e)
+
     # ---- main loop ------------------------------------------------------
 
     def run(self) -> None:
@@ -895,6 +988,12 @@ class MesoPoller:
                  "sectors=%d | spacing=%gs",
                  RENDER_URL, R2_BUCKET, R2_PREFIX, len(MESO_SECTORS),
                  RATE_MIN_SPACING_S)
+        if SELFHEAL_ENABLED:
+            threading.Thread(target=self._selfheal_loop,
+                             name="meso-selfheal", daemon=True).start()
+            log.info("self-heal watchdog ON | goes>%gs hima>%gs grace=%gs every=%gs",
+                     SELFHEAL_STALE_GOES_S, SELFHEAL_STALE_HIMA_S,
+                     SELFHEAL_GRACE_S, SELFHEAL_CHECK_S)
         while True:
             try:
                 if time.monotonic() - self._last_sectors_refresh >= SECTORS_REFRESH_S \
