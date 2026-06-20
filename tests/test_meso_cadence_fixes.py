@@ -282,6 +282,71 @@ class TargetFreshnessTests(unittest.TestCase):
         self.assertFalse(comp([], 3))
 
 
+class TargetSubScanEnumerationTests(unittest.TestCase):
+    """True 2.5-min capture: address EVERY R30x Target sub-scan per 10-min slot, not
+    just the freshest. Covers target_subscans, nearest-sub resolution for a specific
+    requested time, and the poller's per-slot obs-time enumeration."""
+
+    @staticmethod
+    def _target_files(band, subs, res="R20"):
+        return [f"HS_H09_20260612_1940_B{band:02d}_R30{s}_{res}_S0101.DAT.bz2"
+                for s in subs]
+
+    def _fakefs(self, files):
+        class FakeFS:
+            def ls(self, prefix):
+                return files
+        return FakeFS()
+
+    def test_target_subscans_returns_full_set(self):
+        slot = dt.datetime(2026, 6, 12, 19, 40, tzinfo=dt.timezone.utc)
+        fs = self._fakefs(self._target_files(13, [1, 2, 3, 4]))
+        self.assertEqual(ahi_loader.target_subscans(fs, "noaa-himawari9", slot, 13),
+                         {1, 2, 3, 4})
+        # latest_target_subscan stays the MAX of that set (the 'latest' resolve)
+        self.assertEqual(ahi_loader.latest_target_subscan(fs, "x", slot, 13), 4)
+        # a band missing two sub-scans reports only what it has
+        fs2 = self._fakefs(self._target_files(13, [1, 3]))
+        self.assertEqual(ahi_loader.target_subscans(fs2, "x", slot, 13), {1, 3})
+
+    def test_resolve_nearest_picks_requested_subscan_not_latest(self):
+        # only R301 and R303 present: a request NEAR R301 must resolve R301 (proving
+        # 'nearest', not the old 'always max').
+        orig = satellites._get_fs
+        satellites._get_fs = lambda: self._fakefs(self._target_files(13, [1, 3]))
+        try:
+            slot = dt.datetime(2026, 6, 12, 19, 40, tzinfo=dt.timezone.utc)
+            r1 = satellites.HIMAWARI_PACIFIC._resolve_target_sync(
+                slot + dt.timedelta(seconds=10), 13, True)     # near R301
+            r3 = satellites.HIMAWARI_PACIFIC._resolve_target_sync(
+                slot + dt.timedelta(seconds=300), 13, True)    # near R303
+            # nearest_to_target=False still returns the freshest (max)
+            rlatest = satellites.HIMAWARI_PACIFIC._resolve_target_sync(
+                slot + dt.timedelta(seconds=10), 13, False)
+        finally:
+            satellites._get_fs = orig
+        self.assertEqual((r1.product, r1.scan_start.minute, r1.scan_start.second),
+                         ("Target1", 40, 0))
+        self.assertEqual((r3.product, r3.scan_start.minute, r3.scan_start.second),
+                         ("Target3", 45, 0))
+        self.assertEqual(rlatest.product, "Target3")           # max present
+
+    def test_poller_enumerates_all_obs_times(self):
+        orig = mp._get_fs
+        mp._get_fs = lambda: self._fakefs(self._target_files(13, [1, 2, 3, 4]))
+        try:
+            sector = next(s for s in mp.MESO_SECTORS if s.family == "himawari")
+            times = mp.himawari_target_subscan_times(sector, "clean_ir", back_slots=0)
+        finally:
+            mp._get_fs = orig
+        self.assertEqual(len(times), 4)                        # all four R30x
+        self.assertEqual({(b - a).total_seconds() for a, b in zip(times, times[1:])},
+                         {150.0})                              # exactly 2.5 min apart
+        # true-color resolves on visible_red (B03), so it enumerates too
+        self.assertEqual(mp._himawari_ref_band("true_color"), 3)
+        self.assertIsNone(mp._himawari_ref_band("nonsense"))
+
+
 class LaneTests(unittest.TestCase):
     def test_units_split_hot_cold(self):
         p = object.__new__(mp.MesoPoller)

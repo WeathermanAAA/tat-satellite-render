@@ -456,18 +456,27 @@ def _list_target_segments(fs, bucket, slot, band: int, sub: int) -> list[str]:
     return sorted(f for f in files if token in f and f.endswith(".DAT.bz2"))
 
 
-def latest_target_subscan(fs, bucket, slot, band: int) -> Optional[int]:
-    """Highest R30X Target sub-scan present for (slot, band); None if the slot is
-    absent/empty. The Target sector scans 4 sub-scans (R301..R304) per 10-min slot
-    (~2.5 min apart), so the newest present sub-scan is the freshest imagery."""
+def target_subscans(fs, bucket, slot, band: int) -> set[int]:
+    """The SET of R30X Target sub-scans present for (slot, band); empty if the slot
+    is absent/empty. The Target sector scans 4 sub-scans (R301..R304) per 10-min
+    slot (~2.5 min apart). Returning the full set (not just the max) lets a caller
+    address each sub-scan individually so all four become frames -> true 2.5-min
+    cadence even when two sub-scans publish between polls."""
     import re
     res = BAND_RES_SUFFIX[band]
     try:
         files = fs.ls(_target_prefix(bucket, slot))
     except (FileNotFoundError, OSError):
-        return None
+        return set()
     pat = re.compile(rf"_B{band:02d}_R30(\d)_{res}_S\d+\.DAT\.bz2$")
-    subs = {int(m.group(1)) for f in files if (m := pat.search(f))}
+    return {int(m.group(1)) for f in files if (m := pat.search(f))}
+
+
+def latest_target_subscan(fs, bucket, slot, band: int) -> Optional[int]:
+    """Highest R30X Target sub-scan present for (slot, band); None if the slot is
+    absent/empty. The newest present sub-scan is the freshest imagery (the 'latest'
+    resolve); use ``target_subscans`` to enumerate ALL four for full-cadence capture."""
+    subs = target_subscans(fs, bucket, slot, band)
     return max(subs) if subs else None
 
 

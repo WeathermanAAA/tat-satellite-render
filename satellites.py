@@ -1277,7 +1277,7 @@ class HimawariPacificSatellite(Satellite):
         time so distinct sub-scans get distinct frame timestamps). Returns None if
         no recent Target slot has a sub-scan -> caller falls back to FLDK. Sync
         (s3 listing); call via _to_thread."""
-        from vendor.ahi_loader import latest_target_subscan
+        from vendor.ahi_loader import latest_target_subscan, target_subscans
         fs = _get_fs()
         base = time.replace(second=0, microsecond=0)
         floored = base.replace(minute=(base.minute // 10) * 10)
@@ -1289,7 +1289,17 @@ class HimawariPacificSatellite(Satellite):
         for back in range(0, 4):
             slot = floored - dt.timedelta(minutes=10 * back)
             resolved_sat = self.resolve(slot)
-            sub = latest_target_subscan(fs, resolved_sat.bucket, slot, band)
+            if nearest_to_target:
+                # SPECIFIC requested time (e.g. the meso poller addressing one exact
+                # Target sub-scan for full 2.5-min capture): pick the sub-scan whose
+                # obs-time is nearest ``time`` rather than the freshest, so every
+                # R30x can be fetched individually, not just the latest one.
+                subs = target_subscans(fs, resolved_sat.bucket, slot, band)
+                sub = (min(subs, key=lambda s: abs(
+                    ((slot + dt.timedelta(seconds=(s - 1) * 150)) - time)
+                    .total_seconds())) if subs else None)
+            else:
+                sub = latest_target_subscan(fs, resolved_sat.bucket, slot, band)
             if sub:
                 # sub-scan obs time ~ slot + (sub-1)*2.5 min (R301..R304)
                 scan_t = slot + dt.timedelta(seconds=(sub - 1) * 150)

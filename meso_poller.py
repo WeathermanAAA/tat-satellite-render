@@ -155,6 +155,10 @@ SECTORS_REFRESH_S = float(_env("SECTORS_REFRESH_S", "120"))      # re-discover e
 # tight. GOES is unaffected (it always uses the CMIPM meso product).
 MESO_HIMAWARI_PRODUCT = (_env("MESO_HIMAWARI_PRODUCT", "target")
                          or "target").strip().lower()
+# Max Himawari Target sub-scans rendered for one (sector,band) in a single pass.
+# Steady state only one new R30x exists per pass; the cap bounds a post-outage
+# backlog drain so one unit can't monopolise a lane. 4 = the full R301..R304 set.
+MESO_MAX_SUBSCANS_PER_PASS = int(_env("MESO_MAX_SUBSCANS_PER_PASS", "4") or "4")
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))    # min gap between /render calls
 EXTENT_STALE_AFTER_S = float(_env("EXTENT_STALE_AFTER_S", "1800"))  # >this since last scan => stale
 
@@ -337,6 +341,38 @@ _GOES_GENERIC_TO_BAND = {"clean_ir": 13, "wv_upper": 8, "wv_lower": 10,
                          "shortwave_ir": 7, "visible_red": 2}
 _AHI_GENERIC_TO_BAND = {"clean_ir": 13, "wv_upper": 8, "wv_lower": 10,
                         "shortwave_ir": 7, "visible_red": 3}
+
+
+def _himawari_ref_band(channel: str) -> "int | None":
+    """AHI band number the render service resolves a meso ``channel`` ON, used to
+    enumerate that band's Target sub-scans. True-color composites resolve on
+    visible_red (B03 0.5 km), which also pins the sub-scan its sub-bands load from;
+    every other channel resolves on its own band."""
+    if channel == "true_color":
+        return _AHI_GENERIC_TO_BAND["visible_red"]
+    return _AHI_GENERIC_TO_BAND.get(channel)
+
+
+def himawari_target_subscan_times(sector: MesoSector, channel: str,
+                                  back_slots: int = 1) -> "list[dt.datetime]":
+    """Obs-times of every AHI Target sub-scan present for this sector+channel in the
+    current (and ``back_slots`` prior) 10-min slot(s), sorted oldest-first. Per-band
+    on purpose: a band missing one R30x must not make us chase a sub-scan it never
+    published. obs-time = slot + (sub-1)*150 s (R301..R304). Empty list on any
+    listing failure (the caller then falls back to the plain 'latest' render)."""
+    band = _himawari_ref_band(channel)
+    if band is None:
+        return []
+    from vendor.ahi_loader import target_subscans
+    fs = _get_fs()
+    base = utcnow().replace(second=0, microsecond=0)
+    floored = base.replace(minute=(base.minute // 10) * 10)
+    out: list[dt.datetime] = []
+    for back in range(0, back_slots + 1):
+        slot = floored - dt.timedelta(minutes=10 * back)
+        for s in target_subscans(fs, sector.bucket, slot, band):
+            out.append(slot + dt.timedelta(seconds=(s - 1) * 150))
+    return sorted(out)
 
 
 def _get_fs():
@@ -606,9 +642,13 @@ class RenderSkip(Exception):
 def call_render(session: requests.Session, bbox: list[float], channel: str,
                 enhancement: str, storm: Optional[dict] = None,
                 product: Optional[str] = None, satellite: Optional[str] = None,
-                url: str = RENDER_URL) -> tuple[bytes, dict]:
-    body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
-                  "enhancement": enhancement, "format": FRAME_FORMAT}
+                url: str = RENDER_URL, when: "dt.datetime | None" = None
+                ) -> tuple[bytes, dict]:
+    # ``when`` addresses ONE specific scan (its ISO time) instead of "latest" -- used
+    # to fetch each Himawari Target sub-scan individually for true 2.5-min capture.
+    body: dict = {"bbox": bbox, "time": (iso_z(when) if when else "latest"),
+                  "channel": channel, "enhancement": enhancement,
+                  "format": FRAME_FORMAT}
     if storm is not None:
         body["storm"] = storm
     if product is not None:
@@ -1062,6 +1102,14 @@ class MesoPoller:
 
     # ---- one unit -------------------------------------------------------
 
+    def _rendered_scan_times(self, sector: MesoSector, band: Band) -> "set[str]":
+        """ISO-Z timestamps already in this (sector,band)'s manifest. Used to skip
+        Target sub-scans already captured so the enumerate pass is idempotent."""
+        with self._manifest_lock:
+            man = self.manifests.get(sector.slug) or {}
+            b = (man.get("bands") or {}).get(band.key) or {}
+            return {f.get("t") for f in (b.get("frames") or [])}
+
     def process_unit(self, u: Unit, lane: Lane) -> None:
         sector, band = u.sector, u.band
         ext = self.extents.get(sector.slug)
@@ -1081,17 +1129,54 @@ class MesoPoller:
         # picker's sub-point-distance tie-break lands antimeridian sectors on
         # the wrong satellite (Himawari "wins" a Bering Sea GOES-18 M2 box).
         sat_hint = sector_family_hint(sector)
+
+        # Himawari Target: ENUMERATE every present R30x sub-scan and render each one
+        # not already in the manifest, so all four per 10-min slot become frames =>
+        # true 2.5-min cadence regardless of poll timing or lane contention. Sampling
+        # only the freshest sub-scan (the old "latest" resolve) silently dropped any
+        # sub-scan that was never the max at a poll instant -- the residual 300 s gaps
+        # on the cold bands. Idempotent (manifest membership) so steady state renders
+        # only the newly published sub-scan; bounded per pass to drain a backlog
+        # without monopolising the lane. Any listing failure falls through to the
+        # plain 'latest' render below.
+        if sector.family == "himawari" and product == "meso":
+            times = himawari_target_subscan_times(sector, band.channel)
+            if times:
+                have = self._rendered_scan_times(sector, band)
+                todo = [t for t in times if iso_z(t) not in have]
+                if not todo:
+                    return  # every present sub-scan already captured
+                for t in todo[-MESO_MAX_SUBSCANS_PER_PASS:]:
+                    # distinct sub-scans are distinct frames -> skip the sha256
+                    # "same as last" guard (it would drop a byte-identical static
+                    # night frame and then re-render it forever), but membership
+                    # above still prevents re-rendering an already-stored sub-scan.
+                    self._render_and_store(u, lane, bbox, product, sat_hint,
+                                           fallback_ts=t, when=t, dedup_hash=False)
+                return
+            # no Target listing (transient / off-Target) -> fall back to 'latest'
+
+        self._render_and_store(u, lane, bbox, product, sat_hint,
+                               fallback_ts=ext.scan_start, when=None, dedup_hash=True)
+
+    def _render_and_store(self, u: Unit, lane: Lane, bbox: list, product, sat_hint,
+                          *, fallback_ts: "dt.datetime | None", when=None,
+                          dedup_hash: bool = True) -> bool:
+        """Render ONE frame (the 'latest' scan, or the specific ``when`` sub-scan) and
+        upload it. Returns True iff a frame was uploaded. Shared by the plain latest
+        path and the Himawari Target enumerate path."""
+        sector, band = u.sector, u.band
         lane.limiter.acquire()
         _t_render = time.monotonic()
         try:
             png, headers = call_render(lane.session, bbox, band.channel,
                                        band.enhancement, product=product,
                                        satellite=sat_hint,
-                                       url=lane.render_url)
+                                       url=lane.render_url, when=when)
         except RenderSkip as e:
             log.info("skip %s/%s: %s", sector.slug, band.key, e)
             lane.consec_fail = 0
-            return
+            return False
         except RenderError as e:
             lane.consec_fail += 1
             log.warning("[%s] render fail %s/%s (%d): %s", lane.name,
@@ -1100,31 +1185,32 @@ class MesoPoller:
                 lane.circuit_open_until = time.monotonic() + CIRCUIT_COOLDOWN_S
                 log.error("[%s] circuit OPEN: cooling down %ss",
                           lane.name, CIRCUIT_COOLDOWN_S)
-            return
+            return False
         lane.consec_fail = 0
 
         h = hashlib.sha256(png).hexdigest()
-        if h == u.last_hash:
-            return  # no new frame
+        if dedup_hash and h == u.last_hash:
+            return False  # no new frame
         # Stamp the frame with what /render ACTUALLY rendered (X-Scan-Time) so
         # Himawari Target sub-scans (~2.5 min) get distinct timestamps instead of
-        # collapsing onto the 10-min discovery slot; fall back to the discovered
-        # scan time, then now.
+        # collapsing onto the 10-min discovery slot; fall back to the requested
+        # sub-scan time / discovered scan time, then now.
         scan_hdr = (header_get(headers, "X-Scan-Time")
                     or header_get(headers, "X-Source-Time")
                     or header_get(headers, "X-Timestamp"))
-        ts = (parse_iso(scan_hdr) if scan_hdr else None) or ext.scan_start or utcnow()
-        # fext, not ext -- ext is the SectorExtent above.
+        ts = ((parse_iso(scan_hdr) if scan_hdr else None)
+              or when or fallback_ts or utcnow())
         fext, ctype = frame_ext(headers)
         key = frame_key(sector.slug, band.key, ts, fext)
         if not self.r2.put_bytes(key, png, ctype, CACHE_FRAME):
-            return  # upload failed -> do NOT touch manifest; retry next slot
+            return False  # upload failed -> do NOT touch manifest; retry next slot
         self.append_frame(sector, band, key, ts, h)
         u.last_hash = h
         self._last_frame_utc[sector.slug] = utcnow()   # self-heal freshness signal
         log.info("[%s] uploaded %s (%d B, %s, render %.1fs)", lane.name, key,
                  len(png), header_get(headers, "X-Satellite") or "?",
                  time.monotonic() - _t_render)
+        return True
 
     # ---- cadence --------------------------------------------------------
 
