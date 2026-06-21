@@ -1,0 +1,17 @@
+{
+  "method": "ahi_derived_linear_green",
+  "note": "Synthetic ABI green learned from Himawari AHI's native 0.51um green. Replaces the old fixed CIMSS mix (over-greened low sun). G = c0 + cB*blue + cR*red + cV*veggie in post-sun-correct+Rayleigh pre-clip space. ABI only; AHI keeps native green. Coeffs intentionally NOT normalized (least-squares fit).",
+  "trained_from": "Himawari-9 AHI 2026-06-21, 3 strips (WPAC ocean+terminator, Maritime-Continent vegetation, Australia desert), 1038005 px, cos_sza 0.02-0.85; fit R2=0.9988.",
+  "features": [
+    "1",
+    "blue",
+    "red",
+    "veggie"
+  ],
+  "coef": [
+    -0.006837524805535763,
+    0.8740371895222125,
+    0.01749616215457689,
+    0.059939250277854184
+  ]
+}

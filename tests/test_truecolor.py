@@ -37,13 +37,32 @@ def test_synth_green_fractions_sum_to_one():
     assert abs(sum(tc.GREEN_FRACTIONS) - 1.0) < 1e-9
 
 
-def test_synth_green_between_inputs():
+def test_synth_green_uses_ahi_derived_model():
+    # The AHI-derived linear green is active (asset loaded): G = c0 + cB*blue +
+    # cR*red + cV*veggie, dominated by BLUE (the 0.51um green band sits right next
+    # to 0.47um blue) -- NOT the old fixed CIMSS mix that over-greened at low sun.
+    assert tc._GREEN_AHI is not None
+    c0, cB, cR, cV = tc._GREEN_AHI
+    assert cB > cR and cB > cV                    # green is mostly blue
     red = np.array([0.3], np.float32)
     veg = np.array([0.5], np.float32)
     blue = np.array([0.1], np.float32)
     g = tc.synth_green(red, veg, blue)
+    assert np.isclose(g[0], c0 + cB * 0.1 + cR * 0.3 + cV * 0.5, atol=1e-5)
+    # and it genuinely differs from the legacy fixed mix (the whole point)
     fr, fv, fb = tc.GREEN_FRACTIONS
-    assert np.isclose(g[0], fr * 0.3 + fv * 0.5 + fb * 0.1)
+    assert not np.isclose(g[0], fr * 0.3 + fv * 0.5 + fb * 0.1, atol=1e-3)
+
+
+def test_synth_green_falls_back_to_linear_mix(monkeypatch):
+    # If the trained asset is unavailable, synth_green uses the legacy fixed mix
+    # (rendering must never break on a missing asset).
+    monkeypatch.setattr(tc, "_GREEN_AHI", None)
+    red = np.array([0.3], np.float32)
+    veg = np.array([0.5], np.float32)
+    blue = np.array([0.1], np.float32)
+    fr, fv, fb = tc.GREEN_FRACTIONS
+    assert np.isclose(tc.synth_green(red, veg, blue)[0], fr * 0.3 + fv * 0.5 + fb * 0.1)
 
 
 def test_sun_correct_floor():
@@ -169,6 +188,34 @@ def test_assemble_truecolor_midday_warm_tint_is_noop():
     finally:
         tc.WARM_TINT_STRENGTH = saved
     assert np.array_equal(rgb_new, rgb_off)
+
+
+def test_assemble_truecolor_vegetation_green_ocean_blue():
+    """End-to-end guard for the AHI-derived green: through the FULL assemble path
+    (sun-correct -> synth green -> ratio-sharpen -> tone curve -> night blend), a
+    vegetation pixel must stay GREEN-dominant (G>=R and G>=B) and an ocean pixel
+    must stay BLUE-dominant (B>=G). This is the regression that pins the learned
+    green model -- an ocean-only fit (or too-small veggie weight) renders forest
+    yellow-brown; the matched land+ocean fit keeps both surfaces right. Mirrors
+    the real GOES Amazon (G-R>0) + ocean (B>G) renders. (Rayleigh off -> no
+    pyspectral dep; sun-correct/tone-curve/sharpen are the parts that matter.)"""
+    import datetime as dt
+    H = W = 4
+    red = np.full((H, W), 0.05, np.float32)
+    blue = np.full((H, W), 0.04, np.float32)
+    veggie = np.full((H, W), 0.35, np.float32)
+    red[0, 0], blue[0, 0], veggie[0, 0] = 0.035, 0.030, 0.45   # vegetation: chlorophyll absorbs red/blue, high NIR
+    red[0, 1], blue[0, 1], veggie[0, 1] = 0.025, 0.090, 0.015  # ocean: blue-favored, ~zero NIR
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(-2, 2, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    assert tc._GREEN_AHI is not None, "AHI-derived green asset must be present for this guard"
+    rgb, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, when=when,
+                                   sub_sat_lon=0.0, platform_name="GOES-19",
+                                   sensor="abi", do_rayleigh=False)
+    veg, ocean = rgb[0, 0], rgb[0, 1]
+    assert veg[1] >= veg[0] and veg[1] >= veg[2], f"vegetation not green-dominant: {veg}"
+    assert ocean[2] >= ocean[1], f"ocean not blue-dominant: {ocean}"
 
 
 def _have_pyspectral():

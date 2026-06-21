@@ -11,13 +11,17 @@ Recipe matches the documented CIMSS Natural True Color + CIRA GeoColor pipeline
     first** (blue 0.47, red 0.64, veggie 0.86) -> THEN synthesize green. Doing
     Rayleigh before the green synthesis is what keeps clear-sky/ocean a clean
     deep blue and the colors vibrant.
-  * ABI has no green band -> synthesize the CIMSS Natural True Color green:
-        G = 0.45*Red + 0.10*Veggie(0.86) + 0.45*Blue
-    The big 0.45 BLUE share is the fix for the "magenta ocean" failure: over
-    water veggie≈0, so a veggie-heavy green collapses and blue+red dominate ->
-    magenta. The CIMSS blue-heavy mix keeps green up over water (deep blue),
-    while the veggie term still lifts vegetation green over land. Himawari AHI
-    has a native 0.51 green band and skips synthesis entirely.
+  * ABI has no green band -> synthesize green from an **AHI-DERIVED** linear
+    model (green_synth_ahi.json), learned from Himawari's REAL 0.51um green over
+    co-registered AHI scenes (the CIRA GeoColor hybrid-green idea):
+        G = c0 + cB*Blue + cR*Red + cV*Veggie(0.86)   (cB dominant)
+    Green sits right beside blue (0.51 vs 0.47um) so it is mostly BLUE, with a
+    small veggie lift for vegetation. This replaces the old fixed CIMSS mix
+    (0.45*Red + 0.10*Veggie + 0.45*Blue), whose heavy RED share over-greened at
+    low sun and produced the terminator GREEN CAST; the learned green matches the
+    warm/correct AHI look at every sun angle while keeping ocean deep-blue and
+    vegetation green. If the asset is missing it falls back to the fixed mix.
+    Himawari AHI has a native 0.51 green band and skips synthesis entirely.
   * Solar-zenith normalization: ABI CMI and our AHI albedo are raw TOA
     reflectance (NOT sun-angle normalized) -> divide by cos(SZA).
   * A CIRA/EUMETSAT tone curve (gamma-ish stretch) for natural brightness.
@@ -39,8 +43,11 @@ log = logging.getLogger("tat-satellite.truecolor")
 
 # CIMSS Natural True Color synthetic-green fractions (Red, Veggie/NIR, Blue).
 # From ABIQuickGuide_CIMSSRGB_v2: G = 0.45*Red + 0.10*Veggie + 0.45*Blue.
-# (Previously 0.40/0.40/0.20 — the veggie-heavy / blue-light mix that turned
-# open ocean magenta because synth-green collapsed where veggie≈0.)
+# FALLBACK ONLY: used by synth_green when the AHI-derived green asset
+# (green_synth_ahi.json) is absent. The PRIMARY green is the learned AHI model;
+# this fixed mix is the legacy CIMSS Natural True Color green kept as a safety
+# net. (Previously 0.40/0.40/0.20 — the veggie-heavy / blue-light mix that
+# turned open ocean magenta because synth-green collapsed where veggie≈0.)
 GREEN_FRACTIONS = (0.45, 0.10, 0.45)
 
 # Rayleigh subtraction strength (0..1). CIRA GeoColor applies FULL Rayleigh
@@ -166,8 +173,42 @@ def sun_correct(refl: np.ndarray, cos_sza: np.ndarray) -> np.ndarray:
     return refl / denom
 
 
+def _load_green_model():
+    """AHI-derived synthetic-green coefficients (c0, cB, cR, cV) from
+    green_synth_ahi.json, or None to fall back to the legacy fixed mix. The
+    coeffs were fit from Himawari's REAL 0.51um green band over co-registered AHI
+    scenes (the CIRA GeoColor hybrid-green idea) in this pipeline's post-sun-
+    correct + Rayleigh space, so applying them to ABI makes GOES converge on the
+    correct AHI look instead of the linear mix's low-sun green cast."""
+    import json
+    import pathlib
+    try:
+        a = json.loads(pathlib.Path(__file__).with_name("green_synth_ahi.json").read_text())
+        if a.get("features") == ["1", "blue", "red", "veggie"] and len(a["coef"]) == 4:
+            return tuple(float(x) for x in a["coef"])
+        log.warning("green_synth_ahi.json has unexpected shape; using linear fallback")
+    except Exception as e:  # noqa: BLE001 - missing/corrupt asset must not break rendering
+        log.warning("green model asset unavailable (%s); using the linear fallback", e)
+    return None
+
+
+_GREEN_AHI = _load_green_model()   # (c0, cB, cR, cV) or None
+
+
 def synth_green(red: np.ndarray, veggie: np.ndarray, blue: np.ndarray) -> np.ndarray:
-    """Synthesize the missing ABI green (CIMSS Natural True Color)."""
+    """Synthesize the missing ABI green.
+
+    PRIMARY: an AHI-DERIVED green -- a linear model learned from Himawari's native
+    0.51um green (G = c0 + cB*blue + cR*red + cV*veggie). Green is mostly BLUE
+    (0.51um sits right next to 0.47um), with a small veggie lift for vegetation;
+    the old fixed CIMSS mix (0.45*Red + 0.10*Veggie + 0.45*Blue) put far too much
+    RED weight and over-greened at low sun -> the terminator green cast. This
+    learned green matches the warm/correct AHI look at every sun angle. ABI only;
+    AHI keeps its native green. FALLBACK: the legacy fixed mix if the asset is
+    absent. Output is clipped to [0,1] downstream (assemble_truecolor)."""
+    if _GREEN_AHI is not None:
+        c0, cB, cR, cV = _GREEN_AHI
+        return c0 + cB * blue + cR * red + cV * veggie
     fr, fv, fb = GREEN_FRACTIONS
     return fr * red + fv * veggie + fb * blue
 
