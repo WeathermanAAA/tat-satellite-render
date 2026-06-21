@@ -19,9 +19,13 @@ import json
 import logging
 import math
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import Optional, Union
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,6 +99,40 @@ WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "90"))
 
 render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
 cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
+
+# ---------------------------------------------------------------------------
+# Server-side loop export (POST /export) -- ffmpeg-encoded mp4 (primary) + a
+# global-palette gif fallback. Bounded + rate-limited; the webp LOOP poller path
+# and live /render are untouched (this is export-only).
+# ---------------------------------------------------------------------------
+EXPORT_MAX_FRAMES = int(os.getenv("EXPORT_MAX_FRAMES", "300"))   # hard cap on frames
+EXPORT_MAX_DIM = int(os.getenv("EXPORT_MAX_DIM", "2048"))        # reject a frame longer than this
+EXPORT_MAX_CONCURRENT = int(os.getenv("EXPORT_MAX_CONCURRENT", "1"))  # ffmpeg is CPU-heavy
+EXPORT_DWELL_FRAMES = float(os.getenv("EXPORT_DWELL_FRAMES", "6"))    # hold last frame Nx (mirrors SAT_LAST_FRAME_DWELL)
+EXPORT_FETCH_TIMEOUT_S = float(os.getenv("EXPORT_FETCH_TIMEOUT_S", "20"))
+EXPORT_MAX_FRAME_BYTES = int(os.getenv("EXPORT_MAX_FRAME_BYTES", str(25 * 1024 * 1024)))  # per-frame wire cap
+EXPORT_FFMPEG_TIMEOUT_S = float(os.getenv("EXPORT_FFMPEG_TIMEOUT_S", "150"))
+# SSRF guard: only fetch frame URLs from these hosts (the public CDN the loops
+# are served from). Comma-separated env override.
+EXPORT_ALLOWED_HOSTS = {
+    h.strip().lower() for h in os.getenv(
+        "EXPORT_ALLOWED_HOSTS", "cdn.triple-a-tropics.com").split(",") if h.strip()
+}
+export_semaphore = asyncio.Semaphore(EXPORT_MAX_CONCURRENT)
+
+
+def _ffmpeg_available() -> bool:
+    """True if the ffmpeg binary is on PATH + runnable. Checked on boot + gated
+    on each /export so a missing binary returns a clean 503 (frontend falls back
+    to its client-side gif.js) rather than a 500."""
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10, check=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+FFMPEG_AVAILABLE = _ffmpeg_available()
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +308,16 @@ async def lifespan(app: FastAPI):
         GOES_BUCKET_OVERRIDE or "(none, time-based picker active)",
         [s.family for s in ALL_SATELLITES],
     )
+    if FFMPEG_AVAILABLE:
+        try:
+            ver = subprocess.run(["ffmpeg", "-version"], capture_output=True,
+                                 text=True, timeout=10).stdout.splitlines()[0]
+        except Exception:  # noqa: BLE001
+            ver = "ffmpeg (version probe failed)"
+        log.info("export: ffmpeg OK -> %s", ver)
+    else:
+        log.warning("export: ffmpeg NOT available -- POST /export will 503 "
+                    "(frontend falls back to client-side gif.js)")
     yield
     log.info("shutdown")
 
@@ -390,6 +438,26 @@ class RenderRequest(BaseModel):
     def _v_format(cls, v):
         if v not in ("png", "webp"):
             raise ValueError("format must be png or webp")
+        return v
+
+
+class ExportRequest(BaseModel):
+    """A server-side loop export. ``frames`` are the loop's already-rendered
+    R2/CDN image URLs in play order (oldest->newest); the endpoint fetches them,
+    honors ``skip`` (keep every (skip+1)th), and encodes a smooth mp4 (primary)
+    or a global-palette gif. Bounded: <= EXPORT_MAX_FRAMES, each <= EXPORT_MAX_DIM."""
+    frames: list[str] = Field(..., min_length=2, max_length=EXPORT_MAX_FRAMES)
+    fps: int = Field(default=10, ge=1, le=30)
+    skip: int = Field(default=0, ge=0, le=20)
+    interpolate: bool = False
+    target_fps: int = Field(default=0, ge=0, le=60)   # 0 -> 2x fps when interpolate
+    format: str = "mp4"
+
+    @field_validator("format")
+    @classmethod
+    def _v_export_format(cls, v):
+        if v not in ("mp4", "gif"):
+            raise ValueError("format must be mp4 or gif")
         return v
 
 
@@ -621,3 +689,170 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         len(frame_bytes),
     )
     return _response(frame_bytes, "MISS", elapsed_ms)
+
+
+# ---------------------------------------------------------------------------
+# Loop export (POST /export): ffmpeg mp4 (primary) + global-palette gif.
+# Export-only -- the webp LOOP poller path + live /render are untouched.
+# ---------------------------------------------------------------------------
+def _export_vf(dwell_s: float, interpolate: bool, target_fps: int,
+               for_mp4: bool) -> str:
+    """The ffmpeg -vf chain shared by the mp4 + gif encoders (so the gif palette
+    is generated from the SAME frames it's applied to). Order: optional motion
+    interpolation -> last-frame dwell -> even-dim pad (mp4 only, for yuv420p)."""
+    parts = []
+    if interpolate:
+        parts.append(
+            f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir")
+    # dwell is always present (>=0.1s) so the chain is never empty -> no leading
+    # comma when spliced before palettegen/paletteuse.
+    parts.append(f"tpad=stop_mode=clone:stop_duration={dwell_s:.3f}")
+    if for_mp4:
+        parts.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+    return ",".join(parts)
+
+
+def _run_ffmpeg(args: list, timeout: float) -> None:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+        capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace")[-600:] or "ffmpeg failed"
+        raise RuntimeError(f"ffmpeg: {tail}")
+
+
+def _encode_export(tmp: str, fmt: str, fps: int, interpolate: bool,
+                   target_fps: int) -> tuple[bytes, str]:
+    """Encode the numbered PNGs in ``tmp`` (f_%05d.png) to mp4 or gif. Returns
+    (bytes, media_type)."""
+    pat = os.path.join(tmp, "f_%05d.png")
+    dwell_s = min(1.5, max(0.1, EXPORT_DWELL_FRAMES / float(fps)))
+    if fmt == "mp4":
+        out = os.path.join(tmp, "out.mp4")
+        vf = _export_vf(dwell_s, interpolate, target_fps, for_mp4=True)
+        # libx264 -crf 18 yuv420p = broadly-playable, near-lossless, small.
+        _run_ffmpeg(["-framerate", str(fps), "-i", pat, "-vf", vf,
+                     "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                     "-movflags", "+faststart", out], EXPORT_FFMPEG_TIMEOUT_S)
+        return _read(out), "video/mp4"
+    # gif: TWO-PASS GLOBAL palette so ALL frames share ONE palette (kills the
+    # per-frame NeuQuant shimmer of the old client gif.js path).
+    chain = _export_vf(dwell_s, interpolate, target_fps, for_mp4=False)
+    palette = os.path.join(tmp, "palette.png")
+    out = os.path.join(tmp, "out.gif")
+    _run_ffmpeg(["-framerate", str(fps), "-i", pat, "-vf",
+                 f"{chain},palettegen=stats_mode=full", palette],
+                EXPORT_FFMPEG_TIMEOUT_S)
+    _run_ffmpeg(["-framerate", str(fps), "-i", pat, "-i", palette, "-lavfi",
+                 f"{chain}[x];[x][1:v]paletteuse=dither=sierra2_4a", out],
+                EXPORT_FFMPEG_TIMEOUT_S)
+    return _read(out), "image/gif"
+
+
+def _read(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _fetch_frames_to_dir(urls: list, tmp: str) -> int:
+    """Fetch each frame URL (host-allowlisted: SSRF guard) and normalize it to a
+    same-size RGB PNG numbered f_00000.png.. so ffmpeg's %05d input + the gif
+    palette stay uniform. Raises HTTPException on a disallowed host / unreadable
+    or oversized frame. Returns the count written."""
+    import io as _io
+
+    import requests
+    from PIL import Image
+
+    ref = None
+    n = 0
+    for i, url in enumerate(urls):
+        host = (urlparse(url).hostname or "").lower()
+        if host not in EXPORT_ALLOWED_HOSTS:
+            raise HTTPException(status_code=400,
+                                detail=f"frame host not allowed: {host or '?'}")
+        try:
+            # allow_redirects=False: the host allowlist is checked on the URL we
+            # send, so a 3xx to an off-allowlist (internal) host must NOT be
+            # followed -- that would be an SSRF bypass. stream + a wire-byte cap
+            # bound memory; the lazy header dims are checked BEFORE the full RGB
+            # decode so a decompression bomb can't blow up RAM.
+            r = requests.get(url, timeout=EXPORT_FETCH_TIMEOUT_S,
+                             allow_redirects=False, stream=True)
+            if 300 <= r.status_code < 400:
+                raise HTTPException(status_code=502,
+                                    detail=f"frame {i} redirected (not allowed)")
+            r.raise_for_status()
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf.extend(chunk)
+                if len(buf) > EXPORT_MAX_FRAME_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"frame {i} exceeds {EXPORT_MAX_FRAME_BYTES} bytes")
+            im = Image.open(_io.BytesIO(bytes(buf)))   # lazy: dims from header
+            if max(im.size) > EXPORT_MAX_DIM:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"frame {i} {im.size[0]}x{im.size[1]} exceeds "
+                           f"{EXPORT_MAX_DIM}px")
+            im = im.convert("RGB")                     # decode now (dims bounded)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502,
+                                detail=f"could not fetch frame {i}: {e}") from e
+        if ref is None:
+            ref = im.size
+        elif im.size != ref:
+            im = im.resize(ref, Image.LANCZOS)   # keep the ffmpeg input uniform
+        im.save(os.path.join(tmp, f"f_{n:05d}.png"))
+        n += 1
+    return n
+
+
+@app.post("/export")
+@limiter.limit(RATE_LIMIT)
+async def export(request: Request, body: ExportRequest = Body(...)):
+    if not FFMPEG_AVAILABLE:
+        raise HTTPException(status_code=503,
+                            detail="export encoder (ffmpeg) unavailable")
+    step = body.skip + 1
+    urls = body.frames[::step]                       # honor skip: every (skip+1)th
+    if len(urls) < 2:
+        raise HTTPException(status_code=400, detail="need >= 2 frames after skip")
+    if len(urls) > EXPORT_MAX_FRAMES:                # belt-and-suspenders bound
+        urls = urls[-EXPORT_MAX_FRAMES:]
+    if body.interpolate:
+        target_fps = min(60, max(body.fps, body.target_fps or body.fps * 2))
+    else:
+        target_fps = body.fps                        # unused (no minterpolate)
+    t0 = time.perf_counter()
+    tmp = tempfile.mkdtemp(prefix="export-")
+    try:
+        async with export_semaphore:
+            def _job():
+                _fetch_frames_to_dir(urls, tmp)
+                return _encode_export(tmp, body.format, body.fps,
+                                      body.interpolate, target_fps)
+            data, media_type = await asyncio.get_event_loop().run_in_executor(
+                None, _job)
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="export encode timed out")
+    except Exception as e:  # noqa: BLE001
+        log.exception("export failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"export failed: {e}") from e
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        gc.collect()
+    ms = int((time.perf_counter() - t0) * 1000)
+    ext = "mp4" if body.format == "mp4" else "gif"
+    log.info("export ok fmt=%s frames=%d fps=%d interp=%s ms=%d bytes=%d",
+             body.format, len(urls), body.fps, body.interpolate, ms, len(data))
+    return Response(content=data, media_type=media_type, headers={
+        "X-Export-Ms": str(ms),
+        "X-Export-Frames": str(len(urls)),
+        "Content-Disposition": f'attachment; filename="tat_loop.{ext}"',
+    })
