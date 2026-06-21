@@ -185,13 +185,15 @@ class Satellite(abc.ABC):
     ) -> FetchResult:
         return await _to_thread(self._fetch_sync, resolved, bbox, generic_channel)
     async def fetch_true_color(
-        self, bbox: list[float], red_resolved: ResolvedFile
+        self, bbox: list[float], red_resolved: ResolvedFile, downsample: int = 1
     ) -> FetchResult:
         """Fetch a multi-band RGB true-color composite, given the already-
         resolved red-band file (which pins product + scan time so the RGB bands
-        are co-temporal). Implemented per family (ABI synthesizes green; AHI
-        uses its native green). Default raises so an as-yet-unsupported family
-        surfaces a clear message, not AttributeError."""
+        are co-temporal). ``downsample`` strides the co-registered bands BEFORE
+        the per-pixel truecolor recipe (byte-identical to striding the RGB after,
+        but far cheaper) -- the caller then renders with downsample=1. Implemented
+        per family (ABI synthesizes green; AHI uses its native green). Default
+        raises so an as-yet-unsupported family surfaces a clear message."""
         raise NotImplementedError(
             f"true color is not yet available for {self.family}"
         )
@@ -439,6 +441,17 @@ def _truecolor_target_dims(lon_span: float, lat_span: float, max_px: int = 2400)
     nat_h = lat_span / deg_per_px
     scale = min(1.0, max_px / max(nat_w, nat_h, 1.0))
     return max(16, int(round(nat_w * scale))), max(16, int(round(nat_h * scale)))
+def _stride_tc_grids(d: int, *arrays):
+    """Stride each (possibly-None) co-registered 2D grid by [::d, ::d]. Identity
+    for d<=1. Decimating the true-color band/lat/lon grids HERE -- before the
+    per-pixel truecolor recipe (sun-correct/Rayleigh/green/tone/blend, none of
+    which read spatial neighbors) -- is byte-identical to striding the final RGB
+    after the recipe (the same surviving pixels, same per-pixel math), but runs
+    the expensive pyspectral Rayleigh on far fewer pixels. That is what makes the
+    low/default custom-zoom tiers fast; render_png must then NOT stride again."""
+    if d <= 1:
+        return arrays
+    return tuple(a[::d, ::d] if a is not None else None for a in arrays)
 class GOESBaseSatellite(Satellite):
     """Shared GOES (ABI) plumbing for GOES-East and GOES-West.
     Both families speak the same NetCDF format, share the same band layout
@@ -630,13 +643,14 @@ class GOESBaseSatellite(Satellite):
         chosen = exact[0] if exact else min(with_t, key=lambda p: abs((p[1] - scan_start).total_seconds()))[0]
         return self._make_resolved(bucket, chosen, product, scan_start)
     async def fetch_true_color(
-        self, bbox: list[float], red_resolved: ResolvedFile
+        self, bbox: list[float], red_resolved: ResolvedFile, downsample: int = 1
     ) -> FetchResult:
         """Fetch the RGB true-color composite given the resolved red-band file.
         Pulls the other true-color bands from that SAME product/scan so they're
         co-temporal, crops each, resamples the 1 km bands onto the 0.5 km red
         grid (shared geos x/y → exact co-registration), and hands off to
         truecolor.assemble_truecolor. ABI green is synthesized inside.
+        ``downsample`` strides the bands before the recipe (see _stride_tc_grids).
         """
         band_files: dict[str, ResolvedFile] = {"red": red_resolved}
         for role, band in self.truecolor_bands.items():
@@ -651,9 +665,10 @@ class GOESBaseSatellite(Satellite):
             red_resolved.bucket, red_resolved.product,
             self.generic_to_band["clean_ir"], red_resolved.scan_start,
         )
-        return await _to_thread(self._compose_true_color_sync, band_files, bbox, red_resolved)
+        return await _to_thread(self._compose_true_color_sync, band_files, bbox, red_resolved, downsample)
     def _compose_true_color_sync(
-        self, band_files: dict[str, ResolvedFile], bbox: list[float], red_resolved: ResolvedFile
+        self, band_files: dict[str, ResolvedFile], bbox: list[float], red_resolved: ResolvedFile,
+        downsample: int = 1,
     ) -> FetchResult:
         import truecolor
         crops: dict[str, tuple] = {}
@@ -689,6 +704,11 @@ class GOESBaseSatellite(Satellite):
         veggie = grid("veggie") if "veggie" in crops else None
         ir_bt = grid("ir") if "ir" in crops else None  # clean-IR (K) for night fade
         lats, lons = TLAT.astype(np.float32), TLON.astype(np.float32)
+        # Decimate the co-registered grids BEFORE the per-pixel recipe (Rayleigh
+        # etc.) -- byte-identical to striding the RGB after, far cheaper. The
+        # caller renders with downsample=1 so it is not double-strided.
+        red, green, blue, veggie, ir_bt, lats, lons = _stride_tc_grids(
+            downsample, red, green, blue, veggie, ir_bt, lats, lons)
         platform_name = self._pyspectral_platform(red_resolved.bucket)
         rgb, cos_sza = truecolor.assemble_truecolor(
             red, green, blue, veggie, lats, lons,
@@ -1221,13 +1241,14 @@ class HimawariPacificSatellite(Satellite):
             units=disk.units,
         )
     async def fetch_true_color(
-        self, bbox: list[float], red_resolved: ResolvedFile
+        self, bbox: list[float], red_resolved: ResolvedFile, downsample: int = 1
     ) -> FetchResult:
         """AHI true color: native green (band 2), no synthesis. ``red_resolved``
-        carries the snapped 10-min slot + bucket; all bands load from it."""
-        return await _to_thread(self._compose_true_color_sync, bbox, red_resolved)
+        carries the snapped 10-min slot + bucket; all bands load from it.
+        ``downsample`` strides the bands before the recipe (see _stride_tc_grids)."""
+        return await _to_thread(self._compose_true_color_sync, bbox, red_resolved, downsample)
     def _compose_true_color_sync(
-        self, bbox: list[float], red_resolved: ResolvedFile
+        self, bbox: list[float], red_resolved: ResolvedFile, downsample: int = 1
     ) -> FetchResult:
         from vendor.ahi_loader import load_band_sync
         from scipy.interpolate import RegularGridInterpolator
@@ -1274,6 +1295,10 @@ class HimawariPacificSatellite(Satellite):
         veggie = grid("veggie") if "veggie" in disks else None
         ir_bt = grid("ir") if "ir" in disks else None  # clean-IR (K) for night fade
         lats, lons = TLAT.astype(np.float32), TLON.astype(np.float32)
+        # Decimate before the per-pixel recipe (byte-identical, far cheaper);
+        # the caller renders with downsample=1 so it is not double-strided.
+        red, green, blue, veggie, ir_bt, lats, lons = _stride_tc_grids(
+            downsample, red, green, blue, veggie, ir_bt, lats, lons)
         rgb, cos_sza = truecolor.assemble_truecolor(
             red, green, blue, veggie, lats, lons,
             when=red_resolved.scan_start,

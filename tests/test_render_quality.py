@@ -121,5 +121,101 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(wkey("default"), wkey("low"))
 
 
+class TierDpiTests(unittest.TestCase):
+    """The tier knob is the OUTPUT DPI (not a whole-figure bitmap resize)."""
+
+    def test_tier_dpi_ordered_and_default_unchanged(self):
+        self.assertLess(app.TIER_DPI["low"], app.TIER_DPI["default"])
+        self.assertLess(app.TIER_DPI["default"], app.TIER_DPI["high"])
+        # default stays 110 dpi == today (the byte-identical contract).
+        self.assertEqual(app.TIER_DPI["default"], 110)
+        self.assertEqual(app.DEFAULT_DPI, 110)
+
+    def test_loop_path_renders_at_default_dpi(self):
+        # The webp LOOP path (pollers) must render at 110 regardless of quality,
+        # so loop frames are unaffected by the tier dpi. Exercise the REAL
+        # selection expression the endpoint uses (pick_tier_dpi).
+        for q in ("low", "default", "high", "junk"):
+            self.assertEqual(app.pick_tier_dpi("webp", q), 110)
+        # the custom-zoom png path DOES honor the tier dpi
+        self.assertEqual(app.pick_tier_dpi("png", "low"), app.TIER_DPI["low"])
+        self.assertEqual(app.pick_tier_dpi("png", "high"), app.TIER_DPI["high"])
+        self.assertEqual(app.pick_tier_dpi("png", "junk"), app.DEFAULT_DPI)
+
+
+class EncodeWebpNoResizeTests(unittest.TestCase):
+    """The 'low' tier re-encodes its NATIVE render as WebP -- no whole-figure
+    bitmap resize (that is what used to pixelate the chrome)."""
+
+    def test_encode_webp_preserves_dimensions(self):
+        import io
+        from PIL import Image
+        import render
+        src = Image.new("RGB", (837, 611), (10, 20, 30))
+        buf = io.BytesIO(); src.save(buf, "PNG")
+        out = render.encode_webp(buf.getvalue(), app.LOWRES_WEBP_QUALITY)
+        im = Image.open(io.BytesIO(out))
+        self.assertEqual(im.format, "WEBP")
+        self.assertEqual(im.size, (837, 611))   # NOT downscaled to 500
+
+
+def _synthetic_ir() -> "tuple":
+    """A small synthetic scalar-IR FetchResult + bbox for render_png (no network,
+    no pyorbital/pyspectral -- those are only used by the true-color FETCH)."""
+    import numpy as np
+    from satellites import FetchResult
+    import datetime as dt
+    H = W = 40
+    bbox = [-80.0, 20.0, -60.0, 40.0]
+    lons, lats = np.meshgrid(np.linspace(bbox[0], bbox[2], W),
+                             np.linspace(bbox[3], bbox[1], H))
+    bt = np.full((H, W), 270.0, np.float32)
+    bt[10:30, 10:30] = 220.0
+    data = FetchResult(cmi=bt, lats=lats.astype(np.float32),
+                       lons=lons.astype(np.float32), channel=13,
+                       generic_channel="clean_ir",
+                       scan_start=dt.datetime(2026, 6, 20, 12, 0,
+                                              tzinfo=dt.timezone.utc),
+                       product="CMIPF", bucket="noaa-goes19", sat_name="GOES-19",
+                       sub_sat_lon=-75.2, units="K")
+    return data, bbox
+
+
+class RenderPngDpiTests(unittest.TestCase):
+    """render_png's dpi knob scales the OUTPUT pixels uniformly; default==today."""
+
+    def _dims(self, dpi):
+        import io
+        from PIL import Image
+        import render
+        data, bbox = _synthetic_ir()
+        png = render.render_png(data, bbox, 13, "2026-06-20 12:00", "rainbow_ir",
+                                1, dpi=dpi)
+        return Image.open(io.BytesIO(png)).size
+
+    def test_dpi_scales_output_resolution(self):
+        w_low, h_low = self._dims(70)
+        w_def, h_def = self._dims(110)
+        w_high, h_high = self._dims(200)
+        # low smaller, high bigger -- the tiers now differ in OUTPUT resolution.
+        self.assertLess(w_low, w_def)
+        self.assertLess(w_def, w_high)
+        # 12in figure at 110 dpi -> ~1320 px wide (the unchanged default).
+        self.assertAlmostEqual(w_def, 1320, delta=4)
+        self.assertAlmostEqual(w_low, 840, delta=6)    # 12in x 70dpi
+        self.assertAlmostEqual(w_high, 2400, delta=8)  # 12in x 200dpi
+
+    def test_default_dpi_is_the_param_default(self):
+        # render_png()'s dpi default IS 110, so the default tier == calling it
+        # with no dpi arg -> byte-identical to the pre-change call site.
+        import io
+        from PIL import Image
+        import render
+        data, bbox = _synthetic_ir()
+        a = render.render_png(data, bbox, 13, "t", "rainbow_ir", 1)
+        b = render.render_png(data, bbox, 13, "t", "rainbow_ir", 1, dpi=110)
+        self.assertEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

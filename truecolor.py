@@ -63,6 +63,57 @@ WL_GREEN = 0.51
 WL_BLUE = 0.47
 WL_VEGGIE = 0.86
 
+# --- Terminator (sunrise/sunset golden-hour) handling ----------------------
+# Near the terminator FULL Rayleigh subtraction over-corrects at the limb --
+# it strips the warm forward-scattered light, and the synth-green then dominates
+# -> a green cast. Two smoothly-gated corrections fix it WITHOUT touching
+# daytime: both are EXACT no-ops for cos_sza >= *_DAY_COS (smoothstep saturates
+# to 1, so the taper is exactly 1.0 and the warm weight exactly 0.0), so midday
+# true color stays byte-identical. (1) taper Rayleigh to ~0 toward the
+# terminator; (2) add a warm red/orange tint peaking at the terminator, applied
+# to the day-side RGB BEFORE the clean-IR night fade so it develops then fades
+# into night exactly as today. All tunable here.
+RAYLEIGH_TAPER_DAY_COS = 0.30   # cos_sza >= this -> FULL Rayleigh (1.0): daytime unchanged
+RAYLEIGH_TAPER_MIN_COS = 0.05   # cos_sza <= this -> Rayleigh fully tapered off (~0)
+
+WARM_TINT_DAY_COS = 0.30    # cos_sza >= this -> NO warm tint (0.0): daytime unchanged
+WARM_TINT_PEAK_COS = 0.08   # cos_sza <= this -> full warm tint (held through the terminator)
+WARM_TINT_STRENGTH = 1.0    # overall multiplier on the warm tint (0 disables)
+WARM_TINT_RED_ADD = 0.10    # additive red boost at full tint
+WARM_TINT_GREEN_GAIN = 0.16  # multiplicative green attenuation at full tint
+WARM_TINT_BLUE_GAIN = 0.34   # multiplicative blue attenuation at full tint (most -> orange)
+
+
+def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+    """Hermite smoothstep, clamped to [0,1]: 0 for x<=edge0, 1 for x>=edge1.
+    Saturates EXACTLY to 1.0/0.0 outside the edges (t is clipped first), which is
+    what makes the daytime taper/tint exact no-ops -> byte-identical midday."""
+    t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def rayleigh_scale_field(cos_sza: np.ndarray) -> np.ndarray:
+    """Per-pixel Rayleigh strength: RAYLEIGH_SCALE in daytime, smoothly tapering
+    to ~0 near the terminator. EXACTLY RAYLEIGH_SCALE (1.0) for
+    cos_sza >= RAYLEIGH_TAPER_DAY_COS (daytime byte-identical)."""
+    return RAYLEIGH_SCALE * _smoothstep(
+        RAYLEIGH_TAPER_MIN_COS, RAYLEIGH_TAPER_DAY_COS, cos_sza
+    )
+
+
+def warm_terminator_tint(rgb: np.ndarray, cos_sza: np.ndarray) -> np.ndarray:
+    """Warm the day-side RGB toward red/orange near the terminator (sunrise /
+    sunset). The weight is EXACTLY 0 for cos_sza >= WARM_TINT_DAY_COS (midday
+    byte-identical) and ramps to 1 by WARM_TINT_PEAK_COS, held through the
+    terminator; the clean-IR night fade (applied after) then takes over."""
+    w = (1.0 - _smoothstep(WARM_TINT_PEAK_COS, WARM_TINT_DAY_COS, cos_sza))
+    w = w * WARM_TINT_STRENGTH
+    out = rgb.copy()
+    out[..., 0] = np.clip(rgb[..., 0] + w * WARM_TINT_RED_ADD, 0.0, 1.0)
+    out[..., 1] = np.clip(rgb[..., 1] * (1.0 - w * WARM_TINT_GREEN_GAIN), 0.0, 1.0)
+    out[..., 2] = np.clip(rgb[..., 2] * (1.0 - w * WARM_TINT_BLUE_GAIN), 0.0, 1.0)
+    return out  # already rgb.dtype (the in-place clips downcast to out's dtype)
+
 
 # ---------------------------------------------------------------------------
 # Geometry (pyorbital)
@@ -126,7 +177,7 @@ def rayleigh_band(
     azidiff: np.ndarray,
     red_ref_pct: np.ndarray,
     corrector,
-    scale: float = RAYLEIGH_SCALE,
+    scale: "float | np.ndarray" = RAYLEIGH_SCALE,
 ) -> np.ndarray:
     """Subtract molecular (Rayleigh) scattering from a single band via pyspectral.
 
@@ -238,12 +289,16 @@ def assemble_truecolor(
         azidiff = np.where(azidiff > 180.0, 360.0 - azidiff, azidiff)
         corrector = _make_rayleigh(platform_name, sensor)
         red_ref_pct = np.clip(red_c, 0.0, 1.0) * 100.0
-        red_c = rayleigh_band(red_c, WL_RED, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
-        blue_c = rayleigh_band(blue_c, WL_BLUE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+        # Per-pixel Rayleigh strength: full in daytime, tapered toward 0 near the
+        # terminator (it over-corrects at the limb and greens the sunrise/sunset).
+        # Exactly 1.0 for daytime pixels -> byte-identical midday.
+        ray_scale = rayleigh_scale_field(cos_sza)
+        red_c = rayleigh_band(red_c, WL_RED, sun_zen, sat_zen, azidiff, red_ref_pct, corrector, scale=ray_scale)
+        blue_c = rayleigh_band(blue_c, WL_BLUE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector, scale=ray_scale)
         if veggie_c is not None:
-            veggie_c = rayleigh_band(veggie_c, WL_VEGGIE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+            veggie_c = rayleigh_band(veggie_c, WL_VEGGIE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector, scale=ray_scale)
         if green_c is not None:
-            green_c = rayleigh_band(green_c, WL_GREEN, sun_zen, sat_zen, azidiff, red_ref_pct, corrector)
+            green_c = rayleigh_band(green_c, WL_GREEN, sun_zen, sat_zen, azidiff, red_ref_pct, corrector, scale=ray_scale)
 
     # 3) Synthesize green for ABI (CIMSS) from the corrected bands; AHI uses its
     #    native (already-corrected) green.
@@ -258,6 +313,11 @@ def assemble_truecolor(
         rgb = ratio_sharpen(rgb, np.clip(red_c, 0.0, 1.0))
 
     rgb = tone_curve(rgb)
+
+    # Golden-hour: warm the day-side RGB toward red/orange near the terminator
+    # (sunrise/sunset) BEFORE the night fade. Exact no-op in daytime -> midday
+    # byte-identical; develops at the terminator then fades into the IR night.
+    rgb = warm_terminator_tint(rgb, cos_sza)
 
     # GeoColor-lite: fade to clean-IR at night (after the day side is developed).
     if ir_bt is not None:

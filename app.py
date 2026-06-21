@@ -32,7 +32,7 @@ from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from render import render_png, transcode_frame
+from render import render_png, transcode_frame, encode_webp
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -119,13 +119,25 @@ DEG_TO_KM = 111.0  # flat conversion; geos pixel stretch at high lat partially c
 # crisp. The webp LOOP path (format=webp, the floater/meso pollers) is unaffected —
 # it always uses the full PIXEL_BUDGET + the fixed WEBP_FRAME_WIDTH frame.
 QUALITY_BUDGETS = {
-    "low": 250_000,         # ~500 x 500   — compressed, fastest to load, softer
-    "default": 2_250_000,   # ~1500 x 1500 — balanced (the page default)
-    "high": PIXEL_BUDGET,   # ~4000 x 4000 — cleanest, slower to render + load
+    "low": 250_000,         # coarse satellite DATA — decimates hard, fastest
+    "default": 2_250_000,   # balanced (the page default) — UNCHANGED
+    "high": PIXEL_BUDGET,   # ~native data — genuinely sharper than default
 }
 DEFAULT_QUALITY = "default"
-LOWRES_WEBP_WIDTH = 500     # px width the "low" tier re-encodes to
-LOWRES_WEBP_QUALITY = 82    # lossy-WebP quality for the "low" tier
+# The tier knob is the OUTPUT DPI (figsize is held at 12in in render_png, so
+# layout proportions + font sizes scale uniformly and ALL chrome renders crisp
+# at the tier dpi -- never bitmap-resized). default 110 == today (byte-identical);
+# the webp LOOP path always renders at 110 (then transcodes to WEBP_FRAME_WIDTH).
+TIER_DPI = {
+    "low": 70,        # ~840 px  — small + fast, coarse imagery, CRISP chrome
+    "default": 110,   # ~1320 px — the page default (unchanged)
+    "high": 200,      # ~2400 px — sharper, slower (expected)
+}
+DEFAULT_DPI = 110
+# "low" re-encodes its already-small native render as lossy WebP for the smallest
+# download. NO downscale (that is what used to pixelate the chrome) -- the figure
+# is rendered small at the low dpi, then encoded WebP at its native size.
+LOWRES_WEBP_QUALITY = 88    # lossy-WebP quality for the "low" tier (native size)
 
 
 def _native_km_per_pixel_generic(generic_channel: str) -> float:
@@ -160,6 +172,14 @@ def compute_downsample_factor(bbox: list[float], channel, budget: int = PIXEL_BU
     if requested <= budget:
         return 1
     return math.ceil(math.sqrt(requested / budget))
+
+
+def pick_tier_dpi(fmt: str, quality: str) -> int:
+    """Output DPI for a render. The webp LOOP path (pollers) always renders at the
+    default 110 (then transcodes to WEBP_FRAME_WIDTH), so loop frames are
+    unaffected by the tier; the custom-zoom png path honors the tier dpi. Unknown
+    tiers fall back to the default."""
+    return DEFAULT_DPI if fmt == "webp" else TIER_DPI.get(quality, DEFAULT_DPI)
 
 
 def resolve_quality(fmt: str, quality: str) -> tuple[int, str]:
@@ -315,9 +335,10 @@ class RenderRequest(BaseModel):
     # they got. "webp" is the loop-frame path used by the floater + meso
     # pollers: WEBP_FRAME_WIDTH px, lossy WebP (see transcode_frame).
     format: str = "png"
-    # Custom-zoom RESOLUTION tier (png path only): "low" (~500px, compressed
-    # WebP), "default" (~1500px PNG), "high" (~4000px PNG). Ignored on the webp
-    # loop path. Unknown values coerce to "default" so legacy/odd callers stay safe.
+    # Custom-zoom RESOLUTION tier (png path only) -- the tier is the OUTPUT DPI at
+    # a fixed 12in figure: "low" (~840px, lossy WebP), "default" (~1320px PNG),
+    # "high" (~2400px PNG). Ignored on the webp loop path. Unknown values coerce to
+    # "default" so legacy/odd callers stay safe.
     quality: str = "default"
     # Map-overlay toggles (custom-zoom). Default True = the existing look (bold
     # coastlines + political borders, labeled lat/lon gridlines); set False for
@@ -536,11 +557,20 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             return _response(cached, "HIT", elapsed_ms)
 
+        # Output DPI is the tier knob (custom-zoom png path); the webp LOOP path
+        # always renders at the default 110 dpi (then transcodes to the fixed
+        # frame width), so poller frames are unaffected.
+        tier_dpi = pick_tier_dpi(body.format, body.quality)
         try:
             if is_true_color:
-                data = await satellite.fetch_true_color(body.bbox, resolved)
+                # Stride the bands BEFORE the per-pixel recipe (Rayleigh) inside
+                # the fetch -- byte-identical to striding after, but far cheaper
+                # (what makes low fast). render_png must then NOT stride again.
+                data = await satellite.fetch_true_color(body.bbox, resolved, downsample)
+                render_downsample = 1
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
+                render_downsample = downsample
             def _render_job() -> bytes:
                 out = render_png(
                     data,
@@ -548,20 +578,20 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     native_band,
                     resolved.scan_start.strftime("%Y-%m-%d %H:%M"),
                     body.enhancement,
-                    downsample,
+                    render_downsample,
                     storm=body.storm.model_dump() if body.storm is not None else None,
                     coastlines=body.coastlines,
                     gridlines=body.gridlines,
+                    dpi=tier_dpi,
                 )
-                # webp loop frames transcode inside the same executor job so
-                # the render semaphore covers the whole CPU burst and the
-                # cache below stores the final (already-encoded) bytes. The
-                # custom-zoom "low" tier re-encodes the already-small render as
-                # lossy WebP (out_format=="webp") for the smallest download.
+                # webp LOOP frames (floater/meso pollers): downscale the 1320 px
+                # render to the fixed frame width -- UNCHANGED. The custom-zoom
+                # "low" tier instead re-encodes its already-small native render as
+                # lossy WebP with NO downscale, so the chrome stays crisp.
                 if body.format == "webp":
                     out = transcode_frame(out, WEBP_FRAME_WIDTH, WEBP_QUALITY)
                 elif out_format == "webp":   # quality == "low"
-                    out = transcode_frame(out, LOWRES_WEBP_WIDTH, LOWRES_WEBP_QUALITY)
+                    out = encode_webp(out, LOWRES_WEBP_QUALITY)
                 return out
 
             frame_bytes = await asyncio.get_event_loop().run_in_executor(

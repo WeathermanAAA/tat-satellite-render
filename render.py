@@ -114,6 +114,7 @@ def render_png(
     storm: Optional[dict] = None,
     coastlines: bool = True,
     gridlines: bool = True,
+    dpi: int = 110,
 ) -> bytes:
     # ``coastlines`` draws coastlines + political borders; ``gridlines`` draws the
     # labeled lat/lon graticule. Both default True (the standard look); the custom-
@@ -126,10 +127,11 @@ def render_png(
     enh = None if is_rgb else get_enhancement(enhancement)
 
     # Pixel-budget stride. App-layer (compute_downsample_factor) sets this
-    # based on raw bbox×channel so output_pixels ≤ PIXEL_BUDGET. This
-    # composes with the goes.py fetch-time stride: both layers cap output
-    # size, the more aggressive of the two wins. ``cmi[::d, ::d]`` strides the
-    # first two axes for both 2D (scalar) and 3D (RGB) arrays.
+    # based on raw bbox×channel so output_pixels ≤ the tier budget. For SCALAR
+    # products the stride happens HERE; for TRUE COLOR it is applied in the fetch
+    # (satellites._stride_tc_grids, before the per-pixel recipe) and this is
+    # called with downsample=1, so the RGB is never double-strided.
+    # ``cmi[::d, ::d]`` strides the first two axes for both 2D and 3D arrays.
     cmi = data.cmi
     lats = data.lats
     lons = data.lons
@@ -211,7 +213,12 @@ def render_png(
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
-    # Figure size: target ~1400 px wide, height by aspect, dpi=110
+    # Figure size: fixed 12 in wide, height by aspect. The OUTPUT RESOLUTION is
+    # the per-tier ``dpi`` at savefig (default 110 -> ~1320 px; low ~70 -> ~840 px;
+    # high ~200 -> ~2400 px). figsize is held constant so layout proportions +
+    # font sizes scale uniformly and ALL chrome (vector text/lines) renders crisp
+    # at the tier dpi -- never bitmap-resized. default dpi 110 == today (byte-
+    # identical); the webp LOOP path always passes 110 (then transcodes to 1056).
     fig_w = 12.0
     fig_h = max(4.0, fig_w / max(aspect, 0.3))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
@@ -423,10 +430,28 @@ def render_png(
         )
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, facecolor=DARK_BG, edgecolor="none")
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG, edgecolor="none")
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
+
+def encode_webp(png: bytes, quality: int) -> bytes:
+    """Re-encode a rendered PNG as lossy WebP at its NATIVE size (no resize).
+
+    The custom-zoom "low" tier uses this for a small download while keeping the
+    chrome crisp: the figure is already rendered small (low dpi), so there is no
+    bitmap downscale of the composited plot (that is what used to pixelate the
+    title/coastlines/colorbar). Only the codec changes. Distinct from
+    ``transcode_frame``, which DOWNSCALES the 1320 px loop render to the fixed
+    WEBP_FRAME_WIDTH and is the floater/meso poller path -- untouched here.
+    """
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    out = io.BytesIO()
+    im.save(out, "WEBP", quality=quality, method=6)
+    return out.getvalue()
 
 
 def transcode_frame(png: bytes, width: int, quality: int) -> bytes:
