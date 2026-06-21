@@ -1503,7 +1503,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   var ENDED = __ENDED__;
   var BASIN = "__BASIN__";
   var HAFS_ID = "__HAFS_ID__";        // storm_ids join: 01e
-  var FLOATER_ID = "__ATCF_LONG__";   // storm_ids join: ep012026
+  var FLOATER_ID = "__ATCF_LONG__";   // storm_ids join: ep012026 / wp072026
+  var FLOATER_SLUG = "__FLOATER_SLUG__"; // floater index slug: wp07 / ep01 / wp91
   var CDN = "https://cdn.triple-a-tropics.com";
   // Per-basin published intensity-error entry (null = the honesty-guard
   // case: a labeled "no published statistics" panel, never a borrowed
@@ -4881,7 +4882,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     resolve: function (top) {
       var storms = (top && top.storms) || [];
       for (var i = 0; i < storms.length; i++) {
-        if (String(storms[i].id).toLowerCase() === FLOATER_ID &&
+        // FLOATER_ID is the bare atcf_long (e.g. wp072026). The floater index
+        // keys NHC storms by that bare id but JTWC/WP storms by the agency-
+        // prefixed sid (JTWC_WP072026) and invests by an unprefixed sid
+        // (WP912026), so strip a leading agency token before comparing. The
+        // bare match alone left every WPAC/JTWC named storm's Satellite tab
+        // empty (it never resolved its live floater). Match on slug too as a
+        // belt-and-suspenders against any id-format drift.
+        var fid = String(storms[i].id).toLowerCase();
+        if ((fid === FLOATER_ID
+             || fid.replace(/^[a-z]+_/, "") === FLOATER_ID
+             || String(storms[i].slug || "").toLowerCase() === FLOATER_SLUG) &&
             storms[i].manifest) {
           return CDN + "/" + storms[i].manifest;
         }
@@ -5883,6 +5894,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                      json.dumps(basin_entry(ids.basin),
                                 separators=(",", ":")))
             .replace("__ATCF_LONG__", _esc(ids.atcf_long))
+            .replace("__FLOATER_SLUG__",
+                     _esc(f"{ids.basin.lower()}{ids.number:02d}"))
             .replace("__ADV_URL__", _esc(adv_url or adv_key(storm["sid"])))
             .replace("__SST_BASE__", _esc(
                 (sst_base or f"/cyclolab/{ids.sid}/sst").rstrip("/")))
