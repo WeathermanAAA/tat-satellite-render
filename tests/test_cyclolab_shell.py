@@ -1006,11 +1006,11 @@ class TestStage3Mounts(unittest.TestCase):
                          "band switch must keep the moment (nearest frame)")
         self.assertIn("floaters/ep08/x/1012.png", st["satImgSrc"])
 
-    def test_satellite_speed_presets_default_1x_and_switch(self):
-        # final-gate-3 #5: four presets, default 1x; a click changes the
-        # speed multiplier (which scales the playback cadence uniformly,
-        # so the no-stutter contract holds at every speed).
-        # the harness snapshots after EVERY op, so index off the ops.
+    def test_satellite_speed_presets_default_2x_and_switch(self):
+        # Four presets, default 2x (the loops feel sluggish at 1x; matches the
+        # /satellite/ viewers); a click changes the speed multiplier (which scales
+        # the playback cadence uniformly, so the no-stutter contract holds at
+        # every speed). The harness snapshots after EVERY op, so index off the ops.
         recs = run_harness(self.html, {
             "floaters": self._floaters_top(),
             "floater_storm": self._floater_storm(),
@@ -1018,7 +1018,7 @@ class TestStage3Mounts(unittest.TestCase):
                     {"op": "clickSatSpeed", "speed": 4},
                     {"op": "clickSatSpeed", "speed": 0.5}]})
         speeds = [r["state"]["stage3"]["sat"]["speed"] for r in recs]
-        self.assertEqual(speeds, [1, 4, 0.5])
+        self.assertEqual(speeds, [2, 4, 0.5])
 
     def test_satellite_gif_button_and_hooks_exist(self):
         # the export button mounts and the encoder hook is exposed (the

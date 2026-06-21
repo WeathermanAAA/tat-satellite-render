@@ -4602,7 +4602,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   var sat = { man: null, band: null, frames: [], idx: 0, playing: false,
               timer: null, gen: 0, preloaded: {},
               mode: null, bmp: {}, bmpKeys: [], raf: null, lastT: 0,
-              holdT0: 0, presented: [], speed: 1,
+              holdT0: 0, presented: [], speed: 2,
               // auto-refresh (the manifest re-poll): pollTimer = the next
               // scheduled fetch; inactive = the floater stopped producing
               // frames (storm dropped from the index OR newest frame stale).
@@ -4931,7 +4931,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
       host.appendChild(b);
     });
-    satSetSpeed(1);
+    satSetSpeed(2);   // default playback speed: 2x (matches the /satellite/ viewers)
   }
   function satNudgeSpeed(dir) {
     var i = SAT_SPEEDS.indexOf(sat.speed);
