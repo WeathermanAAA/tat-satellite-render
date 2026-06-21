@@ -85,21 +85,27 @@ def test_ratio_sharpen_injects_red_detail():
 
 # --- Terminator (sunrise/sunset) golden-hour handling ----------------------
 
-def test_rayleigh_scale_field_full_in_daytime_taper_at_terminator():
-    cos = np.array([[1.0, 0.6, tc.RAYLEIGH_TAPER_DAY_COS, 0.15,
-                     tc.RAYLEIGH_TAPER_MIN_COS, -0.1]], np.float64)
+def test_rayleigh_scale_field_full_across_dayside_floor_at_horizon():
+    cos = np.array([[1.0, 0.6, tc.RAYLEIGH_TAPER_START_COS, 0.05,
+                     0.0, -0.1]], np.float64)
     s = tc.rayleigh_scale_field(cos)
-    # EXACTLY full (==RAYLEIGH_SCALE) for cos_sza >= the daytime threshold:
-    # this is what keeps midday byte-identical.
+    # EXACTLY full (==RAYLEIGH_SCALE) for cos_sza >= the START threshold (the
+    # whole day side, well into twilight) -- this is what keeps midday byte-
+    # identical AND prevents the broad warm bleed.
     assert s[0, 0] == tc.RAYLEIGH_SCALE
     assert s[0, 1] == tc.RAYLEIGH_SCALE
-    assert s[0, 2] == tc.RAYLEIGH_SCALE
-    # Tapers to ~0 toward/below the terminator, monotonically.
-    assert s[0, 3] < tc.RAYLEIGH_SCALE
-    assert s[0, 4] == 0.0
-    assert s[0, 5] == 0.0
-    mid = s[0, 1:5]
-    assert np.all(np.diff(mid) <= 0)  # non-increasing as the sun sets
+    assert s[0, 2] == tc.RAYLEIGH_SCALE       # at START_COS -> still full
+    # Softens only in the last few degrees, and only toward the FLOOR (never 0).
+    assert tc.RAYLEIGH_FLOOR < s[0, 3] < tc.RAYLEIGH_SCALE   # 0.05 -> partial
+    assert abs(s[0, 4] - tc.RAYLEIGH_FLOOR) < 1e-9           # horizon -> floor
+    assert abs(s[0, 5] - tc.RAYLEIGH_FLOOR) < 1e-9           # below -> floor
+    assert s[0, 4] > 0.0                                     # NEVER zeroed
+    # cos descends across the array, so the strength is non-increasing as the
+    # sun sets toward the horizon.
+    assert np.all(np.diff(s[0]) <= 1e-12)
+    # the gate stays below full daylight
+    assert tc.WARM_TINT_DAY_COS < tc.COS_SZA_FULL_DAY
+    assert tc.RAYLEIGH_TAPER_START_COS < tc.COS_SZA_FULL_DAY
 
 
 def test_warm_tint_is_exact_noop_in_daytime():

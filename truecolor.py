@@ -65,23 +65,33 @@ WL_VEGGIE = 0.86
 
 # --- Terminator (sunrise/sunset golden-hour) handling ----------------------
 # Near the terminator FULL Rayleigh subtraction over-corrects at the limb --
-# it strips the warm forward-scattered light, and the synth-green then dominates
-# -> a green cast. Two smoothly-gated corrections fix it WITHOUT touching
-# daytime: both are EXACT no-ops for cos_sza >= *_DAY_COS (smoothstep saturates
-# to 1, so the taper is exactly 1.0 and the warm weight exactly 0.0), so midday
-# true color stays byte-identical. (1) taper Rayleigh to ~0 toward the
-# terminator; (2) add a warm red/orange tint peaking at the terminator, applied
-# to the day-side RGB BEFORE the clean-IR night fade so it develops then fades
-# into night exactly as today. All tunable here.
-RAYLEIGH_TAPER_DAY_COS = 0.30   # cos_sza >= this -> FULL Rayleigh (1.0): daytime unchanged
-RAYLEIGH_TAPER_MIN_COS = 0.05   # cos_sza <= this -> Rayleigh fully tapered off (~0)
+# stripping the warm forward-scattered light, the synth-green then dominates ->
+# a green cast. Two smoothly-gated corrections fix it WITHOUT touching daytime.
+#
+# Both are confined to a NARROW low-sun band that stays BELOW full daylight:
+# COS_SZA_FULL_DAY is 0.14, so the gates live under it. The first ship started
+# both at cos_sza 0.30 (sun ~17 deg up -- full daylight), which painted a warm/
+# sepia WALL across the whole afternoon (worst over Saharan dust). Now:
+#   * warm tint: ZERO at/above WARM_TINT_DAY_COS (0.12), peaking AT the horizon
+#     -- a thin sunrise/sunset band, half the old amplitude (subtle golden, not
+#     sepia). Never fires in full daylight.
+#   * Rayleigh: stays FULL across the ENTIRE day side; only in the last few
+#     degrees (below RAYLEIGH_TAPER_START_COS 0.10) does it soften -- and only to
+#     RAYLEIGH_FLOOR, NEVER to 0, so clear-sky/ocean stays blue and the broad
+#     warm bleed is gone.
+# Both are EXACT no-ops above their start cos (smoothstep saturates to 1.0 -> the
+# taper is exactly RAYLEIGH_SCALE and the warm weight exactly 0.0), so midday true
+# color stays byte-identical. Applied to the day-side RGB BEFORE the clean-IR
+# night fade so they develop then fade into night. All tunable here.
+RAYLEIGH_TAPER_START_COS = 0.10  # cos_sza >= this -> FULL Rayleigh (1.0): whole day side unchanged
+RAYLEIGH_FLOOR = 0.4             # Rayleigh strength AT the horizon (cos_sza<=0) -- never 0
 
-WARM_TINT_DAY_COS = 0.30    # cos_sza >= this -> NO warm tint (0.0): daytime unchanged
-WARM_TINT_PEAK_COS = 0.08   # cos_sza <= this -> full warm tint (held through the terminator)
+WARM_TINT_DAY_COS = 0.12    # cos_sza >= this -> NO warm tint (0.0): never in full daylight
+WARM_TINT_PEAK_COS = 0.0    # cos_sza <= this (the horizon + below) -> full warm tint
 WARM_TINT_STRENGTH = 1.0    # overall multiplier on the warm tint (0 disables)
-WARM_TINT_RED_ADD = 0.10    # additive red boost at full tint
-WARM_TINT_GREEN_GAIN = 0.16  # multiplicative green attenuation at full tint
-WARM_TINT_BLUE_GAIN = 0.34   # multiplicative blue attenuation at full tint (most -> orange)
+WARM_TINT_RED_ADD = 0.05    # additive red boost at full tint (halved: subtle golden, not sepia)
+WARM_TINT_GREEN_GAIN = 0.08  # multiplicative green attenuation at full tint (halved)
+WARM_TINT_BLUE_GAIN = 0.17   # multiplicative blue attenuation at full tint (halved; most -> orange)
 
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
@@ -93,11 +103,13 @@ def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
 
 
 def rayleigh_scale_field(cos_sza: np.ndarray) -> np.ndarray:
-    """Per-pixel Rayleigh strength: RAYLEIGH_SCALE in daytime, smoothly tapering
-    to ~0 near the terminator. EXACTLY RAYLEIGH_SCALE (1.0) for
-    cos_sza >= RAYLEIGH_TAPER_DAY_COS (daytime byte-identical)."""
-    return RAYLEIGH_SCALE * _smoothstep(
-        RAYLEIGH_TAPER_MIN_COS, RAYLEIGH_TAPER_DAY_COS, cos_sza
+    """Per-pixel Rayleigh strength: FULL (RAYLEIGH_SCALE) across the ENTIRE day
+    side, softening only in the last few degrees near the horizon and only down to
+    RAYLEIGH_FLOOR (never 0 -- keeps clear-sky/ocean blue + kills the broad warm
+    bleed). EXACTLY RAYLEIGH_SCALE for cos_sza >= RAYLEIGH_TAPER_START_COS, so
+    daytime is byte-identical."""
+    return RAYLEIGH_FLOOR + (RAYLEIGH_SCALE - RAYLEIGH_FLOOR) * _smoothstep(
+        0.0, RAYLEIGH_TAPER_START_COS, cos_sza
     )
 
 
