@@ -108,26 +108,32 @@ def test_rayleigh_scale_field_full_across_dayside_floor_at_horizon():
     assert tc.RAYLEIGH_TAPER_START_COS < tc.COS_SZA_FULL_DAY
 
 
-def test_warm_tint_is_exact_noop_in_daytime():
-    # The midday byte-identical guarantee: for a high-cos_sza block the warm
-    # tint returns the RGB bit-for-bit unchanged.
-    rng = np.arange(2 * 3 * 3, dtype=np.float32).reshape(2, 3, 3) / 20.0
-    cos_day = np.full((2, 3), 0.8, np.float32)   # >= WARM_TINT_DAY_COS
-    out = tc.warm_terminator_tint(rng, cos_day)
-    assert np.array_equal(out, rng)
-    # exactly at the daytime threshold is still a no-op (smoothstep saturates)
-    cos_edge = np.full((2, 3), tc.WARM_TINT_DAY_COS, np.float32)
-    assert np.array_equal(tc.warm_terminator_tint(rng, cos_edge), rng)
-
-
-def test_warm_tint_warms_terminator_red_up_blue_green_down():
+def test_warm_tint_disabled_by_default_natural_rgb():
+    # Default contract: the warm tint is OFF, so sunrise/sunset reads as natural
+    # true-color RGB -- the function is a no-op even AT the terminator.
+    assert tc.WARM_TINT_STRENGTH == 0.0
     rgb = np.full((1, 1, 3), 0.5, np.float32)
-    cos_term = np.array([[tc.WARM_TINT_PEAK_COS]], np.float32)  # full tint
-    out = tc.warm_terminator_tint(rgb, cos_term)
-    assert out[0, 0, 0] > 0.5            # red boosted
-    assert out[0, 0, 1] < 0.5            # green pulled down
-    assert out[0, 0, 2] < 0.5            # blue pulled down
-    assert out[0, 0, 2] < out[0, 0, 1]   # blue down MORE than green -> orange/red
+    cos_term = np.array([[tc.WARM_TINT_PEAK_COS]], np.float32)   # the horizon
+    assert np.array_equal(tc.warm_terminator_tint(rgb, cos_term), rgb)
+    cos_day = np.full((1, 1), 0.8, np.float32)
+    assert np.array_equal(tc.warm_terminator_tint(rgb, cos_day), rgb)
+
+
+def test_warm_tint_when_enabled_is_gated_and_warms():
+    # The knob is retained: if re-enabled, the tint stays daytime-gated (exact
+    # no-op for cos_sza >= WARM_TINT_DAY_COS) and warms the terminator correctly
+    # (R up, G/B down, blue down most -> orange).
+    rgb = np.full((1, 1, 3), 0.5, np.float32)
+    saved = tc.WARM_TINT_STRENGTH
+    try:
+        tc.WARM_TINT_STRENGTH = 1.0
+        day = tc.warm_terminator_tint(rgb, np.full((1, 1), 0.8, np.float32))
+        assert np.array_equal(day, rgb)   # daytime still untouched
+        out = tc.warm_terminator_tint(rgb, np.array([[tc.WARM_TINT_PEAK_COS]], np.float32))
+    finally:
+        tc.WARM_TINT_STRENGTH = saved
+    assert out[0, 0, 0] > 0.5 and out[0, 0, 1] < 0.5 and out[0, 0, 2] < 0.5
+    assert out[0, 0, 2] < out[0, 0, 1]   # blue down MORE than green
 
 
 def _midday_scene():

@@ -88,7 +88,12 @@ RAYLEIGH_FLOOR = 0.4             # Rayleigh strength AT the horizon (cos_sza<=0)
 
 WARM_TINT_DAY_COS = 0.12    # cos_sza >= this -> NO warm tint (0.0): never in full daylight
 WARM_TINT_PEAK_COS = 0.0    # cos_sza <= this (the horizon + below) -> full warm tint
-WARM_TINT_STRENGTH = 1.0    # overall multiplier on the warm tint (0 disables)
+# DISABLED (0.0): sunrise/sunset should read as natural true-color RGB, not a warm
+# cast. The window/amplitude tuning below is retained so the effect can be re-
+# enabled by raising this knob, but by default no warm tint is applied -- the
+# terminator is just the (Rayleigh-tapered) true color, which matches the day-side
+# hue and avoids both the old crimson wall AND the full-Rayleigh green at the limb.
+WARM_TINT_STRENGTH = 0.0    # overall multiplier on the warm tint (0 = OFF, natural RGB)
 WARM_TINT_RED_ADD = 0.05    # additive red boost at full tint (halved: subtle golden, not sepia)
 WARM_TINT_GREEN_GAIN = 0.08  # multiplicative green attenuation at full tint (halved)
 WARM_TINT_BLUE_GAIN = 0.17   # multiplicative blue attenuation at full tint (halved; most -> orange)
