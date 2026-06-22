@@ -3694,7 +3694,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     var firstSeg = tp.length > 1 ? [tp[1][0] - tp[0][0],
                                     tp[1][1] - tp[0][1]] : lastSeg;
     var fsLen = Math.max(1e-6, Math.hypot(firstSeg[0], firstSeg[1]));
-    var ringPx = coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; });
+    // SMOOTH the swept-envelope ring ONCE: derive_cone joins the sparse tau
+    // circles with straight tangent chords that read as angular facets through
+    // the recurve. Densify the ring with a CLOSED Catmull-Rom spline (passes
+    // THROUGH every vertex, wraps the seam) so the boundary is a smooth curve.
+    // CRITICAL: this same dense smooth ring feeds BOTH the rendered cone path
+    // (dC) AND the reveal corridor (ringHalfAt) below, so the corridor still
+    // contains the cone exactly (no settle-frame pop-in) and the geometry test
+    // reads real on-curve vertices. catmullRomClosed is hoisted (declared below).
+    var ringPx = catmullRomClosed(
+      coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; }), 3.5);
     // rear/forward extents: how far the ring reaches BEHIND the first
     // track point / BEYOND the last one (signed projection onto the
     // end-segment directions).
@@ -3745,6 +3754,59 @@ HTML_TEMPLATE = r"""<!doctype html>
         }
       }
       return out;
+    }
+    // Closed-ring CENTRIPETAL Catmull-Rom densifier (alpha = 0.5). Centripetal
+    // knot spacing (chord^0.5) is overshoot- and cusp-free, unlike the uniform
+    // form which spikes where the envelope pinches (the tiny tau-0 apex cap) or
+    // turns sharply. Consecutive near-coincident vertices are de-duplicated first
+    // (the small apex arc clusters them, and zero-length knots would divide by
+    // zero) and a closing duplicate dropped, then the spline wraps the seam.
+    // Returns an OPEN dense point list (the caller closes it with Z). Passes
+    // THROUGH every surviving vertex, so the corridor built from the same dense
+    // list contains it exactly.
+    function catmullRomClosed(poly, spacing) {
+      var P = [];
+      for (var k = 0; k < poly.length; k++) {
+        var q = poly[k];
+        if (!P.length ||
+            Math.hypot(q[0] - P[P.length - 1][0],
+                       q[1] - P[P.length - 1][1]) > 0.4) P.push(q);
+      }
+      if (P.length > 1 &&
+          Math.hypot(P[0][0] - P[P.length - 1][0],
+                     P[0][1] - P[P.length - 1][1]) < 0.4) P.pop();
+      var n = P.length;
+      if (n < 3) return poly.slice();
+      function at(j) { return P[((j % n) + n) % n]; }
+      function knot(ti, a, b) {
+        return ti + Math.sqrt(Math.hypot(b[0] - a[0], b[1] - a[1]));
+      }
+      var out = [];
+      for (var i = 0; i < n; i++) {
+        var p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+        var t0 = 0, t1 = knot(t0, p0, p1), t2 = knot(t1, p1, p2),
+            t3 = knot(t2, p2, p3);
+        // ADAPTIVE: emit ~one sample per `spacing` px of this segment, so the
+        // long tangent chords (the facets) get many points while the already-
+        // fine arc steps get few - uniform ~spacing-px point density, no sub-
+        // pixel clutter (which toFixed(1) rounding would turn into false kinks).
+        var m = Math.max(1, Math.round(
+          Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / spacing));
+        for (var s = 0; s < m; s++) {
+          var t = t1 + (t2 - t1) * s / m;
+          // Barry-Goldman pyramid (de Boor for non-uniform Catmull-Rom)
+          var A1 = _lrp(p0, p1, t0, t1, t), A2 = _lrp(p1, p2, t1, t2, t),
+              A3 = _lrp(p2, p3, t2, t3, t);
+          var B1 = _lrp(A1, A2, t0, t2, t), B2 = _lrp(A2, A3, t1, t3, t);
+          out.push(_lrp(B1, B2, t1, t2, t));
+        }
+      }
+      return out;
+    }
+    function _lrp(a, b, ta, tb, t) {
+      if (tb - ta < 1e-9) return [a[0], a[1]];
+      var u = (t - ta) / (tb - ta);
+      return [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u];
     }
     tpExt = catmullRom(tpExt, PER_SEG);
     var cum = [0];
@@ -3831,88 +3893,63 @@ HTML_TEMPLATE = r"""<!doctype html>
       var f3 = (d - samples[j3].d) / sampStep;
       return samples[j3].w + (samples[j3 + 1].w - samples[j3].w) * f3;
     }
-    var CAPV = 5;                       // leading-edge cap vertices
     function polyAt(d) {
-      // corridor polygon: left chain forward, leading-edge cap, right
-      // chain back. THE CAP'S MAXIMUM FORWARD EXTENT IS EXACTLY d -
-      // shoulders sit BEHIND at d - 0.45w and the arc rises to the tip
-      // at d. (The first cut bulged the tip 0.55w BEYOND d; the
-      // high-contrast 1.8px boundary line painting inside that bulge
-      // read as an outline ghosting ahead of the pops - the final-gate
-      // bug. Now ink and pops share one front.) Beyond-front samples
-      // collapse onto the shoulders so interpolation unfolds them.
-      var w = halfAt(d);
-      var back = 0.45 * w;
-      var f = pointAt(Math.max(0, d - back));   // shoulder base
-      var ft = pointAt(d);                       // the tip - AT d
-      var shL = [f.x + f.nx * w, f.y + f.ny * w];
-      var shR = [f.x - f.nx * w, f.y - f.ny * w];
+      // REVEAL CLIP: the corridor (a band intentionally WIDER than the cone, so
+      // the cone's OWN smooth cased edge is what shows through - never the clip
+      // edge) revealed from the rear up to arc d, closed by a FLAT perpendicular
+      // FRONT CUT at d. The lateral edges are static; only the straight front cut
+      // advances, swept smoothly along the centerline tangent. No unfolding cap
+      // and no per-frame cone rebuild, so the growing edge cannot wiggle - the
+      // finished smooth cone is simply uncovered. (An SVG <clipPath><path d>,
+      // mutated via setAttribute each tick: Chromium repaints that reliably,
+      // unlike CSS/WAAPI clip animation on SVG containers.)
       var L = [], R = [];
       for (var j2 = 0; j2 < SAMP; j2++) {
         var s2 = samples[j2];
-        if (s2.d <= d) {
-          var wj = s2.w;
-          L.push((s2.x + s2.nx * wj).toFixed(1) + " " +
-                 (s2.y + s2.ny * wj).toFixed(1));
-          R.push((s2.x - s2.nx * wj).toFixed(1) + " " +
-                 (s2.y - s2.ny * wj).toFixed(1));
-        } else {
-          L.push(shL[0].toFixed(1) + " " + shL[1].toFixed(1));
-          R.push(shR[0].toFixed(1) + " " + shR[1].toFixed(1));
-        }
+        if (s2.d > d) break;            // samples are arc-ordered
+        L.push((s2.x + s2.nx * s2.w).toFixed(1) + " " +
+               (s2.y + s2.ny * s2.w).toFixed(1));
+        R.push((s2.x - s2.nx * s2.w).toFixed(1) + " " +
+               (s2.y - s2.ny * s2.w).toFixed(1));
       }
-      var cap = [];
-      for (var cv = 0; cv < CAPV; cv++) {
-        var th = Math.PI * (cv + 1) / (CAPV + 1);
-        // ellipse arc from the LEFT shoulder rising to the TIP AT d,
-        // back down to the RIGHT shoulder - never past d
-        var fwd = Math.sin(th) * back;
-        var lat2 = Math.cos(th) * w;
-        var tx = f.ny, ty = -f.nx;      // (nx,ny) rotated -90 = tangent
-        cap.push((f.x + f.nx * lat2 + tx * fwd).toFixed(1) + " " +
-                 (f.y + f.ny * lat2 + ty * fwd).toFixed(1));
-      }
-      // an SVG path (M..L..Z), not a CSS polygon: Chromium never
-      // repaints style clip-path mutations on SVG containers (probe:
-      // interpolated computed values, 108 painted px mid-growth) -
-      // updating a real <clipPath><path d> invalidates reliably.
-      return "M" + L.concat(cap, R.reverse()).join(" L ") + " Z";
+      var ft = pointAt(d), w = halfAt(d);
+      var fL = (ft.x + ft.nx * w).toFixed(1) + " " + (ft.y + ft.ny * w).toFixed(1);
+      var fR = (ft.x - ft.nx * w).toFixed(1) + " " + (ft.y - ft.ny * w).toFixed(1);
+      return "M" + L.concat([fL, fR], R.reverse()).join(" L ") + " Z";
     }
-    // TRAPEZOID ease (S4-AD2 #1): quadratic accel/decel over the first
-    // and last 15%, LINEAR plateau between - the sine ease's peak
-    // velocity (1.57x average) measured 1.63%/frame against the 1.5%
-    // smoothness budget once vsync jitter stacked on it; the trapezoid
-    // plateau holds ~0.98%/frame nominal with gentle ends.
-    var EASE_A = 0.15;
-    var EASE_V = 1 / (1 - EASE_A);          // plateau velocity
+    // EASE-OUT (cubic): the front advances quickest just after the hold and
+    // decelerates into the settle, so the cone "draws in" briskly then eases to
+    // rest. Paired with the fixed-timestep accumulator below, the per-frame arc
+    // advance is uniform regardless of vsync jitter (the same de-choppy approach
+    // as the satellite playback). invEaseS is the exact inverse, used to time the
+    // icon pops to the wavefront. Monotonic on [0,1] with easeS(0)=0, easeS(1)=1.
     function easeS(t) {
       t = Math.max(0, Math.min(1, t));
-      if (t < EASE_A) return EASE_V * t * t / (2 * EASE_A);
-      if (t > 1 - EASE_A) {
-        var u = 1 - t;
-        return 1 - EASE_V * u * u / (2 * EASE_A);
-      }
-      return EASE_V * (t - EASE_A / 2);
+      var u = 1 - t;
+      return 1 - u * u * u;
     }
     function invEaseS(f) {
       f = Math.max(0, Math.min(1, f));
-      var fa = EASE_V * EASE_A / 2;         // progress at the corners
-      if (f < fa) return Math.sqrt(2 * EASE_A * f / EASE_V);
-      if (f > 1 - fa) return 1 - Math.sqrt(2 * EASE_A * (1 - f) / EASE_V);
-      return f / EASE_V + EASE_A / 2;
+      return 1 - Math.pow(1 - f, 1 / 3);
     }
 
 
     // ---- the cone (S4-AD1 #8 restyle): crisp navy/white boundary,
     // subtle white-blue interior, NO glow filters -----------------------
-    var dC = coneRing.map(function (c, i) {
-      return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
-        Y(c[1]).toFixed(1);
-    }).join(" ") + " Z";
-    var dF = pts.map(function (p, i) {
-      return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," +
-        Y(p.lat).toFixed(1);
-    }).join(" ");
+    // The cone boundary is the SMOOTH dense ring (catmullRomClosed, computed
+    // once above and shared with the reveal corridor) rendered as a fine
+    // polyline - visually a continuous curve through the recurve, no facets,
+    // and every vertex lies ON the curve so the corridor that contains it is
+    // exact. The centre track is densified the same way (open Catmull-Rom)
+    // so the forecast markers still sit exactly on a smoothly curving line.
+    var dC = "M" + ringPx.map(function (q) {
+      return q[0].toFixed(1) + "," + q[1].toFixed(1);
+    }).join(" L ") + " Z";
+    var dF = "M" + catmullRom(pts.map(function (p) {
+      return [X(p.lon), Y(p.lat)];
+    }), PER_SEG).map(function (q) {
+      return q[0].toFixed(1) + "," + q[1].toFixed(1);
+    }).join(" L ");
     // pill ramp gradients (final-gate #5): THE banner/LIVE-STATUS
     // chrome recipe (edge 0/mid 22/accent 50/mid 78/edge 100) as SVG
     // gradients - the pill is ONE rounded rect FILLED by the ramp, so
@@ -4278,11 +4315,26 @@ HTML_TEMPLATE = r"""<!doctype html>
     } else if (!reduced && grp.animate) {
       revealPath.setAttribute("d", polyAt(0));
       grp.setAttribute("data-reveal", "animated");
-      var t0 = performance.now() + HOLD_MS;
-      var tickFn = function () {
-        var tt = (performance.now() - t0) / GROW_MS;
+      // FIXED-TIMESTEP reveal clock (same de-choppy approach as the satellite
+      // playback): accumulate real elapsed time and advance the simulated clock
+      // in fixed FRAME_MS chunks, so the eased arc progress advances by a uniform
+      // amount per step regardless of vsync jitter (the variable-timestep version
+      // read raw performance.now() and stepped under frame-interval noise). The
+      // accumulator is clamped so a tab-switch stall can't fast-forward / spiral.
+      // Only the clip's flat front moves; the cone geometry never rebuilds.
+      var FRAME_MS = 1000 / 60;
+      var simMs = -HOLD_MS;          // hold before the front starts to grow
+      var prevTs = null, acc = 0;
+      var tickFn = function (ts) {
+        if (prevTs === null) prevTs = ts;
+        acc += Math.min(100, ts - prevTs);   // clamp: never advance > ~6 frames at once
+        prevTs = ts;
+        while (acc >= FRAME_MS) { simMs += FRAME_MS; acc -= FRAME_MS; }
+        var tt = simMs / GROW_MS;
         if (tt >= 1) {
+          revealPath.setAttribute("d", polyAt(Ltot));   // pin the full cone first
           grp.removeAttribute("clip-path");
+          grp.setAttribute("data-reveal", "final");
           acRaf = null;
           return;
         }
