@@ -1576,6 +1576,91 @@ class TestConeCorridorContainment(unittest.TestCase):
         self.assertIn("ac-reveal-clip", a["coneClip"])
         self.assertGreater(a["coneRevealPathLen"], 100)
 
+    # --- HARD RECURVER (the real TD EIGHT / JTWC_WP082026 forecast track) ----
+    # The reveal corridor's per-side NEAREST-crossing half-width (ringEdgesAt)
+    # exists for exactly this shape: a recurver's perpendicular at an early
+    # centerline sample also stabs the cone's FAR limb. The old max|t| latched
+    # onto it, so the band ballooned across open water and the far end was
+    # revealed before the growth front reached it. These guard both ends of
+    # that: the settle frame still fully contains the cone (no pop-in), and a
+    # 30%-grown reveal does NOT already cover most of the cone (no balloon).
+    RECURVER = [(0, 14.2, 147.8), (12, 14.7, 146.1), (24, 15.5, 144.3),
+                (36, 16.4, 142.0), (48, 17.5, 139.6), (60, 18.9, 137.3),
+                (72, 21.0, 135.1), (96, 29.3, 135.9), (120, 35.4, 146.0)]
+
+    def _recurver_adv(self):
+        import json as _json
+        import derived_cone as _dc
+        blob = _json.loads(
+            (REPO / "cyclolab_radii_jtwc_wpac_mean_2015.json").read_text())
+        nm = {int(k): float(v) for k, v in blob["nm_values"].items()}
+        pts = [{"tau_h": t, "lat": la, "lon": lo, "intensity_kt": 30,
+                "dev_label": "TS", "valid_utc": "2026-06-22T00:00:00Z"}
+               for t, la, lo in self.RECURVER]
+        return {"sid": "JTWC_WP082026", "advisory": 1,
+                "issued_utc": "2026-06-22T00:00:00Z", "source": "jtwc",
+                "method": "derived-mean-error-jtwc-wpac-mean-2015",
+                "cone": _dc.derive_cone(pts, nm), "points": pts, "text": None}
+
+    def _seek_adv(self, adv, f):
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": f}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        return (a, _parse_pairs(a["coneRevealD"], " "),
+                _parse_pairs(a["coneOutlineD"], ","))
+
+    def test_recurver_settle_contains_cone_no_popin(self):
+        adv = self._recurver_adv()
+        a, clip, ring = self._seek_adv(adv, 1.0)
+        self.assertGreater(len(ring), 100)
+        outside = [(x, y) for x, y in ring if not _inside(clip, x, y)]
+        self.assertEqual(
+            len(outside), 0,
+            f"{len(outside)}/{len(ring)} recurver ring verts outside the "
+            f"full corridor (first: {outside[:3]}) - the cone would pop in "
+            f"at settle on a recurver")
+
+    def test_recurver_partial_reveal_does_not_balloon(self):
+        adv = self._recurver_adv()
+        _, clip, ring = self._seek_adv(adv, 0.30)
+        frac = sum(1 for x, y in ring if _inside(clip, x, y)) / len(ring)
+        self.assertLess(
+            frac, 0.7,
+            f"a 30% reveal already covers {frac:.0%} of the recurver cone "
+            f"- the corridor ballooned across the recurve to the far limb")
+
+    def test_tight_loop_ships_unclipped_no_popin(self):
+        # A tight cyclonic LOOP (NOW within ~26 nm of +120h while r(120)=180)
+        # makes the union cone SELF-OVERLAP; a flat-front corridor cannot
+        # contain it, so the loop guard ships the finished cone UNCLIPPED
+        # rather than clipping a contiguous arc that would pop in at settle.
+        import json as _json
+        import derived_cone as _dc
+        blob = _json.loads(
+            (REPO / "cyclolab_radii_jtwc_wpac_mean_2015.json").read_text())
+        nm = {int(k): float(v) for k, v in blob["nm_values"].items()}
+        loop = [(0, 15.0, 140.0), (12, 16.2, 140.8), (24, 17.0, 142.0),
+                (36, 17.2, 143.4), (48, 16.6, 144.2), (60, 15.6, 144.0),
+                (72, 15.0, 142.8), (96, 14.8, 141.2), (120, 15.2, 139.6)]
+        pts = [{"tau_h": t, "lat": la, "lon": lo, "intensity_kt": 30,
+                "dev_label": "TS", "valid_utc": "2026-06-22T00:00:00Z"}
+               for t, la, lo in loop]
+        adv = {"sid": "JTWC_WP092026", "advisory": 1,
+               "issued_utc": "2026-06-22T00:00:00Z", "source": "jtwc",
+               "method": "derived-mean-error-jtwc-wpac-mean-2015",
+               "cone": _dc.derive_cone(pts, nm), "points": pts, "text": None}
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": 0.5}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertEqual(a["coneClip"], "none",
+                         "self-overlapping loop cone must render UNCLIPPED")
+        self.assertGreater(len(a["coneOutlineD"]), 40)
+        self.assertFalse(a["coneEmptyShown"])
+
     def test_seek_tip_advances_along_the_track(self):
         # NOT self-referential (adversarial-review find): the tip must
         # MOVE between seeks and the clip polygon must actually grow -
