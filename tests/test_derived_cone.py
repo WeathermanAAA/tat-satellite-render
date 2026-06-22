@@ -304,9 +304,10 @@ class TestBuildDerivedAdvisoryJson(unittest.TestCase):
 
 
 class TestSweptEnvelopeSmoothness(unittest.TestCase):
-    """S4-AD1 #9: the tangent chain must be visually smooth - no
-    scallops, no backtracking micro-edges - across track shapes incl.
-    the engulfed stalled-storm case (domination filter)."""
+    """The union-of-disks boundary must render visually smooth - no
+    scallops, no staircase micro-edges - across track shapes incl. the
+    engulfed stalled-storm case (no domination filter needed: an engulfed
+    disk simply never reaches the union boundary)."""
 
     @staticmethod
     def _max_turn(ring):
@@ -361,7 +362,100 @@ class TestSweptEnvelopeSmoothness(unittest.TestCase):
             [{"tau_h": 0, "lat": 15, "lon": -135},
              {"tau_h": 24, "lat": 16, "lon": -137}], nm_blob)
         self.assertEqual(adv["provenance"]["construction"],
-                         "tangent-chain-swept-envelope")
+                         "union-of-time-scaled-error-disks")
+
+
+class TestUnionEnvelopeInvariants(unittest.TestCase):
+    """The defining properties of the union-of-disks cone that the prior
+    fixed-offset/tangent-chain construction violated on a hard recurver:
+    it never self-intersects, and its perpendicular width grows
+    monotonically with forecast time (narrowest at NOW, widest at the
+    terminus)."""
+
+    # A textbook hard recurver (the real TD EIGHT / JTWC_WP082026 adv 1
+    # forecast track: WNW out to ~135E, then a sharp recurve back to the
+    # NE). lat,lon per tau.
+    EIGHT = [(0, 14.2, 147.8), (12, 14.7, 146.1), (24, 15.5, 144.3),
+             (36, 16.4, 142.0), (48, 17.5, 139.6), (60, 18.9, 137.3),
+             (72, 21.0, 135.1), (96, 29.3, 135.9), (120, 35.4, 146.0)]
+
+    def setUp(self):
+        self.pts = [{"tau_h": t, "lat": la, "lon": lo}
+                    for t, la, lo in self.EIGHT]
+        self.ring = dc.derive_cone(self.pts, FULL_NM)
+
+    @staticmethod
+    def _seg_cross(p1, p2, p3, p4):
+        def ccw(a, b, c):
+            return ((c[1] - a[1]) * (b[0] - a[0])
+                    - (b[1] - a[1]) * (c[0] - a[0]))
+        return (((ccw(p3, p4, p1) > 0) != (ccw(p3, p4, p2) > 0))
+                and ((ccw(p1, p2, p3) > 0) != (ccw(p1, p2, p4) > 0)))
+
+    def test_recurver_ring_is_simple(self):
+        # No two non-adjacent edges of the closed ring cross: the union
+        # boundary is a simple polygon (the tangent chain self-crossed on
+        # the recurve's concave side).
+        r = self.ring
+        n = len(r) - 1
+        for i in range(n):
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue
+                self.assertFalse(
+                    self._seg_cross(r[i], r[i + 1], r[j], r[j + 1]),
+                    f"ring self-intersects at edges {i},{j}")
+
+    def test_perpendicular_width_grows_monotonically(self):
+        # Local (nearest-crossing) perpendicular full-width at each
+        # forecast point must be non-decreasing with tau - the funnel
+        # expands, it does not pinch. Tiny non-monotone wobble at the
+        # n-mi level is tolerated (planar/grid discretisation).
+        import math as _m
+        lat0 = sum(p["lat"] for p in self.pts) / len(self.pts)
+        lon0 = self.pts[0]["lon"]
+        cl = _m.cos(_m.radians(lat0))
+
+        def xy(la, lo):
+            return ((lo - lon0) * 60.0 * cl, (la - lat0) * 60.0)
+        rx = [xy(c[1], c[0]) for c in self.ring]
+        px = [xy(p["lat"], p["lon"]) for p in self.pts]
+
+        def local_width(i):
+            a = px[max(0, i - 1)]
+            b = px[min(len(px) - 1, i + 1)]
+            vx, vy = b[0] - a[0], b[1] - a[1]
+            L = _m.hypot(vx, vy) or 1.0
+            nx, ny = -vy / L, vx / L
+            ppx, ppy = px[i]
+            pos = neg = None
+            for k in range(len(rx) - 1):
+                ax, ay = rx[k]
+                bx, by = rx[k + 1]
+                ex, ey = bx - ax, by - ay
+                det = ex * ny - ey * nx
+                if abs(det) < 1e-9:
+                    continue
+                rxx, ryy = ax - ppx, ay - ppy
+                t = (ex * ryy - ey * rxx) / det
+                s = (nx * ryy - ny * rxx) / det
+                if 0.0 <= s <= 1.0:
+                    if t > 0:
+                        pos = t if pos is None else min(pos, t)
+                    elif t < 0:
+                        neg = -t if neg is None else min(neg, -t)
+            return (pos or 0.0) + (neg or 0.0)
+
+        widths = [local_width(i) for i in range(len(px))]
+        # narrowest at NOW, widest at the terminus
+        self.assertLess(widths[0], widths[-1] * 0.25)
+        self.assertAlmostEqual(widths[-1], 2 * 180.0, delta=0.06 * 360.0)
+        for i in range(len(widths) - 1):
+            self.assertLessEqual(
+                widths[i], widths[i + 1] + 3.0,
+                f"width pinches between tau {self.pts[i]['tau_h']} "
+                f"({widths[i]:.1f}) and {self.pts[i+1]['tau_h']} "
+                f"({widths[i+1]:.1f})")
 
 
 if __name__ == "__main__":

@@ -3694,14 +3694,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     var firstSeg = tp.length > 1 ? [tp[1][0] - tp[0][0],
                                     tp[1][1] - tp[0][1]] : lastSeg;
     var fsLen = Math.max(1e-6, Math.hypot(firstSeg[0], firstSeg[1]));
-    // SMOOTH the swept-envelope ring ONCE: derive_cone joins the sparse tau
-    // circles with straight tangent chords that read as angular facets through
-    // the recurve. Densify the ring with a CLOSED Catmull-Rom spline (passes
-    // THROUGH every vertex, wraps the seam) so the boundary is a smooth curve.
-    // CRITICAL: this same dense smooth ring feeds BOTH the rendered cone path
-    // (dC) AND the reveal corridor (ringHalfAt) below, so the corridor still
-    // contains the cone exactly (no settle-frame pop-in) and the geometry test
-    // reads real on-curve vertices. catmullRomClosed is hoisted (declared below).
+    // SMOOTH the cone ring ONCE: derive_cone returns the union-of-disks
+    // boundary already resampled to a dense polyline, but re-densify it here
+    // with a CLOSED centripetal Catmull-Rom (passes THROUGH every vertex,
+    // wraps the seam) so the displayed boundary is uniformly smooth at canvas
+    // scale and on-curve. CRITICAL: this same dense smooth ring feeds BOTH the
+    // rendered cone path (dC) AND the reveal corridor (ringEdgesAt) below, so
+    // the corridor contains the cone exactly (no settle-frame pop-in) and the
+    // geometry test reads real on-curve vertices. catmullRomClosed is hoisted.
     var ringPx = catmullRomClosed(
       coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; }), 3.5);
     // rear/forward extents: how far the ring reaches BEHIND the first
@@ -3827,11 +3827,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     // when the front tip passes them; index 0 of cum is the rear point)
     var cumIcons = pts.map(function (_, i) { return cum[(i + 1) * PER_SEG]; });
     var HOLD_MS = 1000, GROW_MS = 4000;
-    // exact local cone half-width at a canvas point P with normal n:
-    // max |t| over intersections of the perpendicular line P + t*n
-    // with the ring's edges.
-    function ringHalfAt(px3, py3, nx3, ny3) {
-      var w = 0;
+    // local cone edges at a canvas point P with normal n: the distance to
+    // the NEAREST ring crossing in the +n direction and in the -n direction,
+    // returned as [wPos, wNeg] (0 if that side has no crossing). NEAREST, not
+    // farthest: on a recurve the perpendicular from a centerline sample also
+    // stabs the cone's FAR limb, and the old max|t| latched onto it - so the
+    // corridor ballooned across open water and the far end of the cone was
+    // uncovered (revealed) before the growth front ever reached it. Stopping
+    // at the first boundary on each side keeps the band hugging the LOCAL
+    // cone, so the reveal stays one connected shape growing from the storm.
+    function ringEdgesAt(px3, py3, nx3, ny3) {
+      var wp = Infinity, wn = Infinity;
       for (var ri = 0; ri < ringPx.length; ri++) {
         var a = ringPx[ri];
         var b = ringPx[(ri + 1) % ringPx.length];
@@ -3841,9 +3847,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         var rx = a[0] - px3, ry = a[1] - py3;
         var t3 = (ex2 * ry - ey2 * rx) / det;
         var s3 = (nx3 * ry - ny3 * rx) / det;
-        if (s3 >= 0 && s3 <= 1) w = Math.max(w, Math.abs(t3));
+        if (s3 < 0 || s3 > 1) continue;
+        if (t3 >= 0) { if (t3 < wp) wp = t3; }
+        else if (-t3 < wn) wn = -t3;
       }
-      return w;
+      return [wp === Infinity ? 0 : wp, wn === Infinity ? 0 : wn];
     }
     // resample the (now arc-smooth) extended track at uniform arc steps -
     // more samples than the coarse era so the corridor chains hug the
@@ -3868,54 +3876,91 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       return { x: tpExt[0][0], y: tpExt[0][1], nx: 0, ny: -1 };
     }
-    // per-sample corridor half-width = the cone's REAL local width
-    // (probed at the sample and half a step either side - the ring can
-    // bulge between samples) + margin, so the clip edge always rides
-    // OUTSIDE the casing where the cone has been revealed.
+    // per-sample corridor half-widths = the cone's REAL local edges on EACH
+    // side (wL on the +n side, wR on the -n side), probed at the sample and
+    // half a step either side (the ring can bulge between samples) + margin,
+    // so the clip edge always rides just OUTSIDE the casing where the cone is
+    // revealed. Per-side (asymmetric) is required: a symmetric max-of-both
+    // band would, on the concave flank of a recurve, reach back across the
+    // gap to the far limb - the very balloon ringEdgesAt avoids.
     var CORR_PAD = 16, CORR_MIN = 32;
     var samples = [];
     var sampStep = Ltot / (SAMP - 1);
     for (var sj = 0; sj < SAMP; sj++) {
       var sd = Ltot * sj / (SAMP - 1);
       var sp = pointAt(sd);
-      var wMax = 0;
+      var wLmax = 0, wRmax = 0;
       [-0.5, 0, 0.5].forEach(function (frac) {
         var q = pointAt(sd + frac * sampStep);
-        wMax = Math.max(wMax, ringHalfAt(q.x, q.y, q.nx, q.ny));
+        var e = ringEdgesAt(q.x, q.y, q.nx, q.ny);
+        wLmax = Math.max(wLmax, e[0]);
+        wRmax = Math.max(wRmax, e[1]);
       });
       samples.push({ d: sd, x: sp.x, y: sp.y, nx: sp.nx, ny: sp.ny,
-                     w: Math.max(CORR_MIN, wMax + CORR_PAD) });
+                     wL: Math.max(CORR_MIN, wLmax + CORR_PAD),
+                     wR: Math.max(CORR_MIN, wRmax + CORR_PAD) });
     }
     function halfAt(d) {
-      if (!(sampStep > 0)) return CORR_MIN;  // degenerate-track guard
+      if (!(sampStep > 0)) return [CORR_MIN, CORR_MIN];  // degenerate guard
       d = Math.max(0, Math.min(Ltot, d));
       var j3 = Math.min(SAMP - 2, Math.floor(d / sampStep));
       var f3 = (d - samples[j3].d) / sampStep;
-      return samples[j3].w + (samples[j3 + 1].w - samples[j3].w) * f3;
+      return [samples[j3].wL + (samples[j3 + 1].wL - samples[j3].wL) * f3,
+              samples[j3].wR + (samples[j3 + 1].wR - samples[j3].wR) * f3];
     }
-    function polyAt(d) {
-      // REVEAL CLIP: the corridor (a band intentionally WIDER than the cone, so
-      // the cone's OWN smooth cased edge is what shows through - never the clip
-      // edge) revealed from the rear up to arc d, closed by a FLAT perpendicular
-      // FRONT CUT at d. The lateral edges are static; only the straight front cut
-      // advances, swept smoothly along the centerline tangent. No unfolding cap
-      // and no per-frame cone rebuild, so the growing edge cannot wiggle - the
-      // finished smooth cone is simply uncovered. (An SVG <clipPath><path d>,
-      // mutated via setAttribute each tick: Chromium repaints that reliably,
-      // unlike CSS/WAAPI clip animation on SVG containers.)
+    // REVEAL CLIP corridor vertices (canvas px) revealed from the rear up to
+    // arc d: the L rail forward, the FLAT perpendicular FRONT CUT at d, then
+    // the R rail back. The band is intentionally WIDER than the cone (the
+    // cone's OWN smooth cased edge shows through, never the clip edge); the
+    // lateral edges are static, only the straight front cut advances, so the
+    // growing edge cannot wiggle - the finished cone is simply uncovered.
+    function corridorVerts(d) {
       var L = [], R = [];
       for (var j2 = 0; j2 < SAMP; j2++) {
         var s2 = samples[j2];
         if (s2.d > d) break;            // samples are arc-ordered
-        L.push((s2.x + s2.nx * s2.w).toFixed(1) + " " +
-               (s2.y + s2.ny * s2.w).toFixed(1));
-        R.push((s2.x - s2.nx * s2.w).toFixed(1) + " " +
-               (s2.y - s2.ny * s2.w).toFixed(1));
+        L.push([s2.x + s2.nx * s2.wL, s2.y + s2.ny * s2.wL]);
+        R.push([s2.x - s2.nx * s2.wR, s2.y - s2.ny * s2.wR]);
       }
       var ft = pointAt(d), w = halfAt(d);
-      var fL = (ft.x + ft.nx * w).toFixed(1) + " " + (ft.y + ft.ny * w).toFixed(1);
-      var fR = (ft.x - ft.nx * w).toFixed(1) + " " + (ft.y - ft.ny * w).toFixed(1);
-      return "M" + L.concat([fL, fR], R.reverse()).join(" L ") + " Z";
+      return L.concat([[ft.x + ft.nx * w[0], ft.y + ft.ny * w[0]],
+                       [ft.x - ft.nx * w[1], ft.y - ft.ny * w[1]]],
+                      R.reverse());
+    }
+    function polyAt(d) {
+      // An SVG <clipPath><path d>, mutated via setAttribute each tick:
+      // Chromium repaints that reliably, unlike CSS/WAAPI clip animation on
+      // SVG containers.
+      return "M" + corridorVerts(d).map(function (p) {
+        return p[0].toFixed(1) + " " + p[1].toFixed(1);
+      }).join(" L ") + " Z";
+    }
+    function pointInPoly(poly, qx, qy) {
+      var inside = false, n = poly.length, j = n - 1;
+      for (var i = 0; i < n; i++) {
+        var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+        if (((yi > qy) !== (yj > qy)) &&
+            (qx < (xj - xi) * (qy - yi) / (yj - yi + 1e-12) + xi))
+          inside = !inside;
+        j = i;
+      }
+      return inside;
+    }
+    // LOOP/CUSP GUARD: the flat-front corridor can only enclose a TUBE-LIKE
+    // cone. A track that loops back on itself within ~120 h makes the union
+    // cone SELF-OVERLAP (late large disks engulf the early track), and no
+    // single L/front/R band contains it - some cone vertices would stay
+    // clipped through the whole reveal and POP IN at settle. Detect it (cone
+    // vertices outside the FULL-extent corridor) and, like a degenerate
+    // track, ship the finished cone UNCLIPPED - a static cone never pops.
+    // Real JTWC 120 h forecasts are monotone-ish and never trip this.
+    if (!revealDegenerate) {
+      var fullCorr = corridorVerts(Ltot);
+      var outTol = Math.max(2, ringPx.length * 0.01), outN = 0;
+      for (var rg = 0; rg < ringPx.length && outN <= outTol; rg++) {
+        if (!pointInPoly(fullCorr, ringPx[rg][0], ringPx[rg][1])) outN++;
+      }
+      if (outN > outTol) revealDegenerate = true;   // self-overlap -> static
     }
     // EASE-OUT (cubic): the front advances quickest just after the hold and
     // decelerates into the settle, so the cone "draws in" briskly then eases to
@@ -4362,8 +4407,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         grp.setAttribute("clip-path", "url(#ac-reveal-clip)");
         revealPath.setAttribute("d", polyAt(d));
         var p = pointAt(d);
+        var hw = halfAt(d);            // [wL, wR] - report the wider side
         return { d: d, Ltot: Ltot, tipX: p.x, tipY: p.y,
-                 w: halfAt(d), W: W, H: H };
+                 w: Math.max(hw[0], hw[1]), W: W, H: H };
       },
       settle: function () {
         if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
