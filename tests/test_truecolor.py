@@ -248,5 +248,179 @@ def test_assemble_truecolor_midday_byte_identical_full_recipe():
     assert np.array_equal(rgb_new, rgb_old)
 
 
+# --- Terminator highlight rolloff (cold-cloud-top exposure) ----------------
+
+def test_highlight_rolloff_field_zero_in_day_full_at_terminator():
+    cos = np.array([[1.0, tc.HIGHLIGHT_DAY_COS, 0.25, tc.HIGHLIGHT_PEAK_COS,
+                     0.0, -0.2]], np.float64)
+    s = tc.highlight_rolloff_field(cos)
+    # EXACTLY 0 at/above HIGHLIGHT_DAY_COS -> the daytime knee is a no-op.
+    assert s[0, 0] == 0.0
+    assert s[0, 1] == 0.0
+    # full strength at/below the terminator threshold (and below the horizon).
+    assert abs(s[0, 3] - tc.HIGHLIGHT_STRENGTH) < 1e-12   # at PEAK_COS
+    assert abs(s[0, 4] - tc.HIGHLIGHT_STRENGTH) < 1e-12   # horizon
+    assert abs(s[0, 5] - tc.HIGHLIGHT_STRENGTH) < 1e-12   # below horizon
+    # partial in between, and non-increasing as the sun rises (cos increases).
+    assert 0.0 < s[0, 2] < tc.HIGHLIGHT_STRENGTH
+    assert np.all(np.diff(s[0]) >= -1e-12)                # cos descends -> s ascends
+    # the knee gate lives below full daylight (never fires at noon).
+    assert tc.HIGHLIGHT_DAY_COS <= tc.COS_SZA_FULL_DAY or tc.HIGHLIGHT_DAY_COS == 0.30
+
+
+def test_highlight_rolloff_identity_in_full_day():
+    # In full day (cos >= HIGHLIGHT_DAY_COS) the strength is exactly 0, so the
+    # rolloff is an EXACT identity on the sun-corrected band -- INCLUDING >1
+    # values (which must pass through unchanged so Rayleigh/synth-green/the clip
+    # reproduce midday byte-for-byte).
+    band = np.array([[0.3, 0.7, 1.0, 1.4, 2.5, 9.0]], np.float32)
+    cos = np.full((1, 6), 0.5, np.float32)   # solidly day -> strength 0
+    out = tc.highlight_rolloff(band, cos)
+    assert np.array_equal(out, band)
+
+
+def test_highlight_rolloff_rescues_terminator_highlights():
+    # At the terminator (full strength) the knee soft-compresses >knee band values
+    # BELOW 1 so distinct cloud tops keep distinct (sub-1) values = texture, while
+    # below-knee values pass through untouched. Runs on a single sun-corrected band.
+    knee = tc.HIGHLIGHT_KNEE
+    band = np.array([[0.5, knee - 0.05, 1.5, 2.0, 4.0, 9.0]], np.float32)
+    cos = np.zeros((1, 6), np.float32)       # horizon -> full strength
+    out = tc.highlight_rolloff(band, cos)
+    # below the knee: untouched
+    assert out[0, 0] == np.float32(0.5)
+    assert out[0, 1] == np.float32(knee - 0.05)
+    # above the knee: compressed strictly into (knee, 1), monotonically ordered
+    over = out[0, 2:]
+    assert np.all(over > knee) and np.all(over < 1.0)
+    assert np.all(np.diff(over) > 0)         # 1.5<2<4<9 -> distinct outputs (texture)
+
+
+def test_highlight_rolloff_monotonic_no_inversion():
+    # Across the full input range at full strength the rolloff is strictly
+    # increasing -> tonal ordering is never inverted (no false edges in cloud).
+    band = np.linspace(0.0, 12.0, 200).astype(np.float32)[None, :]
+    cos = np.zeros((1, 200), np.float32)
+    out = tc.highlight_rolloff(band, cos)
+    assert np.all(np.diff(out[0]) > 0)
+
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_highlight_rolloff_recovers_texture_through_full_pipeline():
+    """The regression the rolloff exists for: in the REAL do_rayleigh=True path,
+    Rayleigh clips every band to [0,1], so without the rolloff a range of DIFFERENT
+    bright cloud tops at low sun all clip to flat white (indistinguishable). The
+    rolloff runs on the sun-corrected bands BEFORE that clip, so the tops keep
+    distinct sub-white values. A purely-post-clip rolloff (the earlier buggy
+    design) could not do this -- it would only uniformly darken the merged white.
+    The pixels share one lat/lon (identical sun geometry) so the only variable is
+    reflectance -> the recovered spread is pure texture, not a sun-angle gradient."""
+    import datetime as dt
+    # lon0/lat0 near sunrise on the solstice -> cos_sza ~0.12 (full-strength band).
+    when = dt.datetime(2026, 6, 21, 6, 30, 0, tzinfo=dt.timezone.utc)
+    lats = np.zeros((1, 4), np.float32); lons = np.zeros((1, 4), np.float32)
+    cos, *_ = tc.solar_geometry(lats, lons, when)
+    assert float(cos.max()) < tc.HIGHLIGHT_PEAK_COS, "scene must be deep terminator"
+    # four cloud tops of increasing reflectance; all sun-correct well past 1.0
+    refl = np.array([[0.35, 0.45, 0.55, 0.70]], np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(refl, None, refl.copy(), refl.copy(), lats, lons, **common)
+    saved = tc.HIGHLIGHT_STRENGTH
+    try:
+        tc.HIGHLIGHT_STRENGTH = 0.0           # = old hard-clip behavior
+        off, _ = tc.assemble_truecolor(refl, None, refl.copy(), refl.copy(), lats, lons, **common)
+    finally:
+        tc.HIGHLIGHT_STRENGTH = saved
+    off_red, on_red = off[0, :, 0], on[0, :, 0]
+    # WITHOUT the rolloff all four tops clip to ~identical white (texture lost)...
+    assert off_red.max() - off_red.min() < 1 / 255 and off_red.min() > 0.97
+    # ...WITH it they span a visible, monotonic range below white (texture).
+    assert on_red.max() - on_red.min() > 5 / 255
+    assert np.all(np.diff(on_red) > 0)
+    assert on_red.max() < off_red.max()       # brightest top rescued downward from pure white
+
+
+# --- AHI vegetation vibrance -----------------------------------------------
+
+def test_ahi_vibrance_lifts_vegetation_protects_cloud_and_ocean():
+    rgb = np.array([[[0.25, 0.34, 0.22],   # vegetation: green leads, blue low
+                     [0.10, 0.20, 0.35],   # ocean: blue leads
+                     [0.90, 0.90, 0.90]]], np.float32)  # cloud: neutral white
+    out = tc.ahi_vegetation_vibrance(rgb)
+
+    def sat(p):
+        mx, mn = p.max(), p.min()
+        return (mx - mn) / mx if mx > 0 else 0.0
+
+    def luma(p):
+        return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]
+
+    veg_in, veg_out = rgb[0, 0], out[0, 0]
+    # vegetation gains saturation and shifts greener (G up, R/B down)...
+    assert sat(veg_out) > sat(veg_in)
+    assert veg_out[1] > veg_in[1] and veg_out[0] < veg_in[0] and veg_out[2] < veg_in[2]
+    # ...without changing brightness (luminance-preserving)
+    assert abs(luma(veg_out) - luma(veg_in)) < 1e-3
+    # ocean (blue-led) and cloud (neutral) are untouched
+    assert np.allclose(out[0, 1], rgb[0, 1])
+    assert np.allclose(out[0, 2], rgb[0, 2])
+    # output stays in range and keeps shape/dtype
+    assert out.shape == rgb.shape and out.dtype == rgb.dtype
+    assert out.min() >= 0.0 and out.max() <= 1.0
+
+
+def test_ahi_vibrance_water_guard_protects_teal_water():
+    # Cyan/teal/turbid water reads green>=blue (so (g-b)>0) but absorbs red
+    # (blue > red): the WATER GUARD must drive the lift to ~0 there so the water
+    # is NOT pushed greener, while nearby vegetation (red >= blue) is still lifted.
+    rgb = np.array([[[0.18, 0.50, 0.45],    # teal/turbid water: g>=b, blue >> red
+                     [0.12, 0.40, 0.38],    # shallow shelf water: g>=b, blue > red
+                     [0.10, 0.16, 0.09]]], np.float32)  # vegetation: red >= blue
+    out = tc.ahi_vegetation_vibrance(rgb)
+    # both water pixels are essentially untouched (guard killed the driver)
+    assert np.allclose(out[0, 0], rgb[0, 0], atol=1e-3)
+    assert np.allclose(out[0, 1], rgb[0, 1], atol=1e-3)
+    # the land vegetation pixel is still lifted (green up)
+    assert out[0, 2, 1] > rgb[0, 2, 1]
+
+
+def _veg_scene(sensor, green_native):
+    """A daytime scene whose pixel renders green-dominant, for the AHI-only
+    vibrance gating test. green_native=None -> ABI (synthesized)."""
+    import datetime as dt
+    H = W = 3
+    red = np.full((H, W), 0.10, np.float32)
+    blue = np.full((H, W), 0.06, np.float32)
+    veggie = np.full((H, W), 0.15, np.float32)
+    green = np.full((H, W), 0.35, np.float32) if green_native else None
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(-2, 2, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    return dict(red=red, green=green, blue=blue, veggie=veggie, lats=lats, lons=lons,
+                when=when, sub_sat_lon=0.0, do_rayleigh=False)
+
+
+def test_assemble_vibrance_is_ahi_only():
+    saved = tc.AHI_VIBRANCE_STRENGTH
+    try:
+        # AHI path: turning the vibrance on vs off MUST change the render.
+        ahi = _veg_scene("ahi", green_native=True)
+        tc.AHI_VIBRANCE_STRENGTH = 6.0
+        on, _ = tc.assemble_truecolor(**ahi, platform_name="Himawari-9", sensor="ahi")
+        tc.AHI_VIBRANCE_STRENGTH = 0.0
+        off, _ = tc.assemble_truecolor(**ahi, platform_name="Himawari-9", sensor="ahi")
+        assert not np.array_equal(on, off), "vibrance did not run on the AHI path"
+        # ABI path: the AHI knob is irrelevant -- on vs off is byte-identical.
+        abi = _veg_scene("abi", green_native=False)
+        tc.AHI_VIBRANCE_STRENGTH = 6.0
+        a_on, _ = tc.assemble_truecolor(**abi, platform_name="GOES-19", sensor="abi")
+        tc.AHI_VIBRANCE_STRENGTH = 0.0
+        a_off, _ = tc.assemble_truecolor(**abi, platform_name="GOES-19", sensor="abi")
+        assert np.array_equal(a_on, a_off), "AHI vibrance leaked into the GOES/ABI path"
+    finally:
+        tc.AHI_VIBRANCE_STRENGTH = saved
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
