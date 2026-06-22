@@ -26,6 +26,16 @@ Recipe matches the documented CIMSS Natural True Color + CIRA GeoColor pipeline
     reflectance (NOT sun-angle normalized) -> divide by cos(SZA).
   * A CIRA/EUMETSAT tone curve (gamma-ish stretch) for natural brightness.
   * Red-band ratio sharpening lifts the 1 km green/blue toward the 0.5 km red.
+  * Terminator highlight rolloff: near the terminator the divide-by-cos(SZA)
+    sun-correction (up to ~10x) blows bright cold cloud tops past 1.0 and the
+    Rayleigh [0,1] clip flattens them to white. A sun-angle-gated highlight KNEE
+    (HIGHLIGHT_* knobs) soft-compresses each SUN-CORRECTED band BEFORE that clip,
+    so distinct tops keep distinct sub-1 values (texture) instead of clipping.
+    ZERO in full day (exact no-op) -> midday byte-identical. ABI + AHI.
+  * AHI vegetation vibrance: a green-biased, luminance-preserving saturation lift
+    (AHI_VIBRANCE_* knobs) applied ONLY on the AHI native-green path, so Himawari
+    land/vegetation reads livelier without oversaturating clouds (white) or ocean
+    (blue). The GOES synth-green path is untouched.
   * Day/night via the cos(SZA) field (GeoColor-lite: fade to clean-IR at night).
 
 Geometry (sun + geostationary satellite zenith/azimuth) comes from pyorbital.
@@ -105,6 +115,29 @@ WARM_TINT_RED_ADD = 0.05    # additive red boost at full tint (halved: subtle go
 WARM_TINT_GREEN_GAIN = 0.08  # multiplicative green attenuation at full tint (halved)
 WARM_TINT_BLUE_GAIN = 0.17   # multiplicative blue attenuation at full tint (halved; most -> orange)
 
+# --- Terminator highlight rolloff (cold-cloud-top exposure) -----------------
+# Sun-correction (sun_correct: divide by cos SZA, floored at COS_SZA_FLOOR -> up
+# to ~10x at low sun) pushes bright/cold cloud tops FAR past 1.0 near the
+# terminator; Rayleigh then hard-clips every band to [0,1], flattening those tops
+# to texture-less white. A sun-angle-gated highlight KNEE soft-compresses values
+# above HIGHLIGHT_KNEE back toward 1.0 with a tanh shoulder so distinct cloud tops
+# keep distinct (sub-1) values -- texture survives instead of clipping. CRITICAL
+# placement: it runs on each SUN-CORRECTED band BEFORE Rayleigh/clip (the only
+# stage where the >1 texture still exists); doing it after the clip would only
+# darken already-flattened white. The knee acts ONLY on near-clipping highlights
+# (mid/low tones below the knee pass through untouched), and the cos gate confines
+# it to the low-sun band -- double containment, so vegetation/ocean and daytime
+# cloud are never touched. ZERO in full day: the gate smoothstep saturates EXACTLY
+# to 0 at/above HIGHLIGHT_DAY_COS, so the bands are byte-identical there and
+# Rayleigh / green-synthesis / the clip reproduce midday exactly. Per band, so it
+# helps ABI (incl. its synth-green, built from the compressed bands) and AHI
+# alike. All tunable here.
+HIGHLIGHT_DAY_COS = 0.30   # cos_sza >= this -> NO rolloff (identity): never fires in full day
+HIGHLIGHT_PEAK_COS = 0.20  # cos_sza <= this -> full-strength rolloff (the low-sun terminator band)
+HIGHLIGHT_KNEE = 0.72      # sun-corrected level where compression begins (below it: untouched)
+HIGHLIGHT_SHOULDER = 2.2   # tanh shoulder width above the knee (larger = gentler, keeps more tonal range)
+HIGHLIGHT_STRENGTH = 1.0   # overall amount of the rolloff at full gate (0 = OFF)
+
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
     """Hermite smoothstep, clamped to [0,1]: 0 for x<=edge0, 1 for x>=edge1.
@@ -137,6 +170,40 @@ def warm_terminator_tint(rgb: np.ndarray, cos_sza: np.ndarray) -> np.ndarray:
     out[..., 1] = np.clip(rgb[..., 1] * (1.0 - w * WARM_TINT_GREEN_GAIN), 0.0, 1.0)
     out[..., 2] = np.clip(rgb[..., 2] * (1.0 - w * WARM_TINT_BLUE_GAIN), 0.0, 1.0)
     return out  # already rgb.dtype (the in-place clips downcast to out's dtype)
+
+
+def highlight_rolloff_field(cos_sza: np.ndarray) -> np.ndarray:
+    """Per-pixel highlight-knee strength: 0 in full day (cos_sza >=
+    HIGHLIGHT_DAY_COS), rising to HIGHLIGHT_STRENGTH at/below HIGHLIGHT_PEAK_COS
+    (the deep terminator). The smoothstep saturates EXACTLY to 0 above
+    HIGHLIGHT_DAY_COS, so the daytime knee is an exact no-op -> byte-identical."""
+    return HIGHLIGHT_STRENGTH * (
+        1.0 - _smoothstep(HIGHLIGHT_PEAK_COS, HIGHLIGHT_DAY_COS, cos_sza)
+    )
+
+
+def highlight_rolloff(band: np.ndarray, cos_sza: np.ndarray) -> np.ndarray:
+    """Soft-compress a single SUN-CORRECTED band's highlights above HIGHLIGHT_KNEE
+    with a tanh shoulder, gated by the sun angle (see HIGHLIGHT_* knobs).
+
+    ``band`` is a sun-normalized reflectance band (H,W) and near the terminator
+    MAY be far above 1 (sun_correct multiplies by up to ~10). It is applied
+    BEFORE Rayleigh + the [0,1] clip, which is the only place the >1 cloud-top
+    texture still exists: above the knee the value is pushed toward a shoulder
+    ``soft(x) = knee + (1-knee)*tanh((x-knee)/shoulder)`` that maps [knee, +inf)
+    -> [knee, 1), monotonically, so distinct cloud tops keep distinct values
+    (= texture) instead of all clipping to flat white. The blend is
+    ``out = x + s*(soft(x) - x)``: at full strength (s==STRENGTH) over-knee values
+    land on the <1 shoulder so the downstream Rayleigh clip is a no-op there;
+    below the knee, values pass through untouched. At s==0 (full day) the result
+    is EXACTLY ``band`` (incl. >1 values), so Rayleigh / green-synthesis / the
+    clip all see byte-identical input -> midday byte-identical. Monotonic in the
+    input, so it never inverts tonal ordering."""
+    s = highlight_rolloff_field(cos_sza)
+    knee = HIGHLIGHT_KNEE
+    over = band > knee
+    soft = knee + (1.0 - knee) * np.tanh((band - knee) / HIGHLIGHT_SHOULDER)
+    return np.where(over, band + s * (soft - band), band)
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +373,58 @@ def tone_curve(rgb: np.ndarray) -> np.ndarray:
     return out.astype(np.float32)
 
 
+# --- AHI vegetation vibrance (Himawari native-green path) -------------------
+# AHI's native 0.51um green renders true color correctly, but land/vegetation
+# reads a touch dull/dark. A green-biased VIBRANCE lifts saturation only where a
+# vegetation driver is positive: GREEN-OVER-BLUE penalized by RED-OVER-GREEN,
+# (g - b) - max(r - g, 0). That is positive for vegetation (incl. dull olive
+# where red ~ green) but ZERO for the things we must not touch:
+#   * cloud / grey-white  -> r~=g~=b -> driver ~ 0      (clouds stay white)
+#   * deep ocean          -> blue leads green -> g-b<0  (ocean stays blue)
+#   * desert / bare soil  -> red leads green -> penalty  (no orange neon)
+# (g-b) alone, however, is also positive for CYAN/TEAL water (turbid/shallow/
+# sediment seas: green>=blue, red strongly absorbed) -- which would wrongly green
+# the water. Vegetation reflects red MORE than blue (r>=b) while teal water absorbs
+# red (b>r), so a WATER GUARD multiplies the driver down wherever blue exceeds red,
+# protecting teal/turbid seas while leaving land (r>=b) untouched. The lift is
+# tapered by (1 - saturation) so already-vivid greens don't go neon, capped at
+# AHI_VIBRANCE_MAX, and luminance-preserving (Rec.601) so brightness is unchanged.
+# AHI-ONLY: assemble_truecolor calls it only for sensor=='ahi', so the GOES
+# synth-green path is untouched. Set AHI_VIBRANCE_STRENGTH to 0 to disable.
+AHI_VIBRANCE_STRENGTH = 6.0   # gain applied to the green-driver vibrance (0 = OFF)
+AHI_VIBRANCE_MAX = 0.32       # cap on the per-pixel saturation boost (prevents neon)
+AHI_VIBRANCE_WATER_GUARD = 0.06  # ramp width: driver -> 0 once blue leads red by this (teal water)
+AHI_VIBRANCE_LUMA = (0.299, 0.587, 0.114)  # Rec.601 luma weights (the saturation pivot)
+
+
+def ahi_vegetation_vibrance(rgb: np.ndarray) -> np.ndarray:
+    """Green-biased, luminance-preserving vibrance for the AHI true-color path.
+
+    Saturation is boosted in proportion to a vegetation driver, green-over-blue
+    minus red-over-green ``(g - b) - max(r - g, 0)``, times a WATER GUARD that
+    ramps the driver to 0 wherever blue leads red (cyan/teal/turbid water absorbs
+    red, so b>r; vegetation reflects red, so r>=b). The driver is thus positive
+    for vegetation (lush and dull olive) and zero for grey/white cloud, blue-led
+    deep ocean, red-led desert, AND green-led teal/turbid water -- so only land
+    vegetation is lifted. The boost is tapered by ``(1 - saturation)`` (no neon on
+    already-vivid greens), capped at AHI_VIBRANCE_MAX, and applied around the
+    Rec.601 luma so brightness is unchanged (clouds keep their white). AHI only
+    (assemble-gated)."""
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    sat = np.where(mx > 1e-6, (mx - mn) / np.maximum(mx, 1e-6), 0.0)  # HSV saturation
+    veg = (g - b) - np.maximum(r - g, 0.0)                # green-over-blue, red-penalized
+    water_guard = np.clip(1.0 - (b - r) / AHI_VIBRANCE_WATER_GUARD, 0.0, 1.0)  # ->0 where blue>red
+    green_drive = np.clip(veg * water_guard, 0.0, None)   # vegetation-positive, water-safe
+    amt = np.clip(AHI_VIBRANCE_STRENGTH * green_drive * (1.0 - sat),
+                  0.0, AHI_VIBRANCE_MAX)[..., None]
+    wr, wg, wb = AHI_VIBRANCE_LUMA
+    luma = (wr * r + wg * g + wb * b)[..., None]
+    out = luma + (rgb - luma) * (1.0 + amt)
+    return np.clip(out, 0.0, 1.0).astype(rgb.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Top-level assembly
 # ---------------------------------------------------------------------------
@@ -340,6 +459,20 @@ def assemble_truecolor(
     veggie_c = sun_correct(veggie, cos_sza) if veggie is not None else None
     green_c = sun_correct(green, cos_sza) if green is not None else None
 
+    # 1b) Terminator highlight rolloff -- on the SUN-CORRECTED bands, BEFORE
+    #     Rayleigh's [0,1] clip. Sun-correction is what blows cold cloud tops past
+    #     1.0; compressing here (gated, identity in full day) is the ONLY place the
+    #     >1 cloud-top texture still exists, so by the time Rayleigh clips, the
+    #     terminator values already sit <=1 and the clip keeps them textured instead
+    #     of flattening to white. At full day the gate is 0 -> the bands are
+    #     byte-identical, so Rayleigh / green-synthesis / the clip reproduce midday.
+    red_c = highlight_rolloff(red_c, cos_sza)
+    blue_c = highlight_rolloff(blue_c, cos_sza)
+    if veggie_c is not None:
+        veggie_c = highlight_rolloff(veggie_c, cos_sza)
+    if green_c is not None:
+        green_c = highlight_rolloff(green_c, cos_sza)
+
     # 2) Rayleigh-correct the REAL bands first (CIRA GeoColor order), so the
     #    synthesized green is built from already-corrected red/veggie/blue.
     if do_rayleigh:
@@ -371,6 +504,11 @@ def assemble_truecolor(
         rgb = ratio_sharpen(rgb, np.clip(red_c, 0.0, 1.0))
 
     rgb = tone_curve(rgb)
+
+    # AHI-only: green-biased vegetation vibrance (livelier land without touching
+    # clouds/ocean). The GOES synth-green path is left untouched.
+    if sensor.lower() == "ahi":
+        rgb = ahi_vegetation_vibrance(rgb)
 
     # Golden-hour: warm the day-side RGB toward red/orange near the terminator
     # (sunrise/sunset) BEFORE the night fade. Exact no-op in daytime -> midday
