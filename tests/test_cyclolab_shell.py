@@ -612,6 +612,22 @@ class TestSectionNav(unittest.TestCase):
         # the page is still hydrated/usable (baked odometers intact).
         self.assertEqual(recs[-1]["state"]["odo"]["vmax"], "120")
 
+    def test_recon_tab_opens_and_lazy_mounts_without_throwing(self):
+        # The Recon tab activates + lazy-loads the shared ReconViewer; in jsdom
+        # the external scripts do not load, but initRecon must not throw and the
+        # section/nav must activate (the page stays alive for a later snapshot).
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [
+                 {"op": "openSec", "name": "recon"},
+                 {"op": "snapshot"},
+             ]})
+        self.assertEqual(len(recs), 2)
+        st = recs[-1]["state"]
+        self.assertEqual(st["activeSection"], "sec-recon")
+        self.assertEqual(st["activeNav"], "recon")
+
 
 @unittest.skipIf(NODE is None, "node not on PATH")
 class TestPlainTextStats(unittest.TestCase):

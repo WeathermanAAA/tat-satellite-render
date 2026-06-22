@@ -1115,6 +1115,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <nav class="nav-secs" id="secnav">
       <button class="sec-btn active" data-sec="overview">Overview</button>
       <button class="sec-btn" data-sec="satellite">Satellite</button>
+      <button class="sec-btn" data-sec="recon">Recon</button>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
     </nav>
@@ -1263,6 +1264,17 @@ HTML_TEMPLATE = r"""<!doctype html>
           newest frame first. Frames land every few minutes while the
           floater is active.</p>
       </div>
+    </div></section>
+    <section class="sec" id="sec-recon"><div class="wipe">
+      <h2 class="sec-title">Recon</h2>
+      <div class="card" id="recon-viewer" tabindex="0">
+        <div id="recon-status" class="hafs-statusbox">
+          <div class="hafs-spinner"></div><span>Loading recon&#8230;</span></div>
+      </div>
+      <p class="hafs-caption">Hurricane-hunter aircraft observations (HDOB
+        flight-level + SFMR surface wind, vortex fixes, dropsondes) for this
+        storm. SFMR is unreliable in heavy rain and at very high wind; obs are
+        point-in-time.</p>
     </div></section>
     <section class="sec" id="sec-models"><div class="wipe">
       <h2 class="sec-title">Models</h2>
@@ -1985,6 +1997,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       // (the standalone Guidance tab is gone), so opening Models hydrates both.
       if (name === "models") { initModels(); initGuidance(); }
       else if (name === "satellite") initSatellite();
+      else if (name === "recon") initRecon();
     }
     // THE CONE reveal plays once per tab OPEN (not once per session):
     // rebuilding the SVG re-arms every CSS animation naturally.
@@ -1999,6 +2012,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     else { satPause(); satStopPoll(); }          // leaving: stop both
     if (name !== "models" && hafsViewer && hafsViewer._pause) {
       hafsViewer._pause();
+    }
+    // recon viewer polls current.json; only let it run while its tab is up
+    if (reconViewer) {
+      if (name === "recon" && reconViewer._resume) reconViewer._resume();
+      else if (reconViewer._pause) reconViewer._pause();
     }
     var w = document.querySelector("#sec-" + name + " .wipe");
     if (w) { w.style.animation = "none"; void w.offsetWidth; w.style.animation = ""; }
@@ -4649,6 +4667,46 @@ HTML_TEMPLATE = r"""<!doctype html>
     };
     s.onerror = onerr;
     document.head.appendChild(s);
+  }
+
+  // ---- Recon mount (SAME viewer component as the main /recon/ page) -------
+  // Lazy-load the shared TATRegions basemap helper + the ReconViewer class
+  // from the main site, then mount it LOCKED to this storm (atcf_long matches
+  // the recon manifest slug; name is the fallback match). The viewer hydrates
+  // from CDN/recon/ - the isolated aircraft-recon feed.
+  var reconViewer = null;
+  function _loadScript(src, ready, cb, onerr) {
+    if (ready()) { cb(); return; }
+    var s = document.createElement("script");
+    s.src = src;
+    s.onload = function () { ready() ? cb() : onerr(); };
+    s.onerror = onerr;
+    document.head.appendChild(s);
+  }
+  function initRecon() {
+    var root = document.getElementById("recon-viewer");
+    var status = document.getElementById("recon-status");
+    function fail() {
+      if (status) status.querySelector("span").textContent =
+        "Recon viewer failed to load - reload to retry.";
+    }
+    _loadScript(SITE_BASE + "/models/regions.js",
+      function () { return !!window.TATRegions; },
+      function () {
+        _loadScript(SITE_BASE + "/recon/recon.js",
+          function () { return !!window.ReconViewer; },
+          function () {
+            try {
+              var nmEl = document.getElementById("storm-name");
+              reconViewer = new window.ReconViewer(root, {
+                base: CDN + "/recon",
+                stormLock: FLOATER_ID || SID,
+                stormName: nmEl ? (nmEl.textContent || "").trim() : "",
+                startTab: "storms"
+              });
+            } catch (e) { fail(); }
+          }, fail);
+      }, fail);
   }
   function initModels() {
     function cl(id) { return document.getElementById("cl-hafs-" + id); }
