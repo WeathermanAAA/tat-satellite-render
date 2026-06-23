@@ -232,7 +232,9 @@ def test_assemble_truecolor_midday_byte_identical_full_recipe():
     byte-identical with BOTH terminator hooks in place -- the Rayleigh taper is
     exactly RAYLEIGH_SCALE (so the per-pixel array scale == the old scalar 1.0)
     AND the warm tint is exactly 0. Compares the live recipe to the same pipeline
-    with both hooks neutralized to their pre-change form."""
+    with both terminator hooks neutralized to their pre-change form. (The
+    land-aware Rayleigh relax is active in BOTH calls -- it is deterministic per
+    input, so it cancels and does not affect this midday-taper identity.)"""
     red, blue, veggie, lats, lons, when = _midday_scene()
     common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
                   sensor="abi", do_rayleigh=True)
@@ -246,6 +248,169 @@ def test_assemble_truecolor_midday_byte_identical_full_recipe():
     finally:
         tc.WARM_TINT_STRENGTH, tc.rayleigh_scale_field = saved_strength, saved_field
     assert np.array_equal(rgb_new, rgb_old)
+
+
+# --- Land-aware Rayleigh relax (vegetation de-browning) --------------------
+
+def test_land_rayleigh_relax_field_gate():
+    """The NDVI gate: EXACTLY 1.0 (no relax) over ocean (NDVI<0) and cloud
+    (NDVI~0), dropping to 1-LAND_RAYLEIGH_RELAX over dense vegetation, with a
+    monotone ramp for sparse veg in between."""
+    #          ocean  cloud  sparse  dense-veg
+    red = np.array([[0.05, 0.30, 0.05, 0.04]], np.float32)
+    veg = np.array([[0.01, 0.32, 0.07, 0.45]], np.float32)
+    f = tc.land_rayleigh_relax_field(red, veg)
+    assert f[0, 0] == 1.0                                   # ocean: NDVI<0 -> no relax
+    assert f[0, 1] == 1.0                                   # cloud: NDVI<=LO -> no relax
+    assert abs(f[0, 3] - (1.0 - tc.LAND_RAYLEIGH_RELAX)) < 1e-6   # dense veg -> full relax
+    assert (1.0 - tc.LAND_RAYLEIGH_RELAX) <= f[0, 2] <= 1.0       # sparse: partial
+    # no veggie band -> all ones (exact no-op)
+    assert np.array_equal(tc.land_rayleigh_relax_field(red, None), np.ones_like(red))
+    # disabled (strength 0) -> all ones even over vegetation
+    saved = tc.LAND_RAYLEIGH_RELAX
+    try:
+        tc.LAND_RAYLEIGH_RELAX = 0.0
+        assert np.array_equal(tc.land_rayleigh_relax_field(red, veg), np.ones_like(red))
+    finally:
+        tc.LAND_RAYLEIGH_RELAX = saved
+
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_assemble_land_relax_ocean_cloud_byte_identical():
+    """The de-browning MUST NOT touch ocean or cloud: a do_rayleigh=True midday
+    OCEAN+CLOUD scene is byte-identical with the land relax on vs off, because the
+    NDVI gate is exactly 0 there (deep-blue ocean / white cloud preserved)."""
+    import datetime as dt
+    H, W = 1, 4
+    #             ocean ocean  cloud cloud   (NIR<=red everywhere -> NDVI<=0)
+    red = np.array([[0.02, 0.03, 0.85, 0.80]], np.float32)
+    blue = np.array([[0.09, 0.10, 0.85, 0.82]], np.float32)
+    veggie = np.array([[0.01, 0.015, 0.84, 0.83]], np.float32)
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved = tc.LAND_RAYLEIGH_RELAX
+    try:
+        tc.LAND_RAYLEIGH_RELAX = 0.0   # old behavior: full Rayleigh everywhere
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.LAND_RAYLEIGH_RELAX = saved
+    assert np.array_equal(on, off)
+
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_assemble_land_relax_debrowns_vegetation():
+    """The regression the relax exists for: do_rayleigh=True over vegetation
+    (high NDVI). Full Rayleigh over-subtracts the blue path radiance and the
+    pixel turns red-dominant (brown); the land relax keeps that blue so the pixel
+    is LESS red-dominant. A co-located ocean pixel (NDVI<0) stays byte-identical."""
+    import datetime as dt
+    H, W = 1, 2
+    #            vegetation     ocean
+    red = np.array([[0.07, 0.02]], np.float32)   # veg: red absorbed; ocean dark
+    blue = np.array([[0.12, 0.09]], np.float32)  # veg: blue-heavy TOA haze
+    veggie = np.array([[0.45, 0.01]], np.float32)  # veg: high NIR; ocean ~zero NIR
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-1, 1, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved = tc.LAND_RAYLEIGH_RELAX
+    try:
+        tc.LAND_RAYLEIGH_RELAX = 0.0   # old behavior: full Rayleigh everywhere
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.LAND_RAYLEIGH_RELAX = saved
+    veg_on, veg_off = on[0, 0], off[0, 0]
+    # the relax preserves blue the full correction would have stripped...
+    assert veg_on[2] > veg_off[2], f"blue not preserved: {veg_off} -> {veg_on}"
+    # ...so the vegetation pixel is less red-dominant (less brown)
+    assert (veg_on[0] - veg_on[2]) < (veg_off[0] - veg_off[2])
+    # the ocean pixel (gate 0) is untouched
+    assert np.array_equal(on[0, 1], off[0, 1])
+
+
+def test_land_relax_nir_floor_protects_dark_and_glint_water():
+    """The absolute NIR floor closes the gate where the NDVI gate alone would not:
+    near-black clear water (tiny red AND tiny NIR -> spuriously HIGH NDVI) and sun
+    glint (high NIR but spectrally flat). Both must yield factor 1.0 (no relax),
+    while genuine well-lit vegetation still relaxes."""
+    #              dark-water  glint       dense-veg
+    red = np.array([[0.004, 0.50, 0.04]], np.float32)
+    veg = np.array([[0.012, 0.50, 0.45]], np.float32)
+    f = tc.land_rayleigh_relax_field(red, veg)
+    # dark water: NDVI=(.012-.004)/.016=0.5 (high!) but NIR 0.012 < LAND_NIR_LO -> gated off
+    assert f[0, 0] == 1.0, f"near-black water relaxed: NDVI high but NIR tiny -> {f[0,0]}"
+    # glint: NIR high but NDVI~0 (flat spectrum) -> gated off
+    assert f[0, 1] == 1.0, f"glint relaxed: {f[0,1]}"
+    # real vegetation (high NDVI AND high NIR) still relaxes
+    assert abs(f[0, 2] - (1.0 - tc.LAND_RAYLEIGH_RELAX)) < 1e-6
+
+
+def test_land_rayleigh_relax_field_nan_safe():
+    """NaN inputs (partial-tile edges) map to factor 1.0 -> the relax never
+    poisons an otherwise-valid pixel; dtype is preserved (float32 -> ocean
+    multiply by exactly 1.0 stays bit-identical)."""
+    red = np.array([[np.nan, 0.04, 0.02]], np.float32)
+    veg = np.array([[0.45, np.nan, 0.01]], np.float32)
+    f = tc.land_rayleigh_relax_field(red, veg)
+    assert f.dtype == np.float32
+    assert f[0, 0] == 1.0 and f[0, 1] == 1.0   # any NaN input -> identity
+    assert not np.any(np.isnan(f))
+
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_assemble_land_relax_glint_and_dark_water_byte_identical():
+    """do_rayleigh=True midday scene of SUN GLINT + NEAR-BLACK water is byte-
+    identical with the land relax on vs off (the NIR floor / flat-spectrum NDVI
+    keep the gate at 0 there) -- the failure mode the robustness review flagged."""
+    import datetime as dt
+    H, W = 1, 3
+    #             glint  dark-water near-black
+    red = np.array([[0.55, 0.004, 0.010]], np.float32)
+    blue = np.array([[0.55, 0.090, 0.060]], np.float32)
+    veggie = np.array([[0.55, 0.012, 0.020]], np.float32)
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved = tc.LAND_RAYLEIGH_RELAX
+    try:
+        tc.LAND_RAYLEIGH_RELAX = 0.0
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.LAND_RAYLEIGH_RELAX = saved
+    assert np.array_equal(on, off)
+
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_assemble_land_relax_sparse_vegetation_partial_debrown():
+    """do_rayleigh=True over SPARSE vegetation (mid NDVI, real NIR): the relax
+    still fires (blue preserved -> less brown), end-to-end through assemble."""
+    import datetime as dt
+    H, W = 1, 1
+    red = np.array([[0.06]], np.float32)     # mid NDVI: (0.12-0.06)/0.18 = 0.33
+    blue = np.array([[0.11]], np.float32)
+    veggie = np.array([[0.12]], np.float32)  # NIR above the floor -> guard open
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(0, 0, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved = tc.LAND_RAYLEIGH_RELAX
+    try:
+        tc.LAND_RAYLEIGH_RELAX = 0.0
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.LAND_RAYLEIGH_RELAX = saved
+    assert on[0, 0, 2] > off[0, 0, 2]   # sparse veg also keeps some blue (de-browns)
 
 
 # --- Terminator highlight rolloff (cold-cloud-top exposure) ----------------
