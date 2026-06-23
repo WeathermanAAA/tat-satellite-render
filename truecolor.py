@@ -12,12 +12,16 @@ Recipe matches the documented CIMSS Natural True Color + CIRA GeoColor pipeline
     Rayleigh before the green synthesis is what keeps clear-sky/ocean a clean
     deep blue and the colors vibrant.
   * Land-aware Rayleigh relax: FULL Rayleigh is tuned for dark ocean; over
-    VEGETATED land it over-subtracts the blue path radiance (vegetation is dark
-    in red, so pyspectral's red-keyed backoff never fires) and forest/savanna
-    render muddy BROWN. An NDVI gate (NIR vs red) AND an absolute NIR floor scale
-    the Rayleigh correction down over vegetation only -- EXACTLY a no-op over
-    ocean (low NIR / NDVI<0), cloud/snow/glint (spectrally flat -> NDVI~0) and
-    near-black water (NIR floor), so those stay byte-identical (LAND_* knobs).
+    LAND it over-subtracts the blue path radiance (vegetation is dark in red, so
+    pyspectral's red-keyed backoff never fires) so lush forest renders muddy BROWN
+    and -- the winter failure mode -- DORMANT low-NDVI vegetation reds out to a
+    RED/maroon filter. A SUN-INVARIANT NDVI gate (NIR vs red; a ratio, so the gate
+    is identical at every sun angle -> natural across all seasons) AND an absolute
+    NIR floor scale the Rayleigh correction down over ALL land, dormant through
+    lush, keyed on NDVI's SIGN: positive (>~0.06) = land veg/soil; <=0 = the
+    must-not-touch set. EXACTLY a no-op over ocean (low NIR / NDVI<0), cloud/snow/
+    glint (spectrally flat -> NDVI~0) and near-black water (NIR floor), so those
+    stay byte-identical (LAND_* knobs).
   * ABI has no green band -> synthesize green from an **AHI-DERIVED** linear
     model (green_synth_ahi.json), learned from Himawari's REAL 0.51um green over
     co-registered AHI scenes (the CIRA GeoColor hybrid-green idea):
@@ -89,35 +93,56 @@ WL_VEGGIE = 0.86
 
 # --- Land-aware Rayleigh relax (vegetation de-browning) ---------------------
 # FULL Rayleigh subtraction is tuned to reveal deep-blue OCEAN by stripping the
-# blue-heavy molecular path radiance. Over VEGETATED LAND it over-subtracts: the
-# only brightness-aware backoff pyspectral applies is keyed on the RED reference
-# (it relaxes the correction where red>~20%, i.e. cloud/desert), but vegetation
-# is DARK in red (chlorophyll absorption) so it receives the FULL ~9% blue
-# subtraction -> blue is nearly removed and lush forest renders a dark muddy
-# OLIVE/BROWN (savanna a rust red). Confirmed empirically as the lone shared
+# blue-heavy molecular path radiance. Over LAND it over-subtracts: the only
+# brightness-aware backoff pyspectral applies is keyed on the RED reference (it
+# relaxes the correction where red>~20%, i.e. cloud/desert), but vegetation is
+# DARK in red (chlorophyll absorption) so it receives the FULL ~9% blue
+# subtraction -> blue is nearly removed. Lush forest renders a dark muddy
+# OLIVE/BROWN; DORMANT WINTER vegetation (bare deciduous, dead grass, low sun)
+# reds out to an opaque RED/maroon. Confirmed empirically as the lone shared
 # stage (ABI + AHI) that browns land; ratio-sharpen + tone-curve do not.
 #
-# The fix mirrors pyspectral's own bright-scene relax but keys on the vegetation
-# signal it misses -- NDVI from NIR (veggie 0.86um) vs red -- AND-gated with an
-# absolute NIR floor. Over vegetation (high NDVI, high NIR) the whole Rayleigh
-# correction is scaled DOWN UNIFORMLY across bands (band-balanced -> no
-# blue/cyan/green cast, just less haze removal), so land keeps its blue and reads
-# natural green/tan. The gate is EXACTLY 0 over:
+# The fix mirrors pyspectral's own bright-scene relax but keys on the LAND signal
+# it misses -- NDVI from NIR (veggie 0.86um) vs red -- AND-gated with an absolute
+# NIR floor. The whole Rayleigh correction is scaled DOWN UNIFORMLY across bands
+# (band-balanced -> no blue/cyan/green cast, just less haze removal), so land
+# keeps its blue and reads natural green (vegetated) or tan (dormant), never
+# red-filtered.
+#
+# WHY NDVI, and why these thresholds: NDVI is a RATIO of two co-located bands, so
+# the divide-by-cos(SZA) sun-correction cancels -> the gate is identical at every
+# sun angle and every season (this is what makes the de-browning generalize to
+# the low-winter-sun scene the first ship missed; a brightness gate would NOT --
+# sun-correction amplifies everything ~10x at low sun, so a brightness ceiling
+# would re-open the red-out at the terminator). The discriminator is NDVI's SIGN:
+#   * LAND veg/soil -- NIR > red -> NDVI positive. DORMANT veg still sits at
+#     NDVI ~0.10-0.25 (measured on GOES-16 2018-01-04 winter CONUS), well above 0
+#     but far below the lush ~0.5+. The floor LAND_NDVI_LO=0.06 is set just ABOVE
+#     the flat-spectrum set and BELOW dormant veg, and LAND_NDVI_HI=0.18 so
+#     dormant winter veg already saturates to FULL relax (not just lush summer).
 #   * OCEAN -- liquid water absorbs NIR (NIR ~0.02-0.05), so the NIR floor closes
-#     the gate. This also kills the failure mode where NDVI -- a RATIO -- reads a
+#     the gate. This also kills the failure mode where NDVI -- a ratio -- reads a
 #     spuriously HIGH value over near-black clear water (tiny red AND tiny NIR).
-#     Real deep/teal/turbid water all keep NIR low; measured open ocean here sits
-#     at NIR~0.024 and NDVI<0.
-#   * CLOUD / SNOW / SUN GLINT -- bright but spectrally FLAT (NIR ~= red), so NDVI
-#     ~0 closes the NDVI gate even though NIR is high (glint is a near-mirror
-#     reflection of the solar disk, not a low-NIR event).
-# So deep-blue ocean, white cloud, snow and glint stay byte-identical. The NIR
-# floor additionally fades the relax out as land darkens toward the terminator
-# (NIR -> 0), keeping the terminator a no-op. Sensor-shared: ABI veggie=band3,
-# AHI veggie=band4; degrades to a no-op if no veggie band is present.
-LAND_RAYLEIGH_RELAX = 0.6   # max fraction the Rayleigh correction is cut over full vegetation (0 = OFF)
-LAND_NDVI_LO = 0.14         # NDVI <= this -> NO relax (ocean<0, cloud/snow/glint~0, bare soil): gate 0
-LAND_NDVI_HI = 0.45         # NDVI >= this -> FULL NDVI gate (dense vegetation)
+#     Measured open ocean sits at NIR~0.024, NDVI<0 -> EXACTLY byte-identical.
+#   * CLOUD / SNOW / SUN GLINT -- bright but spectrally FLAT (snow NIR<visible ->
+#     NDVI<0; cloud/glint NIR~=red -> NDVI~0, both below LAND_NDVI_LO), so the
+#     NDVI gate stays 0 even where NIR is high. The smoothstep ramps gently from
+#     the floor, so a pixel grazing it gets ~0 relax (no hard cliff at cloud
+#     edges). OPAQUE flat-spectrum cloud/snow/glint and deep-blue ocean stay
+#     byte-identical. NOTE the qualifier "opaque/flat": a MIXEL carrying a
+#     positive LAND NDVI -- thin cloud/haze over land, or snow-over-forest where
+#     trees poke through -- is relaxed ALONG WITH the land. This is corrective
+#     for thin cloud over the de-browned land (it de-pinks the same red-out
+#     bleeding onto it); snow-over-forest gets a slight blue lift (mean ΔB ~0.003,
+#     an intensification of already-bluish snow), an accepted minor trade-off for
+#     curing the dormant red-out (the lone side effect found in a 3-lens review;
+#     true snow/cloud with NDVI<=0 and all ocean remain EXACT no-ops).
+# The NIR floor additionally fades the relax out as land darkens toward the
+# terminator (NIR -> 0), keeping the terminator a no-op. Sensor-shared: ABI
+# veggie=band3, AHI veggie=band4; degrades to a no-op if no veggie band present.
+LAND_RAYLEIGH_RELAX = 0.6   # max fraction the Rayleigh correction is cut over land vegetation (0 = OFF)
+LAND_NDVI_LO = 0.06         # NDVI <= this -> NO relax (ocean<0, cloud/snow/glint ~0 or <0): gate 0
+LAND_NDVI_HI = 0.18         # NDVI >= this -> FULL NDVI gate (dormant WINTER veg saturates here, not just lush)
 LAND_NIR_LO = 0.05          # sun-corrected NIR(veggie) <= this -> gate forced to 0 (water/shadow/near-black)
 LAND_NIR_HI = 0.10          # NIR >= this -> NIR floor fully open (real vegetation NIR is reliably >=~0.15)
 
@@ -201,13 +226,17 @@ def rayleigh_scale_field(cos_sza: np.ndarray) -> np.ndarray:
 
 def land_rayleigh_relax_field(red_c: np.ndarray, veggie_c: "np.ndarray | None") -> np.ndarray:
     """Per-pixel multiplier in [1-LAND_RAYLEIGH_RELAX, 1] that scales the Rayleigh
-    correction DOWN over vegetated land while leaving ocean/cloud/snow/glint
-    untouched.
+    correction DOWN over land vegetation -- DORMANT through lush -- while leaving
+    ocean/cloud/snow/glint untouched.
 
     The land gate is the product of two smoothsteps over the SUN-CORRECTED,
     pre-Rayleigh NIR (``veggie_c``) and red (``red_c``) reflectances:
-      * an NDVI gate  -- 0 for NDVI<=LAND_NDVI_LO (ocean<0; cloud/snow/glint ~0,
-        being spectrally flat; bare soil), ramping to 1 by LAND_NDVI_HI; and
+      * an NDVI gate  -- 0 for NDVI<=LAND_NDVI_LO (ocean<0; cloud/snow/glint ~0 or
+        <0, being spectrally flat), ramping to 1 by LAND_NDVI_HI. The floor sits
+        just above the flat-spectrum set and the ceiling is low enough that
+        DORMANT winter veg (NDVI ~0.10-0.25) saturates to full relax, not only
+        lush summer veg. NDVI is a RATIO, so the gate is sun-angle/season
+        invariant (the property a brightness gate lacks); and
       * an absolute NIR floor -- 0 for NIR<=LAND_NIR_LO, ramping to 1 by
         LAND_NIR_HI. NDVI is a ratio, so near-black clear water (tiny red AND
         tiny NIR) can read a spuriously high NDVI; the NIR floor closes the gate
@@ -215,7 +244,7 @@ def land_rayleigh_relax_field(red_c: np.ndarray, veggie_c: "np.ndarray | None") 
         NIR is reliably >=~0.15.
     The factor is therefore EXACTLY 1.0 (an exact no-op -> byte-identical) over
     ocean, cloud, snow and sun glint, and drops to 1-LAND_RAYLEIGH_RELAX over
-    full, well-lit vegetation. NaN inputs (partial-tile edges) map to 1.0 so the
+    vegetation (dormant or lush). NaN inputs (partial-tile edges) map to 1.0 so the
     relax never poisons an otherwise-valid pixel (matters on the AHI path, where
     veggie is not in the output RGB). Returns all-ones when no veggie band is
     available or the feature is disabled (LAND_RAYLEIGH_RELAX<=0)."""
@@ -556,12 +585,13 @@ def assemble_truecolor(
         # terminator (it over-corrects at the limb and greens the sunrise/sunset).
         # Exactly 1.0 for daytime pixels -> byte-identical midday.
         ray_scale = rayleigh_scale_field(cos_sza)
-        # Land-aware relax: scale the Rayleigh correction DOWN over vegetated land
-        # (NDVI-gated, from the sun-corrected NIR/red) so lush forest and savanna
-        # keep their blue and read natural green/tan instead of an over-subtracted
-        # muddy brown. EXACTLY 1.0 (no-op) over ocean (NDVI<0) and cloud (NDVI~0),
-        # so deep-blue ocean and white cloud stay byte-identical. Applied to every
-        # band (uniform, band-balanced) so no blue/cyan cast is introduced.
+        # Land-aware relax: scale the Rayleigh correction DOWN over land
+        # vegetation -- dormant through lush -- (sun-invariant NDVI gate, from the
+        # sun-corrected NIR/red) so forest, savanna AND dormant winter veg keep
+        # their blue and read natural green/tan instead of an over-subtracted muddy
+        # brown or winter RED. EXACTLY 1.0 (no-op) over ocean (NDVI<0) and cloud
+        # (NDVI~0), so deep-blue ocean and white cloud stay byte-identical. Applied
+        # to every band (uniform, band-balanced) so no blue/cyan cast is introduced.
         ray_scale = ray_scale * land_rayleigh_relax_field(red_c, veggie_c)
         red_c = rayleigh_band(red_c, WL_RED, sun_zen, sat_zen, azidiff, red_ref_pct, corrector, scale=ray_scale)
         blue_c = rayleigh_band(blue_c, WL_BLUE, sun_zen, sat_zen, azidiff, red_ref_pct, corrector, scale=ray_scale)
