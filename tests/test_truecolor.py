@@ -413,6 +413,30 @@ def test_assemble_land_relax_sparse_vegetation_partial_debrown():
     assert on[0, 0, 2] > off[0, 0, 2]   # sparse veg also keeps some blue (de-browns)
 
 
+def test_land_relax_debrowns_dormant_winter_vegetation():
+    """Regression for the winter RED-OUT: DORMANT vegetation (low NDVI ~0.10-0.18,
+    real NIR) -- bare deciduous / dead grass under low winter sun -- must de-brown,
+    not just lush summer veg. Under the old NDVI floor (0.14) these pixels fell
+    below the gate -> full Rayleigh stripped the blue -> they read RED/maroon
+    (GOES-16 2018-01-04). The lowered floor/ceiling (0.06/0.18) gives them a
+    SUBSTANTIAL relax while a co-located DEEP-OCEAN pixel (NIR<floor) stays an
+    exact no-op."""
+    #            dormant-veg   deep-ocean
+    red = np.array([[0.10, 0.03]], np.float32)   # dormant: red moderate; ocean dark
+    veg = np.array([[0.135, 0.024]], np.float32)  # NDVI~0.149 vs NDVI<0; ocean NIR<LAND_NIR_LO
+    f = tc.land_rayleigh_relax_field(red, veg)
+    # dormant veg now gets a substantial relax (was ~1.0 = no relax under the old floor)
+    assert f[0, 0] < 0.7, f"dormant winter veg not de-browned: factor {f[0,0]}"
+    # deep ocean stays an EXACT no-op (NIR below the floor) -> byte-identical
+    assert f[0, 1] == 1.0, f"ocean touched: factor {f[0,1]}"
+    # the NDVI gate is a RATIO -> sun-angle invariant: scaling both bands by a
+    # common sun-correction factor leaves the dormant-veg gate unchanged (the
+    # property a brightness ceiling would lack; the ocean NIR-floor is absolute by
+    # design and excluded from this invariant).
+    f2 = tc.land_rayleigh_relax_field(red * 1.8, veg * 1.8)
+    assert abs(f2[0, 0] - f[0, 0]) < 1e-6, "dormant-veg gate not sun-invariant"
+
+
 # --- Terminator highlight rolloff (cold-cloud-top exposure) ----------------
 
 def test_highlight_rolloff_field_zero_in_day_full_at_terminator():
