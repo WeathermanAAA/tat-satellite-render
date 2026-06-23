@@ -44,6 +44,10 @@ def test_synth_green_uses_ahi_derived_model():
     assert tc._GREEN_AHI is not None
     c0, cB, cR, cV = tc._GREEN_AHI
     assert cB > cR and cB > cV                    # green is mostly blue
+    # red=0.3 is chosen to sit in the bump+floor NO-OP zone (red > GREEN_BUMP_RED_CUT
+    # -> bump 0; base green > GREEN_COLLAPSE_FLOOR*min(red,blue) -> floor inactive),
+    # so synth_green here equals the BASE linear model exactly. Keep red above
+    # RED_CUT if that constant is ever retuned, or this assertion changes meaning.
     red = np.array([0.3], np.float32)
     veg = np.array([0.5], np.float32)
     blue = np.array([0.1], np.float32)
@@ -56,7 +60,9 @@ def test_synth_green_uses_ahi_derived_model():
 
 def test_synth_green_falls_back_to_linear_mix(monkeypatch):
     # If the trained asset is unavailable, synth_green uses the legacy fixed mix
-    # (rendering must never break on a missing asset).
+    # (rendering must never break on a missing asset). red=0.3 sits in the
+    # bump+floor no-op zone (red > RED_CUT, base green above the floor) so the
+    # result is the bare fixed mix.
     monkeypatch.setattr(tc, "_GREEN_AHI", None)
     red = np.array([0.3], np.float32)
     veg = np.array([0.5], np.float32)
@@ -216,6 +222,188 @@ def test_assemble_truecolor_vegetation_green_ocean_blue():
     veg, ocean = rgb[0, 0], rgb[0, 1]
     assert veg[1] >= veg[0] and veg[1] >= veg[2], f"vegetation not green-dominant: {veg}"
     assert ocean[2] >= ocean[1], f"ocean not blue-dominant: {ocean}"
+
+
+# --- Vegetation green-bump + anti-collapse floor (ABI synth green) ----------
+
+def test_vegetation_green_bump_gates_to_foliage_only():
+    """The bump is non-zero ONLY over vegetation and an EXACT 0 (no-op) over
+    ocean, cloud, desert (red ceiling) and dark/low-NIR water (NIR floor)."""
+    #              veg   ocean cloud desert dormant dark-water
+    red = np.array([[0.05, 0.02, 0.80, 0.30, 0.10, 0.02]], np.float32)
+    veg = np.array([[0.45, 0.015, 0.80, 0.35, 0.18, 0.05]], np.float32)
+    bump = tc.vegetation_green_bump(red, veg)
+    assert bump[0, 0] > 0.02, f"lush veg not bumped: {bump[0,0]}"
+    assert bump[0, 4] > 0.0, f"dormant veg not bumped: {bump[0,4]}"
+    assert bump[0, 1] == 0.0, "ocean bumped (NDVI<0)"
+    assert bump[0, 2] == 0.0, "cloud bumped (NDVI~0)"
+    assert bump[0, 3] == 0.0, "desert bumped (red above ceiling)"
+    assert bump[0, 5] == 0.0, "dark/low-NIR water bumped (NIR below floor)"
+    # lush gets a bigger bump than dormant (magnitude tracks NIR-red vigor)
+    assert bump[0, 0] > bump[0, 4]
+
+
+def test_vegetation_green_bump_red_ceiling_separates_veg_from_desert():
+    """Two pixels with the SAME high NIR but different red: the low-red one
+    (vegetation) is bumped; the high-red one (bright desert/sand) is not."""
+    red = np.array([[0.06, 0.30]], np.float32)
+    veg = np.array([[0.40, 0.40]], np.float32)
+    bump = tc.vegetation_green_bump(red, veg)
+    assert bump[0, 0] > 0.0 and bump[0, 1] == 0.0
+
+
+def test_vegetation_green_bump_nan_safe_and_disable():
+    red = np.array([[np.nan, 0.05]], np.float32)
+    veg = np.array([[0.45, np.nan]], np.float32)
+    b = tc.vegetation_green_bump(red, veg)
+    assert b[0, 0] == 0.0 and b[0, 1] == 0.0 and not np.any(np.isnan(b))
+    saved = tc.GREEN_BUMP_STRENGTH
+    try:
+        tc.GREEN_BUMP_STRENGTH = 0.0
+        assert np.array_equal(tc.vegetation_green_bump(np.array([[0.05]], np.float32),
+                                                       np.array([[0.45]], np.float32)),
+                              np.zeros((1, 1), np.float32))
+    finally:
+        tc.GREEN_BUMP_STRENGTH = saved
+
+
+def test_synth_green_bump_greens_vegetation_not_ocean():
+    """synth_green lifts vegetation green ABOVE blue (the teal cure) while an
+    ocean pixel stays at its blue-heavy base green."""
+    assert tc._GREEN_AHI is not None
+    c0, cB, cR, cV = tc._GREEN_AHI
+    # vegetation
+    r, v, b = np.array([0.05], np.float32), np.array([0.45], np.float32), np.array([0.07], np.float32)
+    base = c0 + cB * b + cR * r + cV * v
+    g = tc.synth_green(r, v, b)
+    assert g[0] > base[0] + 0.02, "vegetation green not bumped above base"
+    assert g[0] > b[0], "vegetation green not above blue (still teal)"
+    # ocean: NDVI<0 -> no bump, floor inactive -> exactly the base
+    ro, vo, bo = np.array([0.02], np.float32), np.array([0.015], np.float32), np.array([0.09], np.float32)
+    base_o = c0 + cB * bo + cR * ro + cV * vo
+    assert np.isclose(tc.synth_green(ro, vo, bo)[0], base_o[0], atol=1e-6)
+
+
+def test_synth_green_collapse_floor_kills_maroon():
+    """A dark low-NIR pixel whose base green falls below both red and blue
+    (-> maroon) is floored so green is no longer the deep minimum; the floor is
+    a no-op where green already sits above K*min(red,blue)."""
+    # maroon: tiny bands, base green collapses under red/blue, NIR below bump floor
+    r, v, b = np.array([0.037], np.float32), np.array([0.054], np.float32), np.array([0.035], np.float32)
+    g = tc.synth_green(r, v, b)
+    assert np.isclose(g[0], tc.GREEN_COLLAPSE_FLOOR * min(0.037, 0.035), atol=1e-4), g[0]
+    assert tc.vegetation_green_bump(r, v)[0] == 0.0   # confirm the floor (not bump) did it
+    # ocean: green already well above K*min -> floor untouched
+    ro, vo, bo = np.array([0.02], np.float32), np.array([0.015], np.float32), np.array([0.09], np.float32)
+    c0, cB, cR, cV = tc._GREEN_AHI
+    assert np.isclose(tc.synth_green(ro, vo, bo)[0], c0 + cB * bo[0] + cR * ro[0] + cV * vo[0], atol=1e-6)
+
+
+def test_assemble_vegetation_reads_green_not_teal():
+    """End-to-end teal cure, PINNED TO THE BUMP (discriminates fix on vs off):
+    the bump must be load-bearing -- it lifts green clearly above blue over a
+    vegetation pixel, and removing it (bump+floor OFF) collapses that margin, so
+    this test FAILS if the cure regresses. A co-located ocean pixel stays blue-
+    dominant either way. (Rayleigh off -> no pyspectral; the on-vs-off delta, not
+    an absolute threshold, isolates the bump as the cause -- the blue-heavy base
+    with Rayleigh OFF already grazes green-over-blue, so an absolute threshold
+    alone would pass with the fix off.)"""
+    import datetime as dt
+    H, W = 1, 2
+    red = np.array([[0.05, 0.025]], np.float32)
+    blue = np.array([[0.07, 0.090]], np.float32)
+    veggie = np.array([[0.45, 0.015]], np.float32)
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-1, 1, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved_s, saved_f = tc.GREEN_BUMP_STRENGTH, tc.GREEN_COLLAPSE_FLOOR
+    try:
+        tc.GREEN_BUMP_STRENGTH = 0.0
+        tc.GREEN_COLLAPSE_FLOOR = 0.0
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.GREEN_BUMP_STRENGTH, tc.GREEN_COLLAPSE_FLOOR = saved_s, saved_f
+    veg_on, veg_off = on[0, 0], off[0, 0]
+    on_margin, off_margin = veg_on[1] - veg_on[2], veg_off[1] - veg_off[2]
+    # the bump is LOAD-BEARING: removing it collapses the green-over-blue margin
+    assert on_margin > off_margin + 0.05, \
+        f"bump not load-bearing: on G-B={on_margin:.3f} off G-B={off_margin:.3f}"
+    # ...and the fixed veg reads clearly green (not cyan/teal G~=B)
+    assert veg_on[1] > veg_on[0] and veg_on[1] > veg_on[2] + 0.06, f"veg not clearly green: {veg_on}"
+    # ocean stays blue-dominant with AND without the fix
+    assert on[0, 1][2] >= on[0, 1][1] and off[0, 1][2] >= off[0, 1][1]
+
+
+def test_assemble_ahi_path_byte_identical_to_bump_off():
+    """The bump/floor are ABI-only (synth_green). The AHI native-green path never
+    calls synth_green, so turning the bump+floor on vs off is byte-identical."""
+    import datetime as dt
+    H = W = 4
+    red = np.full((H, W), 0.05, np.float32)
+    blue = np.full((H, W), 0.07, np.float32)
+    veggie = np.full((H, W), 0.45, np.float32)
+    green = np.full((H, W), 0.12, np.float32)   # native green supplied -> AHI path
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(-2, 2, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="Himawari-9",
+                  sensor="ahi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    saved_s, saved_f = tc.GREEN_BUMP_STRENGTH, tc.GREEN_COLLAPSE_FLOOR
+    try:
+        tc.GREEN_BUMP_STRENGTH = 0.0
+        tc.GREEN_COLLAPSE_FLOOR = 0.0
+        off, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    finally:
+        tc.GREEN_BUMP_STRENGTH, tc.GREEN_COLLAPSE_FLOOR = saved_s, saved_f
+    assert np.array_equal(on, off)
+
+
+def test_assemble_bump_is_exact_ocean_noop_any_sun_angle():
+    """The BUMP (not the floor) is an EXACT no-op over ocean at ANY sun angle --
+    the terminator green-cast guard. Ocean has NDVI<0, so the bump is exactly 0;
+    toggling ONLY GREEN_BUMP_STRENGTH is byte-identical across a wide sun range
+    (the NDVI-SIGN gate is sun-invariant -- this is the property that keeps the
+    limb from greening). The floor is left untouched (it is deterministic per
+    input, so it cancels) -- its separate dark-water behavior is pinned below."""
+    import datetime as dt
+    H, W = 1, 4
+    red = np.array([[0.02, 0.03, 0.025, 0.018]], np.float32)
+    blue = np.array([[0.09, 0.10, 0.095, 0.085]], np.float32)
+    veggie = np.array([[0.012, 0.015, 0.010, 0.014]], np.float32)
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(0, 0, H))  # spans low sun
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved = tc.GREEN_BUMP_STRENGTH
+    try:
+        tc.GREEN_BUMP_STRENGTH = 0.0          # toggle ONLY the bump; floor stays in both
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.GREEN_BUMP_STRENGTH = saved
+    assert np.array_equal(on, off)
+
+
+def test_floor_neutralizes_dark_water_without_greening_it():
+    """The anti-collapse floor is NOT a universal ocean no-op: on DARK/near-black
+    water the blue-heavy base green collapses to a unique minimum (a purple cast)
+    and the floor lifts it -- but only toward K*min(red,blue), which stays BELOW
+    blue, so the pixel is neutralized (no magenta) and NEVER inverted to green-
+    dominant. (This is why the prose says 'corrective on dark water', not 'no-op'.)"""
+    c0, cB, cR, cV = tc._GREEN_AHI
+    r, v, b = np.array([0.05], np.float32), np.array([0.01], np.float32), np.array([0.05], np.float32)
+    base = c0 + cB * b[0] + cR * r[0] + cV * v[0]
+    assert tc.vegetation_green_bump(r, v)[0] == 0.0          # NDVI<0 -> bump exactly 0
+    assert base < tc.GREEN_COLLAPSE_FLOOR * min(r[0], b[0])  # base green collapses (would be purple)
+    g = tc.synth_green(r, v, b)[0]
+    assert g > base                                          # floor lifted it (NOT byte-identical)
+    assert np.isclose(g, tc.GREEN_COLLAPSE_FLOOR * min(r[0], b[0]), atol=1e-4)
+    assert b[0] >= g                                         # blue still on top -> ocean stays blue, not green
 
 
 def _have_pyspectral():
