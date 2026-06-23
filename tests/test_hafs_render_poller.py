@@ -1094,6 +1094,85 @@ class TestProgressive(unittest.TestCase):
         self.assertEqual(snap["frames_done"], 6)
         self.assertEqual(len(snap["frame_batches"]), 5)
 
+    def test_render_delta_chunks_fxx_for_incremental_publish(self):
+        """The whole pair posts AT ONCE (the real upstream-BATCH case). With a
+        chunk of 1, a SINGLE poll must render+publish the frames ASCENDING in
+        SEPARATE subprocess batches (only_fxx '0' then '3' then '6'), not one
+        '0,3,6' that would only surface at the end ('empty until F126'). The
+        manifest must end with all three frames, published incrementally."""
+        saved_chunk = hp.PROGRESSIVE_FXX_CHUNK
+        hp.PROGRESSIVE_FXX_CHUNK = 1
+        try:
+            calls = []
+            polls = {"n": 0}
+            F = lambda *fr: tuple(sorted(fr))
+            full = F(("hafsa", "01e", "storm.atm", 0),
+                     ("hafsa", "01e", "storm.atm", 3),
+                     ("hafsa", "01e", "storm.atm", 6))
+            seq = [(), full]   # poll0 pre-announce (empty), poll1 whole batch
+            manifest_writes = {"n": 0}
+
+            def posted_fn(cycle):
+                i = min(polls["n"], len(seq) - 1)
+                polls["n"] += 1
+                return seq[i]
+
+            with tempfile.TemporaryDirectory() as tmp:
+                r2 = FakeR2()
+                _orig_put = r2.put_json
+                def counting_put(key, obj, cache):
+                    if key.endswith("manifest.json"):
+                        manifest_writes["n"] += 1
+                    return _orig_put(key, obj, cache)
+                r2.put_json = counting_put
+                eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                                   self._prog_render(calls))
+                eng.poll_once()                       # pre-announce (1 manifest write)
+                self.assertEqual(calls, [])
+                writes_before = manifest_writes["n"]
+                eng.poll_once()                       # whole batch posts at once
+            only = [c["only_fxx"] for c in calls]
+            self.assertEqual(only, ["0", "3", "6"],
+                             f"render not chunked ascending: {only}")
+            # >=1 manifest publish per chunk this poll (3 chunks -> 3 incremental
+            # publishes; +1 completion refresh is fine). The point: NOT one
+            # publish-at-the-end -- the building cycle grows hour-by-hour.
+            self.assertGreaterEqual(manifest_writes["n"] - writes_before, 3)
+            man = json.loads(r2.store[f"{self.PREFIX}/manifest.json"])
+            frames = man["cycles"][0]["storms"][0]["frames"]["hafsa"]["storm"]["mslp_wind"]
+            self.assertEqual(sorted(frames), [0, 3, 6])
+        finally:
+            hp.PROGRESSIVE_FXX_CHUNK = saved_chunk
+
+    def test_chunk_disabled_renders_delta_in_one_batch(self):
+        """PROGRESSIVE_FXX_CHUNK<=0 keeps the legacy single-subprocess behavior
+        (the whole delta in one only_fxx) -- the escape hatch."""
+        saved_chunk = hp.PROGRESSIVE_FXX_CHUNK
+        hp.PROGRESSIVE_FXX_CHUNK = 0
+        try:
+            calls = []
+            polls = {"n": 0}
+            F = lambda *fr: tuple(sorted(fr))
+            full = F(("hafsa", "01e", "storm.atm", 0),
+                     ("hafsa", "01e", "storm.atm", 3),
+                     ("hafsa", "01e", "storm.atm", 6))
+            seq = [(), full]
+
+            def posted_fn(cycle):
+                i = min(polls["n"], len(seq) - 1)
+                polls["n"] += 1
+                return seq[i]
+
+            with tempfile.TemporaryDirectory() as tmp:
+                r2 = FakeR2()
+                eng = self._engine(r2, tmp, lambda: "2026060418", posted_fn,
+                                   self._prog_render(calls))
+                eng.poll_once()
+                eng.poll_once()
+            self.assertEqual([c["only_fxx"] for c in calls], ["0,3,6"])
+        finally:
+            hp.PROGRESSIVE_FXX_CHUNK = saved_chunk
+
     def test_exit0_frame_drop_held_then_abandoned(self):
         calls = []
 

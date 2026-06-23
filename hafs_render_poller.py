@@ -135,6 +135,18 @@ HAFS_PROGRESSIVE = (_env("HAFS_PROGRESSIVE", "true") or "").strip().lower() not 
 FXX_END = int(_env("HAFS_FXX_END", "126"))
 FXX_STEP = int(_env("HAFS_FXX_STEP", "3"))
 
+# Progressive render granularity: how many forecast-hour FRAMES one render
+# subprocess covers before the manifest is re-published. HAFS posts a whole
+# cycle's hours upstream in one BATCH, so a single poll's delta is the entire
+# storm x 43 frames; rendering+publishing that as ONE subprocess only surfaces
+# the frames at the very end ("empty until F126"). Rendering ASCENDING in small
+# chunks and publishing after each makes the building cycle populate hour-by-hour
+# so the user can watch the run build and scrub completed hours mid-run. Smaller
+# = smoother build + lower per-subprocess peak memory, but more subprocess
+# startups (each re-imports herbie/matplotlib); 4 frames (=12 fcst h) balances
+# the two. Set 0/negative to disable chunking (render the whole delta at once).
+PROGRESSIVE_FXX_CHUNK = int(_env("HAFS_PROGRESSIVE_FXX_CHUNK", "4"))
+
 # Flat (pre-cycle-scoped) legacy PNG keys are deleted by the completion prune
 # once they are older than this - long enough that no live browser session
 # still holds a manifest that references them.
@@ -1668,39 +1680,48 @@ def make_progressive_source(r2: R2, *, prefix: str = HAFS_R2_PREFIX,
             # running and get falsely abandoned (review-confirmed critical).
             errors = []
             for fxx_set, set_doms in sorted(runnable_by_set.items()):
-                runnable = [(model, storm, d, f) for d in set_doms
-                            for f in fxx_set]
-                log.info("progressive batch: %s %s %s fxx=%s",
-                         model, storm, ",".join(set_doms),
-                         ",".join(str(f) for f in fxx_set))
-                try:
-                    with ProgressHeartbeat(
-                            r2, prefix,
-                            f"{cycle} progressive {model}/{storm}",
-                            clock=clock):
-                        upres = _run_batch(cycle, model, storm, set_doms,
-                                           set(fxx_set))
-                except RenderError as e:
-                    errors.append(str(e))
-                    continue
-                state["rendered"] |= set(upres.get("new_frames") or ())
-                _merge_entry(upres.get("incr") or {})
-                _refresh_counts(posted)
-                _fold_batch_summary(state["summary"], upres,
-                                    f"{model}/{storm}", clock)
-                # Manifest AFTER the PNG barrier (inside _run_batch) - a
-                # listed frame's PNG is already on R2.
-                _publish_manifest()
-                _write_summary()
-                # GATE-REOPEN GUARD (frame level): the subprocess exits 0 as
-                # long as anything rendered; a planned frame that produced
-                # nothing must hold the signature so it retries (bounded by
-                # the attempts cap).
-                dropped = [k for k in runnable if k not in state["rendered"]]
-                if dropped:
-                    errors.append(
-                        "batch exited 0 but produced no frames for "
-                        f"{dropped[:6]}{'...' if len(dropped) > 6 else ''}")
+                # Render the missing fxx ASCENDING in small chunks, publishing
+                # the manifest after EACH so the building cycle populates
+                # hour-by-hour (the frontend re-polls and merges). Without this
+                # the whole storm-delta renders in one subprocess and only
+                # appears at F126. PROGRESSIVE_FXX_CHUNK<=0 -> one chunk (legacy).
+                fxx_ascending = sorted(fxx_set)
+                step = PROGRESSIVE_FXX_CHUNK if PROGRESSIVE_FXX_CHUNK > 0 else len(fxx_ascending)
+                for ci in range(0, len(fxx_ascending), max(step, 1)):
+                    chunk = fxx_ascending[ci:ci + step]
+                    runnable = [(model, storm, d, f) for d in set_doms
+                                for f in chunk]
+                    log.info("progressive batch: %s %s %s fxx=%s",
+                             model, storm, ",".join(set_doms),
+                             ",".join(str(f) for f in chunk))
+                    try:
+                        with ProgressHeartbeat(
+                                r2, prefix,
+                                f"{cycle} progressive {model}/{storm}",
+                                clock=clock):
+                            upres = _run_batch(cycle, model, storm, set_doms,
+                                               set(chunk))
+                    except RenderError as e:
+                        errors.append(str(e))
+                        continue
+                    state["rendered"] |= set(upres.get("new_frames") or ())
+                    _merge_entry(upres.get("incr") or {})
+                    _refresh_counts(posted)
+                    _fold_batch_summary(state["summary"], upres,
+                                        f"{model}/{storm}", clock)
+                    # Manifest AFTER the PNG barrier (inside _run_batch) - a
+                    # listed frame's PNG is already on R2.
+                    _publish_manifest()
+                    _write_summary()
+                    # GATE-REOPEN GUARD (frame level): the subprocess exits 0 as
+                    # long as anything rendered; a planned frame that produced
+                    # nothing must hold the signature so it retries (bounded by
+                    # the attempts cap).
+                    dropped = [k for k in runnable if k not in state["rendered"]]
+                    if dropped:
+                        errors.append(
+                            "batch exited 0 but produced no frames for "
+                            f"{dropped[:6]}{'...' if len(dropped) > 6 else ''}")
             if errors:
                 group_errors.append(
                     f"{model}/{storm}: " + "; ".join(errors)[:600])
