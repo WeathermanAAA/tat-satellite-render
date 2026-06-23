@@ -30,9 +30,20 @@ Recipe matches the documented CIMSS Natural True Color + CIRA GeoColor pipeline
     small veggie lift for vegetation. This replaces the old fixed CIMSS mix
     (0.45*Red + 0.10*Veggie + 0.45*Blue), whose heavy RED share over-greened at
     low sun and produced the terminator GREEN CAST; the learned green matches the
-    warm/correct AHI look at every sun angle while keeping ocean deep-blue and
-    vegetation green. If the asset is missing it falls back to the fixed mix.
-    Himawari AHI has a native 0.51 green band and skips synthesis entirely.
+    warm/correct AHI look at every sun angle while keeping ocean deep-blue. If
+    the asset is missing it falls back to the fixed mix. Himawari AHI has a native
+    0.51 green band and skips synthesis entirely.
+    The blue-heavy base, however, gives vegetation no green-over-blue margin (once
+    the land-aware Rayleigh relax keeps the over-land blue, foliage reads CYAN/TEAL),
+    so synth_green adds two ABI-only corrections on top of the base: a VEGETATION
+    GREEN BUMP (GREEN_BUMP_* knobs) -- the chlorophyll green shoulder the linear fit
+    lacks, gated by NDVI x NIR-floor x a RED CEILING so it lifts ONLY foliage (lush
+    + dormant); an exact no-op over true ocean (NDVI<0), cloud/glint and bright
+    desert (red>RED_CUT), and a visually-negligible nudge in the ramp bands; and an
+    ANTI-COLLAPSE FLOOR (GREEN_COLLAPSE_FLOOR) that stops the blue-heavy green being
+    the DEEP minimum and rendering sparse/dark low-NIR land (and dark water) MAROON,
+    while never inverting a pixel to green-dominant. AHI's native-green path is
+    untouched by both.
   * Solar-zenith normalization: ABI CMI and our AHI albedo are raw TOA
     reflectance (NOT sun-angle normalized) -> divide by cos(SZA).
   * A CIRA/EUMETSAT tone curve (gamma-ish stretch) for natural brightness.
@@ -70,6 +81,72 @@ log = logging.getLogger("tat-satellite.truecolor")
 # net. (Previously 0.40/0.40/0.20 — the veggie-heavy / blue-light mix that
 # turned open ocean magenta because synth-green collapsed where veggie≈0.)
 GREEN_FRACTIONS = (0.45, 0.10, 0.45)
+
+# --- Vegetation green-bump (ABI synth-green only) ---------------------------
+# The AHI-derived synth green (above) is dominated by BLUE (cB~0.87) and was fit
+# to Himawari's NATIVE 0.51um green -- which over hazy tropical vegetation is
+# itself only weakly green (G barely exceeds B); AHI looks lush only because of
+# the AHI-ONLY vegetation VIBRANCE. GOES/ABI gets no vibrance, so the blue-heavy
+# synth green leaves vegetation with NO green-over-blue margin: once the land-
+# aware Rayleigh relax (correctly) keeps the blue path radiance over land, G~=B
+# and the foliage renders CYAN/TEAL (the bug this block cures), or muddy where
+# the green collapses. Anchored against NASA GIBS MODIS/VIIRS CorrectedReflectance
+# (Florida 2026-06-22) + the AHI production look, true vegetation must read a
+# natural GREEN in BOTH lush-summer and dormant-winter scenes.
+#
+# The cure injects the real vegetation GREEN BUMP (chlorophyll's 0.51um shoulder
+# = NIR exceeds red) the linear fit lacks, but ONLY over vegetation, so every
+# other surface stays put. The additive bump is the product of three gates and
+# lifts green above blue only on foliage. It is an EXACT 0 (byte-identical) over
+# the HARD-GUARDED set -- true ocean (NDVI<0), cloud/glint (NDVI~0, spectrally
+# flat) and any pixel brighter in red than RED_CUT (bare desert/sand) -- and
+# VISUALLY NEGLIGIBLE (a sub-~0.02 green nudge that does not flip hue) inside the
+# smoothstep ramp bands: dim/veg-contaminated semi-arid land in the red ramp, and
+# low-positive-NDVI low-NIR pixels at the terminator (where divide-by-cos
+# amplifies the absolute NIR vs the red ceiling unevenly). The veg-vs-everything
+# discrimination is carried by the NDVI-sign gate, which IS sun-invariant:
+#   * NDVI gate   -- 0 for NDVI<=LO (ocean<0, cloud/snow/glint ~0), ramping to 1
+#     by HI. LO=0.06/HI=0.20 so DORMANT winter veg (NDVI ~0.10-0.25) bumps too,
+#     not just lush summer. NDVI is a ratio -> sun-angle/season invariant.
+#   * NIR floor   -- 0 for NIR<=LO, 1 by HI: closes over water/shadow (liquid
+#     water absorbs NIR) and the dark limb, where NDVI -- a ratio of two tiny
+#     numbers -- can read spuriously high. (Absolute, so divide-by-cos can crack
+#     it open a hair at the terminator -- bounded to the negligible nudge above.)
+#   * RED ceiling -- 1 for low red, ramping to 0 by RED_CUT: vegetation is DARK
+#     in red (chlorophyll absorption) while bright DESERT/SAND is RED-bright with
+#     similar NIR. This is the discriminator that keeps the Sahara/Outback/
+#     Sonoran desert TAN (red-dominant) instead of greening it -- the failure of
+#     a raw NIR-keyed lift. Lush+dormant veg sit well under the ceiling.
+# The bump magnitude scales with (NIR-red) so it tracks vegetation vigor (lush ->
+# strong green, dormant -> olive), and uses a SMALL strength -> natural forest
+# green, not neon. ABI-only: synthesized green is the GOES path; AHI keeps its
+# native green (+vibrance) and never calls synth_green, so AHI is byte-identical.
+GREEN_BUMP_STRENGTH = 0.18   # additive green per unit (NIR-red) at full gate (0 = OFF)
+GREEN_BUMP_NDVI_LO = 0.06    # NDVI <= this -> no bump (ocean<0, cloud/snow/glint ~0)
+GREEN_BUMP_NDVI_HI = 0.20    # NDVI >= this -> full NDVI gate (dormant winter veg included)
+GREEN_BUMP_NIR_LO = 0.10     # NIR(veggie) <= this -> gate 0 (water/shadow/dark limb)
+GREEN_BUMP_NIR_HI = 0.18     # NIR >= this -> NIR floor fully open (real vegetation)
+GREEN_BUMP_RED_KEEP = 0.16   # red <= this -> ceiling fully open (vegetation is red-dark)
+GREEN_BUMP_RED_CUT = 0.26    # red >= this -> ceiling shut (bright desert/sand stays tan)
+
+# --- Synth-green anti-collapse floor (ABI synth-green only) -----------------
+# Where vegetation is sparse/dark with low NIR (turbid shallow lakes -- Lake
+# Okeechobee -- wet soil, dark coastal water, NDVI low-positive but NIR below the
+# bump's floor), the blue-heavy synth green can fall BELOW both red and blue, so
+# the pixel renders an unnatural MAROON/PURPLE (green is the unique minimum). A
+# RELATIVE floor keeps green from being the DEEP minimum: green >= K*min(red,
+# blue). It fires on a DEEP relative collapse (the maroon set, where green
+# ~75-80% of the smaller channel) and is an exact no-op on cloud/haze/glint
+# (their green sits ~94% of min, above the floor) and on brighter open water +
+# vegetation (green is already above K*min). It is NOT a universal ocean no-op:
+# on DARK / near-black / shadowed water the blue-heavy base green collapses to a
+# unique minimum (a purple cast) and the floor lifts it toward neutral -- this is
+# CORRECTIVE (it kills a pre-existing magenta) and never inverts the pixel to
+# green-dominant (the lift stops at K*min(red,blue) < blue, so blue stays on top;
+# verified 0/8395 touched ocean px become green-dominant). K=0.90 keeps flat
+# bright surfaces (cloud) byte-identical while leaving real dark-green surfaces a
+# natural green deficit (green stays just below red/blue, not flattened).
+GREEN_COLLAPSE_FLOOR = 0.90  # green >= this * min(red, blue); 0 disables the floor
 
 # Rayleigh subtraction strength (0..1). CIRA GeoColor applies FULL Rayleigh
 # correction to maximize clear/cloud contrast and color vibrancy. With the
@@ -363,22 +440,71 @@ def _load_green_model():
 _GREEN_AHI = _load_green_model()   # (c0, cB, cR, cV) or None
 
 
+def vegetation_green_bump(red: np.ndarray, veggie: np.ndarray) -> np.ndarray:
+    """Additive green lift in [0, ~] that is non-zero ONLY over vegetation.
+
+    The product of three gates over the sun-corrected, post-Rayleigh red/NIR --
+    an NDVI gate (ramp LO..HI), an absolute NIR floor, and a RED CEILING (1 at
+    low red, 0 at high red) -- times ``GREEN_BUMP_STRENGTH * max(NIR-red, 0)``.
+    EXACTLY 0 (an exact no-op) over ocean (NDVI<0), cloud/snow/glint (NDVI~0),
+    water/shadow (NIR<floor) and bright DESERT/SAND (red>ceiling), so only foliage
+    -- lush AND dormant -- is lifted, scaled by its vigor. Inside the smoothstep
+    ramps (semi-arid red 0.16-0.26, or low-NIR pixels at the terminator where
+    divide-by-cos grazes the NIR floor) the bump is small but non-zero -- a sub-
+    ~0.02 nudge that is visually negligible and hue-preserving. NaN-safe (NaN
+    inputs -> 0 bump). Returns all-zeros when disabled (GREEN_BUMP_STRENGTH<=0)."""
+    if GREEN_BUMP_STRENGTH <= 0.0:
+        return np.zeros_like(red)
+    r = np.clip(red, 0.0, None)
+    v = np.clip(veggie, 0.0, None)
+    ndvi = (v - r) / np.maximum(v + r, 1e-6)
+    gate = (
+        _smoothstep(GREEN_BUMP_NDVI_LO, GREEN_BUMP_NDVI_HI, ndvi)
+        * _smoothstep(GREEN_BUMP_NIR_LO, GREEN_BUMP_NIR_HI, v)
+        * (1.0 - _smoothstep(GREEN_BUMP_RED_KEEP, GREEN_BUMP_RED_CUT, r))
+    )
+    bump = (GREEN_BUMP_STRENGTH * gate * np.clip(v - r, 0.0, None)).astype(red.dtype, copy=False)
+    bump[np.isnan(red) | np.isnan(veggie)] = 0.0   # never bump a NaN edge (mirrors land_rayleigh_relax_field)
+    return bump
+
+
 def synth_green(red: np.ndarray, veggie: np.ndarray, blue: np.ndarray) -> np.ndarray:
     """Synthesize the missing ABI green.
 
-    PRIMARY: an AHI-DERIVED green -- a linear model learned from Himawari's native
+    BASE: an AHI-DERIVED green -- a linear model learned from Himawari's native
     0.51um green (G = c0 + cB*blue + cR*red + cV*veggie). Green is mostly BLUE
-    (0.51um sits right next to 0.47um), with a small veggie lift for vegetation;
-    the old fixed CIMSS mix (0.45*Red + 0.10*Veggie + 0.45*Blue) put far too much
-    RED weight and over-greened at low sun -> the terminator green cast. This
-    learned green matches the warm/correct AHI look at every sun angle. ABI only;
-    AHI keeps its native green. FALLBACK: the legacy fixed mix if the asset is
-    absent. Output is clipped to [0,1] downstream (assemble_truecolor)."""
+    (0.51um sits right next to 0.47um); the old fixed CIMSS mix (0.45*Red +
+    0.10*Veggie + 0.45*Blue) put far too much RED weight and over-greened at low
+    sun -> the terminator green cast. FALLBACK: the legacy fixed mix if the asset
+    is absent.
+
+    The blue-heavy base leaves vegetation with no green-over-blue margin (it reads
+    CYAN/TEAL once the land-aware Rayleigh relax keeps the over-land blue), so on
+    top of the base we add:
+      * a VEGETATION GREEN BUMP (vegetation_green_bump) -- the chlorophyll green
+        shoulder the linear fit lacks, gated to foliage only, so lush+dormant veg
+        read natural GREEN; an exact no-op over true ocean (NDVI<0), cloud/glint
+        and bright desert (red>RED_CUT), and a negligible nudge in the ramp bands;
+        and
+      * an ANTI-COLLAPSE FLOOR -- green >= GREEN_COLLAPSE_FLOOR*min(red,blue), so
+        the blue-heavy green can never be the DEEP minimum and render MAROON/PURPLE
+        over sparse/dark low-NIR land (turbid lakes, wet soil) or near-black water;
+        a no-op on cloud/haze (green ~94% of min) and brighter water/veg, and on
+        dark water it neutralizes the purple toward grey WITHOUT inverting the pixel
+        to green-dominant (the lift stops at K*min < blue, so blue stays on top).
+    ABI only; AHI keeps its native green (never calls this). Output is clipped to
+    [0,1] downstream (assemble_truecolor)."""
     if _GREEN_AHI is not None:
         c0, cB, cR, cV = _GREEN_AHI
-        return c0 + cB * blue + cR * red + cV * veggie
-    fr, fv, fb = GREEN_FRACTIONS
-    return fr * red + fv * veggie + fb * blue
+        green = c0 + cB * blue + cR * red + cV * veggie
+    else:
+        fr, fv, fb = GREEN_FRACTIONS
+        green = fr * red + fv * veggie + fb * blue
+    green = green + vegetation_green_bump(red, veggie)
+    if GREEN_COLLAPSE_FLOOR > 0.0:
+        floor = GREEN_COLLAPSE_FLOOR * np.minimum(np.clip(red, 0.0, None), np.clip(blue, 0.0, None))
+        green = np.maximum(green, floor)
+    return green
 
 
 def _make_rayleigh(platform_name: str, sensor: str):
