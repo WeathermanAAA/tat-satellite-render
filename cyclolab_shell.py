@@ -1140,6 +1140,11 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="stage">
     <section class="sec active" id="sec-overview">
       <div class="wipe">
+        <div class="card" id="card-map" style="grid-column:1/-1">
+          <h3>Storm map</h3>
+          <div id="overview-map"></div>
+          <div class="note" id="overview-map-note">Interactive track &amp; layers. Satellite and model imagery stack in as layers when published.</div>
+        </div>
         <div class="ov-col ov-left">
         <div class="card" id="card-hero">
           <div class="sst-hero" id="sst-hero">
@@ -1996,6 +2001,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.querySelectorAll(".sec-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-sec") === name);
     });
+    if (name === "overview" && clMap) clMap.resize();
     if (!inited[name]) {
       inited[name] = true;
       // Stage 3: nothing is fetched until the tab opens (lazy mounts).
@@ -2035,8 +2041,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   // resume the manifest poll on return if the Satellite tab is still active.
   if (typeof document !== "undefined" && document.addEventListener) {
     document.addEventListener("visibilitychange", function () {
-      if (document.hidden) { satStopPoll(); satPause(); }
-      else satStartPoll();
+      if (document.hidden) { satStopPoll(); satPause(); if (clMap) clMap._pause(); }
+      else { satStartPoll(); if (clMap) clMap._resume(); }
     });
   }
 
@@ -4689,6 +4695,21 @@ HTML_TEMPLATE = r"""<!doctype html>
     s.onerror = onerr;
     document.head.appendChild(s);
   }
+  // ---- Overview stacking map (lazy-loaded reusable module) ----
+  var clMap = null;
+  function initOverviewMap() {
+    var root = document.getElementById("overview-map");
+    if (!root || clMap) return;
+    var storm = lastStorm || (typeof BAKED !== "undefined" ? BAKED : null);
+    if (!storm) return;
+    _loadScript(SITE_BASE + "/cyclolab_map.js",
+      function () { return !!window.CycloLabMap; },
+      function () {
+        try { clMap = new window.CycloLabMap(root, { storm: storm }); }
+        catch (e) { if (window.console) console.warn("overview map failed", e); }
+      },
+      function () { if (window.console) console.warn("cyclolab_map.js failed to load"); });
+  }
   function initRecon() {
     var root = document.getElementById("recon-viewer");
     var status = document.getElementById("recon-status");
@@ -5829,6 +5850,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }).catch(function () { done(null); });
   }
   function wire() {
+    try { initOverviewMap(); } catch (e) {}
     PLOTS.forEach(function (p) {
       var el = document.getElementById(p[0]);
       if (!el) return;
