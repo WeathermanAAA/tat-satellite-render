@@ -36,7 +36,7 @@ from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from render import render_png, transcode_frame, encode_webp
+from render import render_png, render_tile_png, band_legend, transcode_frame, encode_webp
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -394,6 +394,11 @@ class RenderRequest(BaseModel):
     # default True -> unchanged.
     coastlines: bool = True   # coastlines + political borders
     gridlines: bool = True    # labeled lat/lon graticule
+    # Map-ready CHROME-FREE tile (CycloLab stacking map). When True, return ONLY
+    # the data pixels (transparent elsewhere), full-bleed over the bbox, as PNG
+    # RGBA -- no title/colorbar/coast/gridlines/badge. Off by default, so the
+    # draw-a-box panel + the floater/meso loop-frame path are byte-identical.
+    tile: bool = False
 
     @field_validator("quality")
     @classmethod
@@ -523,8 +528,11 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
         overlay_part += "|nocoast"
     if not body.gridlines:
         overlay_part += "|nogrid"
+    # The chrome-free map tile is a distinct artifact from the chromed frame at
+    # the same params; key it separately so neither overwrites the other.
+    tile_part = "|tile" if body.tile else ""
     raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
-           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}")
+           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{tile_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -609,6 +617,13 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
+        # Map-ready tile: hand the poller this band's discrete legend (sampled
+        # from the enhancement palette) so it lands in the per-band manifest.
+        # None for true-color (no scalar palette).
+        if body.tile and not is_true_color:
+            leg = band_legend(body.enhancement)
+            if leg:
+                headers["X-Legend"] = json.dumps(leg, separators=(",", ":"))
         media_type = "image/webp" if out_format == "webp" else "image/png"
         return Response(content=content, media_type=media_type, headers=headers)
 
@@ -640,6 +655,13 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
                 render_downsample = downsample
             def _render_job() -> bytes:
+                # Chrome-free georeferenced map tile: bare data pixels, transparent
+                # PNG RGBA, no transcode (the webp loop path would flatten alpha).
+                if body.tile:
+                    return render_tile_png(
+                        data, body.bbox, body.enhancement, render_downsample,
+                        dpi=tier_dpi,
+                    )
                 out = render_png(
                     data,
                     body.bbox,
