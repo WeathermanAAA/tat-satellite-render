@@ -252,6 +252,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     margin-top: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
     font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
     border: 1px solid currentColor; width: fit-content; }
+  /* The genesis-odds pill is invest/PTC-only. For a designated storm it is
+     left [hidden] + empty, but the .formation-pill display above outranks the
+     [hidden] attribute, leaving a stray empty capsule (the "blank pill"). Hide
+     it whenever it carries no odds; a populated invest pill (not empty, not
+     hidden) still shows. */
+  .formation-pill[hidden], .formation-pill:empty { display: none; }
   /* "FORMATION" with "chance" stacked beneath it */
   .formation-pill .fp-eyebrow { display: inline-flex; flex-direction: column;
     line-height: 1.04; font-size: 9px; font-weight: 800; letter-spacing: 0.08em;
@@ -1134,6 +1140,11 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="stage">
     <section class="sec active" id="sec-overview">
       <div class="wipe">
+        <div class="card" id="card-map" style="grid-column:1/-1">
+          <h3>Storm map</h3>
+          <div id="overview-map"></div>
+          <div class="note" id="overview-map-note">Interactive track &amp; layers. Satellite and model imagery stack in as layers when published.</div>
+        </div>
         <div class="ov-col ov-left">
         <div class="card" id="card-hero">
           <div class="sst-hero" id="sst-hero">
@@ -1990,6 +2001,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.querySelectorAll(".sec-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-sec") === name);
     });
+    if (name === "overview" && clMap) clMap.resize();
     if (!inited[name]) {
       inited[name] = true;
       // Stage 3: nothing is fetched until the tab opens (lazy mounts).
@@ -2029,8 +2041,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   // resume the manifest poll on return if the Satellite tab is still active.
   if (typeof document !== "undefined" && document.addEventListener) {
     document.addEventListener("visibilitychange", function () {
-      if (document.hidden) { satStopPoll(); satPause(); }
-      else satStartPoll();
+      if (document.hidden) { satStopPoll(); satPause(); if (clMap) clMap._pause(); }
+      else { satStartPoll(); if (clMap) clMap._resume(); }
     });
   }
 
@@ -3508,6 +3520,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   loadFormation();          // Stage C: eager NHC formation pill (invests only)
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
+  // Mount the Overview stacking map once the DOM is ready (IIFE-A scope).
+  if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", initOverviewMap);
+  else initOverviewMap();
   // ENDED pages used to skip the fetch entirely, which left advFull
   // null FOREVER - no cone, no intensity chart, blank advisory text on
   // every dead-storm page (final-gate-3 #4, the latent variant of the
@@ -4682,6 +4698,21 @@ HTML_TEMPLATE = r"""<!doctype html>
     s.onload = function () { ready() ? cb() : onerr(); };
     s.onerror = onerr;
     document.head.appendChild(s);
+  }
+  // ---- Overview stacking map (lazy-loaded reusable module) ----
+  var clMap = null;
+  function initOverviewMap() {
+    var root = document.getElementById("overview-map");
+    if (!root || clMap) return;
+    var storm = lastStorm || (typeof BAKED !== "undefined" ? BAKED : null);
+    if (!storm) return;
+    _loadScript(SITE_BASE + "/cyclolab_map.js",
+      function () { return !!window.CycloLabMap; },
+      function () {
+        try { clMap = new window.CycloLabMap(root, { storm: storm }); }
+        catch (e) { if (window.console) console.warn("overview map failed", e); }
+      },
+      function () { if (window.console) console.warn("cyclolab_map.js failed to load"); });
   }
   function initRecon() {
     var root = document.getElementById("recon-viewer");
