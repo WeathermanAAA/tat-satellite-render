@@ -436,6 +436,128 @@ def render_png(
     return buf.getvalue()
 
 
+def render_tile_png(
+    data: FetchResult,
+    bbox: list[float],
+    enhancement: str,
+    downsample: int = 1,
+    dpi: int = 110,
+) -> bytes:
+    """Chrome-free, georeferenced map TILE for the CycloLab stacking map.
+
+    ONLY the data pixels (true-color RGB or enhanced IR/WV/visible), transparent
+    everywhere else (off-disk / off-swath / masked), full-bleed over ``bbox`` so
+    the consumer mounts it as a MapLibre image source on the bbox corners. NO
+    title strip, colorbar, gridlines, coastlines, badge, or watermark.
+
+    Separate from render_png ON PURPOSE: the chromed display frame stays
+    byte-identical (this function is never on its path). The scalar/RGB data prep
+    + degenerate guards mirror render_png so a partial-fetch frame still 500s
+    (poller retries/skips) instead of shipping a broken tile."""
+    is_rgb = data.units == "rgb"
+    is_visible = data.units == "1"
+    enh = None if is_rgb else get_enhancement(enhancement)
+
+    cmi = data.cmi
+    lats = data.lats
+    lons = data.lons
+    if downsample > 1:
+        cmi = cmi[::downsample, ::downsample]
+        lats = lats[::downsample, ::downsample]
+        lons = lons[::downsample, ::downsample]
+
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lon_span = lon_max - lon_min
+    lat_span = lat_max - lat_min
+
+    # Bare full-bleed PlateCarree axes; figsize matches the bbox aspect and the
+    # axes aspect is forced 'auto' so the data fills [0,0,1,1] exactly -> the PNG
+    # corners are the bbox corners (the consumer maps them to [TL,TR,BR,BL]).
+    fig_w = 10.0
+    fig_h = max(2.0, fig_w * (lat_span / max(lon_span, 1e-6)))
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    fig.patch.set_alpha(0.0)
+    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
+    ax.patch.set_alpha(0.0)
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_aspect("auto")
+    ax.axis("off")
+
+    if is_rgb:
+        finite_mask = np.isfinite(cmi).all(axis=-1)
+        nan_frac = float((~finite_mask).mean())
+        valid_max = (float(np.clip(cmi[finite_mask], 0.0, 1.0).max(axis=-1).mean())
+                     if finite_mask.any() else 0.0)
+        if nan_frac > 0.50 or valid_max < 0.04:
+            plt.close(fig)
+            raise RuntimeError(
+                f"truecolor tile degenerate (nan={nan_frac * 100:.0f}%) -- skip"
+            )
+        rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
+        # Off-disk pixels -> alpha 0 so the basemap shows through.
+        rgba = np.dstack([rgb, finite_mask.astype(np.float32)])
+        ax.imshow(
+            rgba, origin="upper", extent=[lon_min, lon_max, lat_min, lat_max],
+            transform=ccrs.PlateCarree(), interpolation="nearest", zorder=1,
+        )
+    else:
+        if is_visible:
+            plot_field = np.ma.masked_invalid(normalize_visible(cmi))
+            plot_cmap = plt.get_cmap("gray")
+            plot_cnorm = Normalize(vmin=0.0, vmax=1.0)
+        else:
+            bt = cmi
+            if data.units in ("C", "celsius", "degC"):
+                bt = bt + 273.15
+            bt_c = bt - 273.15
+            nan_frac = float((~np.isfinite(bt_c)).mean())
+            if nan_frac > 0.55:
+                plt.close(fig)
+                raise RuntimeError(
+                    f"scalar tile degenerate (nan={nan_frac * 100:.0f}%) -- skip"
+                )
+            plot_field = np.ma.masked_invalid(bt_c)
+            plot_cmap = enh["cmap"]
+            plot_cnorm = enhancement_norm(enhancement)
+        # Masked (NaN) cells aren't drawn -> transparent over the basemap.
+        ax.pcolormesh(
+            lons, lats, plot_field, cmap=plot_cmap, norm=plot_cnorm,
+            shading="auto", transform=ccrs.PlateCarree(), rasterized=True,
+        )
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, transparent=True)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _rgba_hex(rgba) -> str:
+    r, g, b = (int(round(float(c) * 255)) for c in rgba[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def band_legend(enhancement: str) -> Optional[dict]:
+    """Discrete legend descriptor for a SCALAR enhancement (IR/WV), sampled from
+    its tat_palettes cmap at the colorbar ticks -> {label, discrete, stops}. The
+    floater poller stamps this into the per-band manifest so the CycloLab map can
+    render a legend for the satellite layer. Returns None for true-color / unknown
+    enhancements (RGB has no scalar palette; the map shows a generic note)."""
+    try:
+        enh = get_enhancement(enhancement)
+        ticks = list(enh.get("ticks") or [])
+        cmap = enh["cmap"]
+    except Exception:  # noqa: BLE001
+        return None
+    if not ticks:
+        return None
+    norm = enhancement_norm(enhancement)
+    stops = [{"color": _rgba_hex(cmap(norm(float(t)))), "label": f"{t:g}"}
+             for t in ticks]
+    return {"label": enh.get("cbar_label", "Brightness Temperature (°C)"),
+            "discrete": True, "stops": stops}
+
+
 def encode_webp(png: bytes, quality: int) -> bytes:
     """Re-encode a rendered PNG as lossy WebP at its NATIVE size (no resize).
 

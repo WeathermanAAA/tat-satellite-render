@@ -4740,6 +4740,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (!root || clMap) return;
     var storm = lastStorm || (typeof BAKED !== "undefined" ? BAKED : null);
     if (!storm) return;
+    // Stamp the storm ids the map uses to fetch this storm's floater + microwave
+    // imagery (atcf_long = bare atcf e.g. wp072026; sid = canonical id). Both are
+    // baked into the page; setting them here covers the live-feed storm too.
+    if (FLOATER_ID && !storm.atcf_long) storm.atcf_long = FLOATER_ID;
+    if (SID && !storm.sid) storm.sid = SID;
     _loadScript(SITE_BASE + "/cyclolab_map.js",
       function () { return !!window.CycloLabMap; },
       function () {

@@ -133,6 +133,12 @@ INVEST_DESIGNATION_DEG = float(_env("INVEST_DESIGNATION_DEG", "5.0"))
 
 # Geometry + cadence
 BBOX_DEG = float(_env("BBOX_DEG", "12"))           # square floater width (deg)
+# Map-ready tiles (CycloLab stacking map): a SECOND, chrome-free /render per frame
+# + per-frame WGS84 bounds in the manifest. Additive -- the chromed loop frames and
+# the floater viewer are untouched. HOT_ONLY restricts tiles to hot (IR) bands if
+# the render worker shows CPU/memory pressure (default OFF -> all bands get tiles).
+FLOATER_TILES_ENABLED = (_env("FLOATER_TILES_ENABLED", "1") or "1").lower() not in ("0", "false", "no")
+FLOATER_TILES_HOT_ONLY = (_env("FLOATER_TILES_HOT_ONLY", "0") or "0").lower() in ("1", "true", "yes")
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))   # hot-band target
 TRACKS_REFRESH_S = float(_env("TRACKS_REFRESH_S", "600"))  # storms update every 6 h
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))  # min gap between /render calls
@@ -915,13 +921,21 @@ class RenderSkip(Exception):
 
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
-                enhancement: str, storm: Optional[dict] = None) -> tuple[bytes, dict]:
+                enhancement: str, storm: Optional[dict] = None,
+                tile: bool = False) -> tuple[bytes, dict]:
     body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
                   "enhancement": enhancement, "format": FRAME_FORMAT}
+    # ``tile`` requests the chrome-free georeferenced map tile (transparent PNG,
+    # bare data pixels) for the CycloLab stacking map -- never the chromed frame.
+    # PNG (not FRAME_FORMAT/webp) so the alpha survives.
+    if tile:
+        body["tile"] = True
+        body["format"] = "png"
     # When supplied, /render burns a color-coded intensity badge into the
     # rendered frame's title strip (left side). Only sent from the poller path;
-    # legacy draw-a-box /satellite/ UI omits it and gets the plain title.
-    if storm is not None:
+    # legacy draw-a-box /satellite/ UI omits it and gets the plain title. Never
+    # sent for tiles (chrome-free -> no badge).
+    elif storm is not None:
         body["storm"] = storm
     last_exc: Exception | None = None
     for attempt in range(RENDER_MAX_RETRIES):
@@ -991,6 +1005,8 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
         t = parse_iso(f["t"])
         if t is None or t < history_cut:
             deleted.append(f["key"])
+            if f.get("tile_key"):
+                deleted.append(f["tile_key"])
             continue
         if t >= recent_cut:
             kept.append(f)
@@ -1002,6 +1018,8 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
             last_kept_t = t
         else:
             deleted.append(f["key"])
+            if f.get("tile_key"):
+                deleted.append(f["tile_key"])
     return kept, deleted
 
 
@@ -1232,7 +1250,9 @@ class Poller:
         self.r2.put_json(top_manifest_key(), obj, CACHE_MANIFEST)
 
     def append_frame(self, storm: Storm, band: Band, key: str, ts: dt.datetime,
-                     content_hash: str) -> None:
+                     content_hash: str, bounds: Optional[list] = None,
+                     tile_key: Optional[str] = None,
+                     legend: Optional[dict] = None) -> None:
         mkey = storm_manifest_key(storm.slug)
         man = self.r2.get_json(mkey) or {
             "id": storm.sid, "slug": storm.slug, "name": storm.name,
@@ -1245,7 +1265,13 @@ class Poller:
         bands = man.setdefault("bands", {})
         b = bands.setdefault(band.key, {"label": band.label, "frames": []})
         b["label"] = band.label
-        b["frames"].append({"t": iso_z(ts), "key": key})
+        # ADDITIVE map-ready fields (ignored by the existing floater viewer):
+        # WGS84 [W,S,E,N] bounds + chrome-free tile key PER FRAME (the 12 deg box
+        # re-centers as the storm moves), and the band's discrete legend once.
+        if legend is not None:
+            b["legend"] = legend
+        b["frames"].append({"t": iso_z(ts), "key": key,
+                            "bounds": bounds, "tile_key": tile_key})
         kept, deleted = prune_frames(b["frames"], utcnow())
         b["frames"] = kept
         b["latest"] = kept[-1]["key"] if kept else key
@@ -1310,10 +1336,39 @@ class Poller:
         key = frame_key(storm.slug, band.key, ts, ext)
         if not self.r2.put_bytes(key, frame, ctype, CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
-        self.append_frame(storm, band, key, ts, h)
+
+        # ADDITIVE: chrome-free georeferenced map tile for the CycloLab stacking
+        # map. A SECOND /render with tile=True (the expensive fetch/compose is
+        # shared via the render service's cache, so the marginal cost is one bare
+        # figure). Best-effort: a tile failure never blocks the chromed frame.
+        tile_key = None
+        legend = None
+        want_tile = FLOATER_TILES_ENABLED and (band.hot or not FLOATER_TILES_HOT_ONLY)
+        if want_tile:
+            try:
+                self.limiter.acquire()   # the tile is a 2nd /render -> rate-budget it
+                tile_bytes, tile_headers = call_render(
+                    self.session, bbox, band.channel, band.enhancement, tile=True)
+                tkey = frame_key(storm.slug, band.key + "/tiles", ts, ".png")
+                if self.r2.put_bytes(tkey, tile_bytes, "image/png", CACHE_FRAME):
+                    tile_key = tkey
+                    leg_hdr = next((v for k, v in tile_headers.items()
+                                    if k.lower() == "x-legend"), None)
+                    if leg_hdr:
+                        try:
+                            legend = json.loads(leg_hdr)
+                        except Exception:  # noqa: BLE001
+                            legend = None
+            except (RenderSkip, RenderError) as e:
+                log.info("tile skip %s/%s: %s", storm.slug, band.key, e)
+            except Exception as e:  # noqa: BLE001
+                log.warning("tile fail %s/%s: %s", storm.slug, band.key, e)
+
+        self.append_frame(storm, band, key, ts, h,
+                          bounds=bbox, tile_key=tile_key, legend=legend)
         u.last_hash = h
-        log.info("uploaded %s (%d B, %s)", key, len(frame),
-                 headers.get("X-Satellite", "?"))
+        log.info("uploaded %s (%d B, %s)%s", key, len(frame),
+                 headers.get("X-Satellite", "?"), " +tile" if tile_key else "")
 
     # ---- cadence --------------------------------------------------------
 
