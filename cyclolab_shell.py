@@ -3520,6 +3520,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   loadFormation();          // Stage C: eager NHC formation pill (invests only)
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
+  // Mount the Overview stacking map once the DOM is ready (IIFE-A scope).
+  if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", initOverviewMap);
+  else initOverviewMap();
   // ENDED pages used to skip the fetch entirely, which left advFull
   // null FOREVER - no cone, no intensity chart, blank advisory text on
   // every dead-storm page (final-gate-3 #4, the latent variant of the
@@ -5850,7 +5854,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     }).catch(function () { done(null); });
   }
   function wire() {
-    try { initOverviewMap(); } catch (e) {}
     PLOTS.forEach(function (p) {
       var el = document.getElementById(p[0]);
       if (!el) return;
