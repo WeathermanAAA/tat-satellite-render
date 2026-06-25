@@ -258,6 +258,44 @@ HTML_TEMPLATE = r"""<!doctype html>
      it whenever it carries no odds; a populated invest pill (not empty, not
      hidden) still shows. */
   .formation-pill[hidden], .formation-pill:empty { display: none; }
+  /* Phase 3b/3c: "Most resembles" pill + Analysis table + Archive picker. */
+  .resembles-pill { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    margin-top: 8px; font-size: 12px; color: var(--fg); }
+  .resembles-pill[hidden], .resembles-pill:empty { display: none; }
+  .resembles-pill .rp-lbl { font-size: 9px; font-weight: 800; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); }
+  .resembles-pill .rp-dot { color: var(--muted); }
+  .rp-link { background: none; border: 0; padding: 0; cursor: pointer; font: inherit;
+    font-weight: 800; color: var(--cat-accent); }
+  .rp-link:hover { text-decoration: underline; }
+  .analysis-root, .archive-root { padding: 4px 2px; }
+  .an-head .sec-title { margin: 0 0 2px; }
+  .an-table { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .an-row, .arc-row { display: flex; align-items: center; gap: 10px; width: 100%;
+    text-align: left; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 9px 11px; cursor: pointer; color: var(--fg); font: inherit; }
+  .an-row:hover, .arc-row:hover { border-color: var(--cat-accent); }
+  .an-rank { flex: 0 0 auto; width: 18px; color: var(--muted); font-weight: 800; font-size: 12px; }
+  .an-cat { flex: 0 0 auto; min-width: 30px; text-align: center; padding: 2px 5px;
+    border-radius: 5px; font-size: 10px; font-weight: 800; color: #06121f; }
+  .an-name { flex: 1 1 auto; font-weight: 700; min-width: 0; }
+  .an-name small { color: var(--muted); font-weight: 600; }
+  .an-sub { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
+  .an-sub b { color: var(--fg); }
+  .an-conf { flex: 0 0 auto; font-size: 9.5px; font-weight: 800; letter-spacing: .04em;
+    text-transform: uppercase; padding: 2px 6px; border-radius: 5px; }
+  .an-conf-high { color: #2bd47f; background: rgba(43,212,127,.14); }
+  .an-conf-moderate { color: #f5c842; background: rgba(245,200,66,.14); }
+  .an-conf-low { color: var(--muted); background: rgba(142,162,189,.12); }
+  .an-recon { flex: 0 0 auto; font-size: 8.5px; font-weight: 800; letter-spacing: .06em;
+    color: #5dd3ff; border: 1px solid rgba(93,211,255,.5); border-radius: 4px; padding: 1px 4px; }
+  .archive-search { width: 100%; box-sizing: border-box; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 9px; color: var(--fg);
+    padding: 9px 12px; font: inherit; margin-bottom: 10px; }
+  .archive-list { display: flex; flex-direction: column; gap: 6px; max-height: 38vh;
+    overflow: auto; margin-bottom: 12px; }
+  .archive-map { width: 100%; height: 56vh; min-height: 320px; border-radius: 12px;
+    overflow: hidden; background: var(--navy-deep); }
   /* "FORMATION" with "chance" stacked beneath it */
   .formation-pill .fp-eyebrow { display: inline-flex; flex-direction: column;
     line-height: 1.04; font-size: 9px; font-weight: 800; letter-spacing: 0.08em;
@@ -1011,7 +1049,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     .nav-secs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
       flex-direction: row; background: var(--navy-deep);
       border-top: 1px solid var(--border); padding: 0; }
-    .sec-btn { flex: 1 1 20%; justify-content: center; padding: 12px 3px;
+    .sec-btn { flex: 1 1 0; justify-content: center; padding: 12px 3px;
       min-height: 52px; font-size: 10px; border-left: 0;
       border-top: 3px solid transparent; }
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
@@ -1100,6 +1138,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         <!-- Stage C: NHC formation-chance pill (invests only; populated by
              loadFormation() from cyclolab/{sid}/formation.json). -->
         <div class="formation-pill" id="formation-pill" hidden></div>
+        <!-- Phase 3b: "Most resembles" top-3 analogs (hydrated from
+             cyclolab/{sid}/analogs.json). Self-hides when empty/absent. -->
+        <div class="resembles-pill" id="resembles-pill" hidden></div>
       </div>
     </div>
     <div class="bug-body">
@@ -1124,6 +1165,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       <button class="sec-btn" data-sec="recon">Recon</button>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
+      <button class="sec-btn" data-sec="analysis">Analysis</button>
+      <button class="sec-btn" data-sec="archive">Archive</button>
     </nav>
     <div class="side-foot">
       <button type="button" id="settings-btn" class="settings-btn"
@@ -1423,6 +1466,22 @@ HTML_TEMPLATE = r"""<!doctype html>
                   data-prod="tcd">Discussion</button>
         </div>
         <pre id="advtext" class="advtext">(loading advisory data…)</pre>
+      </div>
+    </div></section>
+    <!-- Phase 3b: ANALYSIS — ranked top-10 analogs ("most resembles"). -->
+    <section class="sec" id="sec-analysis"><div class="wipe">
+      <div id="analysis-root" class="analysis-root" tabindex="0">
+        <div class="note" id="analysis-status">Loading analogs…</div>
+      </div>
+    </div></section>
+    <!-- Phase 3c: ARCHIVE — historical storm picker -> explorer (archive mode). -->
+    <section class="sec" id="sec-archive"><div class="wipe">
+      <div id="archive-root" class="archive-root" tabindex="0">
+        <input id="archive-search" class="archive-search" type="search"
+               placeholder="Search historical storms — name or year…" autocomplete="off">
+        <div id="archive-list" class="archive-list"><div class="note">Loading archive…</div></div>
+        <div id="archive-map" class="archive-map"></div>
+        <div class="note" id="archive-hint">Pick a storm to load its track, intensity, and recon into the explorer.</div>
       </div>
     </div></section>
   </main>
@@ -2044,6 +2103,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (name === "models") { initModels(); initGuidance(); }
       else if (name === "satellite") initSatellite();
       else if (name === "recon") initRecon();
+      else if (name === "analysis") initAnalysis();
+      else if (name === "archive") initArchive();
     }
     // THE CONE reveal plays once per tab OPEN (not once per session):
     // rebuilding the SVG re-arms every CSS animation naturally.
@@ -3552,6 +3613,9 @@ HTML_TEMPLATE = r"""<!doctype html>
   buildVitals();
   buildSettingsUI();
   loadFormation();          // Stage C: eager NHC formation pill (invests only)
+  // Phase 3b: eagerly hydrate the masthead "Most resembles" pill (top-3); the
+  // full ranked table renders lazily when the Analysis tab opens.
+  loadAnalogs(function (a) { if (a) renderResemblesPill(a.analogs); });
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
   // Mount the Overview stacking map once the DOM is ready (IIFE-A scope).
@@ -4748,6 +4812,140 @@ HTML_TEMPLATE = r"""<!doctype html>
       },
       function () { if (window.console) console.warn("cyclolab_map.js failed to load"); });
   }
+  // ===================================================================
+  // Phase 3b/3c: analogs ("most resembles") + archive explorer.
+  // ===================================================================
+  var _analogs = undefined;          // cached analogs.json (null once fetched-empty)
+  var _archiveIdx = null;            // cached archive index
+  var archiveMap = null;             // the archive-mode CycloLabMap instance
+  function _aEsc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; });
+  }
+  var _CONF_LABEL = { high: "High match", moderate: "Moderate", low: "Nearest available" };
+
+  function loadAnalogs(cb) {
+    if (_analogs !== undefined) { cb(_analogs); return; }
+    fetchJson(CDN + "/cyclolab/" + encodeURIComponent(SID) + "/analogs.json")
+      .then(function (a) { _analogs = (a && a.analogs && a.analogs.length) ? a : null; cb(_analogs); })
+      .catch(function () { _analogs = null; cb(null); });
+  }
+
+  // Masthead "Most resembles: A 2020 · B 2021 · C 2016" (top 3, clickable).
+  function renderResemblesPill(analogs) {
+    var pill = document.getElementById("resembles-pill");
+    if (!pill || !analogs || !analogs.length) return;
+    var names = analogs.slice(0, 3).map(function (a) {
+      return '<button class="rp-link" data-sid="' + _aEsc(a.sid) + '">' +
+        _aEsc((a.name || "").toUpperCase()) + " " + _aEsc(a.year) + "</button>";
+    }).join(' <span class="rp-dot">·</span> ');
+    pill.innerHTML = '<span class="rp-lbl">Most resembles</span> ' + names;
+    pill.hidden = false;
+    pill.querySelectorAll(".rp-link").forEach(function (b) {
+      b.addEventListener("click", function () { openArchiveStorm(b.getAttribute("data-sid")); });
+    });
+  }
+
+  // Ranked top-10 table in the Analysis tab.
+  function renderAnalogTable(a, root) {
+    var rows = (a.analogs || []).slice(0, 10).map(function (r) {
+      var col = SSHS[r.peak_cat] || "#8ea2bd";
+      var conf = _CONF_LABEL[r.confidence] || r.confidence;
+      var recon = r.recon_available
+        ? '<span class="an-recon" title="Aircraft recon available">RECON</span>' : "";
+      return '<button class="an-row" data-sid="' + _aEsc(r.sid) + '">' +
+        '<span class="an-rank">' + r.rank + '</span>' +
+        '<span class="an-cat" style="background:' + col + '">' + _aEsc(r.peak_cat) + '</span>' +
+        '<span class="an-name">' + _aEsc((r.name || "").toUpperCase()) + ' <small>' + _aEsc(r.year) + '</small></span>' +
+        '<span class="an-sub">track <b>' + Math.round(r.d_track_km) + '</b> km · int <b>' +
+        Math.round(r.d_int_kt) + '</b> kt</span>' +
+        '<span class="an-conf an-conf-' + _aEsc(r.confidence) + '">' + _aEsc(conf) + '</span>' +
+        recon + '</button>';
+    }).join("");
+    var modeNote = a.mode === "leadtime"
+      ? 'Lead-time match over ' + (a.overlap_hours || 0) + ' h of shared track (live storm).'
+      : 'Full-track similarity (TSAI).';
+    root.innerHTML =
+      '<div class="an-head"><h2 class="sec-title">Most Resembles</h2>' +
+      '<p class="note">' + modeNote + ' Ranked by combined track + intensity distance; ' +
+      'weak matches shown as "nearest available". <a href="https://doi.org/10.1175/WAF-D-17-0182.1" ' +
+      'target="_blank" rel="noopener">method</a>.</p></div>' +
+      '<div class="an-table">' + rows + '</div>';
+    root.querySelectorAll(".an-row").forEach(function (b) {
+      b.addEventListener("click", function () { openArchiveStorm(b.getAttribute("data-sid")); });
+    });
+  }
+
+  function initAnalysis() {   // called once by openSec (it owns the inited guard)
+    var root = document.getElementById("analysis-root");
+    loadAnalogs(function (a) {
+      if (!a) { root.innerHTML = '<div class="note">No analogs available for this storm yet.</div>'; return; }
+      renderAnalogTable(a, root);
+    });
+  }
+
+  // Archive explorer: pick a historical storm -> load it into a CycloLabMap in
+  // archive mode (track + intensity + recon; imagery greyed/unavailable).
+  function renderArchiveList(filter) {
+    var list = document.getElementById("archive-list");
+    if (!list || !_archiveIdx) return;
+    var q = (filter || "").trim().toLowerCase();
+    var storms = (_archiveIdx.storms || []).filter(function (s) {
+      if (!q) return true;
+      return (String(s.name).toLowerCase().indexOf(q) >= 0) || (String(s.year).indexOf(q) >= 0);
+    }).slice(0, 300);
+    if (!storms.length) { list.innerHTML = '<div class="note">No matching storms.</div>'; return; }
+    list.innerHTML = storms.map(function (s) {
+      var recon = s.recon_available ? '<span class="an-recon">RECON</span>' : "";
+      return '<button class="arc-row" data-sid="' + _aEsc(s.sid) + '">' +
+        '<span class="an-cat" style="background:' + (SSHS[s.peak_cat] || "#8ea2bd") + '">' +
+        _aEsc(s.peak_cat) + '</span>' +
+        '<span class="an-name">' + _aEsc((s.name || "").toUpperCase()) + ' <small>' + _aEsc(s.year) +
+        ' · ' + _aEsc(s.basin) + '</small></span>' + recon + '</button>';
+    }).join("");
+    list.querySelectorAll(".arc-row").forEach(function (b) {
+      b.addEventListener("click", function () { loadArchiveStorm(b.getAttribute("data-sid")); });
+    });
+  }
+
+  function initArchive() {   // called once by openSec (it owns the inited guard)
+    var search = document.getElementById("archive-search");
+    if (search) search.addEventListener("input", function () { renderArchiveList(search.value); });
+    fetchJson(CDN + "/cyclolab/archive/index.json").then(function (idx) {
+      _archiveIdx = idx || { storms: [] };
+      renderArchiveList("");
+    }).catch(function () {
+      document.getElementById("archive-list").innerHTML =
+        '<div class="note">Archive index unavailable.</div>';
+    });
+  }
+
+  function loadArchiveStorm(sid) {
+    var mapEl = document.getElementById("archive-map");
+    if (!mapEl) return;
+    mapEl.innerHTML = '<div class="note" style="padding:18px">Loading ' + _aEsc(sid) + '…</div>';
+    fetchJson(CDN + "/cyclolab/archive/" + encodeURIComponent(sid) + "/track.json").then(function (storm) {
+      if (!storm || !storm.points) { mapEl.innerHTML = '<div class="note" style="padding:18px">Track unavailable for this storm.</div>'; return; }
+      _loadScript(SITE_BASE + "/cyclolab_map.js",
+        function () { return !!window.CycloLabMap; },
+        function () {
+          try {
+            if (archiveMap && archiveMap.destroy) archiveMap.destroy();
+            mapEl.innerHTML = "";
+            archiveMap = new window.CycloLabMap(mapEl, { storm: storm, archive: true });
+          } catch (e) { if (window.console) console.warn("archive map failed", e); }
+        },
+        function () { if (window.console) console.warn("cyclolab_map.js failed to load"); });
+    });
+  }
+
+  // Analog click-through (from the pill or the table): switch to the Archive tab
+  // then load that storm into the archive explorer.
+  function openArchiveStorm(sid) {
+    openSec("archive");          // first open lazily inits the archive tab
+    loadArchiveStorm(sid);
+  }
+
   function initRecon() {
     var root = document.getElementById("recon-viewer");
     var status = document.getElementById("recon-status");
