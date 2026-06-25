@@ -1439,6 +1439,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="seg-units" id="settings-units" role="radiogroup"
            aria-label="Wind units"></div>
     </div>
+    <div class="settings-row">
+      <div class="settings-lbl">Map time</div>
+      <div class="seg-units" id="settings-maptime" role="radiogroup"
+           aria-label="Map time mode"></div>
+    </div>
     <p class="settings-note">Display only. Agency forecasts are issued in
       knots; other units are converted here.</p>
   </div>
@@ -1617,7 +1622,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     kmh: { label: "km/h", conv: function (kt) { return kt * 1.852; } }
   };
   var SETTINGS_KEY = "cyclolab:settings";
-  var settings = { windUnits: "kt" };
+  var settings = { windUnits: "kt", mapTime: "synced" };
   function loadSettings() {
     var s = {};
     try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {}; }
@@ -1630,6 +1635,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var u = (q && WIND_UNITS[q]) ? q
           : (WIND_UNITS[s.windUnits] ? s.windUnits : "kt");
     settings.windUnits = u;
+    settings.mapTime = (s.mapTime === "independent") ? "independent" : "synced";
     if (q) saveSettings();
   }
   function saveSettings() {
@@ -1669,6 +1675,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     rerenderUnits();
     syncSettingsUI();
   }
+  function setMapTime(m) {
+    var mode = (m === "independent") ? "independent" : "synced";
+    settings.mapTime = mode;
+    saveSettings();
+    if (clMap && clMap.setTimeMode) clMap.setTimeMode(mode);
+    syncSettingsUI();
+  }
   function rerenderUnits() {
     // DISPLAY-ONLY: re-render every wind surface from the retained data.
     // apply() refreshes the hero + vitals; the W&P chart and the
@@ -1684,12 +1697,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   function syncSettingsUI() {
     var host = document.getElementById("settings-units");
-    if (!host) return;
-    for (var i = 0; i < host.children.length; i++) {
-      var b = host.children[i];
-      b.setAttribute("aria-checked",
-        b.getAttribute("data-unit") === settings.windUnits
-          ? "true" : "false");
+    if (host) {
+      for (var i = 0; i < host.children.length; i++) {
+        var b = host.children[i];
+        b.setAttribute("aria-checked",
+          b.getAttribute("data-unit") === settings.windUnits ? "true" : "false");
+      }
+    }
+    var mt = document.getElementById("settings-maptime");
+    if (mt) {
+      for (var j = 0; j < mt.children.length; j++) {
+        var c = mt.children[j];
+        c.setAttribute("aria-checked",
+          c.getAttribute("data-maptime") === settings.mapTime ? "true" : "false");
+      }
     }
   }
   function buildSettingsUI() {
@@ -1707,6 +1728,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
       host.appendChild(b);
     });
+    var mtHost = document.getElementById("settings-maptime");
+    if (mtHost) {
+      mtHost.innerHTML = "";
+      [["synced", "Synced"], ["independent", "Independent"]].forEach(function (m) {
+        var mb = document.createElement("button");
+        mb.type = "button"; mb.className = "seg-unit";
+        mb.setAttribute("role", "radio");
+        mb.setAttribute("data-maptime", m[0]);
+        mb.textContent = m[1];
+        mb.addEventListener("click", function () { setMapTime(this.getAttribute("data-maptime")); });
+        mtHost.appendChild(mb);
+      });
+    }
     syncSettingsUI();
     var pop = document.getElementById("settings-pop");
     var btn = document.getElementById("settings-btn");
@@ -4709,7 +4743,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     _loadScript(SITE_BASE + "/cyclolab_map.js",
       function () { return !!window.CycloLabMap; },
       function () {
-        try { clMap = new window.CycloLabMap(root, { storm: storm }); }
+        try { clMap = new window.CycloLabMap(root, { storm: storm, timeMode: settings.mapTime }); }
         catch (e) { if (window.console) console.warn("overview map failed", e); }
       },
       function () { if (window.console) console.warn("cyclolab_map.js failed to load"); });
