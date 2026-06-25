@@ -252,6 +252,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     margin-top: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
     font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
     border: 1px solid currentColor; width: fit-content; }
+  /* The genesis-odds pill is invest/PTC-only. For a designated storm it is
+     left [hidden] + empty, but the .formation-pill display above outranks the
+     [hidden] attribute, leaving a stray empty capsule (the "blank pill"). Hide
+     it whenever it carries no odds; a populated invest pill (not empty, not
+     hidden) still shows. */
+  .formation-pill[hidden], .formation-pill:empty { display: none; }
   /* "FORMATION" with "chance" stacked beneath it */
   .formation-pill .fp-eyebrow { display: inline-flex; flex-direction: column;
     line-height: 1.04; font-size: 9px; font-weight: 800; letter-spacing: 0.08em;
