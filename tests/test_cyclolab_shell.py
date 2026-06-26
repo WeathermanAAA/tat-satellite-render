@@ -628,6 +628,23 @@ class TestSectionNav(unittest.TestCase):
         self.assertEqual(st["activeSection"], "sec-recon")
         self.assertEqual(st["activeNav"], "recon")
 
+    def test_ascat_tab_opens_and_lazy_mounts_without_throwing(self):
+        # The ASCAT tab activates + lazy-loads the shared AscatViewer (the same
+        # component as the main /ascat/ page) locked to this storm; in jsdom the
+        # external scripts do not load, but initAscat must not throw and the
+        # section/nav must activate.
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [
+                 {"op": "openSec", "name": "ascat"},
+                 {"op": "snapshot"},
+             ]})
+        self.assertEqual(len(recs), 2)
+        st = recs[-1]["state"]
+        self.assertEqual(st["activeSection"], "sec-ascat")
+        self.assertEqual(st["activeNav"], "ascat")
+
 
 @unittest.skipIf(NODE is None, "node not on PATH")
 class TestPlainTextStats(unittest.TestCase):
