@@ -1122,6 +1122,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <button class="sec-btn active" data-sec="overview">Overview</button>
       <button class="sec-btn" data-sec="satellite">Satellite</button>
       <button class="sec-btn" data-sec="recon">Recon</button>
+      <button class="sec-btn" data-sec="ascat">ASCAT</button>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
     </nav>
@@ -1286,6 +1287,20 @@ HTML_TEMPLATE = r"""<!doctype html>
         flight-level + SFMR surface wind, vortex fixes, dropsondes) for this
         storm. SFMR is unreliable in heavy rain and at very high wind; obs are
         point-in-time.</p>
+    </div></section>
+    <section class="sec" id="sec-ascat"><div class="wipe">
+      <h2 class="sec-title">ASCAT</h2>
+      <div class="card" id="ascat-viewer" tabindex="0">
+        <div id="ascat-status" class="hafs-statusbox">
+          <div class="hafs-spinner"></div><span>Loading ASCAT&#8230;</span></div>
+      </div>
+      <p class="hafs-caption">ASCAT-B / ASCAT-C scatterometer ocean-surface winds
+        for the passes that overflew this storm. ASCAT is a C-band scatterometer:
+        it resolves the broad gale-force wind field well but underestimates the
+        extreme winds in a tropical cyclone's core (saturation and rain) - a
+        wind-field tool, not a peak-intensity tool. Rain- and quality-flagged cells
+        are removed; swaths are intermittent. Same renders as the site-wide
+        <a href="/ascat/">/ascat/</a> viewer. &#169; EUMETSAT.</p>
     </div></section>
     <section class="sec" id="sec-models"><div class="wipe">
       <h2 class="sec-title">Models</h2>
@@ -2044,6 +2059,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (name === "models") { initModels(); initGuidance(); }
       else if (name === "satellite") initSatellite();
       else if (name === "recon") initRecon();
+      else if (name === "ascat") initAscat();
     }
     // THE CONE reveal plays once per tab OPEN (not once per session):
     // rebuilding the SVG re-arms every CSS animation naturally.
@@ -2063,6 +2079,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (reconViewer) {
       if (name === "recon" && reconViewer._resume) reconViewer._resume();
       else if (reconViewer._pause) reconViewer._pause();
+    }
+    // same tab-gated polling for the ASCAT viewer (hydrates from CDN/ascat/)
+    if (ascatViewer) {
+      if (name === "ascat" && ascatViewer._resume) ascatViewer._resume();
+      else if (ascatViewer._pause) ascatViewer._pause();
     }
     var w = document.querySelector("#sec-" + name + " .wipe");
     if (w) { w.style.animation = "none"; void w.offsetWidth; w.style.animation = ""; }
@@ -4725,6 +4746,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   // the recon manifest slug; name is the fallback match). The viewer hydrates
   // from CDN/recon/ - the isolated aircraft-recon feed.
   var reconViewer = null;
+  var ascatViewer = null;
   function _loadScript(src, ready, cb, onerr) {
     if (ready()) { cb(); return; }
     var s = document.createElement("script");
@@ -4768,6 +4790,33 @@ HTML_TEMPLATE = r"""<!doctype html>
                 stormLock: FLOATER_ID || SID,
                 stormName: nmEl ? (nmEl.textContent || "").trim() : "",
                 startTab: "storms"
+              });
+            } catch (e) { fail(); }
+          }, fail);
+      }, fail);
+  }
+  // ---- ASCAT mount (SAME viewer component as the main /ascat/ page) --------
+  // Lazy-load TATRegions + the shared AscatViewer from the main site, then mount
+  // it LOCKED to this storm (the viewer filters the manifest to passes tagged
+  // with this storm and centers on it). Hydrates from CDN/ascat/ - the isolated
+  // scatterometer feed; never touches the track/ACE/climatology pipeline.
+  function initAscat() {
+    var root = document.getElementById("ascat-viewer");
+    var status = document.getElementById("ascat-status");
+    function fail() {
+      if (status) status.querySelector("span").textContent =
+        "ASCAT viewer failed to load - reload to retry.";
+    }
+    _loadScript(SITE_BASE + "/models/regions.js",
+      function () { return !!window.TATRegions; },
+      function () {
+        _loadScript(SITE_BASE + "/ascat/ascat.js",
+          function () { return !!window.AscatViewer; },
+          function () {
+            try {
+              ascatViewer = new window.AscatViewer(root, {
+                base: CDN + "/ascat",
+                stormLock: FLOATER_ID || SID
               });
             } catch (e) { fail(); }
           }, fail);
