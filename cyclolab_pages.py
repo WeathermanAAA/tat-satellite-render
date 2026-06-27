@@ -169,7 +169,16 @@ class CycloLabPageWriter:
             except Exception:           # noqa: BLE001 - invests/malformed
                 continue
             st = self._state.get(sid)
-            if not storm.get("is_active"):
+            # PART 1A - invest-aware liveness. ace_core never sets is_active for
+            # an invest (90-99): its DB/DS nature fails the "tropical" gate, so
+            # is_active drives ACE + the spinning-glyph marker, NOT liveness. An
+            # invest still getting fresh fixes carries recent_invest=True, and
+            # for the PAGE lifecycle that IS live - it must render the active page,
+            # not the frozen "THIS STORM HAS ENDED / archive" view. is_active
+            # alone still governs designated storms (unchanged); a stale invest
+            # (recent_invest False) falls through to the dissipation sweep below.
+            is_live = bool(storm.get("is_active")) or bool(storm.get("recent_invest"))
+            if not is_live:
                 # "Shared links never die" (FG-R3): a storm that ended
                 # between ledger resets (inactive + unknown to us) still gets
                 # its frozen ENDED archive page re-birthed ONCE under the live

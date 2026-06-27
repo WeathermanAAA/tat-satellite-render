@@ -4825,6 +4825,22 @@ HTML_TEMPLATE = r"""<!doctype html>
   function initModels() {
     function cl(id) { return document.getElementById("cl-hafs-" + id); }
     var status = cl("status");
+    // PART 1B - invests (and any system with no HAFS run) carry an empty
+    // HAFS_ID (storm_ids sets hafs_id="" for the 90-99 numbers). A null/empty
+    // stormLock is the /models/-page "show every storm" mode, so constructing
+    // the viewer here would silently mount the FIRST storm in the global HAFS
+    // manifest - i.e. ANOTHER storm's data. There is no HAFS for an invest, so
+    // show the empty stub and never build the viewer (the card's design
+    // contract: invests/PTCs get "HAFS gracefully absent"). A PTC keeps a real
+    // designated number, so HAFS_ID is non-empty and HAFS still runs for it.
+    if (!HAFS_ID) {
+      if (status) status.style.display = "none";
+      var clEmpty = cl("empty"); if (clEmpty) clEmpty.style.display = "block";
+      ["stage", "controls", "player", "caption", "hours"].forEach(function (id) {
+        var el = cl(id); if (el) el.style.display = "none";
+      });
+      return;
+    }
     status.style.display = "flex";
     function fail() {
       status.querySelector("span").textContent =
