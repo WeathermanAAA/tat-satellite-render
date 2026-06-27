@@ -436,6 +436,85 @@ def render_png(
     return buf.getvalue()
 
 
+def render_backdrop_webp(
+    data,
+    bbox,
+    *,
+    enhancement: str = "grayscale",
+    downsample: int = 1,
+    dpi: int = 110,
+    quality: int = 82,
+) -> bytes:
+    """Bare GRAYSCALE Clean-IR backdrop cutout for the ASCAT viewer (PART 4).
+
+    Same brightness-temperature pipeline as render_png's IR/WV branch, but with
+    ZERO baked chrome: ONE full-bleed PlateCarree axes (set_aspect('auto') so the
+    data fills the frame edge-to-edge), and no coastlines / gridlines / colorbar /
+    title strip / storm badge / watermark / min-max overlay. Returns an OPAQUE
+    WebP georeferenced to ``bbox`` ([W, S, E, N]); the consumer (ascat.js) draws
+    it into those exact WGS84 corner bounds and owns the single shared graticule,
+    coastline, colorbar, wind legend and watermark. Grayscale ONLY so the colored
+    wind barbs over it stay legible. Raises RuntimeError on a mostly-NaN
+    (degenerate / partial-fetch) field and ValueError on a non-gray enhancement.
+    """
+    enh = get_enhancement(enhancement)
+    if enh.get("kind") != "gray":
+        raise ValueError(
+            f"render_backdrop_webp requires a grayscale enhancement "
+            f"(got {enhancement!r}, kind={enh.get('kind')!r})"
+        )
+
+    cmi = data.cmi
+    lats = data.lats
+    lons = data.lons
+    if downsample > 1:
+        cmi = cmi[::downsample, ::downsample]
+        lats = lats[::downsample, ::downsample]
+        lons = lons[::downsample, ::downsample]
+
+    # Brightness temperature in °C (source Kelvin unless tagged C) — mirror of
+    # render_png's IR/WV branch.
+    bt = cmi
+    if data.units in ("C", "celsius", "degC"):
+        bt = bt + 273.15
+    bt_c = bt - 273.15
+    nan_frac = float(np.isnan(np.asarray(bt_c, dtype=float)).mean()) if bt_c.size else 1.0
+    if nan_frac > 0.55:
+        raise RuntimeError(
+            f"backdrop render produced a mostly-NaN field (nan={nan_frac:.0%}) "
+            "— bailing so a partial fetch never publishes a near-empty backdrop"
+        )
+    plot_field = np.ma.masked_invalid(bt_c)
+    plot_cmap = enh["cmap"]
+    plot_cnorm = enhancement_norm(enhancement)  # fresh, not shared
+
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lon_span = lon_max - lon_min
+    lat_span = lat_max - lat_min
+    aspect = lon_span / max(lat_span, 1e-6)
+
+    # Pixel proportions track the bbox aspect; set_aspect("auto") then fills the
+    # axes edge-to-edge so the image corners ARE the bbox corners (no letterbox).
+    fig_w = 10.0
+    fig_h = max(2.0, fig_w / max(aspect, 0.2))
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
+    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
+    ax.set_facecolor(DARK_BG)
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_aspect("auto")
+    ax.axis("off")
+    ax.pcolormesh(
+        lons, lats, plot_field,
+        cmap=plot_cmap, norm=plot_cnorm, shading="auto",
+        transform=ccrs.PlateCarree(), rasterized=True,
+    )
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG, edgecolor="none")
+    plt.close(fig)
+    return encode_webp(buf.getvalue(), quality)
+
+
 def encode_webp(png: bytes, quality: int) -> bytes:
     """Re-encode a rendered PNG as lossy WebP at its NATIVE size (no resize).
 

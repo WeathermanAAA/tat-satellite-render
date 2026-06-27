@@ -361,5 +361,75 @@ class TestRefreshStorms(unittest.TestCase):
         self.assertEqual(set(p.storms), set())
 
 
+class TestBackdropEmission(unittest.TestCase):
+    """PART 4: for the IR band, process_unit also renders+uploads a bare
+    grayscale backdrop and stamps bd_key + bounds on the IR frame; best-effort,
+    gated by FLOATER_BACKDROP_ENABLED; chromed frame untouched."""
+
+    def _build(self):
+        rec = {"bytes": {}, "calls": []}
+
+        class RecR2(_FakeR2):
+            def put_bytes(self, key, data, content_type, cache):
+                rec["bytes"][key] = content_type
+                return True
+
+        with mock.patch.object(fp, "R2", RecR2):
+            p = fp.Poller()
+        p.limiter = mock.Mock()   # no real rate-limit sleeping
+
+        def fake_render(session, bbox, channel, enhancement, storm=None, backdrop=False):
+            rec["calls"].append({"backdrop": backdrop, "enh": enhancement})
+            payload = b"BDWEBP" if backdrop else b"CHROMEDWEBP"
+            return payload, {"Content-Type": "image/webp"}
+
+        return p, rec, fake_render
+
+    def _manifest(self, p):
+        return next(v for k, v in p.r2.json_puts.items()
+                    if k.endswith("/manifest.json"))
+
+    def test_ir_emits_backdrop_with_bd_key_and_bounds(self):
+        p, rec, fake_render = self._build()
+        u = fp.Unit(storm=_named_storm(slug="wp08", name="HIGOS"),
+                    band=fp.BANDS_BY_KEY["ir"])
+        with mock.patch.object(fp, "call_render", fake_render), \
+             mock.patch.object(fp, "FLOATER_BACKDROP_ENABLED", True), \
+             mock.patch.object(fp, "FLOATER_BACKDROP_BAND", "ir"):
+            p.process_unit(u)
+        # a grayscale backdrop render was requested
+        self.assertTrue(any(c["backdrop"] and c["enh"] == "grayscale"
+                            for c in rec["calls"]))
+        bd_keys = [k for k in rec["bytes"]
+                   if "/ir/backdrop/" in k and k.endswith(".webp")]
+        self.assertEqual(len(bd_keys), 1)
+        fr = self._manifest(p)["bands"]["ir"]["frames"][-1]
+        self.assertEqual(fr["bd_key"], bd_keys[0])
+        self.assertEqual(len(fr["bounds"]), 4)        # [W,S,E,N]
+        # chromed frame key intact + NOT the backdrop key
+        self.assertIn("key", fr)
+        self.assertNotIn("/backdrop/", fr["key"])
+
+    def test_disabled_emits_no_backdrop(self):
+        p, rec, fake_render = self._build()
+        u = fp.Unit(storm=_named_storm(slug="wp08", name="HIGOS"),
+                    band=fp.BANDS_BY_KEY["ir"])
+        with mock.patch.object(fp, "call_render", fake_render), \
+             mock.patch.object(fp, "FLOATER_BACKDROP_ENABLED", False):
+            p.process_unit(u)
+        self.assertFalse(any(c["backdrop"] for c in rec["calls"]))
+        self.assertFalse(any("/backdrop/" in k for k in rec["bytes"]))
+        self.assertNotIn("bd_key", self._manifest(p)["bands"]["ir"]["frames"][-1])
+
+    def test_prune_drops_backdrop_sibling(self):
+        now = fp.utcnow()
+        old = fp.iso_z(now - dt.timedelta(hours=fp.HISTORY_WINDOW_H + 5))
+        kept, deleted = fp.prune_frames(
+            [{"t": old, "key": "k.webp", "bd_key": "k_bd.webp"}], now)
+        self.assertEqual(kept, [])
+        self.assertIn("k.webp", deleted)
+        self.assertIn("k_bd.webp", deleted)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

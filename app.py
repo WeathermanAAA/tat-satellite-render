@@ -36,7 +36,7 @@ from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from render import render_png, transcode_frame, encode_webp
+from render import render_png, render_backdrop_webp, transcode_frame, encode_webp
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -394,6 +394,11 @@ class RenderRequest(BaseModel):
     # default True -> unchanged.
     coastlines: bool = True   # coastlines + political borders
     gridlines: bool = True    # labeled lat/lon graticule
+    # PART 4 - clean Clean-IR BACKDROP for the ASCAT viewer: a bare GRAYSCALE
+    # raster (no chrome) georeferenced to bbox, returned as WebP. Overrides the
+    # normal render path; the enhancement is forced to grayscale. Additive +
+    # opt-in: every existing caller omits it -> False -> unchanged.
+    backdrop: bool = False
 
     @field_validator("quality")
     @classmethod
@@ -523,8 +528,11 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
         overlay_part += "|nocoast"
     if not body.gridlines:
         overlay_part += "|nogrid"
+    # PART 4: the bare grayscale backdrop is a DISTINCT artifact from the chromed
+    # render at the same bbox/channel -> its own cache slot (never clobbers it).
+    backdrop_part = "|bd" if body.backdrop else ""
     raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
-           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}")
+           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -609,7 +617,8 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
-        media_type = "image/webp" if out_format == "webp" else "image/png"
+        media_type = ("image/webp" if (out_format == "webp" or body.backdrop)
+                      else "image/png")
         return Response(content=content, media_type=media_type, headers=headers)
 
     cached = cache.get(cache_key)
@@ -640,6 +649,17 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
                 render_downsample = downsample
             def _render_job() -> bytes:
+                if body.backdrop:
+                    # PART 4: bare grayscale Clean-IR backdrop for the ASCAT
+                    # viewer (already WebP; skip the chromed render + transcode).
+                    # Enhancement is forced to a gray palette regardless of input.
+                    bd_enh = (body.enhancement
+                              if body.enhancement in ("grayscale", "ir_gray")
+                              else "grayscale")
+                    return render_backdrop_webp(
+                        data, body.bbox, enhancement=bd_enh,
+                        downsample=render_downsample, dpi=tier_dpi,
+                    )
                 out = render_png(
                     data,
                     body.bbox,
