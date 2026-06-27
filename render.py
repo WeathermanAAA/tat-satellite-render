@@ -521,6 +521,11 @@ def render_backdrop_webp(
     # valid region by one cell so an on-disk edge cell never stretches a quad out
     # to a filled coord (shading="auto" averages neighbouring centres -> limb
     # streaks otherwise). Without this, every basin backdrop 500s.
+    # Coerce coords to plain NaN-filled float arrays first -- a fetch may hand back
+    # MASKED lat/lon at the limb, and pcolormesh rejects BOTH non-finite values and
+    # masked-array coords, so np.where alone (which can stay masked) is not enough.
+    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
+    lats = np.asarray(np.ma.filled(lats, np.nan), dtype=float)
     xy_ok = np.isfinite(lons) & np.isfinite(lats)
     if not xy_ok.all():
         valid = _erode1(xy_ok & ~np.ma.getmaskarray(plot_field))

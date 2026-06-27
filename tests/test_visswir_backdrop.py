@@ -63,6 +63,17 @@ class TestOffDiskCoords(unittest.TestCase):
         data, bbox = _fetch_offdisk("1")
         self.assertEqual(render.render_backdrop_webp(data, bbox)[8:12], b"WEBP")
 
+    def test_masked_array_limb_coords_render(self):
+        # some fetches mask the limb instead of NaN-ing it; pcolormesh rejects
+        # masked coords too, so the coercion must handle both.
+        data, bbox = _fetch("K")
+        lats = np.ma.masked_invalid(np.array(data.lats, dtype=float))
+        lons = np.ma.masked_invalid(np.array(data.lons, dtype=float))
+        lats[:5, :] = np.ma.masked
+        lons[:5, :] = np.ma.masked
+        d2 = dataclasses.replace(data, lats=lats, lons=lons)
+        self.assertEqual(render.render_backdrop_webp(d2, bbox)[8:12], b"WEBP")
+
 
 class TestVisibleBackdrop(unittest.TestCase):
     def test_visible_branch_renders_grayscale_webp(self):
