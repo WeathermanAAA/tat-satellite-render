@@ -157,10 +157,14 @@ EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapol
 # disk, so out-of-coverage basins are skipped). Keyed by the region slug the
 # viewers look up in floaters/backdrops.json; bboxes are [W,S,E,N], env-tunable
 # cadence. Global view has no backdrop, so no global mosaic is needed.
+# [W,S,E,N] per region -- ALIGNED to the viewers' TATRegions extents (models/
+# regions.js: atlantic/epac/wpac) so the rendered backdrop covers exactly the
+# region the composite view frames to. Off-disk corners (a basin reaches the
+# satellite limb) render transparent via render_backdrop_webp's NaN-coord mask.
 BASIN_BACKDROP_REGIONS = {
-    "atlantic": [-100.0, 0.0, -10.0, 55.0],
-    "epac":     [-140.0, 5.0, -90.0, 35.0],
-    "wpac":     [105.0, 0.0, 175.0, 50.0],
+    "atlantic": [-100.0, 0.0, -5.0, 55.0],
+    "epac":     [-140.0, 5.0, -80.0, 35.0],
+    "wpac":     [100.0, 0.0, 180.0, 45.0],
 }
 BASIN_BACKDROP_REFRESH_S = float(_env("FLOATER_BASIN_BACKDROP_REFRESH_S", "1800"))
 # The ASCAT + MW canvas viewers draw their map pane at a FIXED pixel aspect
@@ -1475,14 +1479,17 @@ class Poller:
             return
         now = utcnow()
         index: dict = {}
-        for region, region_bbox in BASIN_BACKDROP_REGIONS.items():
+        for region, bbox in BASIN_BACKDROP_REGIONS.items():
             try:
-                clat = (region_bbox[1] + region_bbox[3]) / 2.0
-                clon = (region_bbox[0] + region_bbox[2]) / 2.0
+                clat = (bbox[1] + bbox[3]) / 2.0
+                clon = (bbox[0] + bbox[2]) / 2.0
                 channel, product = backdrop_band(clat, clon, now)
-                # Widen to the viewer map aspect so the basin backdrop fills the
-                # region frame edge-to-edge (same reason as the per-storm box).
-                bbox = widen_bbox_to_view(region_bbox)
+                # NB: basins are rendered at their NATIVE region extent -- NOT
+                # widened to the map aspect like the per-storm box. A basin already
+                # reaches the satellite disk limb; widening it pushes more of the
+                # frame off-disk (transparent) and can cross the dateline, so we
+                # keep the disk-centred extent for maximum real coverage and let
+                # the composite view's aspect margins be basemap.
                 self.limiter.acquire()
                 frame, _hdr = call_render(self.session, bbox, channel, "grayscale",
                                           backdrop=True)

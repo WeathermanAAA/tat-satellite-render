@@ -1,6 +1,7 @@
 """Vis/SWIR satellite-backdrop revision: render_backdrop_webp's VISIBLE branch,
 day/night band selection, per-storm bd_product stamping, and the basin-extent
 backdrop emitter + floaters/backdrops.json manifest block. Network-free."""
+import dataclasses
 import datetime as dt
 import io
 import math
@@ -33,6 +34,34 @@ def _fetch(units):
                        scan_start=dt.datetime(2026, 6, 21, 16, 0, tzinfo=dt.timezone.utc),
                        product="CMIPF", bucket="noaa-goes19", sat_name="GOES-19",
                        sub_sat_lon=-75.2, units=units), bbox
+
+
+def _fetch_offdisk(units="K"):
+    """Like _fetch but with a NaN border in the lat/lon COORD grids -- the
+    geostationary disk limb a basin-scale extent reaches (data present, no
+    geolocation). pcolormesh rejects non-finite coords, so this reproduces the
+    basin-backdrop 500."""
+    data, bbox = _fetch(units)
+    lats = np.array(data.lats, dtype=float)
+    lons = np.array(data.lons, dtype=float)
+    lats[:5, :] = np.nan; lats[:, :5] = np.nan       # off-disk corner ring
+    lons[:5, :] = np.nan; lons[:, :5] = np.nan
+    return dataclasses.replace(data, lats=lats.astype(np.float32),
+                               lons=lons.astype(np.float32)), bbox
+
+
+class TestOffDiskCoords(unittest.TestCase):
+    def test_nan_limb_coords_still_render(self):
+        # a basin extent reaches the geostationary limb -> NaN lat/lon; the
+        # backdrop must mask those cells and still emit a valid WebP, not 500.
+        data, bbox = _fetch_offdisk("K")
+        out = render.render_backdrop_webp(data, bbox)
+        self.assertEqual(out[:4], b"RIFF")
+        self.assertEqual(out[8:12], b"WEBP")
+
+    def test_nan_limb_coords_visible_path(self):
+        data, bbox = _fetch_offdisk("1")
+        self.assertEqual(render.render_backdrop_webp(data, bbox)[8:12], b"WEBP")
 
 
 class TestVisibleBackdrop(unittest.TestCase):
