@@ -152,6 +152,18 @@ NHC_RETIRE_GRACE_H = float(_env("NHC_RETIRE_GRACE_H", "12"))
 NIGHT_ZENITH_DEG = float(_env("NIGHT_ZENITH_DEG", "85"))   # >= this => skip daytime-only bands
 EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapolation
 
+# Basin/regional Vis/SWIR backdrops (basin views). ONE clean per-extent render
+# per basin (NOT a global mosaic: a basin must fit within a single satellite
+# disk, so out-of-coverage basins are skipped). Keyed by the region slug the
+# viewers look up in floaters/backdrops.json; bboxes are [W,S,E,N], env-tunable
+# cadence. Global view has no backdrop, so no global mosaic is needed.
+BASIN_BACKDROP_REGIONS = {
+    "atlantic": [-100.0, 0.0, -10.0, 55.0],
+    "epac":     [-140.0, 5.0, -90.0, 35.0],
+    "wpac":     [105.0, 0.0, 175.0, 50.0],
+}
+BASIN_BACKDROP_REFRESH_S = float(_env("FLOATER_BASIN_BACKDROP_REFRESH_S", "1800"))
+
 # Retention (R2) -- native recent + thinned history.
 RECENT_WINDOW_H = float(_env("RECENT_WINDOW_H", "6"))      # keep native cadence within this
 HISTORY_WINDOW_H = float(_env("HISTORY_WINDOW_H", "24"))   # thin to THIN_SPACING beyond recent
@@ -289,6 +301,18 @@ def solar_zenith_deg(lat: float, lon: float, when: dt.datetime) -> float:
                + math.cos(latr) * math.cos(decl) * math.cos(ha))
     cos_zen = max(-1.0, min(1.0, cos_zen))
     return math.degrees(math.acos(cos_zen))
+
+
+def backdrop_band(lat: float, lon: float, when: dt.datetime) -> tuple:
+    """Pick the satellite-backdrop band by day/night at (lat, lon): day (solar
+    zenith < NIGHT_ZENITH_DEG, i.e. sun a few deg up) -> day VISIBLE; night ->
+    SHORT-WAVE IR. Returns (generic_channel, product_label) -> the consumer header
+    shows the true product. The render service delivers visible as reflectance
+    (units '1') and SWIR as brightness temperature; render_backdrop_webp grayscales
+    either, chrome-free."""
+    if solar_zenith_deg(lat, lon, when) < NIGHT_ZENITH_DEG:
+        return "visible_red", "Vis"
+    return "shortwave_ir", "SWIR"
 
 
 def norm_lon(lon: float) -> float:
@@ -1054,6 +1078,7 @@ class Poller:
         self.retired_invests: dict[str, dt.datetime] = {}
         self.current_named: dict[str, Storm] = {}  # slug -> NHC named (last-known-good)
         self._last_tracks_refresh = 0.0
+        self._last_basin_backdrop = 0.0
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
 
@@ -1253,7 +1278,8 @@ class Poller:
 
     def append_frame(self, storm: Storm, band: Band, key: str, ts: dt.datetime,
                      content_hash: str, bd_key: str | None = None,
-                     bounds: list[float] | None = None) -> None:
+                     bounds: list[float] | None = None,
+                     bd_product: str | None = None) -> None:
         mkey = storm_manifest_key(storm.slug)
         man = self.r2.get_json(mkey) or {
             "id": storm.sid, "slug": storm.slug, "name": storm.name,
@@ -1275,6 +1301,8 @@ class Poller:
             fr["bd_key"] = bd_key
         if bounds:
             fr["bounds"] = bounds
+        if bd_product:
+            fr["bd_product"] = bd_product   # "Vis" | "SWIR" -> consumer header
         b["frames"].append(fr)
         kept, deleted = prune_frames(b["frames"], utcnow())
         b["frames"] = kept
@@ -1340,24 +1368,31 @@ class Poller:
         key = frame_key(storm.slug, band.key, ts, ext)
         if not self.r2.put_bytes(key, frame, ctype, CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
-        # PART 4: for the IR band, also render+upload a bare GRAYSCALE backdrop
-        # at the same bbox/time and stamp it on the frame (bd_key + bounds). Best
-        # effort: any failure here NEVER blocks the chromed frame just uploaded.
+        # Once per storm (on the gate band's slot), render+upload a bare GRAYSCALE
+        # VIS (day) / SWIR (night) backdrop at the same storm box/time and stamp it
+        # on the frame (bd_key + bounds + bd_product). Best effort: any failure
+        # here NEVER blocks the chromed frame just uploaded.
         bd_key: str | None = None
         bounds: list[float] | None = None
+        bd_product: str | None = None
         if FLOATER_BACKDROP_ENABLED and band.key == FLOATER_BACKDROP_BAND:
             try:
+                bd_channel, bd_product = backdrop_band(storm.lat, storm.lon, ts)
                 self.limiter.acquire()
                 bd_frame, _bd_headers = call_render(
-                    self.session, bbox, band.channel, "grayscale", backdrop=True,
+                    self.session, bbox, bd_channel, "grayscale", backdrop=True,
                 )
                 bd_candidate = frame_key(storm.slug, band.key + "/backdrop", ts, ".webp")
                 if self.r2.put_bytes(bd_candidate, bd_frame, "image/webp", CACHE_FRAME):
                     bd_key = bd_candidate
                     bounds = bbox
+                else:
+                    bd_product = None
             except Exception as e:  # noqa: BLE001 - backdrop is best-effort
                 log.warning("backdrop %s/%s skipped: %s", storm.slug, band.key, e)
-        self.append_frame(storm, band, key, ts, h, bd_key=bd_key, bounds=bounds)
+                bd_product = None
+        self.append_frame(storm, band, key, ts, h, bd_key=bd_key, bounds=bounds,
+                          bd_product=bd_product)
         u.last_hash = h
         log.info("uploaded %s (%d B, %s)", key, len(frame),
                  headers.get("X-Satellite", "?"))
@@ -1390,6 +1425,40 @@ class Poller:
 
     # ---- main loop ------------------------------------------------------
 
+    def refresh_basin_backdrops(self) -> None:
+        """Render a bare grayscale VIS (day) / SWIR (night) backdrop for each basin
+        region's extent and publish ``floaters/backdrops.json`` (region -> {product,
+        t, bounds:[W,S,E,N], key}) so the ASCAT/MW viewers can show a backdrop in
+        BASIN views, not just storm-centered. One per-extent render per basin,
+        day/night chosen at the basin center; best-effort — a basin outside a single
+        satellite's disk (RenderSkip) is simply omitted. R2 keys:
+        floaters/backdrops/{region}/{ts}.webp + the floaters/backdrops.json index."""
+        if not FLOATER_BACKDROP_ENABLED:
+            return
+        now = utcnow()
+        index: dict = {}
+        for region, bbox in BASIN_BACKDROP_REGIONS.items():
+            try:
+                clat = (bbox[1] + bbox[3]) / 2.0
+                clon = (bbox[0] + bbox[2]) / 2.0
+                channel, product = backdrop_band(clat, clon, now)
+                self.limiter.acquire()
+                frame, _hdr = call_render(self.session, bbox, channel, "grayscale",
+                                          backdrop=True)
+                key = f"{R2_PREFIX}/backdrops/{region}/{now:%Y%m%dT%H%MZ}.webp"
+                if self.r2.put_bytes(key, frame, "image/webp", CACHE_FRAME):
+                    index[region] = {"product": product, "t": iso_z(now),
+                                     "bounds": bbox, "key": key}
+            except RenderSkip as e:
+                log.info("basin backdrop %s: no single-disk coverage (%s)", region, e)
+            except Exception as e:  # noqa: BLE001 - best effort per basin
+                log.warning("basin backdrop %s failed: %s", region, e)
+        if index:
+            self.r2.put_json(f"{R2_PREFIX}/backdrops.json",
+                             {"generated_utc": iso_z(now), "backdrops": index},
+                             CACHE_MANIFEST)
+            log.info("basin backdrops published: %s", ", ".join(index))
+
     def run(self) -> None:
         log.info("floater poller starting | render=%s | bucket=%s | bbox=%g deg | spacing=%gs",
                  RENDER_URL, R2_BUCKET, BBOX_DEG, RATE_MIN_SPACING_S)
@@ -1399,6 +1468,11 @@ class Poller:
                         or not self.units:
                     self.refresh_storms()
                     self._last_tracks_refresh = time.monotonic()
+                # Basin backdrops refresh on their own cadence, independent of
+                # whether any storms are active (basin views exist with no storms).
+                if time.monotonic() - self._last_basin_backdrop >= BASIN_BACKDROP_REFRESH_S:
+                    self.refresh_basin_backdrops()
+                    self._last_basin_backdrop = time.monotonic()
                 if not self.units:
                     time.sleep(min(TRACKS_REFRESH_S, 60))  # idle: low CPU
                     continue

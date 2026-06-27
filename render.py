@@ -445,25 +445,22 @@ def render_backdrop_webp(
     dpi: int = 110,
     quality: int = 82,
 ) -> bytes:
-    """Bare GRAYSCALE Clean-IR backdrop cutout for the ASCAT viewer (PART 4).
+    """Bare GRAYSCALE Vis/SWIR satellite backdrop cutout for the ASCAT + MW viewers.
 
-    Same brightness-temperature pipeline as render_png's IR/WV branch, but with
-    ZERO baked chrome: ONE full-bleed PlateCarree axes (set_aspect('auto') so the
-    data fills the frame edge-to-edge), and no coastlines / gridlines / colorbar /
-    title strip / storm badge / watermark / min-max overlay. Returns an OPAQUE
-    WebP georeferenced to ``bbox`` ([W, S, E, N]); the consumer (ascat.js) draws
-    it into those exact WGS84 corner bounds and owns the single shared graticule,
-    coastline, colorbar, wind legend and watermark. Grayscale ONLY so the colored
-    wind barbs over it stay legible. Raises RuntimeError on a mostly-NaN
-    (degenerate / partial-fetch) field and ValueError on a non-gray enhancement.
+    Day scenes arrive as a VISIBLE channel (reflectance, units "1") and render via
+    the sqrt-stretched grayscale recipe; night scenes arrive as SHORT-WAVE IR (or
+    clean IR, brightness temperature) and render via the gray BT table. The
+    day/night CHOICE of band is made upstream (pick_backdrop_band); only the units
+    distinguish the two paths here. ZERO baked chrome either way: ONE full-bleed
+    PlateCarree axes (set_aspect('auto') so the data fills the frame edge-to-edge),
+    and no coastlines / gridlines / colorbar / title strip / storm badge /
+    watermark / min-max overlay. Returns an OPAQUE WebP georeferenced to ``bbox``
+    ([W, S, E, N]); the consumer draws it into those exact WGS84 corner bounds and
+    owns the single shared graticule, coastline, colorbar, legend and watermark.
+    Grayscale ONLY so the colored barbs / MW over it stay legible. Raises
+    RuntimeError on a mostly-NaN (degenerate / partial-fetch) field and ValueError
+    on a non-gray enhancement on the thermal path.
     """
-    enh = get_enhancement(enhancement)
-    if enh.get("kind") != "gray":
-        raise ValueError(
-            f"render_backdrop_webp requires a grayscale enhancement "
-            f"(got {enhancement!r}, kind={enh.get('kind')!r})"
-        )
-
     cmi = data.cmi
     lats = data.lats
     lons = data.lons
@@ -472,21 +469,35 @@ def render_backdrop_webp(
         lats = lats[::downsample, ::downsample]
         lons = lons[::downsample, ::downsample]
 
-    # Brightness temperature in °C (source Kelvin unless tagged C) — mirror of
-    # render_png's IR/WV branch.
-    bt = cmi
-    if data.units in ("C", "celsius", "degC"):
-        bt = bt + 273.15
-    bt_c = bt - 273.15
-    nan_frac = float(np.isnan(np.asarray(bt_c, dtype=float)).mean()) if bt_c.size else 1.0
+    if getattr(data, "units", "") == "1":
+        # VIS (day): visible reflectance -> sqrt-stretched grayscale (mirror of
+        # render_png's is_visible branch).
+        field = np.asarray(normalize_visible(cmi), dtype=float)
+        plot_field = np.ma.masked_invalid(field)
+        plot_cmap = plt.get_cmap("gray")
+        plot_cnorm = Normalize(vmin=0.0, vmax=1.0)
+    else:
+        # SWIR / clean IR (night): brightness temperature in °C on the gray table.
+        enh = get_enhancement(enhancement)
+        if enh.get("kind") != "gray":
+            raise ValueError(
+                f"render_backdrop_webp requires a grayscale enhancement on the "
+                f"thermal path (got {enhancement!r}, kind={enh.get('kind')!r})"
+            )
+        bt = cmi
+        if data.units in ("C", "celsius", "degC"):
+            bt = bt + 273.15
+        field = np.asarray(bt - 273.15, dtype=float)
+        plot_field = np.ma.masked_invalid(field)
+        plot_cmap = enh["cmap"]
+        plot_cnorm = enhancement_norm(enhancement)  # fresh, not shared
+
+    nan_frac = float(np.isnan(field).mean()) if field.size else 1.0
     if nan_frac > 0.55:
         raise RuntimeError(
             f"backdrop render produced a mostly-NaN field (nan={nan_frac:.0%}) "
             "— bailing so a partial fetch never publishes a near-empty backdrop"
         )
-    plot_field = np.ma.masked_invalid(bt_c)
-    plot_cmap = enh["cmap"]
-    plot_cnorm = enhancement_norm(enhancement)  # fresh, not shared
 
     lon_min, lat_min, lon_max, lat_max = bbox
     lon_span = lon_max - lon_min
