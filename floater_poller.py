@@ -190,6 +190,12 @@ BASIN_BACKDROP_REGIONS = {
     "io":       [30.0, -35.0, 110.0, 30.0],
 }
 BASIN_BACKDROP_REFRESH_S = float(_env("FLOATER_BASIN_BACKDROP_REFRESH_S", "1800"))
+# Wide-area (hemisphere/global) day-Vis/night-SWIR multi-sat mosaic (mosaic.py):
+# heavier than a basin render (3 disks), so a slower cadence. Kill switch
+# FLOATER_MOSAIC_ENABLED=false leaves the wide views greyed (no mosaic published).
+MOSAIC_ENABLED = (_env("FLOATER_MOSAIC_ENABLED", "1") or "1").lower() \
+    not in ("0", "false", "no")
+MOSAIC_REFRESH_S = float(_env("FLOATER_MOSAIC_REFRESH_S", "2700"))   # 45 min
 # The ASCAT + MW canvas viewers draw their map pane at a FIXED pixel aspect
 # (figW : figW*0.6  ->  W/H = 1.667) and fit the plot frame to the backdrop's
 # WGS84 bounds, then expand to that aspect (cos-lat corrected). A SQUARE backdrop
@@ -1139,6 +1145,10 @@ class Poller:
         self.current_named: dict[str, Storm] = {}  # slug -> NHC named (last-known-good)
         self._last_tracks_refresh = 0.0
         self._last_basin_backdrop = 0.0
+        self._last_mosaic = 0.0
+        # region -> backdrops.json entry; basin refresh + mosaic refresh both
+        # update this single dict and republish the union (no cross-clobber).
+        self._backdrop_index: dict = {}
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
 
@@ -1501,7 +1511,7 @@ class Poller:
         if not FLOATER_BACKDROP_ENABLED:
             return
         now = utcnow()
-        index: dict = {}
+        done = []
         for region, bbox in BASIN_BACKDROP_REGIONS.items():
             try:
                 clat = (bbox[1] + bbox[3]) / 2.0
@@ -1518,17 +1528,54 @@ class Poller:
                                           backdrop=True)
                 key = f"{R2_PREFIX}/backdrops/{region}/{now:%Y%m%dT%H%MZ}.webp"
                 if self.r2.put_bytes(key, frame, "image/webp", CACHE_FRAME):
-                    index[region] = {"product": product, "t": iso_z(now),
-                                     "bounds": bbox, "key": key}
+                    self._backdrop_index[region] = {
+                        "product": product, "t": iso_z(now),
+                        "bounds": bbox, "key": key}
+                    done.append(region)
             except RenderSkip as e:
                 log.info("basin backdrop %s: no single-disk coverage (%s)", region, e)
             except Exception as e:  # noqa: BLE001 - best effort per basin
                 log.warning("basin backdrop %s failed: %s", region, e)
-        if index:
+        if done:
+            self._publish_backdrops(now)
+            log.info("basin backdrops published: %s", ", ".join(done))
+
+    def _publish_backdrops(self, now: dt.datetime) -> None:
+        """Write the merged backdrops.json (basin regions + the wide-area mosaic
+        entries). Both refreshers update ``self._backdrop_index`` and call this, so
+        neither clobbers the other's keys (the poller loop is single-threaded)."""
+        if self._backdrop_index:
             self.r2.put_json(f"{R2_PREFIX}/backdrops.json",
-                             {"generated_utc": iso_z(now), "backdrops": index},
+                             {"generated_utc": iso_z(now),
+                              "backdrops": self._backdrop_index},
                              CACHE_MANIFEST)
-            log.info("basin backdrops published: %s", ", ".join(index))
+
+    def refresh_global_mosaic(self) -> None:
+        """Build the wide-area day-Vis/night-SWIR MULTI-SAT mosaic (GOES-E/W +
+        Himawari, per-pixel terminator, transparent gap) and point the global,
+        nhem and shem viewer regions at it in backdrops.json. Fail-safe: any error
+        leaves the prior entries (or none) in place -- the wide views just stay on
+        their last-known-good / greyed state, no regression. Heavy (multi-disk
+        fetch) so it runs on its own slow cadence."""
+        if not (FLOATER_BACKDROP_ENABLED and MOSAIC_ENABLED):
+            return
+        now = utcnow()
+        try:
+            import mosaic
+            webp, bounds, n_disks = mosaic.build_global_mosaic(now)
+        except Exception as e:  # noqa: BLE001 - never kill the poller loop
+            log.warning("global mosaic build failed: %s", e)
+            return
+        key = f"{R2_PREFIX}/backdrops/mosaic/{now:%Y%m%dT%H%MZ}.webp"
+        if not self.r2.put_bytes(key, webp, "image/webp", CACHE_FRAME):
+            return
+        entry = {"product": "Vis/SWIR", "t": iso_z(now), "bounds": bounds,
+                 "key": key, "sat": "GOES + Himawari", "disks": n_disks,
+                 "mosaic": True}
+        for region in ("global", "nhem", "shem"):
+            self._backdrop_index[region] = dict(entry)
+        self._publish_backdrops(now)
+        log.info("global mosaic published (%d disks, %d KB)", n_disks, len(webp) // 1024)
 
     def run(self) -> None:
         log.info("floater poller starting | render=%s | bucket=%s | bbox=%g deg | spacing=%gs",
@@ -1544,6 +1591,10 @@ class Poller:
                 if time.monotonic() - self._last_basin_backdrop >= BASIN_BACKDROP_REFRESH_S:
                     self.refresh_basin_backdrops()
                     self._last_basin_backdrop = time.monotonic()
+                # Wide-area mosaic on its own (slower) cadence, also storm-agnostic.
+                if time.monotonic() - self._last_mosaic >= MOSAIC_REFRESH_S:
+                    self.refresh_global_mosaic()
+                    self._last_mosaic = time.monotonic()
                 if not self.units:
                     time.sleep(min(TRACKS_REFRESH_S, 60))  # idle: low CPU
                     continue
