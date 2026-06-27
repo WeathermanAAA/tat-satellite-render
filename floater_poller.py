@@ -156,15 +156,38 @@ EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapol
 # per basin (NOT a global mosaic: a basin must fit within a single satellite
 # disk, so out-of-coverage basins are skipped). Keyed by the region slug the
 # viewers look up in floaters/backdrops.json; bboxes are [W,S,E,N], env-tunable
-# cadence. Global view has no backdrop, so no global mosaic is needed.
-# [W,S,E,N] per region -- ALIGNED to the viewers' TATRegions extents (models/
-# regions.js: atlantic/epac/wpac) so the rendered backdrop covers exactly the
-# region the composite view frames to. Off-disk corners (a basin reaches the
-# satellite limb) render transparent via render_backdrop_webp's NaN-coord mask.
+# cadence. Off-disk corners (a basin reaches the satellite limb) render
+# transparent via render_backdrop_webp's NaN-coord mask. Hemisphere/global (and
+# antimeridian-wide) views are served separately by the day-Vis/night-SWIR mosaic.
+# Every regional (non-hemisphere) TATRegions extent that a SINGLE geostationary
+# disk (GOES-East -75.2, GOES-West -137.2, Himawari 140.7) can cover. call_render
+# auto-selects the disk for each bbox; a region with no single-disk coverage (the
+# Africa/Europe/W-Indian-Ocean gap with no Meteosat in the registry, or an extent
+# too wide / antimeridian-spanning for one disk: npac, tpac) raises RenderSkip and
+# is simply omitted from backdrops.json -- those wide/gap views are served by the
+# day-Vis/night-SWIR MOSAIC (hemisphere/global) instead. Bboxes are [W,S,E,N],
+# ALIGNED to models/regions.js extentOf so the backdrop covers exactly the framed
+# region (swpac uses E=200 = 160W so the box is contiguous across the dateline).
 BASIN_BACKDROP_REGIONS = {
+    # --- GOES-East (Atlantic + the Americas) ---
     "atlantic": [-100.0, 0.0, -5.0, 55.0],
+    "watl":     [-100.0, 7.0, -55.0, 45.0],
+    "eatl":     [-65.0, 0.0, 0.0, 35.0],
+    "us":       [-125.0, 24.0, -66.0, 50.0],
+    "eus":      [-100.0, 24.0, -66.0, 50.0],
+    "samer":    [-85.0, -56.0, -34.0, 13.0],
+    # --- GOES-West (E-Pac + W North America + central Pacific) ---
     "epac":     [-140.0, 5.0, -80.0, 35.0],
+    "nepac":    [-180.0, 15.0, -110.0, 60.0],
+    "wus":      [-125.0, 30.0, -100.0, 50.0],
+    "namer":    [-170.0, 10.0, -50.0, 75.0],
+    # --- Himawari (W-Pac + Australia + E Asia / E Indian Ocean) ---
     "wpac":     [100.0, 0.0, 180.0, 45.0],
+    "twpac":    [100.0, 0.0, 180.0, 35.0],
+    "swpac":    [140.0, -35.0, 200.0, 5.0],
+    "aus":      [110.0, -45.0, 155.0, -8.0],
+    "asia":     [40.0, 5.0, 150.0, 75.0],
+    "io":       [30.0, -35.0, 110.0, 30.0],
 }
 BASIN_BACKDROP_REFRESH_S = float(_env("FLOATER_BASIN_BACKDROP_REFRESH_S", "1800"))
 # The ASCAT + MW canvas viewers draw their map pane at a FIXED pixel aspect
