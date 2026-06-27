@@ -163,6 +163,15 @@ BASIN_BACKDROP_REGIONS = {
     "wpac":     [105.0, 0.0, 175.0, 50.0],
 }
 BASIN_BACKDROP_REFRESH_S = float(_env("FLOATER_BASIN_BACKDROP_REFRESH_S", "1800"))
+# The ASCAT + MW canvas viewers draw their map pane at a FIXED pixel aspect
+# (figW : figW*0.6  ->  W/H = 1.667) and fit the plot frame to the backdrop's
+# WGS84 bounds, then expand to that aspect (cos-lat corrected). A SQUARE backdrop
+# therefore leaves bare basemap in the lon-margins of the wide frame. We render
+# the backdrop pre-widened to this aspect so the viewer's expansion is a no-op
+# and the imagery fills the frame edge-to-edge. Keep in sync with ascat.js /
+# microwave.js _layout() (mapH = figW*0.6) and _aspectExtent().
+BACKDROP_VIEW_ASPECT = float(_env("FLOATER_BACKDROP_VIEW_ASPECT", "1.667"))
+BACKDROP_MAX_LON_SPAN = float(_env("FLOATER_BACKDROP_MAX_LON_SPAN", "150"))
 
 # Retention (R2) -- native recent + thinned history.
 RECENT_WINDOW_H = float(_env("RECENT_WINDOW_H", "6"))      # keep native cadence within this
@@ -321,6 +330,30 @@ def norm_lon(lon: float) -> float:
     while lon < -180:
         lon += 360
     return lon
+
+
+def widen_bbox_to_view(bbox: list[float]) -> list[float]:
+    """Widen a ``[W, S, E, N]`` bbox in LONGITUDE so its on-screen aspect matches
+    the canvas viewers' map pane (BACKDROP_VIEW_ASPECT), keeping the latitude span
+    and center. cos-lat corrects the PlateCarree stretch (the viewers do the same
+    in _aspectExtent), so the widened box projects to exactly the viewer aspect
+    and fills the frame with no bare-basemap margins. Never SHRINKS lon (a box
+    already wider than the aspect is kept), and clamps the span so a high-lat box
+    never explodes. Edges are kept continuous around norm_lon(center) (E may
+    exceed +180 across the dateline) -- the viewers project in that same unwrapped
+    frame, matching the per-storm bounds contract."""
+    w, s, e, n = bbox
+    lat_span = float(n) - float(s)
+    clat = (float(s) + float(n)) / 2.0
+    clon = norm_lon((float(w) + float(e)) / 2.0)
+    cur_lon = float(e) - float(w)
+    cosl = max(0.30, math.cos(math.radians(clat)))   # clamp: high-lat boxes stay sane
+    want_lon = lat_span * BACKDROP_VIEW_ASPECT / cosl
+    # Widen only -- a box already wider than the aspect (a basin extent) is never
+    # shrunk; the absolute cap only catches a degenerate high-lat widening.
+    lon_span = max(cur_lon, min(BACKDROP_MAX_LON_SPAN, want_lon))
+    half = lon_span / 2.0
+    return [round(clon - half, 3), round(s, 3), round(clon + half, 3), round(n, 3)]
 
 
 # ---------------------------------------------------------------------------
@@ -1378,14 +1411,19 @@ class Poller:
         if FLOATER_BACKDROP_ENABLED and band.key == FLOATER_BACKDROP_BAND:
             try:
                 bd_channel, bd_product = backdrop_band(storm.lat, storm.lon, ts)
+                # Widen the backdrop box to the viewer map aspect so it fills the
+                # plot edge-to-edge (the square chromed-frame bbox would leave bare
+                # basemap in the wide frame's lon-margins). Separate from the
+                # chromed frame's bbox; the viewer frames to THESE bounds.
+                bd_bbox = widen_bbox_to_view(bbox)
                 self.limiter.acquire()
                 bd_frame, _bd_headers = call_render(
-                    self.session, bbox, bd_channel, "grayscale", backdrop=True,
+                    self.session, bd_bbox, bd_channel, "grayscale", backdrop=True,
                 )
                 bd_candidate = frame_key(storm.slug, band.key + "/backdrop", ts, ".webp")
                 if self.r2.put_bytes(bd_candidate, bd_frame, "image/webp", CACHE_FRAME):
                     bd_key = bd_candidate
-                    bounds = bbox
+                    bounds = bd_bbox
                 else:
                     bd_product = None
             except Exception as e:  # noqa: BLE001 - backdrop is best-effort
@@ -1437,11 +1475,14 @@ class Poller:
             return
         now = utcnow()
         index: dict = {}
-        for region, bbox in BASIN_BACKDROP_REGIONS.items():
+        for region, region_bbox in BASIN_BACKDROP_REGIONS.items():
             try:
-                clat = (bbox[1] + bbox[3]) / 2.0
-                clon = (bbox[0] + bbox[2]) / 2.0
+                clat = (region_bbox[1] + region_bbox[3]) / 2.0
+                clon = (region_bbox[0] + region_bbox[2]) / 2.0
                 channel, product = backdrop_band(clat, clon, now)
+                # Widen to the viewer map aspect so the basin backdrop fills the
+                # region frame edge-to-edge (same reason as the per-storm box).
+                bbox = widen_bbox_to_view(region_bbox)
                 self.limiter.acquire()
                 frame, _hdr = call_render(self.session, bbox, channel, "grayscale",
                                           backdrop=True)

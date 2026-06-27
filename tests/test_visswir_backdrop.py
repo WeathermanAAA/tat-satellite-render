@@ -3,6 +3,7 @@ day/night band selection, per-storm bd_product stamping, and the basin-extent
 backdrop emitter + floaters/backdrops.json manifest block. Network-free."""
 import datetime as dt
 import io
+import math
 import os
 import sys
 import unittest
@@ -124,6 +125,40 @@ class TestPerStormProduct(unittest.TestCase):
         expect_ch = "visible_red" if fr["bd_product"] == "Vis" else "shortwave_ir"
         self.assertEqual(bd_call["channel"], expect_ch)
         self.assertEqual(len(fr["bounds"]), 4)
+        # FIX: the backdrop box is WIDENED to the viewer map aspect (so it fills
+        # the plot edge-to-edge) -- wider in lon than the square chromed frame box,
+        # and the stamped bounds equal the box actually rendered.
+        chromed = next(c for c in calls if not c["backdrop"])
+        chromed_lon = chromed["bbox"][2] - chromed["bbox"][0]
+        bd_lon = bd_call["bbox"][2] - bd_call["bbox"][0]
+        self.assertGreater(bd_lon, chromed_lon)
+        self.assertEqual(bd_call["bbox"], fr["bounds"])
+
+
+class TestBackdropWidening(unittest.TestCase):
+    def test_squares_to_view_aspect(self):
+        # 12x12 square box centred at (lon=135, lat=36)
+        out = fp.widen_bbox_to_view([129.0, 30.0, 141.0, 42.0])
+        # latitude span + box centre are preserved; only lon widens
+        self.assertAlmostEqual(out[1], 30.0)
+        self.assertAlmostEqual(out[3], 42.0)
+        self.assertAlmostEqual((out[0] + out[2]) / 2.0, 135.0, places=2)
+        cosl = max(0.30, math.cos(math.radians(36.0)))
+        want_lon = 12.0 * fp.BACKDROP_VIEW_ASPECT / cosl
+        self.assertAlmostEqual(out[2] - out[0], want_lon, places=2)
+        self.assertGreater(out[2] - out[0], 12.0)   # wider than the square
+
+    def test_never_shrinks_a_wide_box(self):
+        out = fp.widen_bbox_to_view([-100.0, 0.0, -10.0, 30.0])   # 90 x 30
+        self.assertGreaterEqual(out[2] - out[0], 90.0 - 1e-6)
+
+    def test_high_latitude_cos_clamp(self):
+        # cos(lat) is clamped at 0.30 so a high-lat box widens by a BOUNDED factor
+        # rather than exploding; also under the absolute span cap.
+        out = fp.widen_bbox_to_view([0.0, 75.0, 12.0, 87.0])   # clat = 81
+        span = out[2] - out[0]
+        self.assertLessEqual(span, 12.0 * fp.BACKDROP_VIEW_ASPECT / 0.30 + 1e-6)
+        self.assertLessEqual(span, fp.BACKDROP_MAX_LON_SPAN + 1e-6)
 
 
 class TestBasinBackdrops(unittest.TestCase):
