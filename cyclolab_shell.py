@@ -809,6 +809,12 @@ HTML_TEMPLATE = r"""<!doctype html>
      ne_10m coastline polylines. Land paints OVER the graticule, so the
      graticule only shows on open water. */
   .ac-land { fill: #a7b2c4; stroke: none; }
+  /* PART 2: the guidance forecast-tracks graphic uses a RECESSIVE dark-slate
+     land (recon-V2 aesthetic) instead of the bright light-gray .ac-land - the
+     white land blobs fought the colored track aids for attention. gBasemap is
+     the gTracks-only emitter, so the cone / overview maps keep .ac-land. The
+     white coast + slate borders read crisply over this dark land. */
+  .gt-land { fill: #19314e; stroke: none; }
   /* coast + borders are FINE HAIRLINES (phase-4 v2 #3), retuned together: the
      old 2.6 coast / 1.4 border / 0.8 state read as heavy clutter at the cone
      auto-fit zoom. Now coast 1.3, country 0.7, state 0.5 - clean lines that
@@ -1844,7 +1850,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     return '<rect class="ac-ocean-fill" x="0" y="0" width="' + pr.W +
       '" height="' + pr.H + '"/>' +
-      '<path class="ac-land" d="' + pathOf(BASEMAP.land, true) + '"/>' +
+      '<path class="gt-land" d="' + pathOf(BASEMAP.land, true) + '"/>' +
       '<path class="ac-state" d="' + pathOf(BASEMAP.states || [], false) + '"/>' +
       '<path class="ac-border" d="' + pathOf(BASEMAP.borders, false) + '"/>' +
       '<path class="ac-coast" d="' + pathOf(BASEMAP_COAST, false) + '"/>';
@@ -1867,11 +1873,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     empty.style.display = "none";
-    var lats = ext.map(function (p) { return p.lat; }), lons = ext.map(function (p) { return p.lon; });
-    ext.push({ lat: Math.min.apply(null, lats) - 0.8, lon: Math.min.apply(null, lons) - 0.8 });
-    ext.push({ lat: Math.max.apply(null, lats) + 0.8, lon: Math.max.apply(null, lons) + 0.8 });
-    var pr = fitProjection(ext, 1000, 360, 560, 18), H = pr.H;
-    svg.setAttribute("viewBox", "0 0 1000 " + H);
+    // PART 2: aspect-FILL the panel so the tracks fill the frame. The shared
+    // fitProjection fits-to-CONTAIN and centers, which letterboxes a tall/narrow
+    // or wide/short track envelope into a corner with big empty-ocean dead space.
+    // gFitFrame pads the track bbox then expands it to the panel aspect (cos-lat
+    // correct) so both axes fill edge-to-edge.
+    var pr = gFitFrame(ext);
+    svg.setAttribute("viewBox", "0 0 " + pr.W + " " + pr.H);
     var body = [gBasemap(pr), graticule(pr)];
     var ordered = taids.slice().sort(function (a, b) { return (cons[a] ? 1 : 0) - (cons[b] ? 1 : 0); });
     ordered.forEach(function (t) {
@@ -2708,6 +2716,39 @@ HTML_TEMPLATE = r"""<!doctype html>
       lonAt: function (x) { return ((x - offX) / S + x0) / (60 * K); },
       latAt: function (y) { return -((y - offY) / S + y0) / 60; }
     };
+  }
+
+  // PART 2: aspect-FILL projection for the guidance forecast-tracks graphic.
+  // fitProjection fits-to-contain + centers (correct for the cone, whose H can
+  // grow), but a PANEL caps H, so a tall/narrow or wide/short track envelope
+  // gets letterboxed into a corner with big empty-ocean dead space. gFitFrame
+  // pads the track bbox, widens a too-small (single-aid) window to a sane floor,
+  // then EXPANDS the short axis to the panel aspect (cos-lat correct via the same
+  // K fitProjection uses) so spanX:spanY matches the frame -> offX=offY=0, the
+  // tracks fill edge-to-edge. Returns a normal fitProjection result (hMin==hMax
+  // pins H to the fixed panel height).
+  function gFitFrame(points) {
+    var FW = 1000, FH = 540, M = 18, MINDEG = 6;
+    var lats = points.map(function (p) { return p.lat; });
+    var lons = points.map(function (p) { return p.lon; });
+    var loLat = Math.min.apply(null, lats), hiLat = Math.max.apply(null, lats);
+    var loLon = Math.min.apply(null, lons), hiLon = Math.max.apply(null, lons);
+    var padLat = Math.max((hiLat - loLat) * 0.12, 0.6);
+    var padLon = Math.max((hiLon - loLon) * 0.12, 0.6);
+    loLat -= padLat; hiLat += padLat; loLon -= padLon; hiLon += padLon;
+    var cLat = (loLat + hiLat) / 2, cLon = (loLon + hiLon) / 2;
+    if (hiLat - loLat < MINDEG) { loLat = cLat - MINDEG / 2; hiLat = cLat + MINDEG / 2; }
+    if (hiLon - loLon < MINDEG) { loLon = cLon - MINDEG / 2; hiLon = cLon + MINDEG / 2; }
+    var K = Math.max(0.2, Math.cos(cLat * Math.PI / 180));
+    var spanLon = hiLon - loLon, spanLat = hiLat - loLat;
+    var target = ((FW - 2 * M) / (FH - 2 * M)) / K;   // desired lonSpan : latSpan
+    if (spanLon / spanLat < target) {                 // too tall -> widen lon
+      var nl = spanLat * target; loLon = cLon - nl / 2; hiLon = cLon + nl / 2;
+    } else {                                           // too wide -> heighten lat
+      var nh = spanLon / target; loLat = cLat - nh / 2; hiLat = cLat + nh / 2;
+    }
+    return fitProjection([{ lat: loLat, lon: loLon }, { lat: hiLat, lon: hiLon }],
+                         FW, FH, FH, M);
   }
 
   // Sparse-track fallback (PART D): a single-fix (or near-zero-extent) track
