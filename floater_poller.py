@@ -166,6 +166,16 @@ DEACTIVATE_GRACE_H = float(_env("DEACTIVATE_GRACE_H", "24"))  # keep frames afte
 # whatever /render actually sent is what gets keyed and served.
 FRAME_FORMAT = (_env("FRAME_FORMAT", "webp") or "webp").strip().lower()
 
+# PART 4 - clean Clean-IR BACKDROP for the ASCAT viewer. For the IR band only,
+# the poller renders a SECOND, bare GRAYSCALE raster (no chrome) at the same
+# bbox/time and stamps it on the IR frame as bd_key + bounds [W,S,E,N]. Purely
+# additive: the chromed floater frame, the floater viewer, and /satellite/ are
+# byte-identical. FLOATER_BACKDROP_ENABLED=false is the instant rollback (no
+# emission); the consumer falls back to the chromed key when bd_key is absent.
+FLOATER_BACKDROP_ENABLED = (_env("FLOATER_BACKDROP_ENABLED", "1") or "1") \
+    .strip().lower() not in ("0", "false", "no")
+FLOATER_BACKDROP_BAND = (_env("FLOATER_BACKDROP_BAND", "ir") or "ir").strip().lower()
+
 # HTTP timeouts / retries
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
 RENDER_MAX_RETRIES = int(_env("RENDER_MAX_RETRIES", "3"))
@@ -915,13 +925,19 @@ class RenderSkip(Exception):
 
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
-                enhancement: str, storm: Optional[dict] = None) -> tuple[bytes, dict]:
+                enhancement: str, storm: Optional[dict] = None,
+                backdrop: bool = False) -> tuple[bytes, dict]:
     body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
                   "enhancement": enhancement, "format": FRAME_FORMAT}
-    # When supplied, /render burns a color-coded intensity badge into the
-    # rendered frame's title strip (left side). Only sent from the poller path;
-    # legacy draw-a-box /satellite/ UI omits it and gets the plain title.
-    if storm is not None:
+    if backdrop:
+        # PART 4: bare grayscale Clean-IR backdrop (WebP, no chrome, no badge).
+        body["backdrop"] = True
+        body["enhancement"] = "grayscale"
+    elif storm is not None:
+        # When supplied, /render burns a color-coded intensity badge into the
+        # rendered frame's title strip (left side). Only sent from the poller
+        # path; legacy draw-a-box /satellite/ UI omits it and gets the plain
+        # title. Never sent on the bare backdrop path.
         body["storm"] = storm
     last_exc: Exception | None = None
     for attempt in range(RENDER_MAX_RETRIES):
@@ -991,6 +1007,8 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
         t = parse_iso(f["t"])
         if t is None or t < history_cut:
             deleted.append(f["key"])
+            if f.get("bd_key"):
+                deleted.append(f["bd_key"])   # PART 4: drop the backdrop sibling
             continue
         if t >= recent_cut:
             kept.append(f)
@@ -1002,6 +1020,8 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
             last_kept_t = t
         else:
             deleted.append(f["key"])
+            if f.get("bd_key"):
+                deleted.append(f["bd_key"])   # PART 4: drop the backdrop sibling
     return kept, deleted
 
 
@@ -1232,7 +1252,8 @@ class Poller:
         self.r2.put_json(top_manifest_key(), obj, CACHE_MANIFEST)
 
     def append_frame(self, storm: Storm, band: Band, key: str, ts: dt.datetime,
-                     content_hash: str) -> None:
+                     content_hash: str, bd_key: str | None = None,
+                     bounds: list[float] | None = None) -> None:
         mkey = storm_manifest_key(storm.slug)
         man = self.r2.get_json(mkey) or {
             "id": storm.sid, "slug": storm.slug, "name": storm.name,
@@ -1245,7 +1266,16 @@ class Poller:
         bands = man.setdefault("bands", {})
         b = bands.setdefault(band.key, {"label": band.label, "frames": []})
         b["label"] = band.label
-        b["frames"].append({"t": iso_z(ts), "key": key})
+        # PART 4: stamp the bare grayscale backdrop sibling onto the SAME frame
+        # (bd_key = its R2 key, bounds = [W,S,E,N]) so the ASCAT viewer can draw
+        # a chrome-free, georeferenced backdrop. Absent -> the consumer falls
+        # back to the chromed `key`.
+        fr = {"t": iso_z(ts), "key": key}
+        if bd_key:
+            fr["bd_key"] = bd_key
+        if bounds:
+            fr["bounds"] = bounds
+        b["frames"].append(fr)
         kept, deleted = prune_frames(b["frames"], utcnow())
         b["frames"] = kept
         b["latest"] = kept[-1]["key"] if kept else key
@@ -1310,7 +1340,24 @@ class Poller:
         key = frame_key(storm.slug, band.key, ts, ext)
         if not self.r2.put_bytes(key, frame, ctype, CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
-        self.append_frame(storm, band, key, ts, h)
+        # PART 4: for the IR band, also render+upload a bare GRAYSCALE backdrop
+        # at the same bbox/time and stamp it on the frame (bd_key + bounds). Best
+        # effort: any failure here NEVER blocks the chromed frame just uploaded.
+        bd_key: str | None = None
+        bounds: list[float] | None = None
+        if FLOATER_BACKDROP_ENABLED and band.key == FLOATER_BACKDROP_BAND:
+            try:
+                self.limiter.acquire()
+                bd_frame, _bd_headers = call_render(
+                    self.session, bbox, band.channel, "grayscale", backdrop=True,
+                )
+                bd_candidate = frame_key(storm.slug, band.key + "/backdrop", ts, ".webp")
+                if self.r2.put_bytes(bd_candidate, bd_frame, "image/webp", CACHE_FRAME):
+                    bd_key = bd_candidate
+                    bounds = bbox
+            except Exception as e:  # noqa: BLE001 - backdrop is best-effort
+                log.warning("backdrop %s/%s skipped: %s", storm.slug, band.key, e)
+        self.append_frame(storm, band, key, ts, h, bd_key=bd_key, bounds=bounds)
         u.last_hash = h
         log.info("uploaded %s (%d B, %s)", key, len(frame),
                  headers.get("X-Satellite", "?"))

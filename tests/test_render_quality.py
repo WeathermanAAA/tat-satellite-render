@@ -93,6 +93,12 @@ class RenderRequestTests(unittest.TestCase):
         self.assertFalse(r.coastlines)
         self.assertFalse(r.gridlines)
 
+    def test_backdrop_field_default_false_and_parses(self):
+        # PART 4: additive opt-in -> every existing caller omits it -> False.
+        self.assertFalse(app.RenderRequest(bbox=BBOX, channel="clean_ir").backdrop)
+        self.assertTrue(app.RenderRequest(bbox=BBOX, channel="clean_ir",
+                                          backdrop=True).backdrop)
+
 
 class CacheKeyTests(unittest.TestCase):
     def _key(self, **kw):
@@ -119,6 +125,11 @@ class CacheKeyTests(unittest.TestCase):
                                     "noaa-goes19", body.quality)
         self.assertEqual(wkey("low"), wkey("high"))
         self.assertEqual(wkey("default"), wkey("low"))
+
+    def test_backdrop_keys_separately_from_chromed(self):
+        # PART 4: the bare grayscale backdrop is a DISTINCT artifact at the same
+        # bbox/channel -> its own cache slot, never clobbering the chromed render.
+        self.assertNotEqual(self._key(), self._key(backdrop=True))
 
 
 class TierDpiTests(unittest.TestCase):
@@ -215,6 +226,42 @@ class RenderPngDpiTests(unittest.TestCase):
         a = render.render_png(data, bbox, 13, "t", "rainbow_ir", 1)
         b = render.render_png(data, bbox, 13, "t", "rainbow_ir", 1, dpi=110)
         self.assertEqual(a, b)
+
+
+class RenderBackdropTests(unittest.TestCase):
+    """PART 4: render_backdrop_webp = bare GRAYSCALE Clean-IR cutout, WebP,
+    georeferenced to bbox, zero chrome -- the ASCAT viewer's clean backdrop."""
+
+    def test_returns_grayscale_webp_tracking_bbox_aspect(self):
+        import io
+        from PIL import Image
+        import numpy as np
+        import render
+        data, bbox = _synthetic_ir()                      # 20x20deg square bbox
+        out = render.render_backdrop_webp(data, bbox)
+        self.assertEqual(out[:4], b"RIFF")
+        self.assertEqual(out[8:12], b"WEBP")
+        im = Image.open(io.BytesIO(out)).convert("RGB")
+        # square bbox -> ~square raster (no chrome margins skewing the aspect).
+        self.assertAlmostEqual(im.width / im.height, 1.0, delta=0.06)
+        # grayscale: R==G==B on every sampled pixel (bare gray palette).
+        arr = np.asarray(im)
+        s = arr[::40, ::40].reshape(-1, 3)
+        self.assertTrue(np.all(s[:, 0] == s[:, 1]) and np.all(s[:, 1] == s[:, 2]))
+
+    def test_degenerate_field_raises(self):
+        import numpy as np
+        import render
+        data, bbox = _synthetic_ir()
+        data.cmi[:] = np.nan                              # mostly-NaN -> bail
+        with self.assertRaises(RuntimeError):
+            render.render_backdrop_webp(data, bbox)
+
+    def test_non_gray_enhancement_raises(self):
+        import render
+        data, bbox = _synthetic_ir()
+        with self.assertRaises(ValueError):
+            render.render_backdrop_webp(data, bbox, enhancement="rainbow_ir")
 
 
 if __name__ == "__main__":
