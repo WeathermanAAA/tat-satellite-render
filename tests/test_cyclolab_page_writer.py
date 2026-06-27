@@ -137,7 +137,41 @@ class TestPageLifecycle(unittest.TestCase):
         self.assertIn("shadow/cyclolab/NHC_EP072026/index.html", by_key)
         ih = by_key["shadow/cyclolab/NHC_EP902026/index.html"]
         self.assertIn("data-invest", ih[ih.index("<html"):ih.index("<head")])
-        self.assertIn("THIS STORM HAS ENDED", ih)
+        self.assertIn("data-ended", ih[ih.index("<html"):ih.index("<head")])
+
+    def test_active_invest_renders_live_not_ended(self):
+        # PART 1A: an invest is NEVER ace_core-is_active (its DB/DS nature fails
+        # the tropical gate), but a fresh fix sets recent_invest=True. The
+        # lifecycle must render such an invest as a LIVE page (grey/red-X invest
+        # identity, NO "ended/archive" frame) - the 95W-rendered-as-dead bug.
+        invest = {**SYNTH, "sid": "NHC_EP952026", "is_active": False,
+                  "is_invest": True, "recent_invest": True,
+                  "latest_fix_valid_utc": self._recent_fix()}
+        self.w.update("ep", feed([invest]))
+        self.assertEqual(len(self.sink.writes), 1)
+        key, html = self.sink.writes[0]
+        self.assertEqual(key, "shadow/cyclolab/NHC_EP952026/index.html")
+        head = html[html.index("<html"):html.index("<head")]
+        self.assertIn("data-invest", head)          # grey/red-X invest identity
+        self.assertNotIn("data-ended", head)        # NOT frozen as a dead archive
+
+    def test_active_invest_ends_only_after_it_stops_being_recent(self):
+        # The same invest must still END properly once it stops getting fixes
+        # (recent_invest False) - via the normal debounced dissipation sweep,
+        # not immediately. Guards against the fix leaving invests "live forever".
+        invest = {**SYNTH, "sid": "NHC_EP952026", "is_active": False,
+                  "is_invest": True, "recent_invest": True,
+                  "latest_fix_valid_utc": self._recent_fix()}
+        self.w.update("ep", feed([invest]))                       # live birth
+        live_head = self.sink.writes[-1][1]
+        self.assertNotIn("data-ended",
+                         live_head[live_head.index("<html"):live_head.index("<head")])
+        stale = {**invest, "recent_invest": False}
+        for _ in range(ENDED_DEBOUNCE_POLLS):
+            self.w.update("ep", feed([stale]))                   # no longer recent
+        end_html = self.sink.writes[-1][1]
+        self.assertIn("data-ended",
+                      end_html[end_html.index("<html"):end_html.index("<head")])
 
     def test_recent_inactive_rebirths_only_once(self):
         inactive = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,

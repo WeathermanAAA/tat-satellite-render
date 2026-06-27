@@ -7,6 +7,7 @@ format-drift guards. Run: python -m unittest discover -s tests -v
 """
 from __future__ import annotations
 
+import datetime as _dt
 import gzip
 import os
 import sys
@@ -29,13 +30,28 @@ def _adeck(rows):
     return "\n".join(", ".join(str(x) for x in r) for r in rows)
 
 
-# a synthetic a-deck row: BASIN,CY,INIT,TECHNUM,TECH,TAU,LAT,LON,VMAX,MSLP,TY,RAD
-def _row(tech, tau, lat="120N", lon="800W", vmax=40, mslp=1000, init="2026061512", rad=34, ty="TS"):
+def _recent_cycle(hours_ago: int = 6) -> str:
+    """A realistic recent 6-hourly synoptic cycle ('YYYYMMDDHH') within the
+    poller's guidance freshness window (GUIDANCE_MAX_AGE_H) - an active storm's
+    a-deck always carries one. Computed at import so run_once fixtures exercise
+    the live (non-stale) path regardless of wall-clock drift."""
+    t = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours_ago)
+    t = t.replace(hour=(t.hour // 6) * 6, minute=0, second=0, microsecond=0)
+    return t.strftime("%Y%m%d%H")
+
+
+_RECENT_CYCLE = _recent_cycle()
+
+
+# a synthetic a-deck row: BASIN,CY,INIT,TECHNUM,TECH,TAU,LAT,LON,VMAX,MSLP,TY,RAD.
+# init defaults to a RECENT cycle so process_entity's freshness gate sees fresh
+# guidance; parser-level tests pass explicit init values where the cycle matters.
+def _row(tech, tau, lat="120N", lon="800W", vmax=40, mslp=1000, init=_RECENT_CYCLE, rad=34, ty="TS"):
     return ["AL", "90", init, "01", tech, tau, lat, lon, vmax, mslp, ty, rad]
 
 
 # a WPAC DTC adecks_open row (global / ensemble model): BASIN=WP, CY=07, 143E
-def _wp_row(tech, tau, lat="129N", lon="1431E", vmax=30, mslp=1005, init="2026061818"):
+def _wp_row(tech, tau, lat="129N", lon="1431E", vmax=30, mslp=1005, init=_RECENT_CYCLE):
     return ["WP", "07", init, "01", tech, tau, lat, lon, vmax, mslp, "TS", 34]
 
 
@@ -281,6 +297,48 @@ class TestWPGuidance(unittest.TestCase):
         self.assertTrue(st["NHC_EP932026"]["ok"])            # NHC fully processed
         self.assertFalse(st["JTWC_WP072026"]["ok"])          # WP degrades, no crash
         self.assertEqual(st["JTWC_WP072026"].get("reason"), "a-deck unavailable")
+
+
+class TestGuidanceFreshness(unittest.TestCase):
+    """PART 1B: stale a-deck cycles (a recycled invest number's old file) must
+    not render as THIS storm's guidance - they drop to the honest empty state."""
+
+    def test_cycle_is_stale_helper(self):
+        self.assertFalse(gp._cycle_is_stale(None))            # no cycle -> not stale
+        self.assertFalse(gp._cycle_is_stale("garbage"))       # unparseable -> not stale
+        self.assertFalse(gp._cycle_is_stale(_RECENT_CYCLE))   # fresh -> not stale
+        self.assertTrue(gp._cycle_is_stale("2026011500"))     # months old -> stale
+
+    def test_recycled_invest_stale_adeck_drops_to_empty(self):
+        # An invest (95W) whose a-deck only holds a PRIOR same-numbered invest's
+        # old March cycle - the exact 95W-shows-stale-tracks bug. parse_adeck
+        # would pick that cycle; the freshness gate must null it so gTracks shows
+        # the empty state instead of months-old aids for a different system.
+        stale = "2026031100"
+        wp = _adeck([_wp_row("AEMN", 0, init=stale),
+                     _wp_row("AEMN", 12, lat="135N", init=stale),
+                     _wp_row("CEMN", 0, init=stale)])
+        sess = _Session(_feed("JTWC_WP952026"), {"awp952026": wp}, {})
+        written = {}
+        st = gp.run_once(sess, lambda k, o: (written.__setitem__(k, o) or True))
+        gj = written[f"{gp.R2_PREFIX}/JTWC_WP952026/guidance.json"]
+        self.assertEqual(gj["present_aids"], [])              # NO stale aids surfaced
+        self.assertEqual(gj["track_aids"], [])
+        self.assertEqual(gj["aids"], {})
+        self.assertIsNone(gj["init_cycle"])
+        self.assertEqual(gj["stale_skipped"], stale)         # recorded for observability
+        self.assertEqual(st[0].get("guidance_stale"), stale)
+
+    def test_fresh_invest_adeck_passes_through(self):
+        # Same invest sid but a FRESH cycle -> aids ARE published (gate is age,
+        # not invest-ness): never suppress a genuinely-active system's guidance.
+        wp = _adeck([_wp_row("AEMN", 0), _wp_row("AEMN", 12, lat="135N")])
+        sess = _Session(_feed("JTWC_WP952026"), {"awp952026": wp}, {})
+        written = {}
+        gp.run_once(sess, lambda k, o: (written.__setitem__(k, o) or True))
+        gj = written[f"{gp.R2_PREFIX}/JTWC_WP952026/guidance.json"]
+        self.assertIn("AEMN", gj["present_aids"])
+        self.assertNotIn("stale_skipped", gj)
 
 
 _TWO_EP = (

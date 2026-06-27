@@ -385,6 +385,9 @@ const scheduledDelays = [];
     return {
       adv: adv,
       hafsCtor: hafs,
+      hafsEmptyShown:
+        ((win.document.getElementById("cl-hafs-empty") || {}).style || {})
+          .display === "block",
       hafsScriptInjected: !!scriptEl,
       hafsScriptSrc: scriptEl ? scriptEl.src : null,
       sat: sat,

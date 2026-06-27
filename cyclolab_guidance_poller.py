@@ -59,6 +59,15 @@ SHIPS_BASE = "https://ftp.nhc.noaa.gov/atcf/stext"
 CACHE_CONTROL = "public, max-age=120"
 UA = {"User-Agent": "triple-a-tropics-cyclolab-guidance/1.0 (+triple-a-tropics.com)"}
 _TIMEOUT = 25.0
+# PART 1B - invest a-deck freshness gate. Invest numbers 90-99 RECYCLE across a
+# season, so a-deck file a{basin}{nn}{year}.dat accumulates EVERY system that
+# wore that number this year. A fresh invest with no model run yet leaves only a
+# PRIOR same-numbered invest's old cycle in the file; parse_adeck picks that
+# stale cycle, which would otherwise render as THIS storm's "forecast tracks"
+# (months-old aids for a different system). Guidance whose init cycle is older
+# than this is dropped to the empty state. Active storms get a-deck cycles every
+# ~6 h, so 48 h never drops a genuinely-active system.
+GUIDANCE_MAX_AGE_H = float(_env("GUIDANCE_MAX_AGE_H", "48"))
 
 
 def _iso_now() -> str:
@@ -128,6 +137,20 @@ def fetch_adeck(session: requests.Session, url: str) -> Optional[str]:
 def _prior_cycle(cycle: str) -> str:
     t = dt.datetime.strptime(cycle, "%Y%m%d%H").replace(tzinfo=UTC) - dt.timedelta(hours=6)
     return t.strftime("%Y%m%d%H")
+
+
+def _cycle_is_stale(cycle: Optional[str], now=None) -> bool:
+    """True if an a-deck init cycle ('YYYYMMDDHH') is older than
+    GUIDANCE_MAX_AGE_H. None/unparseable -> False (the genuine no-guidance
+    path is the empty-aids branch, handled by the front-end, not here)."""
+    if not cycle:
+        return False
+    try:
+        t = dt.datetime.strptime(str(cycle), "%Y%m%d%H").replace(tzinfo=UTC)
+    except Exception:  # noqa: BLE001 - malformed cycle -> treat as not-stale
+        return False
+    now = now or dt.datetime.now(UTC)
+    return (now - t) > dt.timedelta(hours=GUIDANCE_MAX_AGE_H)
 
 
 def fetch_ships(session: requests.Session, cycle: str, basin: str, nn: str, year: str
@@ -224,6 +247,17 @@ def process_entity(sid: str, session: requests.Session,
     guidance = cg.parse_adeck(raw, basin=basin)
     guidance.update({"sid": sid, "basin": basin, "generated_at": _iso_now(),
                      "source": "dtc-atcf-adecks_open" if is_wp else "nhc-atcf-aid_public"})
+    # PART 1B freshness gate: a stale cycle (a recycled invest number's old
+    # a-deck) is NOT this storm's guidance. Null the aids so the page shows the
+    # honest empty state instead of months-old tracks for a different system;
+    # publishing the empty also overwrites any previously-written stale file.
+    # init_cycle now falls to None, so the SHIPS path below also stubs out.
+    if _cycle_is_stale(guidance.get("init_cycle")):
+        status["guidance_stale"] = guidance.get("init_cycle")
+        guidance.update({"init_time": None, "init_cycle": None, "aids": {},
+                         "present_aids": [], "track_aids": [],
+                         "intensity_aids": [], "consensus": [],
+                         "stale_skipped": status["guidance_stale"]})
     status["warns"] = _qc_guidance(guidance)
     status["guidance"] = put_json(f"{R2_PREFIX}/{sid}/guidance.json", guidance)
     status["init"] = guidance.get("init_cycle")

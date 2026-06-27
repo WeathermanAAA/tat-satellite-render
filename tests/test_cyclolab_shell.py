@@ -596,6 +596,32 @@ class TestSectionNav(unittest.TestCase):
         self.assertEqual(st["activeSection"], "sec-models")
         self.assertEqual(st["activeNav"], "models")
 
+    def test_models_tab_invest_shows_empty_not_other_storm(self):
+        # PART 1B: an invest has hafs_id="" (storm_ids), so initModels must show
+        # the empty stub and NEVER construct the HafsViewer - a null/empty
+        # stormLock would silently mount the FIRST storm in the global manifest
+        # (another storm's data: the 95W-Models-shows-07W bug).
+        invest = {**self.storm, "sid": "NHC_EP952026", "is_invest": True}
+        html = cyclolab_shell.render_page(invest, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"hafs_stub": True, "ops": [{"op": "openSec", "name": "models"}]})
+        s3 = recs[-1]["state"]["stage3"]
+        self.assertIsNone(s3["hafsCtor"])         # viewer NOT constructed for an invest
+        self.assertTrue(s3["hafsEmptyShown"])     # the "no model guidance" stub shows
+
+    def test_models_tab_designated_storm_builds_locked_viewer(self):
+        # Complement: a DESIGNATED storm (non-empty hafs_id) DOES build the
+        # viewer - the guard keys on empty HAFS_ID only and never suppresses a
+        # real storm's HAFS.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"hafs_stub": True, "ops": [{"op": "openSec", "name": "models"}]})
+        s3 = recs[-1]["state"]["stage3"]
+        self.assertIsNotNone(s3["hafsCtor"])      # viewer built for a designated storm
+        self.assertFalse(s3["hafsEmptyShown"])
+
     def test_unknown_section_is_a_noop_no_throw(self):
         # An unknown name must not throw (the harness would non-zero exit on a
         # script error); the page stays alive and renders a further snapshot.
