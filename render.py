@@ -36,7 +36,9 @@ log = logging.getLogger("tat-satellite.render")
 # asset the CycloLab basemap ships). Loaded locally instead of via cartopy's
 # runtime downloader, whose admin_1 URL 404s on the deploy host (coastline +
 # admin_0 borders download fine there; admin_1 does not).
-_STATE_LINES_PATH = Path(__file__).with_name("cyclolab_ne_10m_states.geojson")
+# .resolve() so a relative __file__ (uvicorn import from CWD) still yields the
+# absolute path next to render.py — mirrors cyclolab_basemap's proven pattern.
+_STATE_LINES_PATH = Path(__file__).resolve().with_name("cyclolab_ne_10m_states.geojson")
 
 
 @lru_cache(maxsize=1)
@@ -50,6 +52,16 @@ def _state_lines_feature() -> Optional[ShapelyFeature]:
     if not geoms:
         return None
     return ShapelyFeature(geoms, ccrs.PlateCarree())
+
+
+def state_lines_status() -> str:
+    """Diagnostic: did the vendored admin_1 layer load on this host? Surfaced
+    via the X-State-Lines response header to verify the deploy at runtime."""
+    p = _STATE_LINES_PATH
+    try:
+        return "loaded" if _state_lines_feature() is not None else f"absent(exists={p.exists()},p={p})"
+    except Exception as e:  # noqa: BLE001
+        return f"error:{type(e).__name__}:{e}"[:160]
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"

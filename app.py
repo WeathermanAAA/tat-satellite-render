@@ -36,7 +36,8 @@ from slowapi.util import get_remote_address
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from render import render_png, render_backdrop_webp, transcode_frame, encode_webp
+from render import (render_png, render_backdrop_webp, transcode_frame,
+                    encode_webp, state_lines_status)
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -614,6 +615,9 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             # Resolution tier the frontend echoes in the result meta (and uses,
             # with the media type, to pick the .png/.webp download extension).
             "X-Quality": body.quality if body.format != "webp" else "loop",
+            # Runtime diagnostic: did the vendored admin_1 state-line layer load
+            # on this host? (verifies the deploy + the geojson availability)
+            "X-State-Lines": state_lines_status(),
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
