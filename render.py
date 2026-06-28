@@ -9,7 +9,10 @@ footer credit.
 from __future__ import annotations
 
 import io
+import json
 import logging
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import matplotlib
@@ -20,12 +23,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from cartopy.feature import ShapelyFeature
 from matplotlib.colors import Normalize
+from shapely.geometry import shape
 
 from colormaps import get_enhancement, enhancement_norm, normalize_visible
 from satellites import FetchResult
 
 log = logging.getLogger("tat-satellite.render")
+
+# admin_1 state/province boundary LINES, vendored as NE 10m geojson (the same
+# asset the CycloLab basemap ships). Loaded locally instead of via cartopy's
+# runtime downloader, whose admin_1 URL 404s on the deploy host (coastline +
+# admin_0 borders download fine there; admin_1 does not).
+_STATE_LINES_PATH = Path(__file__).with_name("cyclolab_ne_10m_states.geojson")
+
+
+@lru_cache(maxsize=1)
+def _state_lines_feature() -> Optional[ShapelyFeature]:
+    """admin_1 boundary LINES as a cartopy feature, read once from the vendored
+    geojson (no network). Returns None if the asset is missing/empty."""
+    if not _STATE_LINES_PATH.exists():
+        return None
+    gj = json.loads(_STATE_LINES_PATH.read_text(encoding="utf-8"))
+    geoms = [shape(f["geometry"]) for f in gj.get("features", []) if f.get("geometry")]
+    if not geoms:
+        return None
+    return ShapelyFeature(geoms, ccrs.PlateCarree())
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
@@ -318,19 +342,16 @@ def render_png(
         # dataset (not the admin_1 *lakes* polygons), so it never re-traces the
         # coastline. One more feature layer in the SAME black as the coast +
         # country borders, a touch thinner so US/MX/AU state lines read as
-        # subtle landfall context. Scale tracks the coast (admin_1 lines exist
-        # at 10m/50m; the rare ≥90° wide view steps its 110m coast down to 50m
-        # here). Guarded: a one-off Natural Earth admin_1 fetch failure degrades
-        # to "no state lines" rather than failing the whole frame.
-        state_scale = coast_scale if coast_scale in ("10m", "50m") else "50m"
+        # subtle landfall context. Loaded from the vendored geojson (see
+        # _state_lines_feature) so it works on the deploy host. Guarded: a
+        # missing asset degrades to "no state lines" rather than a failed frame.
         try:
-            ax.add_feature(
-                cfeature.NaturalEarthFeature(
-                    "cultural", "admin_1_states_provinces_lines", state_scale,
-                    edgecolor=BORDER_COLOR, facecolor="none",
-                ),
-                linewidth=0.5, alpha=1.0, zorder=3,
-            )
+            states = _state_lines_feature()
+            if states is not None:
+                ax.add_feature(
+                    states, linewidth=0.5, edgecolor=BORDER_COLOR,
+                    facecolor="none", alpha=1.0, zorder=3,
+                )
         except Exception as e:  # noqa: BLE001 — never let admin_1 break a frame
             log.warning("state borders skipped: %s", e)
 
