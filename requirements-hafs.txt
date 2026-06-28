@@ -15,6 +15,10 @@ requests>=2.31
 # package does not declare it, since it is not on PyPI).
 tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@main#subdirectory=palette
 # The HAFS render pipeline, tag-pinned (the SAME code update-hafs.yml runs). It
-# pulls matplotlib==3.9.3 + numpy==2.1.3 + cfgrib + eccodes + netCDF4 (the GRIB
-# stack the satellite lacks); xarray/herbie are pinned above to the proven combo.
-hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.10.0#subdirectory=hafs_render
+# pulls matplotlib==3.9.3 + numpy==2.1.3 + cfgrib + eccodes + netCDF4 + metpy/scipy
+# (the GRIB + 200 mb potential-vorticity stack the satellite lacks); xarray/herbie
+# are pinned above to the proven combo. v0.11.0 adds the 9 parent-domain
+# environmental products; metpy/scipy ride in via the package's own pyproject deps
+# - clean-venv preflighted against THIS file to hold the numpy/matplotlib pixel
+# pins (numpy 2.1.3 / matplotlib 3.9.3 / xarray 2026.4.0 all unchanged).
+hafs-render @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@hafs-render-v0.11.0#subdirectory=hafs_render
