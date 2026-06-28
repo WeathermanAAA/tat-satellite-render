@@ -314,6 +314,25 @@ def render_png(
             cfeature.BORDERS.with_scale(coast_scale),
             linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
         )
+        # State/province (admin_1) boundary LINES — the internal-boundary-only
+        # dataset (not the admin_1 *lakes* polygons), so it never re-traces the
+        # coastline. One more feature layer in the SAME black as the coast +
+        # country borders, a touch thinner so US/MX/AU state lines read as
+        # subtle landfall context. Scale tracks the coast (admin_1 lines exist
+        # at 10m/50m; the rare ≥90° wide view steps its 110m coast down to 50m
+        # here). Guarded: a one-off Natural Earth admin_1 fetch failure degrades
+        # to "no state lines" rather than failing the whole frame.
+        state_scale = coast_scale if coast_scale in ("10m", "50m") else "50m"
+        try:
+            ax.add_feature(
+                cfeature.NaturalEarthFeature(
+                    "cultural", "admin_1_states_provinces_lines", state_scale,
+                    edgecolor=BORDER_COLOR, facecolor="none",
+                ),
+                linewidth=0.5, alpha=1.0, zorder=3,
+            )
+        except Exception as e:  # noqa: BLE001 — never let admin_1 break a frame
+            log.warning("state borders skipped: %s", e)
 
     # Dashed gridlines auto-spaced
     if gridlines:
