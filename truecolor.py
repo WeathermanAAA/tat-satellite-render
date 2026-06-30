@@ -121,7 +121,19 @@ GREEN_FRACTIONS = (0.45, 0.10, 0.45)
 # strong green, dormant -> olive), and uses a SMALL strength -> natural forest
 # green, not neon. ABI-only: synthesized green is the GOES path; AHI keeps its
 # native green (+vibrance) and never calls synth_green, so AHI is byte-identical.
-GREEN_BUMP_STRENGTH = 0.18   # additive green per unit (NIR-red) at full gate (0 = OFF)
+GREEN_BUMP_STRENGTH = 0.12   # additive green per unit (NIR-red) at full gate (0 = OFF)
+# NOTE (washout retune): the bump is ADDITIVE green, so it raises VALUE (green
+# becomes the max channel) -> it both brightens the canopy and, pushed into the
+# flat top of the tone curve, FLATTENS its luminance contrast. At the original
+# 0.18 GOES vegetation rendered a bright, flat, vivid-mint "carpet" -- saturated
+# but textureless and far too light vs the AHI reference (which gets its lush look
+# from its native green + AHI-only vibrance, not an additive bump). Lowered to
+# 0.12 so the canopy keeps a clear green-over-blue margin (no teal) while reading
+# DEEPER and recovering tonal texture; paired with the lower LAND_RAYLEIGH_RELAX
+# below, which strips a touch more haze veil so the hue stays green at the reduced
+# bump instead of drifting back toward teal. Verified on real GOES-19 Amazon +
+# SE-US summer forest against the AHI Borneo reference. Must stay >~0.05 (the
+# teal-cure regression tests need the bump load-bearing).
 GREEN_BUMP_NDVI_LO = 0.06    # NDVI <= this -> no bump (ocean<0, cloud/snow/glint ~0)
 GREEN_BUMP_NDVI_HI = 0.20    # NDVI >= this -> full NDVI gate (dormant winter veg included)
 GREEN_BUMP_NIR_LO = 0.10     # NIR(veggie) <= this -> gate 0 (water/shadow/dark limb)
@@ -217,7 +229,17 @@ WL_VEGGIE = 0.86
 # The NIR floor additionally fades the relax out as land darkens toward the
 # terminator (NIR -> 0), keeping the terminator a no-op. Sensor-shared: ABI
 # veggie=band3, AHI veggie=band4; degrades to a no-op if no veggie band present.
-LAND_RAYLEIGH_RELAX = 0.6   # max fraction the Rayleigh correction is cut over land vegetation (0 = OFF)
+LAND_RAYLEIGH_RELAX = 0.45  # max fraction the Rayleigh correction is cut over land vegetation (0 = OFF)
+# NOTE (washout retune): lowered 0.6 -> 0.45. Keeping 60% of the over-land blue
+# (relax 0.6) left a haze VEIL that lifted the canopy shadows -> brighter, flatter
+# land, compounding the bright-flat-carpet look the (then-too-strong) green bump
+# produced. Stripping a touch more haze (relax 0.45) DEEPENS the land, restores
+# some luminance contrast, and -- crucially -- nudges the hue back toward green,
+# which is what lets GREEN_BUMP_STRENGTH come down to 0.12 without the foliage
+# drifting to teal. Still well above the floor the dormant-winter de-browning
+# needs (the relax factor over NDVI~0.15 dormant veg stays <0.7, the regression
+# bound) so the winter red-out cure holds, and the change to the AHI native-green
+# path is negligible (AHI stays "correct": sat/Gdom barely move at relax 0.45).
 LAND_NDVI_LO = 0.06         # NDVI <= this -> NO relax (ocean<0, cloud/snow/glint ~0 or <0): gate 0
 LAND_NDVI_HI = 0.18         # NDVI >= this -> FULL NDVI gate (dormant WINTER veg saturates here, not just lush)
 LAND_NIR_LO = 0.05          # sun-corrected NIR(veggie) <= this -> gate forced to 0 (water/shadow/near-black)
