@@ -274,6 +274,17 @@ class TestLiveNames(unittest.TestCase):
         self.assertEqual(ip.parse_current_storm_names(None, cfg, YEAR), {})
         self.assertEqual(ip.parse_current_storm_names({}, {"short": ""}, YEAR), {})
 
+    def test_is_real_storm_name_classifies_designations(self):
+        # Genuine seasonal names.
+        for nm in ("DOUGLAS", "Amanda", "BORIS", "CRISTINA", "ELIDA", "ROSE"):
+            self.assertTrue(ip._is_real_storm_name(nm), nm)
+        # Placeholders + spelled-ordinal designations (b-deck "FOUR" AND the
+        # CurrentStorms basin-suffixed "FOUR-E") + numeric fallbacks.
+        for nm in ("", "  ", "INVEST", "UNNAMED", "NAMELESS", "FOUR", "Four-E",
+                   "ONE", "TWENTY-ONE", "TWENTY-ONE-E", "FIFTY-NINE", "#04",
+                   "04E", "4E"):
+            self.assertFalse(ip._is_real_storm_name(nm), nm)
+
     # --- apply: rename is display-only ------------------------------------
     def test_rename_reaches_tracks_feed_and_ace_total_unchanged(self):
         ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")
@@ -334,6 +345,39 @@ class TestLiveNames(unittest.TestCase):
         names1 = {s["name"] for s in t1["storms"]}
         self.assertIn("AMANDA", names1)
         self.assertNotIn("ONE", names1)                            # base rows renamed too
+
+    @staticmethod
+    def _named_storm(num, name, n_fixes=6, wind=45.0):
+        """A live b-deck frame for one numbered storm (parse_bdeck schema)."""
+        rows = []
+        for i in range(n_fixes):
+            r = _fix(name, 100, 6 * i, wind, sid=f"NHC_EP{num:02d}2026")
+            r["storm_num"], r["source"] = num, "live-atcf"
+            rows.append(r)
+        return pd.DataFrame(rows)
+
+    def test_apply_live_names_never_demotes_real_bdeck_name(self):
+        # THE DOUGLAS BUG: bep042026.dat's terminal BEST line resolved the real
+        # name DOUGLAS (parse_bdeck last-wins) while CurrentStorms.json still
+        # lagged at the depression designation "Four-E". The override must NOT
+        # clobber the real b-deck name back to the designation.
+        named = self._named_storm(4, "DOUGLAS")
+        ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")
+        named1, ab1, tb1 = ip.apply_live_names(named, {4: "FOUR-E"}, ab, tb)
+        self.assertEqual(set(named1["NAME"]), {"DOUGLAS"})   # real name kept
+        self.assertIs(ab1, ab)                               # skip path: no rename
+        self.assertIs(tb1, tb)
+        self.assertEqual(named.iloc[0]["NAME"], "DOUGLAS")   # input not mutated
+
+    def test_apply_live_names_refreshes_designation_display(self):
+        # Genuine unnamed EP depression: b-deck "FOUR" -> CurrentStorms "FOUR-E"
+        # is designation->designation, still applied so the depression card
+        # wears NHC's public "Four-E" form (promotion is only vetoed when it
+        # would DEMOTE a real name).
+        named = self._named_storm(4, "FOUR", wind=25.0)
+        ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")
+        named1, _ab1, _tb1 = ip.apply_live_names(named, {4: "FOUR-E"}, ab, tb)
+        self.assertEqual(set(named1["NAME"]), {"FOUR-E"})
 
     def test_noop_cases(self):
         ab, tb = _synthetic_ace_base("ep"), _synthetic_tracks_base("ep")

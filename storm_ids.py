@@ -22,11 +22,62 @@ ICON_* one-source rule. Change BOTH.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 # THE map. Explicit, exhaustive for the basins TAT serves. (ATCF also
 # defines IO/SH letters; out of scope until those basins are onboarded.)
 BASIN_SUFFIX: dict[str, str] = {"AL": "l", "EP": "e", "CP": "c", "WP": "w"}
+
+
+# --- Designation vs real seasonal name (shared by BOTH live pollers) ---------
+# NHC's spelled-out designation numbers ("ONE".."FIFTY-NINE") - the placeholder
+# a depression/PTC carries before it is NAMED. Lock-step with
+# cyclolab_shell._ptc_number_words()/isNamedTC (same rule; keep in sync).
+def _build_number_words() -> frozenset:
+    ones = ["", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT",
+            "NINE", "TEN", "ELEVEN", "TWELVE", "THIRTEEN", "FOURTEEN", "FIFTEEN",
+            "SIXTEEN", "SEVENTEEN", "EIGHTEEN", "NINETEEN"]
+    tens = ["", "", "TWENTY", "THIRTY", "FORTY", "FIFTY"]
+    s = set()
+    for n in range(1, 60):
+        s.add(ones[n] if n < 20
+              else tens[n // 10] + (("-" + ones[n % 10]) if n % 10 else ""))
+    return frozenset(s)
+
+
+_NUMBER_WORD_DESIGNATIONS = _build_number_words()
+_NAME_PLACEHOLDERS = frozenset({"", "INVEST", "NAMELESS", "UNNAMED"})
+# CurrentStorms suffixes NHC's spelled designation with the basin letter for the
+# eastern basins ("Four-E" EP, "Four-C" CP); AL/WP carry the bare word ("Four").
+# A real seasonal name never contains a hyphen, so peeling a trailing
+# "-<basin letter>" can never truncate a genuine name.
+_DESIGNATION_BASIN_SUFFIXES = ("-E", "-C", "-L", "-W")
+# "#04" / "04E" / "4E" numeric designation fallbacks (parse_bdeck's #NN,
+# knackwx's <num><letter>) - a designation, not a real name.
+_NUMERIC_DESIGNATION_RE = re.compile(r"^#?\d{1,2}[ELCWP]?$")
+
+
+def is_real_storm_name(name) -> bool:
+    """True iff ``name`` is a genuine seasonal storm name (DOUGLAS), NOT an
+    unnamed depression's designation placeholder.
+
+    Recognizes as NON-real: the blank/INVEST/UNNAMED/NAMELESS placeholders,
+    NHC's spelled-ordinal designations in BOTH the b-deck form ("FOUR") and the
+    CurrentStorms basin-suffixed form ("FOUR-E"), and the numeric "#04"/"04E"
+    fallbacks. The live pollers use it so NHC CurrentStorms.json can never DEMOTE
+    an already-real b-deck/feed name back to a designation when CurrentStorms
+    lags a synoptic-time upgrade (bep042026.dat said DOUGLAS while CurrentStorms
+    still said "Four-E", 2026-07-01)."""
+    n = str(name or "").strip().upper()
+    if not n or n in _NAME_PLACEHOLDERS or _NUMERIC_DESIGNATION_RE.match(n):
+        return False
+    core = n
+    for suf in _DESIGNATION_BASIN_SUFFIXES:
+        if core.endswith(suf) and len(core) > len(suf):
+            core = core[:-len(suf)]
+            break
+    return core not in _NUMBER_WORD_DESIGNATIONS
 
 
 @dataclass(frozen=True)

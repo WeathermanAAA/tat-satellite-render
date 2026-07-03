@@ -59,6 +59,8 @@ import boto3
 import requests
 from botocore.config import Config as BotoConfig
 
+from storm_ids import is_real_storm_name
+
 # ---------------------------------------------------------------------------
 # Config (env-driven; safe defaults)
 # ---------------------------------------------------------------------------
@@ -1245,8 +1247,18 @@ class Poller:
 
         # Named = tracks-feed named, with CurrentStorms overriding/adding the
         # authoritative NHC TCs (One-E shows the cycle it is designated, with its
-        # real TD/TS status rather than waiting on the derived feed).
-        named_combined: dict[str, Storm] = {**self.named, **self.current_named}
+        # real TD/TS status rather than waiting on the derived feed) -- EXCEPT it
+        # must never DEMOTE a storm the derived tracks feed has already resolved
+        # to a REAL name back to CurrentStorms' lagging depression designation:
+        # after a synoptic-time upgrade the b-deck/feed carries "DOUGLAS" while
+        # CurrentStorms still shows "Four-E" (2026-07-01). Where the feed already
+        # has the real name it is the authoritative fresh b-deck track, so it
+        # wins; CurrentStorms still ADDS systems the feed lacks and NAMES one the
+        # feed still shows as a designation.
+        named_combined: dict[str, Storm] = dict(self.current_named)
+        for slug, s in self.named.items():
+            if slug not in named_combined or is_real_storm_name(s.name):
+                named_combined[slug] = s
 
         # PROMPT RETIREMENT of dissipated NHC storms (see NHC_RETIRE_GRACE_H):
         # only when CurrentStorms fetched cleanly THIS cycle (current is not

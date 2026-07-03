@@ -52,6 +52,7 @@ import requests
 import ace_core as ac
 import poller_framework as pf
 import feed_recompute as fr
+import storm_ids
 
 # ---------------------------------------------------------------------------
 # Config (env-driven, safe defaults)
@@ -98,6 +99,11 @@ GLOBAL_GEOJSON_KEY = (_env("GLOBAL_GEOJSON_KEY",
 # Same placeholder set the invest path guards with (and ace_core's
 # _PLACEHOLDER_NAMES, which is private to the pinned package).
 _NAME_PLACEHOLDERS = {"", "INVEST", "NAMELESS", "UNNAMED"}
+# Designation-vs-real-name classifier - the SINGLE source in storm_ids, shared
+# with floater_poller so both live workers demote-guard identically. Kept as the
+# private module name apply_live_names already reads.
+_is_real_storm_name = storm_ids.is_real_storm_name
+
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
@@ -385,6 +391,19 @@ def apply_live_names(named: pd.DataFrame, live_names: dict[int, str],
             continue
         old = str(out.loc[mask, "NAME"].iloc[0] or "").strip().upper()
         if old == new:
+            continue
+        # DIRECTIONAL GUARD. CurrentStorms LEADS the b-deck on the naming EVENT
+        # (its whole purpose: promote a depression "ONE"/"FOUR" to the real
+        # "AMANDA"/"DOUGLAS" the instant NHC names it). But it can also LAG:
+        # right after a synoptic-time upgrade the b-deck NAME column already
+        # carries the real name while CurrentStorms still shows the depression
+        # designation (bep042026.dat "DOUGLAS" vs CurrentStorms "Four-E",
+        # 2026-07-01). Only ever PROMOTE (designation -> real), NEVER DEMOTE
+        # (real -> designation): if CurrentStorms offers a designation while the
+        # b-deck already resolved a real name, keep the b-deck's real name.
+        # (designation -> designation, e.g. b-deck "FOUR" -> CurrentStorms
+        # "FOUR-E", still refreshes the display form for an unnamed depression.)
+        if not _is_real_storm_name(new) and _is_real_storm_name(old):
             continue
         out.loc[mask, "NAME"] = new
         if old not in _NAME_PLACEHOLDERS:

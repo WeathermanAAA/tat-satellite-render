@@ -262,6 +262,38 @@ class TestRefreshStorms(unittest.TestCase):
         self.assertEqual(by_slug["wp91"]["category"], "INVEST")
         self.assertEqual(by_slug["wp91"]["nature"], "DB")
 
+    def test_currentstorms_never_demotes_real_feed_name(self):
+        # THE DOUGLAS BUG (floater side): the EP tracks feed already resolved the
+        # real name DOUGLAS (fresh b-deck, last-wins) while CurrentStorms.json
+        # still lagged at the depression designation "Four-E". The
+        # CurrentStorms-override must NOT clobber the real feed name back to the
+        # designation -- the demote-guard keeps DOUGLAS.
+        p = _poller()
+        douglas = _named_storm(slug="ep04", basin="EP", name="DOUGLAS",
+                               lat=17.0, lon=-127.0)
+        four_e = _named_storm(slug="ep04", basin="EP", name="FOUR-E",
+                              lat=17.0, lon=-127.0)
+        _refresh(p, named={"wp": [], "al": [], "ep": [douglas]},
+                 nhc_invests=[], wp=([], set()), current={"ep04": four_e})
+        top = p.r2.json_puts[fp.top_manifest_key()]
+        by_slug = {s["slug"]: s for s in top["storms"]}
+        self.assertEqual(by_slug["ep04"]["name"], "DOUGLAS")   # real name kept
+
+    def test_currentstorms_promotes_feed_designation_to_real_name(self):
+        # The intended promotion still works (only DEMOTION is vetoed): the feed
+        # shows an unnamed depression "FIVE" while CurrentStorms has just named
+        # it AMANDA -> CurrentStorms' real name wins over the feed designation.
+        p = _poller()
+        five = _named_storm(slug="ep05", basin="EP", name="FIVE",
+                            lat=15.0, lon=-120.0)
+        amanda = _named_storm(slug="ep05", basin="EP", name="AMANDA",
+                              lat=15.0, lon=-120.0)
+        _refresh(p, named={"wp": [], "al": [], "ep": [five]},
+                 nhc_invests=[], wp=([], set()), current={"ep05": amanda})
+        top = p.r2.json_puts[fp.top_manifest_key()]
+        by_slug = {s["slug"]: s for s in top["storms"]}
+        self.assertEqual(by_slug["ep05"]["name"], "AMANDA")
+
     def test_explicit_transitioned_from_handoff(self):
         # 91W upgraded: knackwx named entry says transitioned_from=91W -> the
         # invest floater is dropped even before co-location could fire.
