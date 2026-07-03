@@ -799,5 +799,300 @@ def test_assemble_vibrance_is_ahi_only():
         tc.AHI_VIBRANCE_STRENGTH = saved
 
 
+# --- Shared foliage gate + strength-overridable green bump -----------------
+
+def test_foliage_gate_shared_discriminator():
+    """foliage_gate is the shared veg discriminator: >0 over lush AND dormant
+    vegetation, EXACTLY 0 over ocean (NDVI<0), cloud (NDVI~0), bright desert
+    (red>ceiling) and dark/low-NIR water (NIR floor). NaN inputs -> 0."""
+    #              veg   ocean cloud desert dormant dark-water
+    red = np.array([[0.05, 0.02, 0.80, 0.30, 0.10, 0.02]], np.float32)
+    veg = np.array([[0.45, 0.015, 0.80, 0.35, 0.18, 0.05]], np.float32)
+    g = tc.foliage_gate(red, veg)
+    assert g[0, 0] > 0.9                 # lush veg -> full gate
+    assert g[0, 4] > 0.0                 # dormant veg -> non-zero
+    assert g[0, 1] == 0.0                # ocean (NDVI<0)
+    assert g[0, 2] == 0.0                # cloud (NDVI~0)
+    assert g[0, 3] == 0.0                # desert (red above ceiling)
+    assert g[0, 5] == 0.0                # dark/low-NIR water (NIR below floor)
+    # NaN-safe
+    assert tc.foliage_gate(np.array([[np.nan]], np.float32),
+                           np.array([[0.45]], np.float32))[0, 0] == 0.0
+
+
+def test_vegetation_green_bump_strength_override_and_call_time_read():
+    """The bump scales linearly with an explicit ``strength`` (the AHI lift uses
+    this), and the sentinel default (None) reads GREEN_BUMP_STRENGTH at CALL time
+    so test toggles of the module constant still take effect."""
+    red = np.array([[0.05]], np.float32)
+    veg = np.array([[0.45]], np.float32)
+    base = tc.vegetation_green_bump(red, veg)                       # default strength
+    dbl = tc.vegetation_green_bump(red, veg, strength=2 * tc.GREEN_BUMP_STRENGTH)
+    assert base[0, 0] > 0 and np.isclose(dbl[0, 0], 2 * base[0, 0], rtol=1e-5)
+    assert np.array_equal(tc.vegetation_green_bump(red, veg, strength=0.0),
+                          np.zeros((1, 1), np.float32))
+    saved = tc.GREEN_BUMP_STRENGTH
+    try:
+        tc.GREEN_BUMP_STRENGTH = 0.0                                # sentinel reads this now
+        assert np.array_equal(tc.vegetation_green_bump(red, veg),
+                              np.zeros((1, 1), np.float32))
+    finally:
+        tc.GREEN_BUMP_STRENGTH = saved
+
+
+# --- AHI native-green vegetation lift --------------------------------------
+
+def test_ahi_green_lift_greens_blue_dominant_foliage():
+    """The AHI grayness cure: Himawari's native green renders hazy foliage
+    BLUE-dominant (b>g -> gray-blue). The NDVI-gated green lift raises foliage
+    green above the haze-blue so it reads clearly GREEN, while a co-located ocean
+    pixel (NDVI<0) is byte-identical (green_c += 0)."""
+    import datetime as dt
+    H, W = 1, 2
+    #            hazy-foliage   ocean
+    red = np.array([[0.06, 0.02]], np.float32)
+    blue = np.array([[0.15, 0.10]], np.float32)
+    veggie = np.array([[0.42, 0.015]], np.float32)   # foliage high NIR; ocean ~zero
+    green = np.array([[0.13, 0.03]], np.float32)      # foliage NATIVE green BELOW blue (hazy)
+    when = dt.datetime(2026, 6, 21, 3, 0, 0, tzinfo=dt.timezone.utc)  # noon @ ~135E
+    lons, lats = np.meshgrid(np.linspace(134, 136, W), np.linspace(15, 15, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=140.7, platform_name="Himawari-9",
+                  sensor="ahi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    saved = tc.AHI_GREEN_LIFT_STRENGTH
+    try:
+        tc.AHI_GREEN_LIFT_STRENGTH = 0.0
+        off, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    finally:
+        tc.AHI_GREEN_LIFT_STRENGTH = saved
+    veg_on, veg_off = on[0, 0], off[0, 0]
+    # without the lift the hazy foliage is NOT green-dominant (blue on top)...
+    assert veg_off[2] >= veg_off[1], f"expected blue-dominant off-lift foliage: {veg_off}"
+    # ...with it, green leads both red and blue (reads green) and rose vs off
+    assert veg_on[1] > veg_on[0] and veg_on[1] > veg_on[2], f"foliage not green: {veg_on}"
+    assert veg_on[1] > veg_off[1] + 0.03, "lift did not raise foliage green"
+    # ocean (NDVI<0) is an EXACT no-op and stays blue-dominant
+    assert np.array_equal(on[0, 1], off[0, 1])
+    assert on[0, 1][2] >= on[0, 1][1]
+
+
+def test_ahi_green_lift_ocean_cloud_byte_identical():
+    """The AHI green lift MUST NOT touch ocean/cloud: an AHI scene of ocean+cloud
+    is byte-identical with the lift on vs off (foliage_gate is 0 there -> green_c
+    += float 0)."""
+    import datetime as dt
+    H, W = 1, 4
+    #             ocean ocean  cloud cloud  (NIR<=red -> NDVI<=0)
+    red = np.array([[0.02, 0.03, 0.85, 0.80]], np.float32)
+    blue = np.array([[0.10, 0.11, 0.85, 0.82]], np.float32)
+    veggie = np.array([[0.015, 0.02, 0.84, 0.83]], np.float32)
+    green = np.array([[0.04, 0.05, 0.85, 0.82]], np.float32)
+    when = dt.datetime(2026, 6, 21, 3, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(134, 136, W), np.linspace(15, 15, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=140.7, platform_name="Himawari-9",
+                  sensor="ahi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    saved = tc.AHI_GREEN_LIFT_STRENGTH
+    try:
+        tc.AHI_GREEN_LIFT_STRENGTH = 0.0
+        off, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    finally:
+        tc.AHI_GREEN_LIFT_STRENGTH = saved
+    assert np.array_equal(on, off)
+
+
+# --- ABI/GOES vegetation vibrance ------------------------------------------
+
+def test_abi_vibrance_saturates_foliage_luma_preserved_noop_off_foliage():
+    """abi_vegetation_vibrance lifts foliage saturation (green up), eases the cyan
+    lean (blue pulled down), keeps brightness ~unchanged, and is an EXACT no-op
+    (bit-for-bit) over ocean and desert (foliage_gate 0)."""
+    rgb = np.array([[[0.36, 0.47, 0.42],    # foliage: desaturated cyan-green (g>b>r)
+                     [0.13, 0.22, 0.30],    # ocean: blue-led
+                     [0.60, 0.45, 0.44]]], np.float32)  # desert: red-led
+    #                foliage ocean desert  (sun-corrected NIR/red gate fields)
+    red_c = np.array([[0.05, 0.02, 0.30]], np.float32)
+    veg_c = np.array([[0.45, 0.015, 0.34]], np.float32)
+    out = tc.abi_vegetation_vibrance(rgb, red_c, veg_c)
+
+    def sat(p):
+        mx, mn = p.max(), p.min()
+        return (mx - mn) / mx if mx > 0 else 0.0
+
+    def luma(p):
+        return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]
+
+    f_in, f_out = rgb[0, 0], out[0, 0]
+    assert sat(f_out) > sat(f_in)                    # foliage more saturated
+    assert f_out[1] >= f_in[1]                       # green not reduced
+    assert f_out[2] < f_in[2]                        # cyan-lean cured (blue down)
+    assert abs(luma(f_out) - luma(f_in)) < 0.02      # brightness ~preserved (no re-brighten)
+    # ocean + desert exact no-ops
+    assert np.array_equal(out[0, 1], rgb[0, 1])
+    assert np.array_equal(out[0, 2], rgb[0, 2])
+    # disabled -> identity; no veggie -> identity
+    saved_s, saved_w = tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH
+    try:
+        tc.GOES_VIBRANCE_STRENGTH = 0.0; tc.GOES_VIBRANCE_WARMTH = 0.0
+        assert np.array_equal(tc.abi_vegetation_vibrance(rgb, red_c, veg_c), rgb)
+    finally:
+        tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH = saved_s, saved_w
+    assert np.array_equal(tc.abi_vegetation_vibrance(rgb, None, None), rgb)
+
+
+def test_abi_vibrance_ndvi_gated_and_abi_only_end_to_end():
+    """End-to-end: toggling GOES_VIBRANCE changes the ABI foliage render but is an
+    EXACT no-op over ocean and bright desert (NDVI gate 0), and NEVER touches the
+    AHI path (which uses its own native-green vibrance)."""
+    import datetime as dt
+    H, W = 1, 3
+    #            foliage ocean  bright-desert
+    red = np.array([[0.05, 0.02, 0.32]], np.float32)
+    blue = np.array([[0.08, 0.10, 0.20]], np.float32)
+    veggie = np.array([[0.45, 0.015, 0.34]], np.float32)
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-1, 1, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved_s, saved_w = tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH
+    try:
+        tc.GOES_VIBRANCE_STRENGTH = 0.0; tc.GOES_VIBRANCE_WARMTH = 0.0
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH = saved_s, saved_w
+    assert not np.array_equal(on[0, 0], off[0, 0])   # foliage changed
+    assert np.array_equal(on[0, 1], off[0, 1])       # ocean exact no-op
+    assert np.array_equal(on[0, 2], off[0, 2])       # bright desert exact no-op
+    # AHI path is unaffected by the GOES vibrance knob
+    green = np.full((H, W), 0.30, np.float32)
+    acommon = dict(when=when, sub_sat_lon=140.7, platform_name="Himawari-9",
+                   sensor="ahi", do_rayleigh=False)
+    a_on, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **acommon)
+    try:
+        tc.GOES_VIBRANCE_STRENGTH = 0.0
+        a_off, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **acommon)
+    finally:
+        tc.GOES_VIBRANCE_STRENGTH = saved_s
+    assert np.array_equal(a_on, a_off)
+
+
+# --- Pre-Rayleigh gating regression (marine cloud/ocean no-op) --------------
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_abi_vibrance_marine_noop_under_real_rayleigh():
+    """The pre-Rayleigh-gate regression (ABI): over MARGINAL marine mixels whose
+    RAW NDVI is below the foliage floor but whose POST-Rayleigh NDVI is inflated
+    ABOVE it, the ABI vibrance must stay an EXACT no-op through the real
+    do_rayleigh=True path. Gating on the post-Rayleigh bands (the earlier bug) let
+    the warmth term flip these near-neutral pixels green (green speckle on
+    stratocumulus decks); gating on the PRE-Rayleigh bands keeps them byte-
+    identical. Toggling GOES_VIBRANCE is array_equal here."""
+    import datetime as dt
+    H, W = 1, 4
+    # marine mixels: NIR ~<= red -> RAW NDVI <= floor; blue-led (open ocean / cloud gap)
+    red = np.array([[0.030, 0.035, 0.040, 0.028]], np.float32)
+    blue = np.array([[0.11, 0.12, 0.13, 0.10]], np.float32)
+    veggie = np.array([[0.028, 0.034, 0.041, 0.027]], np.float32)
+    assert float(tc.foliage_gate(red, veggie).max()) == 0.0   # pre-Rayleigh: NOT foliage
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-2, 2, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved_s, saved_w = tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH
+    try:
+        tc.GOES_VIBRANCE_STRENGTH = 0.0; tc.GOES_VIBRANCE_WARMTH = 0.0
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH = saved_s, saved_w
+    assert np.array_equal(on, off), "ABI vibrance leaked onto marine mixels under Rayleigh"
+
+
+@pytest.mark.skipif(not _have_pyspectral(), reason="pyspectral Rayleigh unavailable")
+def test_ahi_green_lift_marine_noop_under_real_rayleigh():
+    """The pre-Rayleigh-gate regression (AHI): the additive green lift must NOT
+    flip near-neutral marine mixels green-dominant under real Rayleigh. RAW NDVI
+    below the floor -> pre-Rayleigh gate 0 -> green_c += 0 -> byte-identical, even
+    though Rayleigh would inflate the post-Rayleigh NDVI above the floor."""
+    import datetime as dt
+    H, W = 1, 4
+    red = np.array([[0.030, 0.035, 0.040, 0.028]], np.float32)
+    blue = np.array([[0.11, 0.12, 0.13, 0.10]], np.float32)
+    veggie = np.array([[0.028, 0.034, 0.041, 0.027]], np.float32)
+    green = np.array([[0.09, 0.10, 0.11, 0.085]], np.float32)   # native green, blue-led
+    assert float(tc.foliage_gate(red, veggie).max()) == 0.0
+    when = dt.datetime(2026, 6, 21, 3, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(134, 136, W), np.linspace(15, 15, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=140.7, platform_name="Himawari-9",
+                  sensor="ahi", do_rayleigh=True)
+    on, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    saved = tc.AHI_GREEN_LIFT_STRENGTH
+    try:
+        tc.AHI_GREEN_LIFT_STRENGTH = 0.0
+        off, _ = tc.assemble_truecolor(red, green, blue, veggie, lats, lons, **common)
+    finally:
+        tc.AHI_GREEN_LIFT_STRENGTH = saved
+    assert np.array_equal(on, off), "AHI green lift leaked onto marine mixels under Rayleigh"
+
+
+# --- Foliage BLUE veto (NIR-must-exceed-blue: reject marine cloud/haze) -----
+
+def test_foliage_gate_blue_veto_excludes_marine_mixels():
+    """The NIR-must-exceed-blue veto: a marine cloud/haze mixel has a small POSITIVE
+    NDVI (NIR just over red) but is blue-BRIGHTEST (blue >= NIR); real vegetation
+    reflects NIR far above blue. Passing ``blue`` zeroes the marine mixel while
+    keeping vegetation; omitting ``blue`` (the safe additive ABI bump path) leaves
+    the gate open -- backward compatible."""
+    #              veg    marine-mixel
+    red = np.array([[0.05, 0.10]], np.float32)
+    veg = np.array([[0.45, 0.15]], np.float32)   # NDVI: veg 0.80, marine 0.20 (both > floor)
+    blue = np.array([[0.06, 0.20]], np.float32)  # veg blue-dark; marine blue > NIR
+    g0 = tc.foliage_gate(red, veg)                # no blue -> both open
+    assert g0[0, 0] > 0.5 and g0[0, 1] > 0.0
+    g1 = tc.foliage_gate(red, veg, blue=blue)     # blue veto
+    assert g1[0, 0] > 0.5, "vegetation wrongly vetoed (NIR >> blue)"
+    assert g1[0, 1] == 0.0, "marine mixel not vetoed (NIR < blue)"
+    # NaN blue -> 0 (never poison a valid pixel)
+    assert tc.foliage_gate(np.array([[0.05]], np.float32), np.array([[0.45]], np.float32),
+                           blue=np.array([[np.nan]], np.float32))[0, 0] == 0.0
+
+
+def test_abi_vibrance_marine_mixel_no_flip_end_to_end():
+    """A marine cloud/haze mixel (small +NDVI but blue-brightest, so the rgb is
+    blue-dominant) stays blue-dominant AND byte-identical through the ABI vibrance
+    -- the NIR>blue veto keeps it a no-op -- while a co-located foliage pixel
+    (NIR>>blue) is greened. This is the regression for the marine green speckle."""
+    import datetime as dt
+    H, W = 1, 2
+    #            marine-mixel  foliage
+    red = np.array([[0.10, 0.05]], np.float32)
+    blue = np.array([[0.20, 0.06]], np.float32)     # marine blue-brightest; foliage blue-dark
+    veggie = np.array([[0.15, 0.45]], np.float32)   # marine NIR<blue; foliage NIR>>blue
+    when = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.timezone.utc)
+    lons, lats = np.meshgrid(np.linspace(-1, 1, W), np.linspace(0, 0, H))
+    lats = lats.astype(np.float32); lons = lons.astype(np.float32)
+    common = dict(when=when, sub_sat_lon=0.0, platform_name="GOES-19",
+                  sensor="abi", do_rayleigh=False)
+    on, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    saved_s, saved_w = tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH
+    try:
+        tc.GOES_VIBRANCE_STRENGTH = 0.0; tc.GOES_VIBRANCE_WARMTH = 0.0
+        off, _ = tc.assemble_truecolor(red, None, blue, veggie, lats, lons, **common)
+    finally:
+        tc.GOES_VIBRANCE_STRENGTH, tc.GOES_VIBRANCE_WARMTH = saved_s, saved_w
+    # marine mixel: vetoed -> exact no-op, stays blue-dominant (no green flip)
+    assert np.array_equal(on[0, 0], off[0, 0]), "marine mixel not a vibrance no-op"
+    assert on[0, 0][2] >= on[0, 0][1], "marine mixel flipped green-dominant"
+    # foliage: greened (changed) and green-dominant
+    assert not np.array_equal(on[0, 1], off[0, 1])
+    assert on[0, 1][1] >= on[0, 1][0] and on[0, 1][1] >= on[0, 1][2]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
