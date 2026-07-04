@@ -308,6 +308,21 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn('<html lang="en" data-ptc data-cat=', html)
         self.assertIn("var IS_PTC = true", html)
 
+    def test_ptc_with_numeric_designation_name_stays_ptc(self):
+        # ace_core v0.8.2 relabels a designated-but-unnamed system's spelled
+        # cardinal ("ONE") to its ATCF short id ("01E"/"10W"). That numeric form
+        # is a DESIGNATION, not a real name: _is_named_tc must NOT read it as
+        # named and shed the PTC dress - the same guarantee as the spelled "ONE".
+        for desig in ("01E", "10W", "01L"):
+            s = copy.deepcopy(self.storm)
+            s["sid"] = "NHC_AL012026"
+            s["is_ptc"] = True
+            s["name"] = desig
+            s["current_category"] = "TS"
+            html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+            self.assertIn('<html lang="en" data-ptc data-cat=', html, desig)
+            self.assertIn("var IS_PTC = true", html, desig)
+
     def test_named_ts_vetoes_stale_is_ptc_at_bake(self):
         # DURABILITY: NHC names the PTC (ONE -> ARTHUR) and it becomes a TS, but
         # the feed's is_ptc still LAGS true (operational b-deck NATURE trailing

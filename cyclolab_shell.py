@@ -1512,6 +1512,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (cat !== "TS" && !/^C[1-5]$/.test(cat)) return false;
     var nm = ((storm && storm.name) || "").trim().toUpperCase();
     if (!nm || !/^[A-Z][A-Z'\- ]*$/.test(nm)) return false;   // letters -> a name
+    // The ace_core v0.8.2 numeric designations ("01E"/"10W", the ##X relabel of
+    // a spelled "ONE") are digit-leading, so the letters-only regex above already
+    // rejects them; NUMBER_NAME only needs the spelled forms that pass that gate.
     if (NUMBER_NAME[nm]) return false;                        // "ONE".."FIFTY-NINE"
     return nm !== "INVEST" && nm !== "UNNAMED" && nm !== "NAMELESS";
   }
@@ -6091,7 +6094,9 @@ def _is_named_tc(storm: dict) -> bool:
     if not nm or not nm[0].isalpha():
         return False
     # letters / space / hyphen / apostrophe only -> a real name (the raw sid
-    # carries digits + underscore and is excluded here).
+    # carries digits + underscore and is excluded here; the ace_core v0.8.2
+    # numeric designations "01E"/"10W" are digit-leading -> excluded by the
+    # nm[0].isalpha() guard above, so they never read as a real name).
     if not all(c.isalpha() or c in " -'" for c in nm):
         return False
     return (nm not in _ptc_number_words()

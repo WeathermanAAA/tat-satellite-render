@@ -429,7 +429,9 @@ class TestLiveNames(unittest.TestCase):
             res = eng.poll_once()
             self.assertTrue(res["ep"].ok)                       # fetch survived
             t = sink.store["feeds/ep_tracks_data.json"]
-            self.assertIn("ONE", {s["name"] for s in t["storms"]})  # b-deck stands
+            # b-deck designation stands; ace_core v0.8.2 relabels the spelled
+            # "ONE" to its ATCF short id "01E" (display-name only, ACE untouched).
+            self.assertIn("01E", {s["name"] for s in t["storms"]})
         finally:
             ip._get_text = orig
 
@@ -474,7 +476,8 @@ class TestLiveNames(unittest.TestCase):
         r1 = eng.poll_once()
         t1 = sink.store["feeds/ep_tracks_data.json"]
         self.assertEqual(r1["ep"].status, pf.CHANGED)
-        self.assertIn("ONE", {s["name"] for s in t1["storms"]})
+        # ace_core v0.8.2 relabels the unnamed b-deck "ONE" -> ATCF short id "01E".
+        self.assertIn("01E", {s["name"] for s in t1["storms"]})
         ace1 = sink.store["feeds/ep_ace_data.json"]["current"]["latest_value"]
         lc1 = eng.health("ep").last_change_utc
 
@@ -486,7 +489,7 @@ class TestLiveNames(unittest.TestCase):
         names2 = {s["name"] for s in t2["storms"]}
         self.assertEqual(r2["ep"].status, pf.UNCHANGED)   # no new fix: restamp path
         self.assertIn("AMANDA", names2)                   # ...but the rename shipped
-        self.assertNotIn("ONE", names2)
+        self.assertNotIn("01E", names2)                   # designation replaced by the name
         ace2 = sink.store["feeds/ep_ace_data.json"]["current"]["latest_value"]
         self.assertEqual(ace1, ace2)                      # ACE untouched
         self.assertEqual(lc1, eng.health("ep").last_change_utc)  # honest signal
