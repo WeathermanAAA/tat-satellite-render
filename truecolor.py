@@ -141,6 +141,49 @@ GREEN_BUMP_NIR_HI = 0.18     # NIR >= this -> NIR floor fully open (real vegetat
 GREEN_BUMP_RED_KEEP = 0.16   # red <= this -> ceiling fully open (vegetation is red-dark)
 GREEN_BUMP_RED_CUT = 0.26    # red >= this -> ceiling shut (bright desert/sand stays tan)
 
+# --- Foliage BLUE veto (NIR must exceed blue) -------------------------------
+# NDVI (NIR vs RED) cannot separate real vegetation from thin cloud / haze /
+# Rayleigh-bright water: over marine cloud fields the NIR sits slightly above the
+# red while the BLUE is the brightest band, so those mixels carry a small POSITIVE
+# NDVI and sneak through the NDVI+NIR gate. Real vegetation instead reflects NIR
+# far ABOVE blue (chlorophyll absorbs blue), so (NIR - blue) cleanly separates them:
+# measured on real scenes, vegetation NIR-blue is POSITIVE (p2 >=~0.02 even for
+# dormant winter veg) while flipped marine mixels are NEGATIVE (p50 ~ -0.05). This
+# veto is applied ONLY to the two flip-capable stages -- the AHI additive green
+# lift and the ABI vibrance/warmth -- which can turn a near-neutral marine pixel
+# green; the pre-existing ABI synth-green bump (additive, blue stays on top, never
+# flips) does NOT pass blue and is unchanged. LO=0.0/HI=0.05 keeps all measured
+# vegetation (incl. hazy tropical + dormant winter) while zeroing the marine mixels.
+FOLIAGE_BLUE_LO = 0.0    # NIR-blue <= this -> gate 0 (marine cloud/haze: blue >= NIR)
+FOLIAGE_BLUE_HI = 0.05   # NIR-blue >= this -> gate fully open (vegetation: NIR >> blue)
+
+# --- AHI native-green vegetation lift ---------------------------------------
+# Himawari's NATIVE 0.51um green renders VEGETATION blue-dominant (b>g): over the
+# (usually hazy) Maritime-Continent/tropical foliage the green channel sits BELOW
+# the haze-lifted blue, so land reads a flat GRAY-BLUE rather than green -- and the
+# AHI vibrance below cannot fix it (its green-over-blue driver AND its water guard
+# both gate OFF once b>=g / b>r, which is exactly where hazy foliage lives). The
+# cure is the SAME chlorophyll green bump the ABI synth path uses -- an additive
+# NDVI x NIR x red-ceiling-gated lift (foliage_gate) that raises the native green
+# above the haze-blue so foliage reads natural green; the (now green-dominant)
+# pixel is then free to pick up the vibrance where it applies. NDVI-gated, so it is
+# an EXACT no-op (adds float 0) over ocean (NDVI<0), cloud/glint (NDVI~0), dark
+# water (NIR floor) and bright desert (red ceiling) -- AHI stays byte-identical
+# there. Own strength (NOT the ABI GREEN_BUMP_STRENGTH) so the two paths tune
+# independently and the ABI-bump byte-identity guard on the AHI path still holds.
+AHI_GREEN_LIFT_STRENGTH = 0.28  # additive green per unit (NIR-red) over AHI foliage (0 = OFF)
+# Tuned render-driven on real Himawari-9 scenes (2026-06-30): dry-season savanna
+# (N-Australia Top End), forest under partial monsoon cloud (Indochina/Borneo/
+# S-China). At 0.28 foliage flips from BLUE-dominant (gdom ~0.02, hue ~200 -> a
+# flat gray-blue) to clearly GREEN-dominant (gdom ~0.98, hue ~140-159, sat
+# ~0.24-0.26) while ocean/teal-water/cloud/desert stay byte-identical. The gate is
+# the PRE-Rayleigh foliage_gate (veg_gate_*), NOT the post-Rayleigh bands: Rayleigh
+# inflates NDVI over marine cloud-gap mixels and this lift is ADDITIVE green, which
+# would flip those near-neutral pixels green-dominant (speckling green onto
+# stratocumulus/trade-cumulus decks) -- pre-Rayleigh gating keeps them exactly 0.
+# The lift raises luma modestly -- accepted (AHI foliage was too dark/gray); frame
+# texture (luma std) is preserved.
+
 # --- Synth-green anti-collapse floor (ABI synth-green only) -----------------
 # Where vegetation is sparse/dark with low NIR (turbid shallow lakes -- Lake
 # Okeechobee -- wet soil, dark coastal water, NDVI low-positive but NIR below the
@@ -462,21 +505,23 @@ def _load_green_model():
 _GREEN_AHI = _load_green_model()   # (c0, cB, cR, cV) or None
 
 
-def vegetation_green_bump(red: np.ndarray, veggie: np.ndarray) -> np.ndarray:
-    """Additive green lift in [0, ~] that is non-zero ONLY over vegetation.
+def foliage_gate(red: np.ndarray, veggie: np.ndarray,
+                 blue: "np.ndarray | None" = None) -> np.ndarray:
+    """Per-pixel [0,1] weight that is non-zero ONLY over vegetation (lush AND
+    dormant) -- the shared foliage discriminator.
 
-    The product of three gates over the sun-corrected, post-Rayleigh red/NIR --
-    an NDVI gate (ramp LO..HI), an absolute NIR floor, and a RED CEILING (1 at
-    low red, 0 at high red) -- times ``GREEN_BUMP_STRENGTH * max(NIR-red, 0)``.
-    EXACTLY 0 (an exact no-op) over ocean (NDVI<0), cloud/snow/glint (NDVI~0),
-    water/shadow (NIR<floor) and bright DESERT/SAND (red>ceiling), so only foliage
-    -- lush AND dormant -- is lifted, scaled by its vigor. Inside the smoothstep
-    ramps (semi-arid red 0.16-0.26, or low-NIR pixels at the terminator where
-    divide-by-cos grazes the NIR floor) the bump is small but non-zero -- a sub-
-    ~0.02 nudge that is visually negligible and hue-preserving. NaN-safe (NaN
-    inputs -> 0 bump). Returns all-zeros when disabled (GREEN_BUMP_STRENGTH<=0)."""
-    if GREEN_BUMP_STRENGTH <= 0.0:
-        return np.zeros_like(red)
+    The product of three smoothsteps over the sun-corrected red/NIR -- an NDVI gate
+    (ramp LO..HI), an absolute NIR floor, and a RED CEILING (1 at low red, 0 at high
+    red). EXACTLY 0 over ocean (NDVI<0), cloud/snow/glint (NDVI~0), water/shadow
+    (NIR<floor) and bright DESERT/SAND (red>ceiling); ramps in gently for semi-arid/
+    terminator pixels. When ``blue`` is supplied, a fourth term additionally vetoes
+    pixels where NIR does not clear blue (``smoothstep(FOLIAGE_BLUE_LO/HI, NIR-blue)``)
+    -- real vegetation reflects NIR >> blue, whereas thin cloud / haze / Rayleigh-
+    bright water is blue-brightest and would otherwise sneak a small positive NDVI
+    through and get flipped green by the additive/warmth stages. NaN inputs -> 0.
+    Reused by the ABI/AHI green bump (magnitude x this gate) and the ABI vibrance
+    (saturation lift x this gate); the flip-capable stages pass ``blue`` to enable
+    the marine veto, the safe additive ABI synth-green bump does not."""
     r = np.clip(red, 0.0, None)
     v = np.clip(veggie, 0.0, None)
     ndvi = (v - r) / np.maximum(v + r, 1e-6)
@@ -485,7 +530,39 @@ def vegetation_green_bump(red: np.ndarray, veggie: np.ndarray) -> np.ndarray:
         * _smoothstep(GREEN_BUMP_NIR_LO, GREEN_BUMP_NIR_HI, v)
         * (1.0 - _smoothstep(GREEN_BUMP_RED_KEEP, GREEN_BUMP_RED_CUT, r))
     )
-    bump = (GREEN_BUMP_STRENGTH * gate * np.clip(v - r, 0.0, None)).astype(red.dtype, copy=False)
+    if blue is not None:
+        gate = gate * _smoothstep(FOLIAGE_BLUE_LO, FOLIAGE_BLUE_HI,
+                                  v - np.clip(blue, 0.0, None))
+    gate = gate.astype(red.dtype, copy=False)
+    bad = np.isnan(red) | np.isnan(veggie)
+    if blue is not None:
+        bad = bad | np.isnan(blue)
+    gate[bad] = 0.0
+    return gate
+
+
+def vegetation_green_bump(red: np.ndarray, veggie: np.ndarray,
+                          strength: "float | None" = None,
+                          blue: "np.ndarray | None" = None) -> np.ndarray:
+    """Additive green lift in [0, ~] that is non-zero ONLY over vegetation.
+
+    ``foliage_gate`` (NDVI x NIR-floor x red-ceiling) times ``strength *
+    max(NIR-red, 0)``. EXACTLY 0 (an exact no-op) over ocean (NDVI<0),
+    cloud/snow/glint (NDVI~0), water/shadow (NIR<floor) and bright DESERT/SAND
+    (red>ceiling), so only foliage -- lush AND dormant -- is lifted, scaled by its
+    vigor. Inside the smoothstep ramps the bump is small but non-zero -- a sub-
+    ~0.02 nudge that is visually negligible and hue-preserving. NaN-safe (NaN
+    inputs -> 0 bump). ``strength`` defaults (sentinel None -> read at CALL time,
+    so test toggles of the module constant still take effect) to
+    GREEN_BUMP_STRENGTH -- the ABI synth-green bump; the AHI native-green path
+    passes AHI_GREEN_LIFT_STRENGTH to lift its own foliage green above the haze-
+    blue. Returns all-zeros when the chosen strength is <=0 (disabled)."""
+    s = GREEN_BUMP_STRENGTH if strength is None else strength
+    if s <= 0.0:
+        return np.zeros_like(red)
+    v = np.clip(veggie, 0.0, None)
+    r = np.clip(red, 0.0, None)
+    bump = (s * foliage_gate(red, veggie, blue=blue) * np.clip(v - r, 0.0, None)).astype(red.dtype, copy=False)
     bump[np.isnan(red) | np.isnan(veggie)] = 0.0   # never bump a NaN edge (mirrors land_rayleigh_relax_field)
     return bump
 
@@ -674,6 +751,74 @@ def ahi_vegetation_vibrance(rgb: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0).astype(rgb.dtype)
 
 
+# --- ABI/GOES vegetation vibrance (synth-green path) ------------------------
+# After the washout retune the ABI synth green renders FOLIAGE a desaturated
+# cyan-"mint": green-dominant (the bump keeps G on top) but LOW saturation, with
+# the blue-heavy synth green riding close under green -> a flat gray-green that
+# leans cyan (hue ~150), not a natural forest green. Re-raising GREEN_BUMP would
+# only re-brighten it back to the flat vivid mint the retune removed; the right
+# lever is green SATURATION. This lifts it two ways, BOTH gated to foliage by the
+# shared ``foliage_gate`` (NDVI x NIR x red-ceiling) so every other surface is an
+# EXACT no-op:
+#   * a luma-preserving SATURATION expansion around the Rec.601 luma (brightness
+#     unchanged -> deepens/enriches the green WITHOUT re-brightening), tapered by
+#     (1-sat) so already-vivid pixels don't go neon and capped at
+#     GOES_VIBRANCE_MAX; and
+#   * a WARMTH term that eases the cyan lean by pulling the rendered blue down
+#     toward red ONLY where blue leads red over foliage (the excess-blue that IS
+#     the mint cast), so the hue settles from cyan-green toward true forest green.
+# NDVI is the veg-vs-water discriminator here (NOT the r/b water-guard the AHI
+# vibrance uses): the blue-heavy ABI synth green leaves FOLIAGE itself b>r, which
+# would trip an r/b guard -- NDVI (from the sun-corrected NIR/red) cleanly keeps
+# foliage in and ocean/teal-water (NDVI<0) out. Crucially the gate keys on the
+# PRE-Rayleigh NDVI (the same bands land_rayleigh_relax_field uses): Rayleigh
+# subtracts more red than NIR so it INFLATES NDVI over cloud-gap/thin-cloud mixels
+# above open ocean, and the WARMTH term (an additive blue->red push) can FLIP such
+# a near-neutral pixel green-dominant -- gating pre-Rayleigh keeps marine cloud
+# fields (stratocumulus / trade cumulus) a no-op. ABI only (assemble-gated); AHI has
+# its own native-green + vibrance path. Set GOES_VIBRANCE_STRENGTH (and WARMTH) to
+# 0 to disable.
+GOES_VIBRANCE_STRENGTH = 3.0   # gain on the foliage saturation lift (0 = OFF)
+GOES_VIBRANCE_MAX = 0.28       # cap on the per-pixel saturation boost (prevents neon)
+GOES_VIBRANCE_WARMTH = 0.28    # foliage blue-toward-red pull that eases the cyan/mint lean (0 = OFF)
+
+
+def abi_vegetation_vibrance(rgb: np.ndarray, red_c: "np.ndarray | None",
+                            veggie_c: "np.ndarray | None",
+                            blue_c: "np.ndarray | None" = None) -> np.ndarray:
+    """Green saturation lift for the GOES/ABI synth-green path (foliage only).
+
+    A luma-preserving saturation expansion plus an optional cyan-lean warmth pull,
+    both multiplied by the shared ``foliage_gate``. ``red_c``/``veggie_c`` are the
+    PRE-Rayleigh sun-corrected NIR/red (assemble passes veg_gate_*), so the gate is
+    exactly 0 over deep ocean (NDVI<0), opaque cloud/glint (NDVI~0), dark water (NIR
+    floor) and desert (red ceiling) and those pixels are returned bit-for-bit
+    unchanged (``np.where(gate>0, ...)``). Pre-Rayleigh gating is load-bearing: on
+    the post-Rayleigh bands, Rayleigh's NDVI inflation opens the gate over marine
+    cloud-gap mixels and the warmth term flips them green. Brightness (Rec.601 luma)
+    is preserved by the saturation term (the warmth pull lowers blue only, a small
+    deepening), so foliage is enriched WITHOUT the flat re-brightened mint the bump
+    would give. ABI only (assemble-gated). No-op if disabled or no veggie band."""
+    if (GOES_VIBRANCE_STRENGTH <= 0.0 and GOES_VIBRANCE_WARMTH <= 0.0) or veggie_c is None:
+        return rgb
+    gate = foliage_gate(red_c, veggie_c, blue=blue_c)     # (H,W), 0 off-foliage + marine veto
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    sat = np.where(mx > 1e-6, (mx - mn) / np.maximum(mx, 1e-6), 0.0)
+    amt = np.clip(GOES_VIBRANCE_STRENGTH * gate * (1.0 - sat), 0.0, GOES_VIBRANCE_MAX)[..., None]
+    wr, wg, wb = AHI_VIBRANCE_LUMA
+    luma = (wr * r + wg * g + wb * b)[..., None]
+    out = luma + (rgb - luma) * (1.0 + amt)              # luma-preserving saturation
+    if GOES_VIBRANCE_WARMTH > 0.0:
+        excess_blue = np.clip(out[..., 2] - out[..., 0], 0.0, None)   # cyan lean = blue over red
+        out[..., 2] = out[..., 2] - gate * GOES_VIBRANCE_WARMTH * excess_blue
+    out = np.clip(out, 0.0, 1.0)
+    # exact no-op off foliage (gate==0 -> return the original pixel bit-for-bit)
+    out = np.where((gate > 0.0)[..., None], out, rgb)
+    return out.astype(rgb.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Top-level assembly
 # ---------------------------------------------------------------------------
@@ -722,6 +867,19 @@ def assemble_truecolor(
     if green_c is not None:
         green_c = highlight_rolloff(green_c, cos_sza)
 
+    # PRE-Rayleigh sun-corrected NIR/red kept for the vegetation GATE (foliage_gate)
+    # used by the AHI green lift + ABI vibrance below. These MUST key on the same
+    # water/cloud-safe discriminator that land_rayleigh_relax_field uses -- the
+    # PRE-Rayleigh NDVI -- NOT the post-Rayleigh bands. Rayleigh subtracts more red
+    # than NIR, so it INFLATES NDVI over cloud-gap / thin-cloud mixels above open
+    # ocean; gating on the corrected bands cracks the gate open there and speckles
+    # green onto marine cloud fields (stratocumulus / trade cumulus). Captured here
+    # (rayleigh_band returns fresh arrays, so these references stay pre-Rayleigh),
+    # they are exactly 0 over ocean (NDVI<0) and opaque cloud (NDVI~0).
+    veg_gate_red = red_c
+    veg_gate_nir = veggie_c
+    veg_gate_blue = blue_c   # for the NIR-must-exceed-blue marine veto (foliage_gate)
+
     # 2) Rayleigh-correct the REAL bands first (CIRA GeoColor order), so the
     #    synthesized green is built from already-corrected red/veggie/blue.
     if do_rayleigh:
@@ -754,6 +912,18 @@ def assemble_truecolor(
         if veggie_c is None:
             raise ValueError("ABI true color needs a veggie band to synthesize green")
         green_c = synth_green(red_c, veggie_c, blue_c)
+    elif veg_gate_nir is not None and AHI_GREEN_LIFT_STRENGTH > 0.0:
+        # AHI native-green foliage lift: Himawari's native 0.51um green renders
+        # (often hazy) vegetation BLUE-dominant -> foliage reads gray-blue. Add the
+        # same NDVI-gated chlorophyll green bump the ABI path uses (own strength) so
+        # foliage green rises above the haze-blue. Gated on the PRE-Rayleigh NIR/red
+        # (veg_gate_*) so it is exactly 0 over ocean/cloud/desert/dark-water --
+        # additive green would otherwise flip near-neutral marine-cloud mixels
+        # green-dominant where Rayleigh inflates their NDVI -> green_c += 0 there,
+        # AHI byte-identical off vegetation.
+        green_c = green_c + vegetation_green_bump(veg_gate_red, veg_gate_nir,
+                                                  strength=AHI_GREEN_LIFT_STRENGTH,
+                                                  blue=veg_gate_blue)
 
     rgb = np.clip(np.dstack([red_c, green_c, blue_c]), 0.0, 1.0)
 
@@ -762,10 +932,14 @@ def assemble_truecolor(
 
     rgb = tone_curve(rgb)
 
-    # AHI-only: green-biased vegetation vibrance (livelier land without touching
-    # clouds/ocean). The GOES synth-green path is left untouched.
+    # Vegetation vibrance -- livelier foliage without touching clouds/ocean/desert.
+    # AHI: green-biased saturation on the native-green path. ABI: NDVI-gated green
+    # saturation + cyan-lean warmth on the synth-green path. Each is sensor-scoped
+    # and an exact no-op off foliage.
     if sensor.lower() == "ahi":
         rgb = ahi_vegetation_vibrance(rgb)
+    elif sensor.lower() == "abi":
+        rgb = abi_vegetation_vibrance(rgb, veg_gate_red, veg_gate_nir, veg_gate_blue)
 
     # Golden-hour: warm the day-side RGB toward red/orange near the terminator
     # (sunrise/sunset) BEFORE the night fade. Exact no-op in daytime -> midday
