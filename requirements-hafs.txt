@@ -12,8 +12,13 @@ herbie-data==2026.3.0
 boto3>=1.34
 requests>=2.31
 # Shared TAT palettes - imported by the hafs_render render path (the hafs-render
-# package does not declare it, since it is not on PyPI).
-tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@main#subdirectory=palette
+# package does not declare it, since it is not on PyPI). IMMUTABLE tag, NOT @main:
+# Railway rebuilds this worker ONLY when THIS branch is pushed, so a bare @main
+# never re-fetches on a TAT-only palette push -- the worker silently keeps whatever
+# palette it was last built with (this branch rendered the pre-purple rainbow_ir
+# for weeks after the re-anchor landed on TAT main). Bump the tag here to ship a
+# palette change (the ace-core / main-repo requirements.txt pattern).
+tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@tat-palettes-v0.2.2#subdirectory=palette
 # The HAFS render pipeline, tag-pinned (the SAME code update-hafs.yml runs). It
 # pulls matplotlib==3.9.3 + numpy==2.1.3 + cfgrib + eccodes + netCDF4 + metpy/scipy
 # (the GRIB + 200 mb potential-vorticity stack the satellite lacks); xarray/herbie
