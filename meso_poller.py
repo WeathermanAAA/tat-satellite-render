@@ -84,6 +84,8 @@ import boto3
 import requests
 from botocore.config import Config as BotoConfig
 
+import meso_anchor
+from meso_anchor import Anchor
 from meso_sectors import MESO_SECTORS, MesoSector
 
 # poller_framework is dependency-free (no requests/boto3); import its health +
@@ -161,6 +163,48 @@ MESO_HIMAWARI_PRODUCT = (_env("MESO_HIMAWARI_PRODUCT", "target")
 MESO_MAX_SUBSCANS_PER_PASS = int(_env("MESO_MAX_SUBSCANS_PER_PASS", "4") or "4")
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))    # min gap between /render calls
 EXTENT_STALE_AFTER_S = float(_env("EXTENT_STALE_AFTER_S", "1800"))  # >this since last scan => stale
+
+# --- Stable common-extent ("anchor") -----------------------------------------
+# The operators steer M1/M2/Target around: GOES jumps 1-2x/day (genuine
+# repositions) but is byte-stable between; the Himawari Target creeps EVERY slot
+# (continuous storm-following). Rendering each frame to the live per-scan box let
+# that motion bleed straight into the loop -> the wander. Instead we pin each
+# sector's loop to ONE reference extent (meso_anchor.plan_anchor), held pixel-
+# locked until the live box no longer covers it (drift/reposition) or its span
+# changes (zoom), then SNAP. See meso_anchor for the full rationale + guarantees.
+# Kill switch: MESO_ANCHOR=false renders the live per-scan box (the old
+# behaviour) WITHOUT a rebuild (env + restart).
+MESO_ANCHOR_ENABLED = _env_bool("MESO_ANCHOR", True)
+# Per-family inset margin (deg). GOES is stable within a position, so 0 = full
+# operator-box coverage + snap only on a genuine move (== the old behaviour).
+# Himawari drifts continuously, so a non-zero margin is BOTH the hysteresis that
+# keeps the loop locked AND the data-coverage buffer (the box may drift up to the
+# margin before the anchor must move; the trimmed margin is never shown blank).
+MESO_ANCHOR_MARGIN_GOES_DEG = float(_env("MESO_ANCHOR_MARGIN_GOES_DEG", "0.0"))
+MESO_ANCHOR_MARGIN_HIMA_DEG = float(_env("MESO_ANCHOR_MARGIN_HIMA_DEG", "0.6"))
+# Containment slack (deg): a held anchor is allowed to poke at most this far
+# outside the live data box before it re-anchors -- so it both (a) absorbs the
+# sub-0.001 deg float/rounding noise in the discovered extent (no churn; measured
+# GOES jitter = 0) and (b) BOUNDS the worst-case blank strip to this width. At
+# 0.003 deg (~0.3 px at the 1056 px frame width) that strip is sub-pixel = invisible,
+# and only ever shows on the trailing edge for the single cycle before a re-anchor.
+# GOES (margin 0 -> anchor == the live data box) only ever pokes by this same
+# sub-pixel hold tolerance, and in practice not even that (it is byte-stable
+# within a position, so its anchor tracks the live box exactly).
+MESO_ANCHOR_COVER_BUFFER_DEG = float(_env("MESO_ANCHOR_COVER_BUFFER_DEG", "0.003"))
+# Relative live-span change that counts as an operator ZOOM (re-inset, new dims).
+MESO_ANCHOR_SPAN_TOL = float(_env("MESO_ANCHOR_SPAN_TOL", "0.12"))
+# A centre shift above (this x margin) is a genuine RELOCATION (adopt the new
+# box) rather than a small drift (pan, keep span). With the GOES margin 0 this is
+# 0 -> any move adopts the live box exactly (== the old behaviour).
+MESO_ANCHOR_DRIFT_LIMIT_MULT = float(_env("MESO_ANCHOR_DRIFT_LIMIT_MULT", "1.5"))
+# Plausibility ceiling (deg) on a sector's lat/lon span. Real meso sectors are
+# ~5-35 deg (a ~1000 km box; a near-polar tile's lat/lon bounding box inflates to
+# ~34 deg at most). A discovery whose bounding box exceeds this is a glitch (a
+# corrupt nav / wrong product) -- it is rejected at discovery (preserve
+# last-known-good extent) AND the anchor holds, so one bad scan can never balloon
+# the anchor to a near-global box. 80 deg = generous headroom over the real max.
+MESO_ANCHOR_MAX_SPAN_DEG = float(_env("MESO_ANCHOR_MAX_SPAN_DEG", "80"))
 
 # Retention (R2) -- native recent + thinned history (render-once policy).
 RECENT_WINDOW_H = float(_env("RECENT_WINDOW_H", "6"))
@@ -299,6 +343,22 @@ def sector_family_hint(sector: MesoSector) -> str:
     return "GOES-West" if sector.bucket == "noaa-goes18" else "GOES-East"
 
 
+def sector_anchor_margin(sector: MesoSector) -> float:
+    """Anchor inset margin (deg) for a sector's family. GOES is byte-stable
+    within a position -> 0 (full coverage, snap only on a genuine move == the old
+    behaviour); the Himawari Target drifts continuously -> a non-zero margin
+    absorbs the creep (kept locked) while guaranteeing the trimmed edge is never
+    shown blank."""
+    return (MESO_ANCHOR_MARGIN_HIMA_DEG if sector.family == "himawari"
+            else MESO_ANCHOR_MARGIN_GOES_DEG)
+
+
+def anchor_key(slug: str) -> str:
+    """R2 key for a sector's persisted anchor (survives restarts/self-heal so a
+    deploy or watchdog bounce doesn't snap every locked loop)."""
+    return f"{R2_PREFIX}/{slug}/anchor.json"
+
+
 # ---------------------------------------------------------------------------
 # Discovered sector extent (the per-scan result of extent discovery)
 # ---------------------------------------------------------------------------
@@ -434,8 +494,14 @@ def discover_goes_extent(sector: MesoSector) -> SectorExtent:
     # e<w), NOT degenerate. Validate latitude order + a positive WRAPPED lon span
     # instead of lon_w < lon_e.
     lon_span = (bbox[2] - bbox[0]) % 360.0
-    if not (bbox[1] < bbox[3] and 0.0 < lon_span < 359.0):
-        raise DiscoverError(f"degenerate bbox {bbox} for {s3_key}")
+    lat_span = bbox[3] - bbox[1]
+    # Reject degenerate AND implausibly-large boxes (a glitchy nav / wrong
+    # product whose bounding box balloons): a real meso sector is ~5-35 deg, so a
+    # box wider/taller than MESO_ANCHOR_MAX_SPAN_DEG is bad data -> preserve the
+    # sector's last-known-good extent (and never let it balloon the anchor).
+    if not (bbox[1] < bbox[3] and 0.0 < lon_span < MESO_ANCHOR_MAX_SPAN_DEG
+            and lat_span < MESO_ANCHOR_MAX_SPAN_DEG):
+        raise DiscoverError(f"implausible bbox {bbox} for {s3_key}")
     return SectorExtent(bbox=bbox, scan_start=scan_start,
                         sat_name=satellites.goes_sat_label(sector.bucket))
 
@@ -525,8 +591,13 @@ def discover_himawari_extent(sector: MesoSector) -> SectorExtent:
     lons = lon[finite]
     bbox = [round(float(np.min(lons)), 3), round(float(np.min(lats)), 3),
             round(float(np.max(lons)), 3), round(float(np.max(lats)), 3)]
-    if not (bbox[0] < bbox[2] and bbox[1] < bbox[3]):
-        raise DiscoverError(f"degenerate Target bbox {bbox}")
+    # Degenerate OR implausibly large (a bad nav projecting most of the disk) ->
+    # preserve last-known-good. The Target is ~10 deg; > MESO_ANCHOR_MAX_SPAN_DEG
+    # is glitch data. (Target never crosses +/-180, so plain ordering is correct.)
+    if not (bbox[0] < bbox[2] and bbox[1] < bbox[3]
+            and (bbox[2] - bbox[0]) < MESO_ANCHOR_MAX_SPAN_DEG
+            and (bbox[3] - bbox[1]) < MESO_ANCHOR_MAX_SPAN_DEG):
+        raise DiscoverError(f"implausible Target bbox {bbox}")
     return SectorExtent(bbox=bbox, scan_start=chosen_slot, sat_name=sector.satellite)
 
 
@@ -868,6 +939,11 @@ class MesoPoller:
         # Written by the main (discovery) thread, read by the lane threads --
         # whole-value dict assignment, so readers always see a complete extent.
         self.extents: dict[str, SectorExtent] = {}
+        # Per-sector STABLE anchor (the reference box every frame renders to --
+        # see meso_anchor). Written by the discovery thread, read by the lane
+        # threads; whole-value dict assignment, so a lane reader never sees a
+        # half-updated Anchor. Empty until first discovery (or load from R2).
+        self.anchors: dict[str, Anchor] = {}
         # Per-sector health -- the freshness heartbeat (poller_framework).
         self.health: dict[str, SourceHealth] = {
             s.slug: SourceHealth(name=s.slug) for s in MESO_SECTORS
@@ -937,12 +1013,77 @@ class MesoPoller:
                 h.last_change_utc = now
             h.consecutive_failures = 0
             h.last_error = None
+            # Plan the STABLE render box from the live box BEFORE publishing the
+            # extent, so a lane thread that wakes between the two assignments
+            # never renders the live (unanchored) box for a cycle. (process_unit
+            # short-circuits on a missing extent, so anchor-set-first is safe.)
+            if MESO_ANCHOR_ENABLED:
+                self._update_anchor(sector, ext, now)
             self.extents[sector.slug] = ext
             # Refresh each band unit's sector view (extent read live in process).
-            log.info("discover %s -> bbox=%s scan=%s",
-                     sector.slug, ext.bbox, iso_z(ext.scan_start))
+            log.info("discover %s -> live=%s anchor=%s scan=%s",
+                     sector.slug, ext.bbox,
+                     (self.anchors.get(sector.slug).bbox
+                      if self.anchors.get(sector.slug) else ext.bbox),
+                     iso_z(ext.scan_start))
         self.write_top_manifest()
         self.emit_health()
+
+    # ---- stable anchor (locked loop extent) ----------------------------
+
+    def _update_anchor(self, sector: MesoSector, ext: SectorExtent,
+                       now: dt.datetime) -> None:
+        """(Re-)plan a sector's stable anchor from the freshly discovered live
+        box. HELD unchanged while the live box still covers the anchor and its
+        span is steady -- the loop stays pixel-locked; SNAPS (and persists) on a
+        genuine drift / operator zoom / reposition. See meso_anchor.plan_anchor."""
+        margin = sector_anchor_margin(sector)
+        prev = self.anchors.get(sector.slug)
+        new_bbox, reason = meso_anchor.plan_anchor(
+            prev.bbox if prev else None, ext.bbox,
+            margin_lon=margin, margin_lat=margin,
+            cover_buffer=MESO_ANCHOR_COVER_BUFFER_DEG,
+            span_tol=MESO_ANCHOR_SPAN_TOL,
+            drift_limit=MESO_ANCHOR_DRIFT_LIMIT_MULT * margin,
+            max_span=MESO_ANCHOR_MAX_SPAN_DEG)
+        if prev is not None and reason == "hold":
+            return  # locked -- the loop's frames stay pixel-for-pixel stable
+        anchor = Anchor(bbox=new_bbox, source_scan=ext.scan_start,
+                        set_utc=now, reason=reason)
+        self.anchors[sector.slug] = anchor   # whole-value swap (lane-safe)
+        if prev is not None:
+            log.info("re-anchor %s (%s): center moved %.3f deg | %s -> %s",
+                     sector.slug, reason,
+                     meso_anchor.center_shift_deg(prev.bbox, new_bbox),
+                     prev.bbox, new_bbox)
+        else:
+            log.info("anchor %s (%s) -> %s", sector.slug, reason, new_bbox)
+        self._persist_anchor(sector.slug, anchor)
+
+    def _persist_anchor(self, slug: str, anchor: Anchor) -> None:
+        """Best-effort persist so a restart / self-heal bounce / deploy doesn't
+        snap a locked loop. A persist failure is non-fatal (worst case: one snap
+        on the next restart)."""
+        try:
+            self.r2.put_json(anchor_key(slug), anchor.to_json(), CACHE_MANIFEST)
+        except Exception as e:  # noqa: BLE001
+            log.warning("persist anchor %s failed: %s", slug, e)
+
+    def _load_anchors(self) -> None:
+        """Restore persisted anchors at startup so a restart doesn't re-anchor
+        (snap) every locked loop. A missing or corrupt anchor file simply leaves
+        the sector to anchor fresh on its first discovery."""
+        if not MESO_ANCHOR_ENABLED:
+            return
+        for sector in MESO_SECTORS:
+            d = self.r2.get_json(anchor_key(sector.slug))
+            if not d:
+                continue
+            a = Anchor.from_json(d)
+            if a is not None:
+                self.anchors[sector.slug] = a
+                log.info("loaded anchor %s (%s, set %s) -> %s", sector.slug,
+                         a.reason, iso_z(a.set_utc), a.bbox)
 
     # ---- manifests ------------------------------------------------------
 
@@ -1055,8 +1196,14 @@ class MesoPoller:
             ext = self.extents.get(sector.slug)
             if ext is None:
                 continue
-            cx = round((ext.bbox[0] + ext.bbox[2]) / 2.0, 2)
-            cy = round((ext.bbox[1] + ext.bbox[3]) / 2.0, 2)
+            # Advertise the ANCHOR box -- the extent the frames are actually
+            # rendered to (what the viewer shows) -- not the live per-scan box.
+            anchor = self.anchors.get(sector.slug)
+            bbox = anchor.bbox if anchor else ext.bbox
+            # Antimeridian-safe centre (the old (w+e)/2 was wrong for a dateline-
+            # crossing GOES-18 M2 box).
+            cx = round(meso_anchor.center_lon(bbox), 2)
+            cy = round((bbox[1] + bbox[3]) / 2.0, 2)
             sectors_out.append({
                 "slug": sector.slug,
                 "satellite": ext.sat_name or sector.satellite,
@@ -1064,7 +1211,7 @@ class MesoPoller:
                 "label": sector.label,
                 "lat": cy,
                 "lon": cx,
-                "bbox": ext.bbox,
+                "bbox": bbox,
                 "scan": iso_z(ext.scan_start),
                 "bands": [b.key for b in BANDS],
                 "manifest": f"{R2_PREFIX}/{sector.slug}/manifest.json",
@@ -1115,7 +1262,12 @@ class MesoPoller:
         ext = self.extents.get(sector.slug)
         if ext is None:
             return  # sector has no discovered extent yet -> nothing to render
-        bbox = list(ext.bbox)
+        # Render every frame to the STABLE anchor box (the locked loop extent),
+        # not the live per-scan box, so consecutive frames are geo-aligned AND
+        # pixel-identical. Falls back to the live box if anchoring is disabled
+        # (MESO_ANCHOR=false) or no anchor exists yet -- the old behaviour.
+        anchor = self.anchors.get(sector.slug)
+        bbox = list(anchor.bbox) if anchor else list(ext.bbox)
         # All meso sectors render from their rapid-scan product via the "meso"
         # hint: GOES -> CMIPM (find_file forces _pick_meso past the 12° span gate),
         # Himawari -> the ~2.5-min Target sub-scans (ALL six bands incl. true-color,
@@ -1387,6 +1539,10 @@ class MesoPoller:
             b = ((self.manifests.get(slug) or {}).get("bands") or {}) \
                 .get(band_key) or {}
             u.last_hash = b.get("last_hash")
+        # Restore stable anchors BEFORE the lane threads start so a restart /
+        # self-heal bounce doesn't snap every locked loop. (Loaded anchors are
+        # re-validated against the live box on the first discovery.)
+        self._load_anchors()
         # Lane scheduler threads -- started AFTER the manifests + dedup hashes
         # are seeded so neither lane can race the startup reconcile. Daemon:
         # they die with the main (discovery/health) thread.
