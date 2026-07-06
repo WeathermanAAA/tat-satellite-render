@@ -15,7 +15,7 @@ requests>=2.31
 # package does not declare it, since it is not on PyPI). Tag-pinned (the ace-core
 # pattern); bump this in lockstep with requirements.txt so the HAFS and satellite
 # render paths never run on divergent palette versions.
-tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@tat-palettes-v0.2.1#subdirectory=palette
+tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@tat-palettes-v0.2.2#subdirectory=palette
 # The HAFS render pipeline, tag-pinned (the SAME code update-hafs.yml runs). It
 # pulls matplotlib==3.9.3 + numpy==2.1.3 + cfgrib + eccodes + netCDF4 (the GRIB
 # stack the satellite lacks); xarray/herbie are pinned above to the proven combo.
