@@ -26,7 +26,7 @@ python-dateutil==2.9.0
 # path the way a bare @main pin does (@main only refetches when tsr happens to
 # rebuild for some other reason, which a TAT-only palette push does not cause).
 # https://github.com/WeathermanAAA/Triple-A-Tropics/tree/main/palette
-tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@tat-palettes-v0.2.1#subdirectory=palette
+tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@tat-palettes-v0.2.2#subdirectory=palette
 # True-color recipe: scipy for band co-registration (RegularGridInterpolator),
 # pyorbital for sun + geostationary-satellite geometry, pyspectral for Rayleigh
 # (atmospheric) correction. pyspectral pulls RSR + Rayleigh LUTs on first use
