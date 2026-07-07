@@ -55,6 +55,17 @@ UTC = dt.timezone.utc
 # slot is complete the instant its one file lands (§3.2 "MCMIP = 1 file").
 MCMIP_ITEM = "MCMIP"
 
+# The tiled-product manifest scheme id (SSOT -- s2_pyramid reads it from here so
+# the emitted manifest.scheme and any future variant never drift). A future
+# EPSG:3857 reproject (§5.5) would add "webmercator-xyz".
+TILE_SCHEME = "flat-native-xyz"
+
+# Per-frame pyramid COMPLETION marker (written LAST, after every tile PUT
+# succeeds): its presence == "this frame's whole pyramid is on R2". Idempotency
+# heads THIS, not a tile, so a partial/interrupted emit (tiles present, marker
+# absent) is re-rendered by the next run instead of being skipped as complete.
+READY_MARKER = "_ready.json"
+
 
 # ---------------------------------------------------------------------------
 # Object-key parsing -> a generalized SatSlot (superset of s1_slots.Slot)
@@ -213,6 +224,15 @@ class ProductEntry:
     render_sat_hint: str = ""       # /render "satellite", e.g. "GOES-East"
     # --- cadence (backfill tick + staleness window) ---
     cadence_s: int = 600
+    # --- zoomable/tiled product (Stage-2 Phase 2a pyramid emitter) ---
+    # tiled=True routes the slot through s2_pyramid (an XYZ tile pyramid + a
+    # tiled latest_times.json) instead of the single-frame writer. floaters/meso
+    # stay tiled=False single-frame sequences (SATELLITE-REARCH §4.2).
+    tiled: bool = False
+    tile_size: int = 512            # tile edge px (§4.2 "WebP, 512 px")
+    pyramid_px: int = 4096          # target long-edge of the rendered raster -> maxzoom
+    projection: str = "equirectangular"      # PlateCarree; flat-native pyramid (§4.1)
+    sector_bbox: Optional[tuple] = None      # [W,S,E,N] fetch/render extent for a tiled product
 
     # -- routing ------------------------------------------------------------
     def claims(self, slot: Optional[SatSlot]) -> bool:
@@ -307,6 +327,87 @@ class ProductEntry:
             "product": self.product_path,
             "path": f"{self.product_path}/{{t}}{self.frame_ext}",
             "tile": None,
+            "times": times,
+            "latest": times[-1] if times else None,
+            "as_of": as_of.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "count": len(times),
+        }
+
+    # -- tiled/pyramid keys + manifest (Stage-2 Phase 2a) -------------------
+    # The zoomable-product analogue of frame_key/latest_times/build_latest_times.
+    # Deterministic keys: a redelivery/backfill resolves a (stamp,z,x,y) to the
+    # SAME tile key, so dedup-by-existence holds exactly as for single frames.
+    def tile_template(self) -> str:
+        """Product-relative XYZ tile path template for the manifest `tile` key
+        (the viewer joins the R2 prefix + substitutes {t}/{z}/{x}/{y})."""
+        return f"{self.product_path}/{{t}}/{{z}}/{{x}}/{{y}}{self.frame_ext}"
+
+    def tile_key(self, prefix: str, stamp: str, z: int, x: int, y: int) -> str:
+        """Absolute R2 tile key: prefix/{product_path}/{stamp}/{z}/{x}/{y}.webp."""
+        return (f"{prefix.strip('/')}/{self.product_path}"
+                f"/{stamp}/{z}/{x}/{y}{self.frame_ext}")
+
+    def tile_stamp_prefix(self, prefix: str, stamp: str) -> str:
+        """List/delete prefix for one frame's whole pyramid (prune enumerates
+        this and deletes ALL tiles + the marker -- a single-key prune would
+        orphan tiles)."""
+        base = f"{prefix.strip('/')}/{self.product_path}"
+        return f"{base}/{stamp}/" if stamp else f"{base}/"
+
+    def ready_key(self, prefix: str, stamp: str) -> str:
+        """The per-frame completion marker key (written LAST). head() THIS for
+        idempotency so a partial emit is never mistaken for a complete one."""
+        return f"{prefix.strip('/')}/{self.product_path}/{stamp}/{READY_MARKER}"
+
+    def stamp_from_ready_key(self, key: str) -> Optional[str]:
+        """Recover {stamp} from a completion-marker key (None otherwise)."""
+        suffix = "/" + READY_MARKER
+        if not key.endswith(suffix):
+            return None
+        stamp = key[: -len(suffix)].rsplit("/", 1)[-1]
+        try:
+            dt.datetime.strptime(stamp, STAMP_FMT)
+        except ValueError:
+            return None
+        return stamp
+
+    def stamp_from_tile_key(self, key: str) -> Optional[str]:
+        """Recover {stamp} from a tile key (cold-start dedup lets R2 be the
+        ledger). None for latest_times.json/health.json or a malformed key."""
+        if not key.endswith(self.frame_ext):
+            return None
+        parts = key[: -len(self.frame_ext)].split("/")
+        if len(parts) < 4:
+            return None
+        stamp, z, x, y = parts[-4], parts[-3], parts[-2], parts[-1]
+        if not (z.isdigit() and x.isdigit() and y.isdigit()):
+            return None
+        try:
+            dt.datetime.strptime(stamp, STAMP_FMT)
+        except ValueError:
+            return None
+        return stamp
+
+    def build_tiled_latest_times(self, stamps: Iterable[str], *, bounds,
+                                 image_px, maxzoom: int, as_of: dt.datetime,
+                                 tile_size: int = 512, min_zoom: int = 0) -> dict:
+        """The §4.1 SLIDER manifest, tiled variant (superset of the single-frame
+        shape: keeps product/path/tile/times/latest/as_of/count with path=None +
+        tile populated, adds scheme/projection/tile_size/minzoom/maxzoom/
+        image_px/bounds). The viewer branches on `tile is not None` and derives
+        the per-zoom grid from image_px+maxzoom -- it never lists the bucket."""
+        times = sorted(set(stamps))
+        return {
+            "product": self.product_path,
+            "path": None,                         # tiled: no single-frame path
+            "tile": self.tile_template(),
+            "scheme": TILE_SCHEME,                # vs a future "webmercator-xyz" (§5.5)
+            "projection": self.projection,
+            "tile_size": tile_size,
+            "minzoom": min_zoom,
+            "maxzoom": maxzoom,
+            "image_px": [int(image_px[0]), int(image_px[1])] if image_px else None,
+            "bounds": [float(b) for b in bounds] if bounds is not None else None,
             "times": times,
             "latest": times[-1] if times else None,
             "as_of": as_of.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -415,6 +516,44 @@ REGISTRY: tuple[ProductEntry, ...] = (
         render_channel="clean_ir", render_enhancement="rainbow_ir",
         render_product_hint="meso", render_sat_hint="Himawari-Pacific",
         cadence_s=150,
+    ),
+
+    # --- GOES-19 CONUS clean-IR TILE PYRAMID (Stage-2 Phase 2a zoomable) ---
+    # NEW zoomable product: native-res C13 CONUS cut into a 512 px flat-native
+    # XYZ WebP pyramid (s2_pyramid). No prod baseline -> reference-render gated
+    # (§6.3/§9), so pixel-identity is against the FROZEN colortable, not a prod
+    # frame. Single-band clean-IR => renderable with xarray+matplotlib (no satpy).
+    ProductEntry(
+        product_id="goes19-conus-ir",
+        family="goes", substrate="cmip", bucket="noaa-goes19", sat_num="19",
+        s3_prefix="ABI-L2-CMIPC/", sns_filter_prefixes=("ABI-L2-CMIPC/",),
+        accept_sectors=frozenset({"CMIPC"}),
+        channels=("clean_ir",), bands=(13,),
+        sat_key="goes19", sector_key="conus", band_key="ir",
+        prod_meso_slug=None,
+        render_channel="clean_ir", render_enhancement="rainbow_ir",
+        render_product_hint="conus", render_sat_hint="GOES-East",
+        cadence_s=300,
+        tiled=True, tile_size=512, pyramid_px=4096,
+        # bbox fully inside the Mode-6 CONUS footprint (-135,14,-55,50) so the
+        # fetch picker resolves CMIPC (not full disk). [W,S,E,N].
+        sector_bbox=(-125.0, 15.0, -66.0, 49.0),
+    ),
+
+    # --- GOES-19 FULL-DISK clean-IR TILE PYRAMID (same code, bigger source) ---
+    ProductEntry(
+        product_id="goes19-fd-ir",
+        family="goes", substrate="cmip", bucket="noaa-goes19", sat_num="19",
+        s3_prefix="ABI-L2-CMIPF/", sns_filter_prefixes=("ABI-L2-CMIPF/",),
+        accept_sectors=frozenset({"CMIPF"}),
+        channels=("clean_ir",), bands=(13,),
+        sat_key="goes19", sector_key="fd", band_key="ir",
+        prod_meso_slug=None,
+        render_channel="clean_ir", render_enhancement="rainbow_ir",
+        render_product_hint="fd", render_sat_hint="GOES-East",
+        cadence_s=600,
+        tiled=True, tile_size=512, pyramid_px=8192,
+        sector_bbox=(-156.0, -60.0, 6.0, 60.0),
     ),
 )
 
