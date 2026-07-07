@@ -221,7 +221,8 @@ class FilesystemStore:
 # ---------------------------------------------------------------------------
 def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
                  bounds, spec: PyramidSpec = PyramidSpec(), *,
-                 skip_if_present: bool = True) -> dict:
+                 skip_if_present: bool = True,
+                 scheme: str = "flat-native-xyz") -> dict:
     """Cut `raster` and PUT every tile under
     ``{prefix}/{entry.product_path}/{stamp}/{z}/{x}/{y}.webp``, then write the
     per-frame completion marker (``_ready.json``) LAST.
@@ -237,9 +238,14 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
     ready_key = entry.ready_key(prefix, stamp)
     if skip_if_present and store.head(ready_key):
         return {"stamp": stamp, "outcome": "duplicate", "n_tiles": 0,
-                "bounds": list(bounds), "image_px": None, "maxzoom": None}
+                "bounds": list(bounds), "image_px": None, "maxzoom": None,
+                "scheme": scheme}
 
-    cut = cut_pyramid(raster, spec)
+    if scheme == "webmercator-xyz":
+        import s2_webmerc                          # lazy: scipy only when reprojecting
+        cut = s2_webmerc.cut_webmerc_pyramid(raster, bounds, spec)
+    else:
+        cut = cut_pyramid(raster, spec)
     n = 0
     for (z, x, y), data in cut["tiles"].items():
         if not store.put_bytes(entry.tile_key(prefix, stamp, z, x, y),
@@ -248,7 +254,8 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
         n += 1
     meta = {"stamp": stamp, "outcome": "rendered", "n_tiles": n,
             "bounds": [float(b) for b in bounds], "image_px": list(cut["image_px"]),
-            "maxzoom": cut["maxzoom"], "tile_counts": cut["tile_counts"]}
+            "maxzoom": cut["maxzoom"], "tile_counts": cut["tile_counts"],
+            "scheme": scheme}
     # Commit marker LAST -- only now is the frame's pyramid provably whole.
     if not store.put_json(ready_key, {"image_px": meta["image_px"],
                                       "maxzoom": meta["maxzoom"],
@@ -260,15 +267,17 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
 
 def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
                          bounds, image_px, maxzoom: int, as_of, *,
-                         spec: PyramidSpec = PyramidSpec()) -> dict:
+                         spec: PyramidSpec = PyramidSpec(),
+                         scheme: str = "flat-native-xyz") -> dict:
     """Build + PUT the tiled SLIDER manifest (§4.1 tiled variant, superset).
 
     The viewer NEVER lists the bucket: `tile` is a product-relative path
-    template, and the grid at each zoom is derivable from `image_px`+`maxzoom`.
+    template; for flat-native it derives the per-zoom grid from image_px+maxzoom,
+    for webmercator-xyz it uses the global XYZ grid + `bounds` to fitBounds.
     """
     lt = entry.build_tiled_latest_times(
         stamps, bounds=bounds, image_px=image_px, maxzoom=maxzoom, as_of=as_of,
-        tile_size=spec.tile_size, min_zoom=spec.min_zoom)
+        tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme)
     store.put_json(entry.latest_times_key(prefix), lt, CACHE_MANIFEST)
     return lt
 

@@ -231,7 +231,10 @@ class ProductEntry:
     tiled: bool = False
     tile_size: int = 512            # tile edge px (§4.2 "WebP, 512 px")
     pyramid_px: int = 4096          # target long-edge of the rendered raster -> maxzoom
-    projection: str = "equirectangular"      # PlateCarree; flat-native pyramid (§4.1)
+    projection: str = "equirectangular"      # PlateCarree; the rendered raster's projection
+    # Tile SCHEME (§4.1/§5.5): "flat-native-xyz" (Phase 2a, pixels unchanged) or
+    # "webmercator-xyz" (Phase 2b, reprojected to EPSG:3857 for MapLibre GL).
+    pyramid_scheme: str = "flat-native-xyz"
     sector_bbox: Optional[tuple] = None      # [W,S,E,N] fetch/render extent for a tiled product
 
     # -- routing ------------------------------------------------------------
@@ -390,7 +393,8 @@ class ProductEntry:
 
     def build_tiled_latest_times(self, stamps: Iterable[str], *, bounds,
                                  image_px, maxzoom: int, as_of: dt.datetime,
-                                 tile_size: int = 512, min_zoom: int = 0) -> dict:
+                                 tile_size: int = 512, min_zoom: int = 0,
+                                 scheme: str = TILE_SCHEME) -> dict:
         """The §4.1 SLIDER manifest, tiled variant (superset of the single-frame
         shape: keeps product/path/tile/times/latest/as_of/count with path=None +
         tile populated, adds scheme/projection/tile_size/minzoom/maxzoom/
@@ -401,7 +405,7 @@ class ProductEntry:
             "product": self.product_path,
             "path": None,                         # tiled: no single-frame path
             "tile": self.tile_template(),
-            "scheme": TILE_SCHEME,                # vs a future "webmercator-xyz" (§5.5)
+            "scheme": scheme,                     # flat-native-xyz | webmercator-xyz (§5.5)
             "projection": self.projection,
             "tile_size": tile_size,
             "minzoom": min_zoom,
@@ -535,6 +539,7 @@ REGISTRY: tuple[ProductEntry, ...] = (
         render_product_hint="conus", render_sat_hint="GOES-East",
         cadence_s=300,
         tiled=True, tile_size=512, pyramid_px=4096,
+        pyramid_scheme="webmercator-xyz",   # MapLibre GL tiled viewer (Phase 2b)
         # bbox fully inside the Mode-6 CONUS footprint (-135,14,-55,50) so the
         # fetch picker resolves CMIPC (not full disk). [W,S,E,N].
         sector_bbox=(-125.0, 15.0, -66.0, 49.0),
@@ -553,6 +558,7 @@ REGISTRY: tuple[ProductEntry, ...] = (
         render_product_hint="fd", render_sat_hint="GOES-East",
         cadence_s=600,
         tiled=True, tile_size=512, pyramid_px=8192,
+        pyramid_scheme="webmercator-xyz",   # MapLibre GL tiled viewer (Phase 2b)
         sector_bbox=(-156.0, -60.0, 6.0, 60.0),
     ),
 )

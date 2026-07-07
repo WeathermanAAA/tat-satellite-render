@@ -60,6 +60,9 @@ def main(argv=None) -> int:
                     help="override the raster long-edge (drives maxzoom)")
     ap.add_argument("--quality", type=int, default=90,
                     help="WebP quality (default 90 -- rainbow_ir colortable edges, §4.2)")
+    ap.add_argument("--scheme", default=None,
+                    choices=["flat-native-xyz", "webmercator-xyz"],
+                    help="tile scheme (default: the product's pyramid_scheme)")
     args = ap.parse_args(argv)
 
     entry = R.REGISTRY_BY_ID.get(args.product)
@@ -79,15 +82,16 @@ def main(argv=None) -> int:
 
     store, is_r2 = _make_store(args.store)
     spec = P.PyramidSpec(tile_size=entry.tile_size, quality=args.quality)
+    scheme = args.scheme or entry.pyramid_scheme
 
-    print(f"[fetch] {entry.product_id}  time={args.time}  bbox={entry.sector_bbox}")
+    print(f"[fetch] {entry.product_id}  time={args.time}  bbox={entry.sector_bbox}  scheme={scheme}")
     img = I.produce_imagery(entry, time=when, nearest=True)
     print(f"[imagery] {img.product} {img.s3_key.split('/')[-1]}  stamp={img.stamp}")
     print(f"[imagery] raster={img.rgba.shape[1]}x{img.rgba.shape[0]}  "
           f"bounds(W,S,E,N)={tuple(round(b,3) for b in img.bounds)}")
 
     meta = P.emit_pyramid(entry, store, args.prefix, img.stamp, img.rgba,
-                          img.bounds, spec)
+                          img.bounds, spec, scheme=scheme)
     if meta["outcome"] == "duplicate":
         print(f"[emit] duplicate -- {img.stamp} already present, skipped")
     else:
@@ -95,24 +99,25 @@ def main(argv=None) -> int:
               f"per-zoom={meta['tile_counts']}")
 
     # Rebuild the manifest from R2 reality so re-runs accumulate a real series.
-    # The current frame's geometry (from its raster, not the emit outcome) is the
-    # advertised top-level; times[] includes ONLY COMPLETE frames cut at the SAME
-    # maxzoom, so the viewer's per-frame grid derivation never 404s. A frame at a
-    # different pyramid geometry (a pyramid_px change) is dropped + logged loudly.
+    # The current frame's maxzoom is read from its OWN tiles in the store
+    # (scheme-agnostic -- flat-native and webmercator have different maxzoom
+    # rules, and it works on a 'duplicate' too); times[] then keeps only COMPLETE
+    # frames at that same maxzoom, so the viewer's grid derivation never 404s. A
+    # frame at a different geometry (scheme/pyramid_px change) is dropped + logged.
     image_px = [img.rgba.shape[1], img.rgba.shape[0]]
-    maxzoom = P.max_zoom_for(image_px[0], image_px[1], spec.tile_size)
     frames = P.complete_stamps(entry, store, args.prefix)   # [(stamp, maxzoom)]
+    maxzoom = dict(frames).get(img.stamp, meta.get("maxzoom") or 0)
     times = [s for s, mz in frames if mz == maxzoom]
     dropped = [s for s, mz in frames if mz != maxzoom]
     if img.stamp not in times:
         times.append(img.stamp)
     if dropped:
         print(f"[manifest] WARNING: dropped {len(dropped)} frame(s) at a DIFFERENT "
-              f"pyramid geometry (maxzoom != {maxzoom}); a pyramid_px change needs a "
-              f"fresh prefix or a full re-emit. e.g. {dropped[:3]}")
+              f"pyramid geometry (maxzoom != {maxzoom}); a scheme/pyramid_px change "
+              f"needs a fresh prefix or a full re-emit. e.g. {dropped[:3]}")
     manifest = P.write_tiled_manifest(entry, store, args.prefix, times,
                                       img.bounds, image_px, maxzoom,
-                                      dt.datetime.now(UTC), spec=spec)
+                                      dt.datetime.now(UTC), spec=spec, scheme=scheme)
 
     mkey = entry.latest_times_key(args.prefix)
     sample = entry.tile_key(args.prefix, img.stamp, maxzoom, 0, 0)
