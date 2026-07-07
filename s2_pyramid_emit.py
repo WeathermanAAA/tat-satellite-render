@@ -90,8 +90,16 @@ def main(argv=None) -> int:
     print(f"[imagery] raster={img.rgba.shape[1]}x{img.rgba.shape[0]}  "
           f"bounds(W,S,E,N)={tuple(round(b,3) for b in img.bounds)}")
 
+    # Calibrated BT data raster beside the tiles (pixel/BT inspector, §6).
+    bt_png = bt_desc = None
+    if getattr(img, "bt_grid", None) is not None:
+        import s2_bt
+        bt_png = s2_bt.encode_bt_png(img.bt_grid)
+        bt_desc = s2_bt.bt_descriptor(entry.product_path, img.bounds, img.bt_dims)
+        print(f"[bt] calibrated BT raster {img.bt_dims[0]}x{img.bt_dims[1]}  ({len(bt_png)//1024} KB)")
+
     meta = P.emit_pyramid(entry, store, args.prefix, img.stamp, img.rgba,
-                          img.bounds, spec, scheme=scheme)
+                          img.bounds, spec, scheme=scheme, bt_png=bt_png)
     if meta["outcome"] == "duplicate":
         print(f"[emit] duplicate -- {img.stamp} already present, skipped")
     else:
@@ -117,7 +125,8 @@ def main(argv=None) -> int:
               f"needs a fresh prefix or a full re-emit. e.g. {dropped[:3]}")
     manifest = P.write_tiled_manifest(entry, store, args.prefix, times,
                                       img.bounds, image_px, maxzoom,
-                                      dt.datetime.now(UTC), spec=spec, scheme=scheme)
+                                      dt.datetime.now(UTC), spec=spec, scheme=scheme,
+                                      bt=bt_desc)
 
     mkey = entry.latest_times_key(args.prefix)
     sample = entry.tile_key(args.prefix, img.stamp, maxzoom, 0, 0)

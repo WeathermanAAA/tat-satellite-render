@@ -364,6 +364,10 @@ class ProductEntry:
         idempotency so a partial emit is never mistaken for a complete one."""
         return f"{prefix.strip('/')}/{self.product_path}/{stamp}/{READY_MARKER}"
 
+    def bt_key(self, prefix: str, stamp: str, ext: str = ".png") -> str:
+        """Calibrated BT data-raster key (beside the tiles) for the inspector."""
+        return f"{prefix.strip('/')}/{self.product_path}/{stamp}/bt{ext}"
+
     def stamp_from_ready_key(self, key: str) -> Optional[str]:
         """Recover {stamp} from a completion-marker key (None otherwise)."""
         suffix = "/" + READY_MARKER
@@ -396,7 +400,7 @@ class ProductEntry:
     def build_tiled_latest_times(self, stamps: Iterable[str], *, bounds,
                                  image_px, maxzoom: int, as_of: dt.datetime,
                                  tile_size: int = 512, min_zoom: int = 0,
-                                 scheme: str = TILE_SCHEME) -> dict:
+                                 scheme: str = TILE_SCHEME, bt: Optional[dict] = None) -> dict:
         """The §4.1 SLIDER manifest, tiled variant (superset of the single-frame
         shape: keeps product/path/tile/times/latest/as_of/count with path=None +
         tile populated, adds scheme/projection/tile_size/minzoom/maxzoom/
@@ -414,6 +418,7 @@ class ProductEntry:
             "maxzoom": maxzoom,
             "image_px": [int(image_px[0]), int(image_px[1])] if image_px else None,
             "bounds": [float(b) for b in bounds] if bounds is not None else None,
+            "bt": bt,                             # calibrated BT data-raster block (inspector) or None
             "times": times,
             "latest": times[-1] if times else None,
             "as_of": as_of.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),

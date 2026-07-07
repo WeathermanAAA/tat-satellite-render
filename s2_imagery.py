@@ -52,7 +52,7 @@ class ImageryResult:
     """A chrome-free equirectangular RGBA raster + the geo/time metadata the
     pyramid emitter needs."""
     __slots__ = ("rgba", "bounds", "scan_start", "product", "bucket", "s3_key",
-                 "generic_channel", "enhancement")
+                 "generic_channel", "enhancement", "bt_grid", "bt_dims")
 
     def __init__(self, rgba, bounds, scan_start, product, bucket, s3_key,
                  generic_channel, enhancement):
@@ -64,6 +64,8 @@ class ImageryResult:
         self.s3_key = s3_key
         self.generic_channel = generic_channel
         self.enhancement = enhancement
+        self.bt_grid = None      # HxW float BT (deg C, NaN off-data), equirect
+        self.bt_dims = None      # (w, h)
 
     @property
     def stamp(self) -> str:
@@ -161,6 +163,37 @@ def render_imagery_rgba(cmi: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     return rgba, (W, S, E, N)
 
 
+BT_PX = 1280   # long-edge of the calibrated BT data raster (compact; §6 inspector)
+
+
+def resample_bt_equirect(cmi: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+                         bounds, out_w: int = BT_PX, units: str = "K"):
+    """Resample the source (curvilinear) brightness temperature onto a regular
+    equirectangular grid (deg C, NaN off-data) for the pixel/BT inspector. This
+    is a DATA resample (values), separate from the colorized pcolormesh. Returns
+    (bt_grid HxW float, (w, h)). The viewer maps lon/lat -> col/row linearly."""
+    from scipy.interpolate import griddata
+    bt_c = _to_bt_celsius(cmi, units)
+    W, S, E, N = bounds
+    span_x = max(E - W, 1e-6); span_y = max(N - S, 1e-6)
+    out_h = max(1, round(out_w * span_y / span_x))
+    # Downsample the source before triangulating (keep griddata fast + robust).
+    st = max(1, int(max(cmi.shape) // 700))
+    sl = (slice(None, None, st), slice(None, None, st))
+    plon = np.asarray(lons[sl]).ravel()
+    plat = np.asarray(lats[sl]).ravel()
+    pval = np.asarray(bt_c[sl]).ravel()
+    m = np.isfinite(plon) & np.isfinite(plat) & np.isfinite(pval)
+    glon = np.linspace(W, E, out_w)
+    glat = np.linspace(N, S, out_h)          # row 0 = north (matches tile origin)
+    gx, gy = np.meshgrid(glon, glat)
+    try:
+        grid = griddata((plon[m], plat[m]), pval[m], (gx, gy), method="linear")
+    except Exception:                        # degenerate triangulation -> nearest
+        grid = griddata((plon[m], plat[m]), pval[m], (gx, gy), method="nearest")
+    return grid.astype(np.float32), (out_w, out_h)
+
+
 def produce_imagery(entry, time: Optional[dt.datetime] = None,
                     nearest: bool = True) -> ImageryResult:
     """End-to-end: fetch the newest (or nearest-to-`time`) clean-IR frame for a
@@ -187,10 +220,19 @@ def produce_imagery(entry, time: Optional[dt.datetime] = None,
                 os.environ.pop("SAT_MAX_PX_PER_AXIS", None)
             else:
                 os.environ["SAT_MAX_PX_PER_AXIS"] = _prev
+    units = getattr(r, "units", "K")
     rgba, bounds = render_imagery_rgba(
-        r.cmi, r.lats, r.lons, entry.render_enhancement, entry.pyramid_px,
-        units=getattr(r, "units", "K"))
-    return ImageryResult(
+        r.cmi, r.lats, r.lons, entry.render_enhancement, entry.pyramid_px, units=units)
+    res = ImageryResult(
         rgba=rgba, bounds=bounds, scan_start=r.scan_start, product=r.product,
         bucket=r.bucket, s3_key=getattr(resolved, "s3_key", ""),
         generic_channel=entry.render_channel, enhancement=entry.render_enhancement)
+    # Calibrated BT data raster for the pixel/BT inspector (bounds MUST match the
+    # imagery so lon/lat probes line up). Non-fatal: a failure just disables the
+    # inspector for this frame, never blocks the imagery.
+    try:
+        res.bt_grid, res.bt_dims = resample_bt_equirect(
+            r.cmi, r.lats, r.lons, bounds, units=units)
+    except Exception:   # noqa: BLE001
+        res.bt_grid, res.bt_dims = None, None
+    return res

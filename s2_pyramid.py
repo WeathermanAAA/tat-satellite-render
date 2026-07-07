@@ -222,7 +222,8 @@ class FilesystemStore:
 def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
                  bounds, spec: PyramidSpec = PyramidSpec(), *,
                  skip_if_present: bool = True,
-                 scheme: str = "flat-native-xyz") -> dict:
+                 scheme: str = "flat-native-xyz",
+                 bt_png: Optional[bytes] = None) -> dict:
     """Cut `raster` and PUT every tile under
     ``{prefix}/{entry.product_path}/{stamp}/{z}/{x}/{y}.webp``, then write the
     per-frame completion marker (``_ready.json``) LAST.
@@ -252,10 +253,16 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
                                data, TILE_CONTENT_TYPE, CACHE_FRAME):
             raise IOError(f"tile PUT failed: {entry.tile_key(prefix, stamp, z, x, y)}")
         n += 1
+    # Calibrated BT data raster beside the tiles (before the marker, so it is part
+    # of the atomically-completed frame the inspector can rely on).
+    if bt_png is not None:
+        if not store.put_bytes(entry.bt_key(prefix, stamp), bt_png,
+                               "image/png", CACHE_FRAME):
+            raise IOError(f"BT-raster PUT failed: {entry.bt_key(prefix, stamp)}")
     meta = {"stamp": stamp, "outcome": "rendered", "n_tiles": n,
             "bounds": [float(b) for b in bounds], "image_px": list(cut["image_px"]),
             "maxzoom": cut["maxzoom"], "tile_counts": cut["tile_counts"],
-            "scheme": scheme}
+            "scheme": scheme, "has_bt": bt_png is not None}
     # Commit marker LAST -- only now is the frame's pyramid provably whole.
     if not store.put_json(ready_key, {"image_px": meta["image_px"],
                                       "maxzoom": meta["maxzoom"],
@@ -268,7 +275,8 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
 def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
                          bounds, image_px, maxzoom: int, as_of, *,
                          spec: PyramidSpec = PyramidSpec(),
-                         scheme: str = "flat-native-xyz") -> dict:
+                         scheme: str = "flat-native-xyz",
+                         bt: Optional[dict] = None) -> dict:
     """Build + PUT the tiled SLIDER manifest (§4.1 tiled variant, superset).
 
     The viewer NEVER lists the bucket: `tile` is a product-relative path
@@ -277,7 +285,7 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
     """
     lt = entry.build_tiled_latest_times(
         stamps, bounds=bounds, image_px=image_px, maxzoom=maxzoom, as_of=as_of,
-        tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme)
+        tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme, bt=bt)
     store.put_json(entry.latest_times_key(prefix), lt, CACHE_MANIFEST)
     return lt
 
