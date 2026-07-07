@@ -231,6 +231,8 @@ class ProductEntry:
     tiled: bool = False
     tile_size: int = 512            # tile edge px (§4.2 "WebP, 512 px")
     pyramid_px: int = 4096          # target long-edge of the rendered raster -> maxzoom
+    fetch_max_px: int = 0           # >0 raises satellites' SAT_MAX_PX_PER_AXIS for a
+                                    # native-res tiled fetch (0 = keep the 2400 default)
     projection: str = "equirectangular"      # PlateCarree; the rendered raster's projection
     # Tile SCHEME (§4.1/§5.5): "flat-native-xyz" (Phase 2a, pixels unchanged) or
     # "webmercator-xyz" (Phase 2b, reprojected to EPSG:3857 for MapLibre GL).
@@ -538,7 +540,7 @@ REGISTRY: tuple[ProductEntry, ...] = (
         render_channel="clean_ir", render_enhancement="rainbow_ir",
         render_product_hint="conus", render_sat_hint="GOES-East",
         cadence_s=300,
-        tiled=True, tile_size=512, pyramid_px=4096,
+        tiled=True, tile_size=512, pyramid_px=6144, fetch_max_px=4800,
         pyramid_scheme="webmercator-xyz",   # MapLibre GL tiled viewer (Phase 2b)
         # bbox fully inside the Mode-6 CONUS footprint (-135,14,-55,50) so the
         # fetch picker resolves CMIPC (not full disk). [W,S,E,N].
@@ -557,7 +559,7 @@ REGISTRY: tuple[ProductEntry, ...] = (
         render_channel="clean_ir", render_enhancement="rainbow_ir",
         render_product_hint="fd", render_sat_hint="GOES-East",
         cadence_s=600,
-        tiled=True, tile_size=512, pyramid_px=8192,
+        tiled=True, tile_size=512, pyramid_px=8192, fetch_max_px=4800,
         pyramid_scheme="webmercator-xyz",   # MapLibre GL tiled viewer (Phase 2b)
         sector_bbox=(-156.0, -60.0, 6.0, 60.0),
     ),

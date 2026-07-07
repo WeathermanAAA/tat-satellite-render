@@ -900,7 +900,10 @@ class GOESBaseSatellite(Satellite):
         # striding, the byte-range reads from S3 + matplotlib pcolormesh
         # become the wall-clock bottleneck. Output resolution stays the same
         # (matplotlib resamples), and 2400 px easily covers a 1320 px figure.
-        MAX_PX_PER_AXIS = 2400
+        # Env-overridable (default 2400 -> byte-identical for meso/floater/render):
+        # the Stage-2 TILED emitter raises it so a zoomable pyramid reaches the
+        # sensor's native resolution instead of a 2400-px-strided proxy.
+        MAX_PX_PER_AXIS = int(os.getenv("SAT_MAX_PX_PER_AXIS", "2400"))
         x_stride = max(1, (ix1 - ix0) // MAX_PX_PER_AXIS)
         y_stride = max(1, (iy_bot - iy_top) // MAX_PX_PER_AXIS)
         sub = ds.isel(x=slice(ix0, ix1, x_stride), y=slice(iy_top, iy_bot, y_stride))
@@ -1377,7 +1380,7 @@ class HimawariPacificSatellite(Satellite):
                 f"crop produced empty window (line_offset={disk.line_offset}, "
                 f"global lines {il_lo_g}..{il_hi_g}, local span 0..{disk.n_lines})"
             )
-        MAX_PX_PER_AXIS = 2400
+        MAX_PX_PER_AXIS = int(os.getenv("SAT_MAX_PX_PER_AXIS", "2400"))  # Stage-2 tiled: raise for native res
         x_stride = max(1, (ic_hi - ic_lo) // MAX_PX_PER_AXIS)
         y_stride = max(1, (il_hi - il_lo) // MAX_PX_PER_AXIS)
         sub_data = disk.data[il_lo:il_hi:y_stride, ic_lo:ic_hi:x_stride]

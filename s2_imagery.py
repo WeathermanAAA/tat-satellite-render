@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 from typing import Optional
 
 import numpy as np
@@ -172,7 +173,20 @@ def produce_imagery(entry, time: Optional[dt.datetime] = None,
     t = time or dt.datetime.now(UTC)
     if t.tzinfo is None:
         t = t.replace(tzinfo=UTC)
-    resolved, r = asyncio.run(_fetch_async(sat, entry, t, nearest))
+    # Opt this tiled product into a finer-than-default fetch so the pyramid can
+    # reach the sensor's native resolution (satellites.py reads the env at crop
+    # time). Restore after so we never perturb a co-tenant meso/floater fetch.
+    _prev = os.environ.get("SAT_MAX_PX_PER_AXIS")
+    if entry.fetch_max_px:
+        os.environ["SAT_MAX_PX_PER_AXIS"] = str(entry.fetch_max_px)
+    try:
+        resolved, r = asyncio.run(_fetch_async(sat, entry, t, nearest))
+    finally:
+        if entry.fetch_max_px:
+            if _prev is None:
+                os.environ.pop("SAT_MAX_PX_PER_AXIS", None)
+            else:
+                os.environ["SAT_MAX_PX_PER_AXIS"] = _prev
     rgba, bounds = render_imagery_rgba(
         r.cmi, r.lats, r.lons, entry.render_enhancement, entry.pyramid_px,
         units=getattr(r, "units", "K"))

@@ -37,6 +37,15 @@ def merc_y_to_lat(y_norm: float) -> float:
     return _R2D * math.atan(math.sinh(math.pi * (1.0 - 2.0 * y_norm)))
 
 
+def lat_to_merc_y(lat: float) -> float:
+    """Forward Web-Mercator: latitude -> normalized world-Y in [0,1] (0=north).
+    This is the exact inverse of merc_y_to_lat -- y = 0.5 - asinh(tan(lat))/2pi.
+    (NOT the Gudermannian 0.5 - atan(sinh(lat))/2pi, which is a DIFFERENT curve
+    and mis-registers vectors against the imagery, error growing with latitude.)"""
+    lat = max(-WEBMERC_LAT_LIMIT, min(WEBMERC_LAT_LIMIT, lat))
+    return 0.5 - math.asinh(math.tan(math.radians(lat))) / (2.0 * math.pi)
+
+
 def tile_geo_bounds(z: int, x: int, y: int) -> tuple:
     """Geographic (W,S,E,N) of an XYZ tile in the global Web-Mercator scheme."""
     n = float(2 ** z)
@@ -115,11 +124,9 @@ def cut_webmerc_pyramid(raster: np.ndarray, bounds, spec: PyramidSpec = PyramidS
         # Only iterate the tile range that overlaps the data footprint.
         x0 = max(0, int((w + 180.0) / 360.0 * nz))
         x1 = min(nz - 1, int((e + 180.0) / 360.0 * nz))
-        # y grows southward; north edge = smaller y.
-        yn = 0.5 - math.atan(math.sinh(math.radians(min(n, WEBMERC_LAT_LIMIT)))) / (2 * math.pi)
-        ys = 0.5 - math.atan(math.sinh(math.radians(max(s, -WEBMERC_LAT_LIMIT)))) / (2 * math.pi)
-        y0 = max(0, int(yn * nz))
-        y1 = min(nz - 1, int(ys * nz))
+        # y grows southward; north edge = smaller y (correct forward Mercator).
+        y0 = max(0, int(lat_to_merc_y(min(n, WEBMERC_LAT_LIMIT)) * nz))
+        y1 = min(nz - 1, int(lat_to_merc_y(max(s, -WEBMERC_LAT_LIMIT)) * nz))
         c = 0
         for ty in range(y0, y1 + 1):
             for tx in range(x0, x1 + 1):

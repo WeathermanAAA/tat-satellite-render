@@ -38,6 +38,17 @@ class TestWebMercGeo(unittest.TestCase):
         self.assertAlmostEqual(WM.merc_y_to_lat(0.0), WM.WEBMERC_LAT_LIMIT, places=4)
         self.assertAlmostEqual(WM.merc_y_to_lat(1.0), -WM.WEBMERC_LAT_LIMIT, places=4)
 
+    def test_forward_inverse_roundtrip(self):
+        # lat_to_merc_y must be the EXACT inverse of merc_y_to_lat -- the fix for
+        # the vector-vs-imagery mis-registration (was the Gudermannian by mistake).
+        for lat in (-80, -45, -20, 0, 20, 33.5, 45, 60, 80):
+            self.assertAlmostEqual(WM.merc_y_to_lat(WM.lat_to_merc_y(lat)), lat, places=6)
+        self.assertAlmostEqual(WM.lat_to_merc_y(0.0), 0.5, places=9)   # equator = mid
+        # regression: NOT the Gudermannian atan(sinh(lat)); they diverge with lat.
+        import math
+        gud = 0.5 - math.atan(math.sinh(math.radians(45))) / (2 * math.pi)
+        self.assertGreater(abs(WM.lat_to_merc_y(45) - gud), 0.02)   # ~868px @ z6
+
     def test_tile_geo_bounds_z0_is_world(self):
         w, s, e, n = WM.tile_geo_bounds(0, 0, 0)
         self.assertAlmostEqual(w, -180.0); self.assertAlmostEqual(e, 180.0)
