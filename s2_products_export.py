@@ -21,16 +21,27 @@ import s2_recipes as X
 import s2_registry as R
 from colormaps import get_enhancement, enhancement_norm
 
-# Colorbar presentation per FROZEN enhancement: (ticks top->bottom, caption).
-# Ticks are display labels inside the norm range (house style: the existing
-# explorer rainbow_ir bar shows 40/0/-40/-80).
+# Colorbar presentation per FROZEN enhancement: (numeric tick values, caption).
+# Tick POSITIONS are computed from the palette norm -- (vmax - v)/(vmax - vmin)
+# from the top -- so a label sits exactly at its color (the old evenly-spread
+# ticks were up to 15 degC off on the -95..40 rainbow_ir span).
 CBARS = {
-    "rainbow_ir": (["40", "0", "−40", "−80"], "Brightness temperature (°C)"),
-    "dvorak":     (["40", "0", "−40", "−80"], "Brightness temperature (°C)"),
-    "wv_tat":     (["0", "−30", "−60", "−90"], "Brightness temperature (°C)"),
-    "grayscale":  (["30", "−10", "−50", "−90"], "Brightness temperature (°C)"),
+    "rainbow_ir": ([40, 0, -40, -80], "Brightness temperature (°C)"),
+    "dvorak":     ([40, 0, -40, -80], "Brightness temperature (°C)"),
+    "wv_tat":     ([0, -30, -60, -90], "Brightness temperature (°C)"),
+    "grayscale":  ([30, -10, -50, -90], "Brightness temperature (°C)"),
 }
-REFL_TICKS = (["100", "50", "0"], "Reflectance (%)")
+REFL_TICKS = ([100, 50, 0], "Reflectance (%)")
+
+
+def _fmt(v):
+    return str(v).replace("-", "−")
+
+
+def tick_marks(values, vmin, vmax):
+    """[{t: label, p: fraction-from-top}] with exact norm placement."""
+    return [{"t": _fmt(v), "p": round((vmax - v) / (vmax - vmin), 4)}
+            for v in values]
 
 BAR_W, BAR_H = 14, 230
 
@@ -74,10 +85,13 @@ def product_row(e) -> dict:
             cbar_key = None              # multispectral RGB / truecolor: no scalar bar
     cbar = None
     if cbar_key == "_refl":
-        cbar = {"img": "cbars/gray_refl.png", "ticks": REFL_TICKS[0], "cap": REFL_TICKS[1]}
+        cbar = {"img": "cbars/gray_refl.png",
+                "ticks": tick_marks(REFL_TICKS[0], 0, 100), "cap": REFL_TICKS[1]}
     elif cbar_key:
-        ticks, cap = CBARS[cbar_key]
-        cbar = {"img": f"cbars/{cbar_key}.png", "ticks": ticks, "cap": cap}
+        values, cap = CBARS[cbar_key]
+        norm = enhancement_norm(cbar_key)
+        cbar = {"img": f"cbars/{cbar_key}.png",
+                "ticks": tick_marks(values, norm.vmin, norm.vmax), "cap": cap}
     return {"key": e.band_key, "id": e.product_id, "path": e.product_path,
             "title": title, "group": group, "bt": bt, "dayOnly": day_only,
             "cbar": cbar}

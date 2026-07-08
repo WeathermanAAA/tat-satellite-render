@@ -58,10 +58,16 @@ Defaults: full `conus` suite, `--max-zoom 5`, every **900 s**. Override in
 `S2_CRON_PREFIX`. Duplicate scans are skipped via the per-frame ready marker.
 
 **Zoom-tier rule (Q7):** the cron stays at `--max-zoom 5`; full-res z6 is an
-on-demand `run --rm emit --product …` (no `--max-zoom`) — but z6 and z5 frames
-must NOT share a product prefix (the manifest keeps ONE geometry and drops the
-others with a WARNING). For a deep-zoom session either use a different
-`--prefix` or accept that the next cron tick's manifest supersedes it.
+on-demand `run --rm emit --product … --prefix shadow-z6` (no `--max-zoom`).
+z6 and z5 frames must NOT share a product prefix: the manifest keeps ONE
+geometry, so the emitter now **refuses** an emit that would drop existing
+frames (override for deliberate migrations: `--allow-geometry-change`), and a
+scan the cron already emitted **dedups on the ready marker** — an uncapped
+re-emit of it on the same prefix writes nothing (the emitter says so).
+The lifecycle TTL rule covers `shadow/sat/goes19/` as a whole, including a
+`shadow-z6`-style sub-prefix only if it also starts with that path — for
+one-off deep-zoom prefixes outside it, re-run the lifecycle service with the
+matching `--prefix`.
 
 **PUT budget** (R2 Class A, $4.50/M after the 1M free tier):
 - suite z0–5 ≈ 950 PUTs/emit → 15-min cron ≈ **2.8 M/mo ≈ $8–13/mo**

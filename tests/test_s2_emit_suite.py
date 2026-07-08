@@ -86,6 +86,33 @@ class TestSuiteEmit(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(tmp, "shadow/sat/goes19/conus/dust/latest_times.json")))
 
+    def test_geometry_change_refused_then_allowed(self):
+        # Q7 on-demand-z6 guard: an emit whose maxzoom differs from the
+        # prefix's existing frames REFUSES (would clobber the loop) unless
+        # --allow-geometry-change is passed.
+        tmp = tempfile.mkdtemp(prefix="s2geom-")
+        later = SCAN + dt.timedelta(minutes=5)
+
+        def fake(entry, time=None, nearest=True, band_cache=None):
+            img = _fake_img(entry)
+            img.scan_start = time or SCAN
+            return img
+
+        with mock.patch.object(E.I, "produce_recipe_imagery", fake):
+            args = ["--product", "goes19-conus-airmass", "--store", f"local:{tmp}"]
+            rc = E.main(args + ["--max-zoom", "2", "--time", SCAN.isoformat()])
+            self.assertEqual(rc, 0)
+            with self.assertRaises(RuntimeError):
+                E.main(args + ["--max-zoom", "1", "--time", later.isoformat()])
+            rc = E.main(args + ["--max-zoom", "1", "--time", later.isoformat(),
+                                "--allow-geometry-change"])
+            self.assertEqual(rc, 0)
+        import json
+        man = json.load(open(os.path.join(
+            tmp, "shadow/sat/goes19/conus/airmass/latest_times.json")))
+        self.assertEqual(man["maxzoom"], 1)
+        self.assertEqual(man["count"], 1)   # migration dropped the old-geometry frame
+
     def test_total_failure_exits_nonzero(self):
         all_ids = {e.product_id for e in R.REGISTRY
                    if e.tiled and e.sector_key == "conus" and e.recipe_id}

@@ -89,6 +89,11 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
                           max_zoom=args.max_zoom)
     if meta["outcome"] == "duplicate":
         print(f"[emit] duplicate -- {img.stamp} already present, skipped")
+        if args.max_zoom is None:
+            # The Q7 on-demand-z6 gotcha: a scan the z5 cron already emitted
+            # dedups on the ready marker, so an uncapped re-emit writes NOTHING.
+            print("[emit] NOTE: frames dedup by ready marker -- to re-cut this "
+                  "scan at native zoom use a DIFFERENT --prefix (e.g. shadow-z6)")
     else:
         print(f"[emit] wrote {meta['n_tiles']} tiles  maxzoom={meta['maxzoom']}  "
               f"per-zoom={meta['tile_counts']}")
@@ -107,6 +112,17 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
         times.append(img.stamp)
     if args.keep and len(times) > args.keep:
         times = sorted(times)[-args.keep:]   # viewer window; R2 keeps the rest until TTL
+    if dropped and not args.allow_geometry_change:
+        # Refuse rather than clobber: an uncapped z6 emit against the z5 cron
+        # prefix would rebuild the manifest around ONE frame and discard the
+        # whole loop (until the next cron tick reversed it). RuntimeError (not
+        # sys.exit) so suite mode's per-product isolation contains it.
+        raise RuntimeError(
+            f"{entry.product_id}: this emit (maxzoom={maxzoom}) would DROP "
+            f"{len(dropped)} existing frame(s) at a different pyramid geometry "
+            f"(e.g. {dropped[:3]}). For an on-demand deep-zoom cut use a "
+            f"different --prefix; for a deliberate geometry migration pass "
+            f"--allow-geometry-change.")
     if dropped:
         print(f"[manifest] WARNING: dropped {len(dropped)} frame(s) at a DIFFERENT "
               f"pyramid geometry (maxzoom != {maxzoom}); a scheme/pyramid_px change "
@@ -163,6 +179,10 @@ def main(argv=None) -> int:
     ap.add_argument("--keep", type=int, default=90,
                     help="manifest lists only the newest N frames (default 90, the "
                          "export window; older tiles stay until the R2 lifecycle TTL)")
+    ap.add_argument("--allow-geometry-change", action="store_true",
+                    help="permit an emit whose maxzoom differs from the prefix's "
+                         "existing frames (drops them from the manifest); without "
+                         "this the emit refuses instead of clobbering the loop")
     args = ap.parse_args(argv)
 
     if bool(args.product) == bool(args.suite):
