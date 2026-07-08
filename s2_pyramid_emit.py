@@ -63,6 +63,8 @@ def main(argv=None) -> int:
     ap.add_argument("--scheme", default=None,
                     choices=["flat-native-xyz", "webmercator-xyz"],
                     help="tile scheme (default: the product's pyramid_scheme)")
+    ap.add_argument("--max-zoom", type=int, default=None,
+                    help="cap the pyramid maxzoom (cron uses 5 for z0-5; omit for native z6+ on-demand)")
     args = ap.parse_args(argv)
 
     entry = R.REGISTRY_BY_ID.get(args.product)
@@ -99,7 +101,8 @@ def main(argv=None) -> int:
         print(f"[bt] calibrated BT raster {img.bt_dims[0]}x{img.bt_dims[1]}  ({len(bt_png)//1024} KB)")
 
     meta = P.emit_pyramid(entry, store, args.prefix, img.stamp, img.rgba,
-                          img.bounds, spec, scheme=scheme, bt_png=bt_png)
+                          img.bounds, spec, scheme=scheme, bt_png=bt_png,
+                          max_zoom=args.max_zoom)
     if meta["outcome"] == "duplicate":
         print(f"[emit] duplicate -- {img.stamp} already present, skipped")
     else:

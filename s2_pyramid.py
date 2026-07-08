@@ -223,7 +223,8 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
                  bounds, spec: PyramidSpec = PyramidSpec(), *,
                  skip_if_present: bool = True,
                  scheme: str = "flat-native-xyz",
-                 bt_png: Optional[bytes] = None) -> dict:
+                 bt_png: Optional[bytes] = None,
+                 max_zoom: Optional[int] = None) -> dict:
     """Cut `raster` and PUT every tile under
     ``{prefix}/{entry.product_path}/{stamp}/{z}/{x}/{y}.webp``, then write the
     per-frame completion marker (``_ready.json``) LAST.
@@ -244,7 +245,8 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
 
     if scheme == "webmercator-xyz":
         import s2_webmerc                          # lazy: scipy only when reprojecting
-        cut = s2_webmerc.cut_webmerc_pyramid(raster, bounds, spec)
+        # max_zoom caps the pyramid (cron pre-renders z0..5; z6+ = on-demand emit).
+        cut = s2_webmerc.cut_webmerc_pyramid(raster, bounds, spec, maxzoom=max_zoom)
     else:
         cut = cut_pyramid(raster, spec)
     n = 0

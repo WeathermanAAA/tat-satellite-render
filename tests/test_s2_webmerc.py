@@ -120,6 +120,16 @@ class TestEmitWebMerc(unittest.TestCase):
         self.assertIn(STAMP, frames)
         self.assertEqual(frames[STAMP], meta["maxzoom"])
 
+    def test_emit_max_zoom_caps_pyramid(self):
+        # Q7 cost tiering: the cron emits z0..N and z-native stays on-demand.
+        r2 = _FakeR2()
+        meta = P.emit_pyramid(self.e, r2, "shadow", STAMP, _opaque(600, 900),
+                              BOUNDS, FAST, scheme="webmercator-xyz", max_zoom=3)
+        self.assertEqual(meta["maxzoom"], 3)
+        zs = {int(k.split("/")[-3]) for k in r2.store if k.endswith(".webp")}
+        self.assertLessEqual(max(zs), 3)
+        self.assertEqual(dict(P.complete_stamps(self.e, r2, "shadow"))[STAMP], 3)
+
     def test_manifest_scheme_webmercator(self):
         lt = self.e.build_tiled_latest_times(
             [STAMP], bounds=BOUNDS, image_px=(900, 600), maxzoom=5,
