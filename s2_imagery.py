@@ -304,7 +304,16 @@ def fetch_band_crops(entry, bands, time=None, nearest=True, cache=None):
     bbox = list(entry.sector_bbox)
 
     async def _resolve():
-        anchor = await sat.find_file(t, "clean_ir", bbox, nearest_to_target=nearest)
+        if (entry.render_product_hint or "").lower() == "fd":
+            # Bypass find_file's CONUS-first ordering (same guard as the
+            # single-band fd path in _fetch_async above).
+            anchor = await sat._pick_full_disk(entry.bucket, bbox, 13, t, nearest)
+            if anchor is None:
+                raise RuntimeError(
+                    f"no GOES full-disk (CMIPF) C13 file for {entry.product_id} "
+                    f"near {t.isoformat()}")
+        else:
+            anchor = await sat.find_file(t, "clean_ir", bbox, nearest_to_target=nearest)
         others = [b for b in bands if b != 13]
         sibs = await asyncio.gather(*(
             sat._find_band_at(anchor.bucket, anchor.product, b, anchor.scan_start)

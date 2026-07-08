@@ -102,6 +102,29 @@ class TestRecipeTable(unittest.TestCase):
         self.assertEqual([(g.lo, g.hi) for g in r.guns],
                          [(-6.7, 2.6), (-3.1, 5.2), (243.55, 292.65)])
 
+    def test_quickguide_ash_and_dayconvection_locked(self):
+        # ABI-tuned Ash values (NOT the SEVIRI heritage -4..2/-4..5/243..303)
+        a = X.RECIPES_BY_KEY["ash"]
+        self.assertEqual([(g.lo, g.hi, g.gamma) for g in a.guns],
+                         [(-6.7, 2.6, 1.0), (-6.0, 6.3, 1.0), (243.6, 302.4, 1.0)])
+        # Day Convection: green gamma is 1 per the ABI quick guide (EUMETSAT
+        # heritage 0.5 deliberately NOT used); blue is reflectance FRACTION.
+        d = X.RECIPES_BY_KEY["dayconvection"]
+        self.assertEqual([g.expr for g in d.guns],
+                         [("diff", 8, 10), ("diff", 7, 13), ("diff", 5, 2)])
+        self.assertEqual([(g.lo, g.hi, g.gamma) for g in d.guns],
+                         [(-35.0, 5.0, 1.0), (-5.0, 60.0, 1.0), (-0.75, 0.25, 1.0)])
+        self.assertEqual(d.guns[2].kind, "refl")
+        # Day Land Cloud = EUMETSAT Natural Color, ABI-stretched
+        n = X.RECIPES_BY_KEY["daylandcloud"]
+        self.assertEqual([(g.expr, g.lo, g.hi) for g in n.guns],
+                         [(("band", 5), 0.0, 0.975), (("band", 3), 0.0, 1.086),
+                          (("band", 2), 0.0, 1.0)])
+
+    def test_ir_rgbs_carry_c13_bt(self):
+        for key in ("airmass", "dust", "ash", "nightmicro", "daycloudphase"):
+            self.assertEqual(X.RECIPES_BY_KEY[key].bt_band, 13, key)
+
 
 class TestEngine(unittest.TestCase):
     def test_compute_rgb_shape_and_alpha(self):
@@ -172,6 +195,23 @@ class TestRegistrySuite(unittest.TestCase):
         ids = {e.product_id for e in R.matching_entries(slot)}
         for want in ("goes19-conus-dust", "goes19-conus-nightmicro", "goes19-conus-c15"):
             self.assertIn(want, ids)
+
+    def test_fd_rows_generated(self):
+        # every recipe except truecolor gets an fd row (truecolor excluded: its
+        # product_path would collide with the Phase-1 goes19-fd-mcmip row)
+        for r in X.RECIPES:
+            e = R.REGISTRY_BY_ID.get(f"goes19-fd-{r.key}")
+            if r.key == "truecolor":
+                self.assertIsNone(e)
+                continue
+            self.assertIsNotNone(e, f"no fd row for {r.key}")
+            self.assertEqual(e.render_product_hint, "fd")
+            self.assertEqual(e.s3_prefix, "ABI-L2-CMIPF/")
+            self.assertEqual(e.sector_bbox, R._FD_BBOX)
+        # no product_path collisions anywhere in the registry among TILED rows
+        # (the fd-mcmip placeholder is tiled=False and may alias a future path)
+        paths = [e.product_path for e in R.REGISTRY if e.tiled]
+        self.assertEqual(len(paths), len(set(paths)))
 
     def test_products_index(self):
         idx = R.build_products_index("goes19", "conus", dt.datetime(2026, 7, 8, tzinfo=UTC))

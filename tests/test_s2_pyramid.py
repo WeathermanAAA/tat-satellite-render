@@ -335,8 +335,16 @@ class TestRegistryTiled(unittest.TestCase):
                      "OR_ABI-L2-CMIPF-M6C13_G19_s20260010000226_e20260010009546_c20260010010005.nc")
         MCMIPF = ("ABI-L2-MCMIPF/2026/001/00/"
                   "OR_ABI-L2-MCMIPF-M6_G19_s20260010000226_e20260010009546_c20260010010005.nc")
-        self.assertEqual({e.product_id for e in R.matching_entries(R.parse_key(CMIPF_C13))},
-                         {"goes19-fd-ir"})            # C13 FD -> the new tiled IR product
+        # A C13 FD object feeds the IR product AND every fd suite recipe that
+        # needs C13 (shared-band claiming is the documented registry contract);
+        # the leak-check is that NOTHING outside cmip/fd/goes19 claims it.
+        claimed = R.matching_entries(R.parse_key(CMIPF_C13))
+        ids = {e.product_id for e in claimed}
+        self.assertIn("goes19-fd-ir", ids)
+        self.assertIn("goes19-fd-dust", ids)          # suite rows share the file
+        for e in claimed:
+            self.assertEqual((e.substrate, e.sector_key, e.family),
+                             ("cmip", "fd", "goes"), e.product_id)
         self.assertEqual({e.product_id for e in R.matching_entries(R.parse_key(MCMIPF))},
                          {"goes19-fd-mcmip"})         # MCMIP still only the mcmip product
 

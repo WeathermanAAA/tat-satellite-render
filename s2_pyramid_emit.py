@@ -147,12 +147,18 @@ def _write_products_index(store, prefix: str, sat_key: str, sector_key: str):
 def _pin_suite_scan(entries, when):
     """Resolve the clean-IR anchor ONCE so every suite product renders the SAME
     scan (a 'latest' that drifts to a newer scan mid-suite would split the
-    suite across two times)."""
+    suite across two times). fd sectors bypass find_file's CONUS-first pick."""
     from satellites import GOESEastSatellite
     sat = GOESEastSatellite()
     t = when or dt.datetime.now(UTC)
-    bbox = list(entries[0].sector_bbox)
-    resolved = asyncio.run(sat.find_file(t, "clean_ir", bbox, nearest_to_target=True))
+    e0 = entries[0]
+    bbox = list(e0.sector_bbox)
+    if (e0.render_product_hint or "").lower() == "fd":
+        resolved = asyncio.run(sat._pick_full_disk(e0.bucket, bbox, 13, t, True))
+        if resolved is None:
+            sys.exit(f"ERROR: no full-disk C13 scan near {t.isoformat()}")
+    else:
+        resolved = asyncio.run(sat.find_file(t, "clean_ir", bbox, nearest_to_target=True))
     return resolved.scan_start
 
 

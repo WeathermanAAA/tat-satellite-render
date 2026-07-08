@@ -614,7 +614,33 @@ def _recipe_row(r) -> ProductEntry:
 
 
 SUITE_ROWS: tuple[ProductEntry, ...] = tuple(_recipe_row(r) for r in _rx.RECIPES)
-REGISTRY = REGISTRY + SUITE_ROWS
+
+# FULL-DISK variants of the suite ("one recipe -> every sector" is config too).
+# goes19-fd-ir already IS the fd C13 row. truecolor is EXCLUDED for now: its
+# product_path would collide with the Phase-1 goes19-fd-mcmip placeholder row
+# (sat/goes19/fd/truecolor), and FD 0.5 km C02 is a separate fetch-budget call
+# -- revisit with the MCMIP renderer work (registry Phase 3 note above).
+_FD_BBOX = (-156.0, -60.0, 6.0, 60.0)   # same extent as goes19-fd-ir
+_FD_PX_BY_KM = {0.5: 6144, 1.0: 6144, 2.0: 5120}
+
+
+def _fd_recipe_row(r) -> ProductEntry:
+    return dataclasses.replace(
+        _recipe_row(r),
+        product_id=f"goes19-fd-{r.key}",
+        s3_prefix="ABI-L2-CMIPF/", sns_filter_prefixes=("ABI-L2-CMIPF/",),
+        accept_sectors=frozenset({"CMIPF"}),
+        sector_key="fd",
+        render_product_hint="fd",
+        cadence_s=600,
+        pyramid_px=_FD_PX_BY_KM[r.finest_km],
+        sector_bbox=_FD_BBOX,
+    )
+
+
+FD_SUITE_ROWS: tuple[ProductEntry, ...] = tuple(
+    _fd_recipe_row(r) for r in _rx.RECIPES if r.key != "truecolor")
+REGISTRY = REGISTRY + SUITE_ROWS + FD_SUITE_ROWS
 
 REGISTRY_BY_ID = {e.product_id: e for e in REGISTRY}
 

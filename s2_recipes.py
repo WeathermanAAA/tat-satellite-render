@@ -125,12 +125,35 @@ RECIPES: tuple[Recipe, ...] = (
         Gun(("diff", 8, 10), -26.2, 0.6),
         Gun(("diff", 12, 13), -43.2, 6.7),
         Gun(("band", 8), 243.9, 208.5),          # inverted (warm=dark)
-    ), source="NOAA STAR/CIRA ABI Air Mass RGB quick guide"),
+    ), bt_band=13, source="NOAA STAR/CIRA ABI Air Mass RGB quick guide"),
     Recipe("dust", "Dust RGB", "rgb", "rgb_guns", guns=(
         Gun(("diff", 15, 13), -6.7, 2.6),
         Gun(("diff", 14, 11), -0.5, 20.0, 2.5),
         Gun(("band", 13), 261.2, 288.7),
-    ), source="EUMETSAT/CIRA ABI Dust RGB quick guide"),
+    ), bt_band=13, source="EUMETSAT/CIRA ABI Dust RGB quick guide"),
+    Recipe("ash", "Ash RGB", "rgb", "rgb_guns", guns=(
+        Gun(("diff", 15, 13), -6.7, 2.6),
+        Gun(("diff", 14, 11), -6.0, 6.3),
+        Gun(("band", 13), 243.6, 302.4),
+    ), bt_band=13, source="NASA SPoRT/CIRA GOES Ash RGB quick guide (ABI-tuned "
+                          "values, NOT the SEVIRI heritage -4..2/-4..5/243..303)"),
+    Recipe("dayconvection", "Day Convection RGB", "rgb", "rgb_guns", guns=(
+        Gun(("diff", 8, 10), -35.0, 5.0),
+        # gamma 1 per the ABI quick guide table (EUMETSAT's Severe Storms
+        # heritage uses 0.5 on this gun; we cite the ABI guide like the rest).
+        Gun(("diff", 7, 13), -5.0, 60.0),
+        Gun(("diff", 5, 2), -0.75, 0.25, kind="refl"),
+    ), day_only=True,
+       source="NOAA STAR/CIRA ABI Day Convection RGB quick guide (blue gun is "
+              "reflectance FRACTION -0.75..0.25; the guide's % label is the "
+              "EUMETSAT -75..25% gun)"),
+    Recipe("daylandcloud", "Day Land Cloud (Natural Color)", "rgb", "rgb_guns", guns=(
+        Gun(("band", 5), 0.0, 0.975, kind="refl"),
+        Gun(("band", 3), 0.0, 1.086, kind="refl"),
+        Gun(("band", 2), 0.0, 1.0, kind="refl"),
+    ), day_only=True,
+       source="NOAA STAR/CIRA ABI Day Land Cloud RGB quick guide (the EUMETSAT "
+              "Natural Color RGB, ABI-stretched 97.5/108.6/100%)"),
     Recipe("firetemp", "Fire Temperature RGB", "rgb", "rgb_guns", guns=(
         Gun(("band", 7), 273.15, 333.15, 0.4),
         Gun(("band", 6), 0.0, 1.0, kind="refl"),
@@ -140,12 +163,13 @@ RECIPES: tuple[Recipe, ...] = (
         Gun(("band", 13), 280.65, 219.65),       # 7.5 .. -53.5 C, inverted
         Gun(("band", 2), 0.0, 0.78, kind="refl"),
         Gun(("band", 5), 0.01, 0.59, kind="refl"),
-    ), day_only=True, source="NOAA/CIRA ABI Day Cloud Phase Distinction quick guide"),
+    ), day_only=True, bt_band=13,
+       source="NOAA/CIRA ABI Day Cloud Phase Distinction quick guide"),
     Recipe("nightmicro", "Nighttime Microphysics", "rgb", "rgb_guns", guns=(
         Gun(("diff", 15, 13), -6.7, 2.6),
         Gun(("diff", 13, 7), -3.1, 5.2),
         Gun(("band", 13), 243.55, 292.65),
-    ), source="EUMETSAT/CIRA ABI Nighttime Microphysics quick guide"),
+    ), bt_band=13, source="EUMETSAT/CIRA ABI Nighttime Microphysics quick guide"),
 
     # ---- the 16 ABI single channels (C13 clean-IR = the existing
     # goes19-conus-ir row; irbd adds the corrected Dvorak BD look) ----------
