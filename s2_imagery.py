@@ -29,8 +29,10 @@ SSOT) and satellites' fetch; render.py / truecolor.py are untouched.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import os
+import shutil
 from typing import Optional
 
 import numpy as np
@@ -236,3 +238,241 @@ def produce_imagery(entry, time: Optional[dt.datetime] = None,
     except Exception:   # noqa: BLE001
         res.bt_grid, res.bt_dims = None, None
     return res
+
+
+# ============================================================================
+# Multi-product imagery suite (Phase 3) -- the recipe engine's fetch+render.
+#
+# Same FROZEN-renderer-reuse contract as the clean-IR path above, applied to
+# multi-band products: co-registration is the EXACT technique satellites.py's
+# fetch_true_color has always used (per-band geos crops sampled onto ONE
+# regular lat/lon target grid via _latlon_to_xy + _sample_geos), and the
+# emissive single channels are colorized with the SAME frozen tat_palettes
+# cmap+norm objects the meso/floater products render with. satellites.py /
+# render.py / truecolor.py stay untouched; the two resolution caps we need
+# (SAT_MAX_PX_PER_AXIS, TRUECOLOR_MAX_PX) are already env-overridable.
+# ============================================================================
+import s2_recipes
+
+
+@contextlib.contextmanager
+def _env_override(**pairs):
+    """Temporarily set env vars (skips None values); always restores."""
+    prev = {}
+    try:
+        for k, v in pairs.items():
+            if v is None:
+                continue
+            prev[k] = os.environ.get(k)
+            os.environ[k] = str(v)
+        yield
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+
+
+def _open_crop_band(sat, resolved, bbox):
+    """Download + geos-crop one band file (mirrors _compose_true_color_sync's
+    per-band worker; the tmp dir is always cleaned)."""
+    ds, tmp_dir = sat.open(resolved)
+    try:
+        return sat._crop_to_bbox(ds, bbox)
+    finally:
+        ds.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def fetch_band_crops(entry, bands, time=None, nearest=True, cache=None):
+    """Fetch co-temporal geos crops for `bands` of one CONUS scan.
+
+    Anchors on the clean-IR (C13) file to resolve product+scan, then locates
+    every sibling band at that SAME scan (satellites._find_band_at -- the
+    frozen co-temporality guarantee fetch_true_color relies on). Returns
+    (anchor ResolvedFile, {band: (cmi, x, y)}, proj) where proj =
+    (lon_origin, H, r_eq, r_pol). `cache` (optional dict) memoizes crops
+    across products of one suite emit, keyed (band, stamp)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from satellites import GOESEastSatellite
+
+    sat = GOESEastSatellite()
+    t = time or dt.datetime.now(UTC)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+    bbox = list(entry.sector_bbox)
+
+    async def _resolve():
+        anchor = await sat.find_file(t, "clean_ir", bbox, nearest_to_target=nearest)
+        others = [b for b in bands if b != 13]
+        sibs = await asyncio.gather(*(
+            sat._find_band_at(anchor.bucket, anchor.product, b, anchor.scan_start)
+            for b in others))
+        files = dict(zip(others, sibs))
+        if 13 in bands:
+            files[13] = anchor
+        return anchor, files
+
+    anchor, files = asyncio.run(_resolve())
+    stamp = anchor.scan_start.strftime("%Y%m%dT%H%M%SZ")
+
+    crops = {}
+    missing = []
+    for b in bands:
+        got = cache.get((b, stamp)) if cache is not None else None
+        if got is not None:
+            crops[b] = got
+        else:
+            missing.append(b)
+    proj = None
+    if missing:
+        with _env_override(SAT_MAX_PX_PER_AXIS=(entry.fetch_max_px or None)):
+            with ThreadPoolExecutor(max_workers=len(missing)) as pool:
+                futures = {b: pool.submit(_open_crop_band, sat, files[b], bbox)
+                           for b in missing}
+                results = {b: f.result() for b, f in futures.items()}
+        for b, (cmi, x, y, lon_origin, H, r_eq, r_pol) in results.items():
+            crops[b] = (cmi, x, y)
+            proj = (lon_origin, H, r_eq, r_pol)
+            if cache is not None:
+                cache[(b, stamp)] = crops[b]
+                cache["_proj"] = proj
+    if proj is None:
+        proj = cache["_proj"] if cache is not None else None
+    if proj is None:
+        raise RuntimeError("no band crops fetched and no cached projection")
+    return anchor, crops, proj
+
+
+def sample_bands_to_grid(crops, proj, bbox, out_w):
+    """Sample every band crop onto ONE regular lat/lon grid over `bbox`
+    (row 0 = north, exactly the pyramid/tile origin). This is the frozen
+    fetch_true_color co-registration, generalized to N bands. Returns
+    ({band: HxW float32}, bounds, (out_w, out_h))."""
+    from satellites import _latlon_to_xy, _sample_geos
+
+    W, S, E, N = bbox
+    span_x = max(E - W, 1e-6)
+    span_y = max(N - S, 1e-6)
+    out_h = max(1, round(out_w * span_y / span_x))
+    tgt_lons = np.linspace(W, E, out_w)
+    tgt_lats = np.linspace(N, S, out_h)          # row 0 = north
+    TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+    lon_origin, H, r_eq, r_pol = proj
+    TX, TY = _latlon_to_xy(TLAT, TLON, lon_origin, H, r_eq, r_pol)
+    sampled = {b: _sample_geos(c, x, y, TX, TY) for b, (c, x, y) in crops.items()}
+    return sampled, (W, S, E, N), (out_w, out_h)
+
+
+def _colorize_bt(bt_k, enhancement):
+    """Kelvin field -> float RGB 0..1 via a FROZEN tat_palettes enhancement
+    (the exact cmap+norm objects the meso/floater renders use; NaN -> NaN)."""
+    bt_c = np.asarray(bt_k, dtype=np.float64) - 273.15
+    cmap = get_enhancement(enhancement)["cmap"]
+    norm = enhancement_norm(enhancement)
+    rgba = cmap(norm(np.ma.masked_invalid(bt_c)))       # HxWx4 float, bad -> cmap bad
+    rgb = np.asarray(rgba[..., :3], dtype=np.float32)
+    rgb[~np.isfinite(bt_c)] = np.nan                    # keep off-data out of alpha
+    return rgb
+
+
+def _decimate_bt(grid_c, bounds, out_w=BT_PX):
+    """Nearest-index decimation of the (already regular) target-grid BT field
+    to the compact inspector raster. Exact values, no interpolation, no NaN
+    bleed. Returns (bt HxW float32, (w, h))."""
+    Hh, Ww = grid_c.shape
+    ow = min(out_w, Ww)
+    W, S, E, N = bounds
+    oh = max(1, round(ow * max(N - S, 1e-6) / max(E - W, 1e-6)))
+    oh = min(oh, Hh)
+    rows = np.round(np.linspace(0, Hh - 1, oh)).astype(int)
+    cols = np.round(np.linspace(0, Ww - 1, ow)).astype(int)
+    return grid_c[rows][:, cols].astype(np.float32), (ow, oh)
+
+
+def produce_recipe_imagery(entry, time=None, nearest=True,
+                           band_cache=None):
+    """End-to-end recipe product: co-temporal band fetch -> one regular grid ->
+    declarative band math (s2_recipes) -> chrome-free RGBA + optional BT raster.
+    Same ImageryResult contract as produce_imagery, so the pyramid emitter and
+    Q7 --max-zoom tiering apply unchanged."""
+    if not entry.recipe_id:
+        raise ValueError(f"{entry.product_id} has no recipe_id")
+    recipe = s2_recipes.RECIPES_BY_KEY[entry.recipe_id]
+    if recipe.kind == "truecolor":
+        return produce_truecolor(entry, time=time, nearest=nearest)
+
+    anchor, crops, proj = fetch_band_crops(
+        entry, recipe.bands, time=time, nearest=nearest, cache=band_cache)
+    sampled, bounds, _ = sample_bands_to_grid(
+        crops, proj, entry.sector_bbox, entry.pyramid_px)
+
+    if recipe.kind == "rgb_guns":
+        rgb = s2_recipes.compute_rgb(recipe, sampled)
+        rgba = s2_recipes.rgba_from_rgb(rgb)
+    elif recipe.kind == "single_palette":
+        rgb = _colorize_bt(sampled[recipe.band], recipe.enhancement)
+        rgba = s2_recipes.rgba_from_rgb(rgb)
+    elif recipe.kind == "sandwich":
+        ir_rgb = _colorize_bt(sampled[13], "rainbow_ir")
+        rgb = s2_recipes.sandwich_rgb(sampled[2], ir_rgb)
+        rgba = s2_recipes.rgba_from_rgb(rgb)
+    else:
+        raise ValueError(f"unknown recipe kind {recipe.kind!r}")
+
+    res = ImageryResult(
+        rgba=rgba, bounds=bounds, scan_start=anchor.scan_start,
+        product=anchor.product, bucket=anchor.bucket, s3_key=anchor.s3_key,
+        generic_channel=recipe.key,
+        enhancement=recipe.enhancement or recipe.kind)
+    if recipe.bt_band:
+        try:
+            res.bt_grid, res.bt_dims = _decimate_bt(
+                sampled[recipe.bt_band] - 273.15, bounds)
+        except Exception:   # noqa: BLE001  (inspector is best-effort, never blocks)
+            res.bt_grid, res.bt_dims = None, None
+    return res
+
+
+def produce_truecolor(entry, time=None, nearest=True):
+    """True color / GeoColor-lite through the FROZEN pipeline VERBATIM:
+    satellites.fetch_true_color -> truecolor.assemble_truecolor (CIMSS synthetic
+    green, CIRA Rayleigh order, tone curve, night IR fade). Its output is
+    already a regular lat/lon grid over the bbox (row 0 = north), so it maps
+    straight into the pyramid. Only the resolution caps are raised (both are
+    designed env overrides); zero code-path changes."""
+    from satellites import GOESEastSatellite
+
+    sat = GOESEastSatellite()
+    t = time or dt.datetime.now(UTC)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+    bbox = list(entry.sector_bbox)
+
+    async def _go():
+        resolved = await sat.find_file(t, "visible_red", bbox,
+                                       nearest_to_target=nearest)
+        return resolved, await sat.fetch_true_color(bbox, resolved)
+
+    # TRUECOLOR_MAX_PX is a module-level constant read at import (unlike
+    # SAT_MAX_PX_PER_AXIS, which is re-read per crop), so raise it by patching
+    # the module attribute -- _compose_true_color_sync resolves the global at
+    # call time. Restored in `finally`; the floater/meso default is untouched.
+    import satellites as _sats
+    _prev_cap = _sats.TRUECOLOR_MAX_PX
+    _sats.TRUECOLOR_MAX_PX = int(entry.pyramid_px)
+    try:
+        with _env_override(SAT_MAX_PX_PER_AXIS=(entry.fetch_max_px or None)):
+            resolved, r = asyncio.run(_go())
+    finally:
+        _sats.TRUECOLOR_MAX_PX = _prev_cap
+
+    rgb = np.asarray(r.cmi, dtype=np.float32)
+    rgba = s2_recipes.rgba_from_rgb(rgb, valid=r.geom_valid)
+    W, S, E, N = bbox
+    return ImageryResult(
+        rgba=rgba, bounds=(W, S, E, N), scan_start=r.scan_start,
+        product=r.product, bucket=r.bucket,
+        s3_key=getattr(resolved, "s3_key", ""),
+        generic_channel="truecolor", enhancement="tat_neon")

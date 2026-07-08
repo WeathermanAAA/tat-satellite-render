@@ -238,6 +238,10 @@ class ProductEntry:
     # "webmercator-xyz" (Phase 2b, reprojected to EPSG:3857 for MapLibre GL).
     pyramid_scheme: str = "flat-native-xyz"
     sector_bbox: Optional[tuple] = None      # [W,S,E,N] fetch/render extent for a tiled product
+    # Multi-product imagery suite (Phase 3): a s2_recipes.RECIPES key routes this
+    # product through the recipe engine (s2_imagery.produce_recipe_imagery)
+    # instead of the single-band clean-IR path. None = pre-suite behavior.
+    recipe_id: Optional[str] = None
 
     # -- routing ------------------------------------------------------------
     def claims(self, slot: Optional[SatSlot]) -> bool:
@@ -570,7 +574,80 @@ REGISTRY: tuple[ProductEntry, ...] = (
     ),
 )
 
+
+# ---------------------------------------------------------------------------
+# Multi-product imagery suite (Phase 3): one tiled CONUS row PER RECIPE,
+# generated from the declarative s2_recipes table -- "add a product = add a
+# config row" (report §2/§6). Every row shares the CONUS clean-IR pyramid's
+# geometry/settings; only band set + recipe routing differ. The existing
+# goes19-conus-ir row IS the suite's C13 channel (untouched -- zero visual
+# change for the shipped product).
+# ---------------------------------------------------------------------------
+import s2_recipes as _rx   # stdlib-only at import time (numpy is lazy inside)
+
+_CONUS_BBOX = (-125.0, 15.0, -66.0, 49.0)   # same bbox as goes19-conus-ir
+
+# Pyramid long-edge by the recipe's finest native band resolution over the
+# ~59-degree CONUS lon span: 0.5 km ~ 10600 native px, 1 km ~ 5300, 2 km ~ 2650.
+# (0.5 km class capped at the 4800 fetch stride -- see fetch_max_px.)
+_PX_BY_KM = {0.5: 4800, 1.0: 4096, 2.0: 3072}
+
+
+def _recipe_row(r) -> ProductEntry:
+    return ProductEntry(
+        product_id=f"goes19-conus-{r.key}",
+        family="goes", substrate="cmip", bucket="noaa-goes19", sat_num="19",
+        s3_prefix="ABI-L2-CMIPC/", sns_filter_prefixes=("ABI-L2-CMIPC/",),
+        accept_sectors=frozenset({"CMIPC"}),
+        channels=(), bands=tuple(r.bands),
+        sat_key="goes19", sector_key="conus", band_key=r.key,
+        prod_meso_slug=None,
+        render_channel="recipe", render_enhancement=r.enhancement,
+        render_product_hint="conus", render_sat_hint="GOES-East",
+        cadence_s=300,
+        tiled=True, tile_size=512,
+        pyramid_px=_PX_BY_KM[r.finest_km], fetch_max_px=4800,
+        pyramid_scheme="webmercator-xyz",
+        sector_bbox=_CONUS_BBOX,
+        recipe_id=r.key,
+    )
+
+
+SUITE_ROWS: tuple[ProductEntry, ...] = tuple(_recipe_row(r) for r in _rx.RECIPES)
+REGISTRY = REGISTRY + SUITE_ROWS
+
 REGISTRY_BY_ID = {e.product_id: e for e in REGISTRY}
+
+
+def build_products_index(sat_key: str, sector_key: str,
+                         as_of: dt.datetime) -> dict:
+    """The suite index (products.json) for one sector -- the on-R2 SSOT the
+    viewer's product picker mirrors. Registry-derived, so a new recipe row
+    appears here with zero index code."""
+    import s2_recipes as _r
+    prods = []
+    for e in REGISTRY:
+        if not (e.tiled and e.sat_key == sat_key and e.sector_key == sector_key):
+            continue
+        r = _r.RECIPES_BY_KEY.get(e.recipe_id) if e.recipe_id else None
+        prods.append({
+            "id": e.product_id,
+            "path": e.product_path,
+            "title": r.title if r else "C13 · 10.3 µm (Clean IR)",
+            "group": r.group if r else "channel",
+            "enhancement": e.render_enhancement or None,
+            "bt": bool(r.bt_band) if r else True,   # the clean-IR row ships BT
+            "day_only": bool(r and r.day_only),
+        })
+    return {
+        "sat": sat_key, "sector": sector_key,
+        "as_of": as_of.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "count": len(prods), "products": prods,
+    }
+
+
+def products_index_key(prefix: str, sat_key: str, sector_key: str) -> str:
+    return f"{prefix.strip('/')}/sat/{sat_key}/{sector_key}/products.json"
 
 
 def matching_entries(slot: Optional[SatSlot]) -> list[ProductEntry]:

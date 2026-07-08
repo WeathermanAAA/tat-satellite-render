@@ -1,0 +1,96 @@
+# docker-compose.s2.yml -- the STAGE-2 shadow tile-pyramid emitter as a BOX
+# service (SATELLITE-REARCH §4.1/§5.5 + Phase-3 imagery suite). SHADOW ONLY:
+# writes shadow/sat/goes19/** on R2; no viewer cutover, live /satellite/
+# untouched. Deploys on the Hostinger box (NOT Railway).
+#
+# Shares the meso/S1 image base (Dockerfile.meso -- tat_palettes + the full
+# render deps incl. scipy/pyorbital/pyspectral with pre-warmed Rayleigh LUTs)
+# and the SAME .env the s1/meso stacks load (R2_ENDPOINT / R2_ACCESS_KEY_ID /
+# R2_SECRET_ACCESS_KEY / R2_BUCKET). No host pip, no cred paste.
+#
+# Fully ISOLATED from the meso + S1 stacks: distinct image tag (tat-s2) +
+# distinct compose project (-p tat-s2). It runs NO server -- just one-shot or
+# looping emits against NOAA anon S3 + R2.
+#
+# Build once:   docker compose -p tat-s2 -f docker-compose.s2.yml build emit
+#
+# One-shot emit (the Q6 eyeball step -- native z6 + BT, one product):
+#   docker compose -p tat-s2 -f docker-compose.s2.yml run --rm emit \
+#       --product goes19-conus-ir --store r2 --prefix shadow
+#
+# Whole imagery suite, one scan (24 products; ~950 PUTs at z0-5):
+#   docker compose -p tat-s2 -f docker-compose.s2.yml run --rm emit \
+#       --suite conus --store r2 --prefix shadow --max-zoom 5
+#
+# Cron loop (Q7 tiering baked in: z0-5, suite, 15-min default):
+#   docker compose -p tat-s2 -f docker-compose.s2.yml --profile cron up -d emit-cron
+#
+# Lifecycle TTL (one-time; merge-safe rule on shadow/sat/goes19/):
+#   docker compose -p tat-s2 -f docker-compose.s2.yml run --rm lifecycle --days 10
+#
+# (`docker compose run` implicitly enables the target service's profile, so the
+# profile gates only `up` -- a plain `up -d` starts NOTHING here by accident.)
+#
+# NOTE (palette pin): Dockerfile.meso installs tat-palettes @main in a CACHED
+# pip layer -- the same Docker-layer trap as the meso stack ([[shared-palette-
+# module]]): a future palette change needs the requirements pin bumped (or a
+# --no-cache build) to reach this image.
+
+services:
+  # One-shot emitter: args come from `docker compose run --rm emit <args>`.
+  emit:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s2:latest
+    entrypoint: ["python", "s2_pyramid_emit.py"]
+    env_file: .env
+    profiles: ["manual"]
+    # A 4800 px true-color assembly (Rayleigh + geometry at ~1 km) peaks well
+    # over the meso render's footprint; OOM-kill in-container, never the box.
+    mem_limit: 8g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Cron emitter: the Q7-tiered suite loop. z0-5 only (native z6 stays a manual
+  # `run --rm emit --product ... ` on demand); duplicate scans dedup via the
+  # per-frame ready marker, so the interval only bounds FRESHNESS, not writes.
+  # Knobs (set in .env to override): S2_CRON_SUITE, S2_CRON_MAX_ZOOM,
+  # S2_CRON_INTERVAL_S, S2_CRON_PREFIX.
+  emit-cron:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s2:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-cron] suite=$${S2_CRON_SUITE:-conus} max-zoom=$${S2_CRON_MAX_ZOOM:-5} interval=$${S2_CRON_INTERVAL_S:-900}s"
+        while true; do
+          python s2_pyramid_emit.py \
+            --suite "$${S2_CRON_SUITE:-conus}" \
+            --store r2 --prefix "$${S2_CRON_PREFIX:-shadow}" \
+            --max-zoom "$${S2_CRON_MAX_ZOOM:-5}" \
+            || echo "[s2-cron] emit failed rc=$$? (next tick retries)"
+          sleep "$${S2_CRON_INTERVAL_S:-900}"
+        done
+    env_file: .env
+    profiles: ["cron"]
+    restart: always
+    mem_limit: 8g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  # R2 object-lifecycle TTL on the shadow pyramid prefix (merge-safe: touches
+  # only the s2-shadow-sat-goes19-ttl rule; meso/floater/feeds rules untouched).
+  lifecycle:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s2:latest
+    entrypoint: ["python", "scripts/s2_shadow_lifecycle.py"]
+    env_file: .env
+    profiles: ["manual"]
+    mem_limit: 256m
