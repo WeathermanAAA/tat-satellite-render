@@ -154,6 +154,13 @@ RECIPES: tuple[Recipe, ...] = (
     ), day_only=True,
        source="NOAA STAR/CIRA ABI Day Land Cloud RGB quick guide (the EUMETSAT "
               "Natural Color RGB, ABI-stretched 97.5/108.6/100%)"),
+    Recipe("snowfog", "Day Snow-Fog RGB", "rgb", "rgb_guns", guns=(
+        Gun(("band", 3), 0.0, 1.0, 1.7, kind="refl"),
+        Gun(("band", 5), 0.0, 0.7, 1.7, kind="refl"),
+        Gun(("diff", 7, 13), 0.0, 30.0, 1.7),
+    ), day_only=True,
+       source="NOAA STAR/CIRA ABI Day Snow-Fog RGB quick guide (R C03 0-100% "
+              "g1.7, G C05 0-70% g1.7, B C07-C13 0-30 K g1.7)"),
     Recipe("firetemp", "Fire Temperature RGB", "rgb", "rgb_guns", guns=(
         Gun(("band", 7), 273.15, 333.15, 0.4),
         Gun(("band", 6), 0.0, 1.0, kind="refl"),

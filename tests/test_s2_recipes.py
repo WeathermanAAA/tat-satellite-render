@@ -121,6 +121,18 @@ class TestRecipeTable(unittest.TestCase):
                          [(("band", 5), 0.0, 0.975), (("band", 3), 0.0, 1.086),
                           (("band", 2), 0.0, 1.0)])
 
+    def test_quickguide_snowfog_locked(self):
+        # Day Snow-Fog: R C03 0-100% g1.7, G C05 0-70% g1.7, B = C07-C13
+        # BT difference 0-30 K g1.7 (all three guns gamma 1.7 per the guide).
+        s = X.RECIPES_BY_KEY["snowfog"]
+        self.assertEqual([g.expr for g in s.guns],
+                         [("band", 3), ("band", 5), ("diff", 7, 13)])
+        self.assertEqual([(g.lo, g.hi, g.gamma) for g in s.guns],
+                         [(0.0, 1.0, 1.7), (0.0, 0.7, 1.7), (0.0, 30.0, 1.7)])
+        self.assertEqual([g.kind for g in s.guns], ["refl", "refl", "bt"])
+        self.assertTrue(s.day_only)
+        self.assertEqual(s.bands, (3, 5, 7, 13))
+
     def test_ir_rgbs_carry_c13_bt(self):
         for key in ("airmass", "dust", "ash", "nightmicro", "daycloudphase"):
             self.assertEqual(X.RECIPES_BY_KEY[key].bt_band, 13, key)
