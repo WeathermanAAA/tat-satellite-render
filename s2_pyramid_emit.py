@@ -2,7 +2,7 @@
 """Stage-2 shadow pyramid emitter -- END-TO-END runner (Phase 2a/3).
 
 Fetch frames for tiled ProductEntry rows, reproduce the FROZEN renderer's
-chrome-free imagery (s2_imagery), cut a 512 px XYZ WebP pyramid + a SLIDER
+chrome-free imagery (s2_imagery), cut a 512 px XYZ WebP pyramid + a slider
 latest_times.json (s2_pyramid), and write it to a SHADOW R2 prefix --
 registry-driven, additive, and NOT touching the running S1 shadow.
 

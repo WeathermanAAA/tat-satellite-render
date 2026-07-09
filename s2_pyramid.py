@@ -2,7 +2,7 @@
 """Stage-2 SHADOW PYRAMID EMITTER -- pure tiling + manifest core (Phase 2a).
 
 Cuts ONE rendered imagery raster into a **512 px flat-native XYZ WebP tile
-pyramid** and emits a SLIDER-style ``latest_times.json`` manifest, to a SHADOW
+pyramid** and emits an operational-monitor-style ``latest_times.json`` manifest, to a SHADOW
 R2 prefix, driven by an ``s2_registry.ProductEntry``. This is the *zoomable
 product* path (SATELLITE-REARCH §4.1/§4.2/§6): floaters + meso stay single-frame
 sequences (§4.2), only genuinely-zoomable wide products get a pyramid.
@@ -279,7 +279,7 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
                          spec: PyramidSpec = PyramidSpec(),
                          scheme: str = "flat-native-xyz",
                          bt: Optional[dict] = None) -> dict:
-    """Build + PUT the tiled SLIDER manifest (§4.1 tiled variant, superset).
+    """Build + PUT the tiled slider manifest (§4.1 tiled variant, superset).
 
     The viewer NEVER lists the bucket: `tile` is a product-relative path
     template; for flat-native it derives the per-zoom grid from image_px+maxzoom,

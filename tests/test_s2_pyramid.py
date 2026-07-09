@@ -3,7 +3,7 @@
 tiled ProductEntry helpers (s2_registry). No network, no boto3, no matplotlib --
 synthetic rasters + a hand FakeR2/FilesystemStore (the repo convention; moto is
 reserved for SQS only). Covers: the pyramid cut (maxzoom/levels/512/skip-empty/
-lossless-exactness/determinism), deterministic tile keys, the SLIDER manifest,
+lossless-exactness/determinism), deterministic tile keys, the slider manifest,
 idempotency + PUT-failure, per-stamp prune, cold-start stamp recovery, and the
 new tiled registry rows + routing (no cross-substrate leak).
 

@@ -405,7 +405,7 @@ class ProductEntry:
                                  image_px, maxzoom: int, as_of: dt.datetime,
                                  tile_size: int = 512, min_zoom: int = 0,
                                  scheme: str = TILE_SCHEME, bt: Optional[dict] = None) -> dict:
-        """The §4.1 SLIDER manifest, tiled variant (superset of the single-frame
+        """The §4.1 slider manifest, tiled variant (superset of the single-frame
         shape: keeps product/path/tile/times/latest/as_of/count with path=None +
         tile populated, adds scheme/projection/tile_size/minzoom/maxzoom/
         image_px/bounds). The viewer branches on `tile is not None` and derives

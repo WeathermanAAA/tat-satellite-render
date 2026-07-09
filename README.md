@@ -2,7 +2,7 @@
 
 Custom GOES-19 ABI render service for [triple-a-tropics.com/satellite/](https://triple-a-tropics.com/satellite/).
 
-Worldview-Snapshots-style: user picks a bbox + time + channel + enhancement, gets back a clean cropped PNG with title strip and basemap. Backend pulls the source NetCDF straight from the public NOAA AWS bucket, crops in geostationary projection space before materializing pixels (RAM-cheap), and renders with matplotlib + cartopy.
+Custom-snapshot tool: user picks a bbox + time + channel + enhancement, gets back a clean cropped PNG with title strip and basemap. Backend pulls the source NetCDF straight from the public NOAA AWS bucket, crops in geostationary projection space before materializing pixels (RAM-cheap), and renders with matplotlib + cartopy.
 
 ## Endpoints
 
