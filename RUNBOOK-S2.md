@@ -19,15 +19,31 @@ git fetch origin && git checkout s2-sat-ingest && git pull
 docker compose -p tat-s2 -f docker-compose.s2.yml build emit
 ```
 
-## 1) One-time: lifecycle TTL (Q7 retention floor)
+## 1) Retention: the object-level prune (Q7 retention floor)
+
+> Bucket lifecycle rules are OUT: the box R2 token lacks
+> Get/PutBucketLifecycleConfiguration (the old `lifecycle` service
+> AccessDenied'd, 2026-07-08) and token scopes stay frozen. `s2_prune.py`
+> needs only ListObjectsV2 + DeleteObject + Get/PutObject — the scopes the
+> token already has.
 
 ```bash
-docker compose -p tat-s2 -f docker-compose.s2.yml run --rm lifecycle --days 10
+# dry-run report (what WOULD go; deletes nothing):
+docker compose -p tat-s2 -f docker-compose.s2.yml run --rm prune
+# delete now:
+docker compose -p tat-s2 -f docker-compose.s2.yml run --rm prune --apply
+# daily loop (start once, survives reboots):
+docker compose -p tat-s2 -f docker-compose.s2.yml --profile cron up -d prune-cron
 ```
 
-Merge-safe: adds/updates only the `s2-shadow-sat-goes19-ttl` rule on
-`shadow/sat/goes19/`; every other bucket rule is preserved. `--show` prints
-rules without changing anything.
+Deletes `shadow/sat/**` frames whose **stamp** is older than 14 days
+(`S2_PRUNE_DAYS`), always keeping the newest 2 stamps per product
+(`S2_PRUNE_KEEP_MIN`) so an emitter outage can never empty a product.
+Ready markers are deleted first (an interrupted prune never leaves an
+advertised half-frame); manifests that still list a pruned stamp are
+rewritten (cron-emitted products self-heal anyway on the next tick).
+Non-frame keys (`latest_times.json`, `products.json`, `health.json`)
+are never touched, and prefixes outside `shadow/` are refused outright.
 
 ## 2) One-shot emit (the eyeball step)
 
@@ -64,15 +80,15 @@ geometry, so the emitter now **refuses** an emit that would drop existing
 frames (override for deliberate migrations: `--allow-geometry-change`), and a
 scan the cron already emitted **dedups on the ready marker** — an uncapped
 re-emit of it on the same prefix writes nothing (the emitter says so).
-The lifecycle TTL rule covers `shadow/sat/goes19/` as a whole, including a
-`shadow-z6`-style sub-prefix only if it also starts with that path — for
-one-off deep-zoom prefixes outside it, re-run the lifecycle service with the
-matching `--prefix`.
+The prune's default `--prefix shadow/sat/` covers every sat product prefix;
+a `shadow-z6/…`-style prefix sits OUTSIDE it — run the prune service once
+with the matching `--prefix shadow-z6/…` (still must start with `shadow/`)
+to age those out too.
 
 **PUT budget** (R2 Class A, $4.50/M after the 1M free tier):
 - suite z0–5 ≈ 950 PUTs/emit → 15-min cron ≈ **2.8 M/mo ≈ $8–13/mo**
 - suite z0–5 @ 30 min ≈ 1.4 M/mo ≈ **~$2/mo**; single product @ 5 min ≈ 0.35 M/mo ≈ free tier
-- storage is minor (TTL keeps ≈10 days; manifests list only the newest 90 frames)
+- storage is minor (the prune keeps ≈14 days; manifests list only the newest 90 frames)
 
 ## 4) Verify (anyone, no creds — the CDN serves shadow/)
 

@@ -25,8 +25,11 @@
 # Cron loop (Q7 tiering baked in: z0-5, suite, 15-min default):
 #   docker compose -p tat-s2 -f docker-compose.s2.yml --profile cron up -d emit-cron
 #
-# Lifecycle TTL (one-time; merge-safe rule on shadow/sat/goes19/):
-#   docker compose -p tat-s2 -f docker-compose.s2.yml run --rm lifecycle --days 10
+# Retention (object-level prune; the box token CANNOT set bucket lifecycle
+# rules -- Get/PutBucketLifecycleConfiguration AccessDenied, scopes frozen):
+#   dry-run report:  docker compose -p tat-s2 -f docker-compose.s2.yml run --rm prune
+#   delete now:      docker compose -p tat-s2 -f docker-compose.s2.yml run --rm prune --apply
+#   daily loop:      docker compose -p tat-s2 -f docker-compose.s2.yml --profile cron up -d prune-cron
 #
 # (`docker compose run` implicitly enables the target service's profile, so the
 # profile gates only `up` -- a plain `up -d` starts NOTHING here by accident.)
@@ -83,14 +86,43 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
-  # R2 object-lifecycle TTL on the shadow pyramid prefix (merge-safe: touches
-  # only the s2-shadow-sat-goes19-ttl rule; meso/floater/feeds rules untouched).
-  lifecycle:
+  # Object-level shadow TTL (ListObjectsV2 + DeleteObject only -- works with
+  # the box token's object read/write scope; replaces the bucket-lifecycle
+  # approach that AccessDenied'd). Dry-run by default; pass --apply to delete.
+  prune:
     build:
       context: .
       dockerfile: Dockerfile.meso
     image: tat-s2:latest
-    entrypoint: ["python", "scripts/s2_shadow_lifecycle.py"]
+    entrypoint: ["python", "s2_prune.py"]
     env_file: .env
     profiles: ["manual"]
     mem_limit: 256m
+
+  # Daily prune loop (knobs in .env: S2_PRUNE_DAYS / S2_PRUNE_KEEP_MIN /
+  # S2_PRUNE_PREFIX / S2_PRUNE_INTERVAL_S). shadow/sat/** frames older than
+  # 14 d go; the newest keep-min stamps per product always survive.
+  prune-cron:
+    build:
+      context: .
+      dockerfile: Dockerfile.meso
+    image: tat-s2:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-prune-cron] days=$${S2_PRUNE_DAYS:-14} keep-min=$${S2_PRUNE_KEEP_MIN:-2} prefix=$${S2_PRUNE_PREFIX:-shadow/sat/} interval=$${S2_PRUNE_INTERVAL_S:-86400}s"
+        while true; do
+          python s2_prune.py --apply \
+            --days "$${S2_PRUNE_DAYS:-14}" \
+            --keep-min "$${S2_PRUNE_KEEP_MIN:-2}" \
+            --prefix "$${S2_PRUNE_PREFIX:-shadow/sat/}" \
+            || echo "[s2-prune-cron] prune failed rc=$$? (next tick retries)"
+          sleep "$${S2_PRUNE_INTERVAL_S:-86400}"
+        done
+    env_file: .env
+    profiles: ["cron"]
+    restart: always
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
