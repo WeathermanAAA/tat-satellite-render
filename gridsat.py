@@ -199,13 +199,17 @@ class GridSatB1Satellite(Satellite):
         var = _CHANNEL_VARS[generic_channel]
         data, lats1, lons1 = load_crop_sync(resolved.s3_key, var, bbox)
         finite_frac = float(np.isfinite(data).mean()) if data.size else 0.0
-        if finite_frac < 0.02:
-            # honest failure: e.g. WV over a region/era whose source satellite
-            # carried no water-vapor channel -- never render an empty frame
+        # honest failure thresholds: the 11 µm CDR is near-complete (a sparse
+        # crop means a real gap); WV exists only where the era's source
+        # satellites carried a water-vapor channel, so demand real coverage
+        # rather than letting the render's generic NaN guard produce a
+        # misleading 'partial fetch' error downstream
+        min_frac = 0.40 if var == "irwvp" else 0.02
+        if finite_frac < min_frac:
             raise RuntimeError(
-                f"GridSat-B1 {var} has no data for this region/time "
-                f"({finite_frac:.0%} valid) -- the 11 µm IR window is the "
-                "reliable deep-archive channel")
+                f"GridSat-B1 {'6.7 µm water vapor' if var == 'irwvp' else var} "
+                f"is not present for this era/region ({finite_frac:.0%} valid) "
+                "-- the 11 µm IR window is the reliable deep-archive channel")
         LON, LAT = np.meshgrid(lons1, lats1)
         return FetchResult(
             cmi=data,
