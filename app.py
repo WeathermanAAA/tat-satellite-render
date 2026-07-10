@@ -38,6 +38,7 @@ from cache import RenderCache
 from poller_framework import process_mem_mb
 from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
+import gridsat
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -566,10 +567,34 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # surfaces as 422 with a message that names the right satellite for the
     # region (e.g. Himawari for Western Pacific).
     parsed_time, _ = parse_request_time(body.time)
-    try:
-        satellite: Satellite = pick_satellite(body.bbox, parsed_time)
-    except (CoverageError, UnsupportedTimeError) as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    # DEEP-ARCHIVE TIER (Time Machine): explicit times before the GOES-R /
+    # Himawari archives dispatch to the GridSat-B1 CDR (1980+, one merged
+    # geostationary IR record). ADDITIVE: these dates previously 502'd; every
+    # "latest" / 2017+ request takes the unchanged native path below.
+    use_gridsat = (not is_latest) and parsed_time < gridsat.ABI_CUTOVER
+    if use_gridsat:
+        if generic_channel not in gridsat.GridSatB1Satellite.generic_to_band:
+            raise HTTPException(
+                status_code=422,
+                detail="multi-band fields are not available before 2017 — the "
+                       "deep archive (GridSat-B1) is a single-channel record: "
+                       "use the 11 µm IR window (clean_ir) or 6.7 µm water "
+                       "vapor (wv_upper)")
+        satellite: Satellite = gridsat.GRIDSAT
+        # ~8 km native — the archive is already far below the pixel budget;
+        # never stride it further
+        downsample = 1
+    else:
+        try:
+            satellite = pick_satellite(body.bbox, parsed_time)
+        except (CoverageError, UnsupportedTimeError) as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+    if body.format == "btpng" and not use_gridsat:
+        raise HTTPException(
+            status_code=422,
+            detail="format=btpng (calibrated-BT raster) is currently served "
+                   "for the deep-archive (GridSat-B1) tier only — the live "
+                   "suites publish per-frame bt.png beside their tiles")
 
     # Resolve which file we'll use; this gives us the snapped scan time which
     # is part of the cache key. For "latest" we don't snap to file precision
@@ -653,6 +678,10 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
                 render_downsample = downsample
             def _render_job() -> bytes:
+                if body.format == "btpng":
+                    # calibrated-BT u16 raster (objfix / TC-Diagnostics
+                    # archive reanalysis input) — chrome-free by design
+                    return gridsat.bt_png_from_fetch(data)
                 if body.backdrop:
                     # PART 4: bare grayscale Clean-IR backdrop for the ASCAT
                     # viewer (already WebP; skip the chromed render + transcode).

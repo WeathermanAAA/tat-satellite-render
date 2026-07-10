@@ -401,13 +401,22 @@ def render_png(
     title_ax.set_facecolor(DARK_BG)
     title_ax.axis("off")
     # Sensor label: read off FetchResult so it works for both ABI (GOES) and
-    # AHI (Himawari) without per-family branching here.
-    sensor_label = "AHI" if data.bucket.startswith("noaa-himawari") else "ABI"
-    center_title = (
-        f"{data.sat_name} {sensor_label} True Color · {time_str} UTC"
-        if is_rgb
-        else f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC"
-    )
+    # AHI (Himawari) without per-family branching here. The GridSat-B1 deep
+    # archive gets an HONEST era title — actual source, channel, cadence and
+    # resolution — so an old frame can never imply modern imagery.
+    is_gridsat = data.bucket.startswith("noaa-cdr-gridsat")
+    if is_gridsat:
+        sensor_label = "geostationary IR composite"
+        gs_chan = "11 µm IR window" if channel == 1 else "6.7 µm water vapor"
+        center_title = (
+            f"GridSat-B1 · {gs_chan} · 3-hourly · ~8 km · {time_str} UTC")
+    else:
+        sensor_label = "AHI" if data.bucket.startswith("noaa-himawari") else "ABI"
+        center_title = (
+            f"{data.sat_name} {sensor_label} True Color · {time_str} UTC"
+            if is_rgb
+            else f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC"
+        )
     title_ax.text(
         0.5, 0.5,
         center_title,
@@ -455,7 +464,9 @@ def render_png(
     # Watermark: top-left of the map axes, mirroring the title strip's
     # right-aligned product label so the two corners balance visually.
     # Translucent dark backing rect keeps it legible over hot pixels.
-    source_label = "JMA" if data.bucket.startswith("noaa-himawari") else "NOAA"
+    source_label = ("NOAA CDR" if is_gridsat
+                    else "JMA" if data.bucket.startswith("noaa-himawari")
+                    else "NOAA")
     ax.text(
         0.01, 0.99,
         f"@WeathermanAAA_  ·  {source_label} {data.sat_name} {sensor_label}",
