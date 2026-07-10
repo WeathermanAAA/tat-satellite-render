@@ -67,6 +67,13 @@ def render_refl_cbar_png(path: str):
     Image.fromarray(img, "RGBA").save(path)
 
 
+_GEO_EXPORT = {   # global composite rows (no Recipe object): title + palette
+    "ir":   ("Clean IR window · multi-satellite", "rainbow_ir"),
+    "irbd": ("IR Dvorak BD · multi-satellite", "dvorak"),
+    "wv":   ("6.2 µm Water Vapor · multi-satellite", "wv_tat"),
+}
+
+
 def product_row(e) -> dict:
     r = None
     if e.recipe_id:
@@ -74,7 +81,10 @@ def product_row(e) -> dict:
             r = X.recipe_for(e.family, e.recipe_id)
         except KeyError:
             r = None
-    if r is None:   # the pre-suite clean-IR row
+    if r is None and e.sat_key == "geo":
+        title, cbar_key = _GEO_EXPORT[e.band_key]
+        group, day_only, bt = "channel", False, True
+    elif r is None:   # the pre-suite clean-IR row
         title, group, day_only, bt = "C13 · 10.3 µm (Clean IR)", "channel", False, True
         cbar_key = "rainbow_ir"
     else:
@@ -124,6 +134,7 @@ def main(argv=None) -> int:
     # TVProducts.products stays the goes19 list -- compare.html and any
     # existing reader see an unchanged shape (additive key only).
     hw_rows = _sector_rows("himawari9", "wpac")
+    geo_rows = _sector_rows("geo", "global")
 
     cdir = os.path.join(args.out, "cbars")
     os.makedirs(cdir, exist_ok=True)
@@ -141,11 +152,13 @@ def main(argv=None) -> int:
               "sector": args.sector,
               "products": rows,
               "himawari9": {"sector": "wpac", "products": hw_rows},
+              "geo": {"sector": "global", "products": geo_rows},
           }, indent=2, ensure_ascii=False) + ";\n")
     with open(os.path.join(args.out, "products.js"), "w") as f:
         f.write(js)
     print(f"wrote products.js ({len(rows)} goes19 + {len(hw_rows)} himawari9 "
-          f"products) + {len(CBARS)+1} colorbars -> {args.out}")
+          f"+ {len(geo_rows)} geo-global products) + {len(CBARS)+1} colorbars "
+          f"-> {args.out}")
     return 0
 
 

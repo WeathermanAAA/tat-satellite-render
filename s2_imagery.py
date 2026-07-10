@@ -748,3 +748,183 @@ def produce_ahi_truecolor(entry, time=None, nearest=True, band_cache=None):
     rgba = s2_recipes.rgba_from_rgb(np.asarray(rgb, dtype=np.float32),
                                     valid=geom_valid)
     return _ahi_result(entry, rgba, bounds, slot, bucket, "truecolor", "tat_neon")
+
+
+# ============================================================================
+# GLOBAL GEO-RING COMPOSITE ("the explorer opens on the world"): GOES-19 East
+# + GOES-18 West + Himawari-9 full disks reprojected onto ONE global
+# equirectangular grid, per-pixel NADIR-NEAREST selection with a smooth
+# cross-fade in the overlaps (blending BT, not colors, so the frozen
+# enhancement stays consistent across satellites), then colorized like any
+# single-band suite product and cut into the standard webmerc pyramid.
+#
+# HONESTY: the Meteosat sector (Africa / Europe / Mideast / W Indian Ocean,
+# roughly 10°W..75°E) has NO ingested satellite -- pixels farther than
+# GEO_MAX_ZENITH from every ring member stay TRANSPARENT (alpha 0). No
+# satellite is stretched across its limb to fake coverage; the frontend
+# labels the gap "Meteosat — coming".
+#
+# Only BT fields composite globally (BT is BT on every sensor); RGB recipes
+# stay per-satellite (ABI vs AHI band differences) -- enforced by the field
+# table below, not by convention.
+# ============================================================================
+
+GEO_MAX_ZENITH_DEG = 65.0    # limb cutoff: beyond this a disk is unusable
+GEO_BLEND_DEG = 10.0         # cross-fade width approaching the cutoff
+
+# global composite fields: band per sensor + the FROZEN enhancement.
+GEO_GLOBAL_FIELDS = {
+    "ir":   {"goes_band": 13, "ahi_band": 13, "enhancement": "rainbow_ir"},
+    "irbd": {"goes_band": 13, "ahi_band": 13, "enhancement": "dvorak"},
+    "wv":   {"goes_band": 8,  "ahi_band": 8,  "enhancement": "wv_tat"},
+}
+
+# ring membership: fetch window = sub_lon ± GEO_MAX_ZENITH, clamped to avoid
+# antimeridian-crossing GOES fetch bboxes (the clipped slivers are covered by
+# the neighboring satellite at a BETTER zenith angle, so nothing visible is
+# lost -- nadir-nearest would never pick the clipped limb anyway).
+_GEO_RING = (
+    {"name": "GOES-East", "kind": "goes_east", "sub": -75.2,
+     "window": (-140.2, -10.2)},
+    {"name": "GOES-West", "kind": "goes_west", "sub": -137.2,
+     "window": (-180.0, -72.2)},
+    {"name": "Himawari-9", "kind": "ahi", "sub": 140.7,
+     "window": (75.7, 205.7)},   # unwrapped east edge (crosses 180)
+)
+
+
+def _geo_zenith_deg(TLON, TLAT, sub_lon):
+    """Great-circle angular distance (deg) from a sub-satellite point."""
+    lat = np.deg2rad(TLAT)
+    dlon = np.deg2rad(TLON - sub_lon)
+    cosp = np.cos(lat) * np.cos(dlon)
+    return np.rad2deg(np.arccos(np.clip(cosp, -1.0, 1.0))).astype(np.float32)
+
+
+def _geo_ring_weight(TLON, TLAT, sub_lon):
+    """Blend weight: 1 near nadir, ramping to 0 at GEO_MAX_ZENITH."""
+    psi = _geo_zenith_deg(TLON, TLAT, sub_lon)
+    return np.clip((GEO_MAX_ZENITH_DEG - psi) / GEO_BLEND_DEG, 0.0, 1.0)
+
+
+def _fetch_goes_disk_bt(kind, band, window, lat_band, t, nearest):
+    """One GOES full disk band crop + its geos proj params (the frozen
+    fetch_band_crops machinery, per-satellite)."""
+    from satellites import GOES_EAST, GOES_WEST
+    sat = GOES_EAST if kind == "goes_east" else GOES_WEST
+    bbox = [window[0], lat_band[0], window[1], lat_band[1]]
+
+    async def _resolve():
+        resolved = await sat._pick_full_disk(
+            sat.resolve(t).bucket, bbox, band, t, nearest)
+        if resolved is None:
+            raise RuntimeError(f"no {sat.family} full-disk B{band:02d} near {t.isoformat()}")
+        if band != 13:
+            resolved = await sat._find_band_at(
+                resolved.bucket, resolved.product, band, resolved.scan_start)
+        return resolved
+
+    resolved = asyncio.run(_resolve())
+    with _env_override(SAT_MAX_PX_PER_AXIS=4800):
+        cmi, x, y, lon_origin, H, r_eq, r_pol = _open_crop_band(sat, resolved, bbox)
+    return cmi, x, y, (lon_origin, H, r_eq, r_pol), resolved
+
+
+def produce_global_composite(entry, time=None, nearest=True, band_cache=None):
+    """The geo-ring global product: fetch each member's disk, sample its
+    lon-window slice of the global grid, nadir-weight blend the BTs, colorize
+    with the frozen enhancement. Per-satellite failures degrade HONESTLY --
+    the member's sector goes transparent (logged), never stretched over."""
+    from satellites import _latlon_to_xy, _sample_geos
+
+    field = GEO_GLOBAL_FIELDS.get(entry.band_key)
+    if field is None:
+        raise ValueError(f"{entry.product_id}: not a global composite field")
+    t = time or dt.datetime.now(UTC)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+
+    W, S, E, N = entry.sector_bbox
+    out_w = int(entry.pyramid_px)
+    out_h = max(1, round(out_w * (N - S) / max(E - W, 1e-6)))
+    lons1 = np.linspace(W, E, out_w).astype(np.float32)
+    lats1 = np.linspace(N, S, out_h).astype(np.float32)   # row 0 = north
+
+    btsum = np.zeros((out_h, out_w), np.float32)
+    wsum = np.zeros((out_h, out_w), np.float32)
+    used, anchor = [], None
+
+    for member in _GEO_RING:
+        w0, w1 = member["window"]
+        # column slice of the global grid this member can contribute to
+        # (wrapped comparison: the Himawari window's unwrapped E>180 part
+        # maps to the grid's far-west columns)
+        lon_u = lons1.copy()
+        if w1 > 180:
+            lon_u = np.where(lon_u < w0 - 1e-9, lon_u + 360.0, lon_u)
+        cols = np.where((lon_u >= w0) & (lon_u <= w1))[0]
+        if cols.size == 0:
+            continue
+        c0, c1 = int(cols[0]), int(cols[-1]) + 1
+        # Himawari's wrapped window is non-contiguous on the global grid --
+        # handle it as a boolean column mask instead of a slice
+        col_mask = np.zeros(out_w, bool)
+        col_mask[cols] = True
+        TLON = np.meshgrid(lons1[col_mask], lats1)[0]
+        TLAT = np.meshgrid(lons1[col_mask], lats1)[1]
+        wgt = _geo_ring_weight(TLON, TLAT, member["sub"])
+        if float(wgt.max()) <= 0:
+            continue
+        try:
+            if member["kind"] == "ahi":
+                pseudo = type("E", (), {"sector_key": "fd",
+                                        "sector_bbox": (w0, S, w1, N)})()
+                slot, bucket, disks = fetch_ahi_band_disks(
+                    pseudo, [field["ahi_band"]], time=time, nearest=nearest,
+                    cache=band_cache)
+                d = disks[field["ahi_band"]]
+                from satellites import _ahi_latlon_to_xy_deg
+                x_deg, y_deg = _ahi_latlon_to_xy_deg(TLAT, TLON, d.sub_lon)
+                bt = _ahi_sample_disk(np.asarray(x_deg, np.float32),
+                                      np.asarray(y_deg, np.float32), d)
+                stamp_dt = slot
+            else:
+                cmi, x, y, proj, resolved = _fetch_goes_disk_bt(
+                    member["kind"], field["goes_band"], member["window"],
+                    (S, N), t, nearest)
+                TX, TY = _latlon_to_xy(TLAT, TLON, *proj)
+                bt = _sample_geos(cmi, x, y, TX, TY).astype(np.float32)
+                stamp_dt = resolved.scan_start
+                if member["kind"] == "goes_east":
+                    anchor = resolved
+        except Exception as e:   # noqa: BLE001 -- honest per-member degrade
+            print(f"[geo] {member['name']} unavailable -- sector stays "
+                  f"transparent: {e}")
+            continue
+        valid = np.isfinite(bt)
+        wv = np.where(valid, wgt, 0.0).astype(np.float32)
+        btsum[:, col_mask] += np.where(valid, bt, 0.0) * wv
+        wsum[:, col_mask] += wv
+        used.append((member["name"], stamp_dt))
+        del bt, wgt, wv, TLON, TLAT
+
+    if not used:
+        raise RuntimeError("global composite: no ring member delivered data")
+    with np.errstate(invalid="ignore"):
+        bt_k = np.where(wsum > 0, btsum / np.maximum(wsum, 1e-9), np.nan)
+    rgb = _colorize_bt(bt_k, field["enhancement"])
+    rgba = s2_recipes.rgba_from_rgb(rgb)           # alpha 0 in the Meteosat gap
+
+    scan = anchor.scan_start if anchor is not None else max(u[1] for u in used)
+    res = ImageryResult(
+        rgba=rgba, bounds=(W, S, E, N), scan_start=scan,
+        product="GEO-RING", bucket="geo-ring",
+        s3_key=" + ".join(u[0] for u in used),
+        generic_channel=entry.band_key, enhancement=field["enhancement"])
+    try:
+        res.bt_grid, res.bt_dims = _decimate_bt(
+            bt_k - 273.15, (W, S, E, N),
+            out_w=(getattr(entry, "bt_px", 0) or 2048))
+    except Exception:   # noqa: BLE001
+        res.bt_grid, res.bt_dims = None, None
+    return res

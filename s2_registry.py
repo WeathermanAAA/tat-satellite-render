@@ -698,7 +698,44 @@ HW_FD_ROWS: tuple[ProductEntry, ...] = tuple(
     _hw_recipe_row(r, "fd", _HW_FD_BBOX, _HW_FD_PX_BY_KM)
     for r in _rx.AHI_RECIPES if r.key != "truecolor")
 
-REGISTRY = REGISTRY + SUITE_ROWS + FD_SUITE_ROWS + HW_WPAC_ROWS + HW_FD_ROWS
+# ---------------------------------------------------------------------------
+# GLOBAL GEO-RING COMPOSITE (the explorer's global default): GOES-19 East +
+# GOES-18 West + Himawari-9 full disks stitched nadir-nearest onto one global
+# webmerc pyramid (s2_imagery.produce_global_composite). BT fields ONLY --
+# BT composites cleanly across sensors; RGBs stay per-satellite (honesty).
+# The Meteosat sector stays transparent (no ingest -- never faked).
+# ---------------------------------------------------------------------------
+_GEO_TITLES = {
+    "ir":   "Clean IR window · multi-satellite",
+    "irbd": "IR Dvorak BD · multi-satellite",
+    "wv":   "6.2 µm Water Vapor · multi-satellite",
+}
+_GEO_ENH = {"ir": "rainbow_ir", "irbd": "dvorak", "wv": "wv_tat"}
+
+
+def _geo_row(key: str) -> ProductEntry:
+    return ProductEntry(
+        product_id=f"geo-global-{key}",
+        family="geo", substrate="cmip", bucket="geo-ring", sat_num="00",
+        s3_prefix="", sns_filter_prefixes=(), accept_sectors=frozenset(),
+        channels=(), bands=(),
+        sat_key="geo", sector_key="global", band_key=key,
+        prod_meso_slug=None,
+        render_channel="geo_composite", render_enhancement=_GEO_ENH[key],
+        render_product_hint="global", render_sat_hint="GEO ring",
+        cadence_s=600,
+        tiled=True, tile_size=512, pyramid_px=8192,
+        pyramid_scheme="webmercator-xyz",
+        sector_bbox=(-180.0, -60.0, 180.0, 60.0),
+        recipe_id=None, bt_px=2560,
+    )
+
+
+GEO_GLOBAL_ROWS: tuple[ProductEntry, ...] = tuple(
+    _geo_row(k) for k in ("ir", "irbd", "wv"))
+
+REGISTRY = (REGISTRY + SUITE_ROWS + FD_SUITE_ROWS + HW_WPAC_ROWS + HW_FD_ROWS
+            + GEO_GLOBAL_ROWS)
 
 REGISTRY_BY_ID = {e.product_id: e for e in REGISTRY}
 
@@ -719,10 +756,12 @@ def build_products_index(sat_key: str, sector_key: str,
                 r = _r.recipe_for(e.family, e.recipe_id)
             except KeyError:
                 r = None
+        fallback_title = (_GEO_TITLES.get(e.band_key, "C13 · 10.3 µm (Clean IR)")
+                          if e.sat_key == "geo" else "C13 · 10.3 µm (Clean IR)")
         prods.append({
             "id": e.product_id,
             "path": e.product_path,
-            "title": r.title if r else "C13 · 10.3 µm (Clean IR)",
+            "title": r.title if r else fallback_title,
             "group": r.group if r else "channel",
             "enhancement": e.render_enhancement or None,
             "bt": bool(r.bt_band) if r else True,   # the clean-IR row ships BT

@@ -66,7 +66,10 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
 
     print(f"[fetch] {entry.product_id}  time={when.isoformat() if when else 'latest'}  "
           f"bbox={entry.sector_bbox}  scheme={scheme}")
-    if entry.recipe_id:
+    if entry.sat_key == "geo":
+        img = I.produce_global_composite(entry, time=when, nearest=True,
+                                         band_cache=band_cache)
+    elif entry.recipe_id:
         img = I.produce_recipe_imagery(entry, time=when, nearest=True,
                                        band_cache=band_cache)
     else:
@@ -155,6 +158,11 @@ def _pin_suite_scan(entries, when):
     t = when or dt.datetime.now(UTC)
     e0 = entries[0]
     bbox = list(e0.sector_bbox)
+
+    if e0.sat_key == "geo":
+        # the composite fetches each ring member's newest scan itself; the
+        # pin is just a shared reference time for the suite tick
+        return t.replace(second=0, microsecond=0)
 
     if e0.family == "himawari":
         from satellites import HIMAWARI_PACIFIC
