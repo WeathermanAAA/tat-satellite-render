@@ -443,8 +443,10 @@ class RenderRequest(BaseModel):
     @field_validator("format")
     @classmethod
     def _v_format(cls, v):
-        if v not in ("png", "webp"):
-            raise ValueError("format must be png or webp")
+        # btpng = the calibrated-BT u16 raster (deep-archive diagnostics
+        # input; gated to the GridSat tier in the endpoint)
+        if v not in ("png", "webp", "btpng"):
+            raise ValueError("format must be png, webp or btpng")
         return v
 
 
