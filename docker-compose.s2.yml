@@ -59,9 +59,10 @@ services:
   # Cron emitter: the Q7-tiered suite loop. z0-5 only (native z6 stays a manual
   # `run --rm emit --product ... ` on demand); duplicate scans dedup via the
   # per-frame ready marker, so the interval only bounds FRESHNESS, not writes.
-  # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list --
-  # e.g. "conus fd himawari9-wpac himawari9-fd"; falls back to the legacy
-  # single S2_CRON_SUITE), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
+  # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list;
+  # DEFAULTS to the FULL set -- conus fd himawari9-wpac himawari9-fd
+  # geo-global -- so a bare `up` runs everything; the legacy single
+  # S2_CRON_SUITE still overrides), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
   # S2_CRON_PREFIX. A failed suite never blocks the rest of the tick.
   emit-cron:
     build:
@@ -71,7 +72,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        SUITES="$${S2_CRON_SUITES:-$${S2_CRON_SUITE:-conus}}"
+        SUITES="$${S2_CRON_SUITES:-$${S2_CRON_SUITE:-conus fd himawari9-wpac himawari9-fd geo-global}}"
         echo "[s2-cron] suites=$$SUITES max-zoom=$${S2_CRON_MAX_ZOOM:-5} interval=$${S2_CRON_INTERVAL_S:-900}s"
         while true; do
           for suite in $$SUITES; do
