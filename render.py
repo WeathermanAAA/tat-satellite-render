@@ -405,7 +405,12 @@ def render_png(
     # archive gets an HONEST era title — actual source, channel, cadence and
     # resolution — so an old frame can never imply modern imagery.
     is_gridsat = data.bucket.startswith("noaa-cdr-gridsat")
-    if is_gridsat:
+    is_mergir = data.bucket == "gesdisc-mergir"
+    if is_mergir:
+        sensor_label = "merged geostationary IR"
+        center_title = (
+            f"NASA MergIR · 11 µm IR window · 30-min · ~4 km · {time_str} UTC")
+    elif is_gridsat:
         sensor_label = "geostationary IR composite"
         gs_chan = "11 µm IR window" if channel == 1 else "6.7 µm water vapor"
         center_title = (
@@ -464,7 +469,8 @@ def render_png(
     # Watermark: top-left of the map axes, mirroring the title strip's
     # right-aligned product label so the two corners balance visually.
     # Translucent dark backing rect keeps it legible over hot pixels.
-    source_label = ("NOAA CDR" if is_gridsat
+    source_label = ("NASA" if is_mergir
+                    else "NOAA CDR" if is_gridsat
                     else "JMA" if data.bucket.startswith("noaa-himawari")
                     else "NOAA")
     ax.text(
