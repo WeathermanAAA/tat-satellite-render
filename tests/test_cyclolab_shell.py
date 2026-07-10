@@ -134,10 +134,63 @@ class TestRenderContract(unittest.TestCase):
         # the page <title> also carries the name.
         self.assertIn(f"<title>{name}", html)
 
+    def test_copyable_plots_module_emitted(self):
+        # Right-click-to-copy: the module, the toast CSS, the clipboard + Safari
+        # fallback paths, the @WeathermanAAA mark, cors-safety, and EVERY overview
+        # plot id (the PLOTS wiring list) are present in the emitted page.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn("initPlotCopy", html)
+        self.assertIn("cl-toast", html)
+        self.assertIn("ClipboardItem", html)
+        self.assertIn("@WeathermanAAA", html)
+        self.assertIn("cors=1", html)            # cors-safe (untainted canvas)
+        self.assertIn('"image/png"', html)
+        self.assertIn("Copied", html)
+        self.assertIn("Downloaded", html)        # Safari / no-clipboard fallback
+        for pid in ("advcone", "intensity", "chart", "trackplot", "swathplot",
+                    "sst-hero-img"):
+            self.assertIn('"' + pid + '"', html)  # in the PLOTS wiring array
+
     def test_data_cat_matches_current_category(self):
         html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
         self.assertEqual(self.storm["current_category"], "C4")
         self.assertIn('<html lang="en" data-cat="C4">', html)
+
+    def test_inland_fill_layer_removed_keeps_coastal_lines(self):
+        # v3: the inland county/zone FILL layer was REMOVED - the cone's W/W
+        # presence is now ONLY the coastal breakpoint LINES. No fill render
+        # artifacts should remain, but the coastal-line scaffold stays.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertNotIn('class="ww-zone"', html)               # no fill paths
+        self.assertNotIn('id="ac-ww-zones-group"', html)        # no fill group
+        self.assertNotIn(".ac-ww-zones", html)                  # no fill CSS
+        self.assertIn("advFull.ww", html)                       # coastal lines stay
+        self.assertIn('id="ac-ww-group"', html)                 # coastal-line group
+
+    def test_jtwc_source_relabels_advisory_text_buttons(self):
+        # CYCLOLAB_DESIGN §8.4: a JTWC advisory (advFull.source === "jtwc")
+        # relabels the tcp/tcd buttons to "JTWC Warning" / "Prognostic
+        # Reasoning"; NHC keeps "Public Advisory" / "Discussion". Render-time,
+        # off the fetched advFull -- one template serves both sources.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn('advFull.source === "jtwc"', html)        # source-aware switch
+        self.assertIn('"JTWC Warning"', html)
+        self.assertIn('"Prognostic Reasoning"', html)
+        self.assertIn('"Public Advisory"', html)                # NHC label retained
+        self.assertIn('"Discussion"', html)
+
+    def test_part_d_graticules_and_sparse_fallback(self):
+        # PART D: track/swath get a sparse-track fallback extent (a 1-fix track
+        # still draws land + graticule), and the SST raster gets a lat/long
+        # lattice OVERLAY reusing the shared graticule() helper (one source).
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertIn("function ensureMinExtent(", html)
+        # both track + swath route their extent through the fallback
+        self.assertEqual(html.count("fitProjection(ensureMinExtent(extent, 8)"), 2)
+        self.assertIn('id="sst-grat"', html)                     # SST overlay element
+        self.assertIn("function renderSstGraticule(", html)
+        self.assertIn("ac-graticule", html)                      # reuses cone grat style
+        self.assertIn(".sst-grat {", html)
 
     def test_unknown_category_falls_back_to_TD(self):
         s = copy.deepcopy(self.storm)
@@ -188,13 +241,107 @@ class TestRenderContract(unittest.TestCase):
         self.assertIn('<html lang="en" data-cat="C4">', live)
         self.assertNotIn('<html lang="en" data-ended', live)
 
-    def test_invest_sid_raises(self):
-        # storm_ids contract: invests (90-99) get no page. render_page parses
-        # the sid up front, so the guard propagates.
+    def test_invest_gets_grey_redx_subset_page(self):
+        # Stage C: an invest renders a grey / red-X SUBSET page (no longer
+        # rejected). data-invest drives the grey override + red-X glyph; the
+        # cone/advisories/HAFS sections are CSS-hidden; IS_INVEST is baked true.
         s = copy.deepcopy(self.storm)
         s["sid"] = "NHC_EP902026"
-        with self.assertRaises(InvestSidError):
-            cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        s["is_invest"] = True
+        s["name"] = "90E"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('<html lang="en" data-invest data-cat=', html)
+        self.assertIn('class="invest-x"', html)
+        self.assertIn("var IS_INVEST = true", html)
+        self.assertIn("INVEST AREA", html)
+        # NHC formation-chance pill scaffold + eager loader
+        self.assertIn('id="formation-pill"', html)
+        self.assertIn("function loadFormation", html)
+        # page-side freshness guard: a frozen pill (poller stopped restamping
+        # generated_at) must HIDE rather than show stale odds.
+        self.assertIn("function fresh", html)
+        self.assertIn("f.generated_at", html)
+        # named-storm pages must NOT carry the invest attribute on <html>
+        # (the data-invest CSS rules are baked into every page; assert the TAG).
+        named = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertNotIn('<html lang="en" data-invest', named)
+        self.assertIn("var IS_INVEST = false", named)
+
+    def test_ptc_gets_grey_redx_but_keeps_cone_and_models(self):
+        # A Potential Tropical Cyclone wears the invest grey/red-X identity under
+        # its REAL designation, but — unlike a 90-99 invest — KEEPS the cone +
+        # advisories + Models (NHC is actively advising). Banner reads the NHC
+        # classification "POTENTIAL TROPICAL CYCLONE", no category chip, no ACE.
+        s = copy.deepcopy(self.storm)
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["name"] = "ONE"
+        s["current_category"] = "TD"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('<html lang="en" data-ptc data-cat=', html)
+        self.assertNotIn('<html lang="en" data-invest', html)     # NOT an invest
+        self.assertIn('class="invest-x"', html)                   # shares the red X
+        self.assertIn("var IS_PTC = true", html)
+        self.assertIn("var IS_INVEST = false", html)
+        self.assertIn("POTENTIAL TROPICAL CYCLONE", html)         # NHC classification
+        self.assertIn('id="formation-pill"', html)                # keeps the pill
+        # grey identity + ACE-hide are SHARED with invests; cone/advisories
+        # hiding is INVEST-ONLY (a PTC keeps them).
+        self.assertIn("html[data-ptc] #vrow-ace", html)           # PTC hides ACE
+        self.assertNotIn("html[data-ptc] #sec-advisories", html)  # PTC keeps cone
+        self.assertNotIn('html[data-ptc] [data-sec="advisories"]', html)
+        # a named storm carries neither attribute
+        named = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        self.assertNotIn('<html lang="en" data-ptc', named)
+        self.assertIn("var IS_PTC = false", named)
+
+    def test_ptc_with_ts_winds_but_placeholder_name_stays_ptc(self):
+        # A PTC can carry TS-strength winds (current_category "TS") while still
+        # UNNAMED ("ONE") - it is not yet a tropical storm, so it KEEPS the PTC
+        # dress. The bake veto must not shed on category alone.
+        s = copy.deepcopy(self.storm)
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["name"] = "ONE"
+        s["current_category"] = "TS"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertIn('<html lang="en" data-ptc data-cat=', html)
+        self.assertIn("var IS_PTC = true", html)
+
+    def test_ptc_with_numeric_designation_name_stays_ptc(self):
+        # ace_core v0.8.2 relabels a designated-but-unnamed system's spelled
+        # cardinal ("ONE") to its ATCF short id ("01E"/"10W"). That numeric form
+        # is a DESIGNATION, not a real name: _is_named_tc must NOT read it as
+        # named and shed the PTC dress - the same guarantee as the spelled "ONE".
+        for desig in ("01E", "10W", "01L"):
+            s = copy.deepcopy(self.storm)
+            s["sid"] = "NHC_AL012026"
+            s["is_ptc"] = True
+            s["name"] = desig
+            s["current_category"] = "TS"
+            html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+            self.assertIn('<html lang="en" data-ptc data-cat=', html, desig)
+            self.assertIn("var IS_PTC = true", html, desig)
+
+    def test_named_ts_vetoes_stale_is_ptc_at_bake(self):
+        # DURABILITY: NHC names the PTC (ONE -> ARTHUR) and it becomes a TS, but
+        # the feed's is_ptc still LAGS true (operational b-deck NATURE trailing
+        # the classification). The bake must follow the LIVE classification and
+        # shed the PTC dress: a named TS+ system is never "potential".
+        s = copy.deepcopy(self.storm)
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True                 # stale flag
+        s["name"] = "ARTHUR"
+        s["current_category"] = "TS"
+        html = cyclolab_shell.render_page(s, feed_url=FEED_URL)
+        self.assertNotIn('<html lang="en" data-ptc', html)   # no PTC on <html>
+        self.assertIn("var IS_PTC = false", html)
+        self.assertIn('data-cat="TS"', html)
+        # the baked banner type word is the real classification, not "POTENTIAL
+        # TROPICAL CYCLONE" (the literal still appears in the live-JS branch).
+        self.assertIn('id="storm-type">TROPICAL STORM<', html)
+        self.assertNotIn(
+            'id="storm-type">POTENTIAL TROPICAL CYCLONE<', html)
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
@@ -464,6 +611,32 @@ class TestSectionNav(unittest.TestCase):
         self.assertEqual(st["activeSection"], "sec-models")
         self.assertEqual(st["activeNav"], "models")
 
+    def test_models_tab_invest_shows_empty_not_other_storm(self):
+        # PART 1B: an invest has hafs_id="" (storm_ids), so initModels must show
+        # the empty stub and NEVER construct the HafsViewer - a null/empty
+        # stormLock would silently mount the FIRST storm in the global manifest
+        # (another storm's data: the 95W-Models-shows-07W bug).
+        invest = {**self.storm, "sid": "NHC_EP952026", "is_invest": True}
+        html = cyclolab_shell.render_page(invest, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"hafs_stub": True, "ops": [{"op": "openSec", "name": "models"}]})
+        s3 = recs[-1]["state"]["stage3"]
+        self.assertIsNone(s3["hafsCtor"])         # viewer NOT constructed for an invest
+        self.assertTrue(s3["hafsEmptyShown"])     # the "no model guidance" stub shows
+
+    def test_models_tab_designated_storm_builds_locked_viewer(self):
+        # Complement: a DESIGNATED storm (non-empty hafs_id) DOES build the
+        # viewer - the guard keys on empty HAFS_ID only and never suppresses a
+        # real storm's HAFS.
+        html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"hafs_stub": True, "ops": [{"op": "openSec", "name": "models"}]})
+        s3 = recs[-1]["state"]["stage3"]
+        self.assertIsNotNone(s3["hafsCtor"])      # viewer built for a designated storm
+        self.assertFalse(s3["hafsEmptyShown"])
+
     def test_unknown_section_is_a_noop_no_throw(self):
         # An unknown name must not throw (the harness would non-zero exit on a
         # script error); the page stays alive and renders a further snapshot.
@@ -479,6 +652,39 @@ class TestSectionNav(unittest.TestCase):
         self.assertEqual(len(recs), 3)
         # the page is still hydrated/usable (baked odometers intact).
         self.assertEqual(recs[-1]["state"]["odo"]["vmax"], "120")
+
+    def test_recon_tab_opens_and_lazy_mounts_without_throwing(self):
+        # The Recon tab activates + lazy-loads the shared ReconViewer; in jsdom
+        # the external scripts do not load, but initRecon must not throw and the
+        # section/nav must activate (the page stays alive for a later snapshot).
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [
+                 {"op": "openSec", "name": "recon"},
+                 {"op": "snapshot"},
+             ]})
+        self.assertEqual(len(recs), 2)
+        st = recs[-1]["state"]
+        self.assertEqual(st["activeSection"], "sec-recon")
+        self.assertEqual(st["activeNav"], "recon")
+
+    def test_ascat_tab_opens_and_lazy_mounts_without_throwing(self):
+        # The ASCAT tab activates + lazy-loads the shared AscatViewer (the same
+        # component as the main /ascat/ page) locked to this storm; in jsdom the
+        # external scripts do not load, but initAscat must not throw and the
+        # section/nav must activate.
+        recs = run_harness(
+            self.html,
+            {"feed": {"storms": [self.storm]},
+             "ops": [
+                 {"op": "openSec", "name": "ascat"},
+                 {"op": "snapshot"},
+             ]})
+        self.assertEqual(len(recs), 2)
+        st = recs[-1]["state"]
+        self.assertEqual(st["activeSection"], "sec-ascat")
+        self.assertEqual(st["activeNav"], "ascat")
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
@@ -874,11 +1080,11 @@ class TestStage3Mounts(unittest.TestCase):
                          "band switch must keep the moment (nearest frame)")
         self.assertIn("floaters/ep08/x/1012.png", st["satImgSrc"])
 
-    def test_satellite_speed_presets_default_1x_and_switch(self):
-        # final-gate-3 #5: four presets, default 1x; a click changes the
-        # speed multiplier (which scales the playback cadence uniformly,
-        # so the no-stutter contract holds at every speed).
-        # the harness snapshots after EVERY op, so index off the ops.
+    def test_satellite_speed_presets_default_2x_and_switch(self):
+        # Four presets, default 2x (the loops feel sluggish at 1x; matches the
+        # /satellite/ viewers); a click changes the speed multiplier (which scales
+        # the playback cadence uniformly, so the no-stutter contract holds at
+        # every speed). The harness snapshots after EVERY op, so index off the ops.
         recs = run_harness(self.html, {
             "floaters": self._floaters_top(),
             "floater_storm": self._floater_storm(),
@@ -886,7 +1092,7 @@ class TestStage3Mounts(unittest.TestCase):
                     {"op": "clickSatSpeed", "speed": 4},
                     {"op": "clickSatSpeed", "speed": 0.5}]})
         speeds = [r["state"]["stage3"]["sat"]["speed"] for r in recs]
-        self.assertEqual(speeds, [1, 4, 0.5])
+        self.assertEqual(speeds, [2, 4, 0.5])
 
     def test_satellite_gif_button_and_hooks_exist(self):
         # the export button mounts and the encoder hook is exposed (the
@@ -1444,6 +1650,91 @@ class TestConeCorridorContainment(unittest.TestCase):
         self.assertIn("ac-reveal-clip", a["coneClip"])
         self.assertGreater(a["coneRevealPathLen"], 100)
 
+    # --- HARD RECURVER (the real TD EIGHT / JTWC_WP082026 forecast track) ----
+    # The reveal corridor's per-side NEAREST-crossing half-width (ringEdgesAt)
+    # exists for exactly this shape: a recurver's perpendicular at an early
+    # centerline sample also stabs the cone's FAR limb. The old max|t| latched
+    # onto it, so the band ballooned across open water and the far end was
+    # revealed before the growth front reached it. These guard both ends of
+    # that: the settle frame still fully contains the cone (no pop-in), and a
+    # 30%-grown reveal does NOT already cover most of the cone (no balloon).
+    RECURVER = [(0, 14.2, 147.8), (12, 14.7, 146.1), (24, 15.5, 144.3),
+                (36, 16.4, 142.0), (48, 17.5, 139.6), (60, 18.9, 137.3),
+                (72, 21.0, 135.1), (96, 29.3, 135.9), (120, 35.4, 146.0)]
+
+    def _recurver_adv(self):
+        import json as _json
+        import derived_cone as _dc
+        blob = _json.loads(
+            (REPO / "cyclolab_radii_jtwc_wpac_mean_2015.json").read_text())
+        nm = {int(k): float(v) for k, v in blob["nm_values"].items()}
+        pts = [{"tau_h": t, "lat": la, "lon": lo, "intensity_kt": 30,
+                "dev_label": "TS", "valid_utc": "2026-06-22T00:00:00Z"}
+               for t, la, lo in self.RECURVER]
+        return {"sid": "JTWC_WP082026", "advisory": 1,
+                "issued_utc": "2026-06-22T00:00:00Z", "source": "jtwc",
+                "method": "derived-mean-error-jtwc-wpac-mean-2015",
+                "cone": _dc.derive_cone(pts, nm), "points": pts, "text": None}
+
+    def _seek_adv(self, adv, f):
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": f}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        return (a, _parse_pairs(a["coneRevealD"], " "),
+                _parse_pairs(a["coneOutlineD"], ","))
+
+    def test_recurver_settle_contains_cone_no_popin(self):
+        adv = self._recurver_adv()
+        a, clip, ring = self._seek_adv(adv, 1.0)
+        self.assertGreater(len(ring), 100)
+        outside = [(x, y) for x, y in ring if not _inside(clip, x, y)]
+        self.assertEqual(
+            len(outside), 0,
+            f"{len(outside)}/{len(ring)} recurver ring verts outside the "
+            f"full corridor (first: {outside[:3]}) - the cone would pop in "
+            f"at settle on a recurver")
+
+    def test_recurver_partial_reveal_does_not_balloon(self):
+        adv = self._recurver_adv()
+        _, clip, ring = self._seek_adv(adv, 0.30)
+        frac = sum(1 for x, y in ring if _inside(clip, x, y)) / len(ring)
+        self.assertLess(
+            frac, 0.7,
+            f"a 30% reveal already covers {frac:.0%} of the recurver cone "
+            f"- the corridor ballooned across the recurve to the far limb")
+
+    def test_tight_loop_ships_unclipped_no_popin(self):
+        # A tight cyclonic LOOP (NOW within ~26 nm of +120h while r(120)=180)
+        # makes the union cone SELF-OVERLAP; a flat-front corridor cannot
+        # contain it, so the loop guard ships the finished cone UNCLIPPED
+        # rather than clipping a contiguous arc that would pop in at settle.
+        import json as _json
+        import derived_cone as _dc
+        blob = _json.loads(
+            (REPO / "cyclolab_radii_jtwc_wpac_mean_2015.json").read_text())
+        nm = {int(k): float(v) for k, v in blob["nm_values"].items()}
+        loop = [(0, 15.0, 140.0), (12, 16.2, 140.8), (24, 17.0, 142.0),
+                (36, 17.2, 143.4), (48, 16.6, 144.2), (60, 15.6, 144.0),
+                (72, 15.0, 142.8), (96, 14.8, 141.2), (120, 15.2, 139.6)]
+        pts = [{"tau_h": t, "lat": la, "lon": lo, "intensity_kt": 30,
+                "dev_label": "TS", "valid_utc": "2026-06-22T00:00:00Z"}
+               for t, la, lo in loop]
+        adv = {"sid": "JTWC_WP092026", "advisory": 1,
+               "issued_utc": "2026-06-22T00:00:00Z", "source": "jtwc",
+               "method": "derived-mean-error-jtwc-wpac-mean-2015",
+               "cone": _dc.derive_cone(pts, nm), "points": pts, "text": None}
+        recs = run_harness(self.html, {
+            "ops": [{"op": "applyAdvisory", "adv": adv},
+                    {"op": "openSec", "name": "advisories"},
+                    {"op": "coneSeek", "f": 0.5}]})
+        a = recs[-1]["state"]["stage3"]["adv"]
+        self.assertEqual(a["coneClip"], "none",
+                         "self-overlapping loop cone must render UNCLIPPED")
+        self.assertGreater(len(a["coneOutlineD"]), 40)
+        self.assertFalse(a["coneEmptyShown"])
+
     def test_seek_tip_advances_along_the_track(self):
         # NOT self-referential (adversarial-review find): the tip must
         # MOVE between seeks and the clip polygon must actually grow -
@@ -1702,6 +1993,131 @@ class TestOverviewPlots(unittest.TestCase):
         self.assertGreater(st["chartChildCount"], 0)
         self.assertTrue(st["overview"]["trackRendered"])
         self.assertTrue(st["overview"]["swathRendered"])
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestPtcLifecycle(unittest.TestCase):
+    """The PTC dress is LIVE, not baked: a page born as a Potential Tropical
+    Cyclone must SHED the grey/red-X/formation-pill identity the moment the
+    feed shows a named/designated TC (and re-wear it on the reverse). node +
+    jsdom drives the real hydration path (the Arthur 2026-06-17 regression)."""
+
+    def _ptc_one(self):
+        # A PTC born with TS-strength winds but still UNNAMED ("ONE") - exactly
+        # the live AL012026 bake (data-ptc + data-cat="TS"). spawn_sid lets the
+        # formation pill fall back to its spawning invest's odds.
+        s = copy.deepcopy(load_storm())
+        s["sid"] = "NHC_AL012026"
+        s["is_ptc"] = True
+        s["is_active"] = True
+        s["name"] = "ONE"
+        s["current_category"] = "TS"
+        s["spawn_sid"] = "NHC_AL902026"
+        return s
+
+    def _arthur(self, ptc_one, *, stale_is_ptc=False):
+        # NHC names the system: ONE -> ARTHUR, a genuine Tropical Storm.
+        a = copy.deepcopy(ptc_one)
+        a["name"] = "ARTHUR"
+        a["current_category"] = "TS"
+        a["is_ptc"] = stale_is_ptc      # False normally; True exercises the veto
+        return a
+
+    def test_naming_sheds_the_ptc_dress_live(self):
+        ptc = self._ptc_one()
+        html = cyclolab_shell.render_page(ptc, feed_url=FEED_URL)
+        # sanity: born in full PTC dress
+        self.assertIn('<html lang="en" data-ptc', html)
+        recs = run_harness(
+            html,
+            {"feed": {"storms": [ptc]},          # boot keeps it PTC
+             "formation": {"p48": 60, "p7": 60, "level": "medium"},
+             "ops": [
+                 {"op": "snapshot"},                       # boot: PTC
+                 {"op": "apply", "storm": self._arthur(ptc)},  # named -> shed
+             ]})
+        boot, after = (r["state"] for r in recs)
+        # boot: the grey/red-X dress + the stale 60/60 formation pill (the bug)
+        self.assertTrue(boot["ptc"])
+        self.assertTrue(boot["isPtc"])
+        self.assertEqual(boot["glyphCat"], "PTC")
+        self.assertTrue(boot["formationShown"])
+        self.assertIn("60", boot["formationText"])
+        self.assertFalse(boot["aceRowShown"])
+        # after NHC names ARTHUR: the dress is SHED, the real category worn
+        self.assertFalse(after["ptc"])                     # data-ptc cleared (#2)
+        self.assertFalse(after["isPtc"])
+        self.assertEqual(after["stormName"], "ARTHUR")
+        self.assertEqual(after["cat"], "TS")               # SSHWS category (#3)
+        self.assertEqual(after["glyphCat"], "S")           # not "PTC" (#1/#3)
+        self.assertEqual(after["odo"]["cat"], "S")
+        self.assertEqual(after["typeWord"], "TROPICAL STORM")
+        self.assertNotIn("POTENTIAL TROPICAL CYCLONE", after["typeWord"])
+        self.assertFalse(after["formationShown"])          # no chance pill (#5)
+        self.assertEqual(after["formationText"], "")
+        self.assertTrue(after["aceRowShown"])              # ACE row back (#4)
+        # the SST hero subtitle (and, by the same DOM read, the Track/Wind
+        # plot lockups) now read the LIVE name + type (#6)
+        if after["hero"]:
+            self.assertEqual(after["hero"]["sub"], "TROPICAL STORM ARTHUR")
+            self.assertEqual(after["hero"]["glyphLabel"], "S")
+
+    def test_named_storm_sheds_even_when_feed_is_ptc_lags(self):
+        # DURABILITY: the feed's is_ptc still reads true (b-deck NATURE lag), but
+        # the system is a named TS - the page must shed anyway (the veto).
+        ptc = self._ptc_one()
+        html = cyclolab_shell.render_page(ptc, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"feed": {"storms": [ptc]},
+             "ops": [{"op": "apply",
+                      "storm": self._arthur(ptc, stale_is_ptc=True)}]})
+        after = recs[-1]["state"]
+        self.assertFalse(after["ptc"])
+        self.assertFalse(after["isPtc"])
+        self.assertEqual(after["glyphCat"], "S")
+        self.assertFalse(after["formationShown"])
+
+    def test_unnamed_ptc_with_ts_winds_keeps_the_dress(self):
+        # A PTC with TS-strength winds but still UNNAMED ("ONE", is_ptc true)
+        # must KEEP the dress - category alone never sheds it.
+        ptc = self._ptc_one()
+        html = cyclolab_shell.render_page(ptc, feed_url=FEED_URL)
+        recs = run_harness(
+            html,
+            {"feed": {"storms": [ptc]},
+             "ops": [{"op": "apply", "storm": ptc}]})
+        after = recs[-1]["state"]
+        self.assertTrue(after["ptc"])
+        self.assertTrue(after["isPtc"])
+        self.assertEqual(after["glyphCat"], "PTC")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestMobileCopyGesture(unittest.TestCase):
+    """Mobile plot copy: a stationary >=450ms long-press fires doCopy ->
+    clipboard.write (the lazy ClipboardItem) -- the touch parallel to the
+    desktop right-click. A quick tap or a scroll/pan (touchmove past the
+    dead-band) must NOT copy, so normal scrolling over a plot is preserved."""
+
+    def setUp(self):
+        self.storm = load_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL)
+
+    def test_long_press_copies_tap_and_scroll_do_not(self):
+        recs = run_harness(self.html, {
+            "feed": {"storms": [self.storm]},
+            "ops": [
+                {"op": "longPress", "id": "intensity"},    # svg plot, direct listener
+                {"op": "tap", "id": "intensity"},          # <450ms -> no copy
+                {"op": "scrollPlot", "id": "intensity"},   # touchmove -> cancelled
+                {"op": "longPress", "id": "trackplot"},     # stage plot -> bubbles to .map-stage
+            ]})
+        writes = [r["state"]["clipWrites"] for r in recs]
+        # cumulative: press=1, tap=+0, scroll=+0, stage-press=+1
+        self.assertEqual(
+            writes, [1, 1, 1, 2],
+            f"long-press must copy; tap/scroll must not (clipWrites={writes})")
 
 
 if __name__ == "__main__":

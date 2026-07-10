@@ -25,11 +25,15 @@ import json
 import logging
 import math
 import os
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional, Union
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,7 +41,10 @@ from pydantic import BaseModel, Field, field_validator
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from render import render_png, transcode_frame
+from render import (render_png, render_backdrop_webp, transcode_frame,
+                    encode_webp, state_lines_status)
+import gridsat
+import mergir
 from satellites import (
     ALL_SATELLITES,
     CoverageError,
@@ -106,6 +113,40 @@ WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "90"))
 render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
 cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
 
+# ---------------------------------------------------------------------------
+# Server-side loop export (POST /export) -- ffmpeg-encoded mp4 (primary) + a
+# global-palette gif fallback. Bounded + rate-limited; the webp LOOP poller path
+# and live /render are untouched (this is export-only).
+# ---------------------------------------------------------------------------
+EXPORT_MAX_FRAMES = int(os.getenv("EXPORT_MAX_FRAMES", "300"))   # hard cap on frames
+EXPORT_MAX_DIM = int(os.getenv("EXPORT_MAX_DIM", "2048"))        # reject a frame longer than this
+EXPORT_MAX_CONCURRENT = int(os.getenv("EXPORT_MAX_CONCURRENT", "1"))  # ffmpeg is CPU-heavy
+EXPORT_DWELL_FRAMES = float(os.getenv("EXPORT_DWELL_FRAMES", "6"))    # hold last frame Nx (mirrors SAT_LAST_FRAME_DWELL)
+EXPORT_FETCH_TIMEOUT_S = float(os.getenv("EXPORT_FETCH_TIMEOUT_S", "20"))
+EXPORT_MAX_FRAME_BYTES = int(os.getenv("EXPORT_MAX_FRAME_BYTES", str(25 * 1024 * 1024)))  # per-frame wire cap
+EXPORT_FFMPEG_TIMEOUT_S = float(os.getenv("EXPORT_FFMPEG_TIMEOUT_S", "150"))
+# SSRF guard: only fetch frame URLs from these hosts (the public CDN the loops
+# are served from). Comma-separated env override.
+EXPORT_ALLOWED_HOSTS = {
+    h.strip().lower() for h in os.getenv(
+        "EXPORT_ALLOWED_HOSTS", "cdn.triple-a-tropics.com").split(",") if h.strip()
+}
+export_semaphore = asyncio.Semaphore(EXPORT_MAX_CONCURRENT)
+
+
+def _ffmpeg_available() -> bool:
+    """True if the ffmpeg binary is on PATH + runnable. Checked on boot + gated
+    on each /export so a missing binary returns a clean 503 (frontend falls back
+    to its client-side gif.js) rather than a 500."""
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10, check=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+FFMPEG_AVAILABLE = _ffmpeg_available()
+
 
 # ---------------------------------------------------------------------------
 # Pixel budget — replaces the old hard 30° edge cap. Any bbox is accepted; we
@@ -120,6 +161,34 @@ cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
 # ---------------------------------------------------------------------------
 PIXEL_BUDGET = 16_000_000
 DEG_TO_KM = 111.0  # flat conversion; geos pixel stretch at high lat partially cancels lon shrink
+
+# Custom-zoom (draw-a-box) output RESOLUTION TIERS. Each tier is the pixel budget
+# the downsample factor targets, so the output dimension scales with it (a bbox is
+# never upscaled — a small zoom already under the budget renders native). "low"
+# additionally re-encodes the already-small render as lossy WebP for the smallest /
+# fastest download; "default" and "high" stay lossless PNG so text + coastlines stay
+# crisp. The webp LOOP path (format=webp, the floater/meso pollers) is unaffected —
+# it always uses the full PIXEL_BUDGET + the fixed WEBP_FRAME_WIDTH frame.
+QUALITY_BUDGETS = {
+    "low": 250_000,         # coarse satellite DATA — decimates hard, fastest
+    "default": 2_250_000,   # balanced (the page default) — UNCHANGED
+    "high": PIXEL_BUDGET,   # ~native data — genuinely sharper than default
+}
+DEFAULT_QUALITY = "default"
+# The tier knob is the OUTPUT DPI (figsize is held at 12in in render_png, so
+# layout proportions + font sizes scale uniformly and ALL chrome renders crisp
+# at the tier dpi -- never bitmap-resized). default 110 == today (byte-identical);
+# the webp LOOP path always renders at 110 (then transcodes to WEBP_FRAME_WIDTH).
+TIER_DPI = {
+    "low": 70,        # ~840 px  — small + fast, coarse imagery, CRISP chrome
+    "default": 110,   # ~1320 px — the page default (unchanged)
+    "high": 200,      # ~2400 px — sharper, slower (expected)
+}
+DEFAULT_DPI = 110
+# "low" re-encodes its already-small native render as lossy WebP for the smallest
+# download. NO downscale (that is what used to pixelate the chrome) -- the figure
+# is rendered small at the low dpi, then encoded WebP at its native size.
+LOWRES_WEBP_QUALITY = 88    # lossy-WebP quality for the "low" tier (native size)
 
 
 def _native_km_per_pixel_generic(generic_channel: str) -> float:
@@ -137,11 +206,13 @@ def _native_km_per_pixel(channel) -> float:
     return _native_km_per_pixel_generic(channel)
 
 
-def compute_downsample_factor(bbox: list[float], channel) -> int:
-    """Integer factor N such that requested_pixels / N**2 <= PIXEL_BUDGET.
+def compute_downsample_factor(bbox: list[float], channel, budget: int = PIXEL_BUDGET) -> int:
+    """Integer factor N such that requested_pixels / N**2 <= ``budget``.
 
     Returns 1 when the request already fits. Caller passes N to render_png
     which strides the cmi/lats/lons arrays by [::N, ::N] before pcolormesh.
+    ``budget`` defaults to the full PIXEL_BUDGET; the custom-zoom resolution
+    tiers pass a smaller budget (QUALITY_BUDGETS) to cap the output dimension.
     """
     # Wrapped span: lon_max < lon_min is a valid antimeridian crossing
     # (e.g. a GOES-18 meso sector steered over the Bering Sea). A zero
@@ -153,9 +224,31 @@ def compute_downsample_factor(bbox: list[float], channel) -> int:
     px_w = (lon_w_deg * DEG_TO_KM) / km_per_px
     px_h = (lat_h_deg * DEG_TO_KM) / km_per_px
     requested = px_w * px_h
-    if requested <= PIXEL_BUDGET:
+    if requested <= budget:
         return 1
-    return math.ceil(math.sqrt(requested / PIXEL_BUDGET))
+    return math.ceil(math.sqrt(requested / budget))
+
+
+def pick_tier_dpi(fmt: str, quality: str) -> int:
+    """Output DPI for a render. The webp LOOP path (pollers) always renders at the
+    default 110 (then transcodes to WEBP_FRAME_WIDTH), so loop frames are
+    unaffected by the tier; the custom-zoom png path honors the tier dpi. Unknown
+    tiers fall back to the default."""
+    return DEFAULT_DPI if fmt == "webp" else TIER_DPI.get(quality, DEFAULT_DPI)
+
+
+def resolve_quality(fmt: str, quality: str) -> tuple[int, str]:
+    """Map (output format, resolution tier) -> (pixel_budget, output_format).
+
+    The webp LOOP path (format=="webp", the floater/meso pollers) is unchanged:
+    full budget + a webp frame. The png/custom-zoom path honors the tier — low/
+    default/high budgets, with "low" re-encoded as lossy WebP for the smallest,
+    fastest download. Unknown tiers fall back to the default.
+    """
+    if fmt == "webp":
+        return PIXEL_BUDGET, "webp"
+    q = quality if quality in QUALITY_BUDGETS else DEFAULT_QUALITY
+    return QUALITY_BUDGETS[q], ("webp" if q == "low" else "png")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +392,16 @@ async def lifespan(app: FastAPI):
         GOES_BUCKET_OVERRIDE or "(none, time-based picker active)",
         [s.family for s in ALL_SATELLITES],
     )
+    if FFMPEG_AVAILABLE:
+        try:
+            ver = subprocess.run(["ffmpeg", "-version"], capture_output=True,
+                                 text=True, timeout=10).stdout.splitlines()[0]
+        except Exception:  # noqa: BLE001
+            ver = "ffmpeg (version probe failed)"
+        log.info("export: ffmpeg OK -> %s", ver)
+    else:
+        log.warning("export: ffmpeg NOT available -- POST /export will 503 "
+                    "(frontend falls back to client-side gif.js)")
     yield
     log.info("shutdown")
 
@@ -372,6 +475,28 @@ class RenderRequest(BaseModel):
     # they got. "webp" is the loop-frame path used by the floater + meso
     # pollers: WEBP_FRAME_WIDTH px, lossy WebP (see transcode_frame).
     format: str = "png"
+    # Custom-zoom RESOLUTION tier (png path only) -- the tier is the OUTPUT DPI at
+    # a fixed 12in figure: "low" (~840px, lossy WebP), "default" (~1320px PNG),
+    # "high" (~2400px PNG). Ignored on the webp loop path. Unknown values coerce to
+    # "default" so legacy/odd callers stay safe.
+    quality: str = "default"
+    # Map-overlay toggles (custom-zoom). Default True = the existing look (bold
+    # coastlines + political borders, labeled lat/lon gridlines); set False for
+    # clean imagery with no overlay. Legacy callers + the pollers omit them ->
+    # default True -> unchanged.
+    coastlines: bool = True   # coastlines + political borders
+    gridlines: bool = True    # labeled lat/lon graticule
+    # PART 4 - clean Clean-IR BACKDROP for the ASCAT viewer: a bare GRAYSCALE
+    # raster (no chrome) georeferenced to bbox, returned as WebP. Overrides the
+    # normal render path; the enhancement is forced to grayscale. Additive +
+    # opt-in: every existing caller omits it -> False -> unchanged.
+    backdrop: bool = False
+
+    @field_validator("quality")
+    @classmethod
+    def _v_quality(cls, v):
+        v = (v or "default").strip().lower()
+        return v if v in ("low", "default", "high") else "default"
 
     @field_validator("bbox")
     @classmethod
@@ -417,8 +542,30 @@ class RenderRequest(BaseModel):
     @field_validator("format")
     @classmethod
     def _v_format(cls, v):
-        if v not in ("png", "webp"):
-            raise ValueError("format must be png or webp")
+        # btpng = the calibrated-BT u16 raster (deep-archive diagnostics
+        # input; gated to the GridSat tier in the endpoint)
+        if v not in ("png", "webp", "btpng"):
+            raise ValueError("format must be png, webp or btpng")
+        return v
+
+
+class ExportRequest(BaseModel):
+    """A server-side loop export. ``frames`` are the loop's already-rendered
+    R2/CDN image URLs in play order (oldest->newest); the endpoint fetches them,
+    honors ``skip`` (keep every (skip+1)th), and encodes a smooth mp4 (primary)
+    or a global-palette gif. Bounded: <= EXPORT_MAX_FRAMES, each <= EXPORT_MAX_DIM."""
+    frames: list[str] = Field(..., min_length=2, max_length=EXPORT_MAX_FRAMES)
+    fps: int = Field(default=10, ge=1, le=30)
+    skip: int = Field(default=0, ge=0, le=20)
+    interpolate: bool = False
+    target_fps: int = Field(default=0, ge=0, le=60)   # 0 -> 2x fps when interpolate
+    format: str = "mp4"
+
+    @field_validator("format")
+    @classmethod
+    def _v_export_format(cls, v):
+        if v not in ("mp4", "gif"):
+            raise ValueError("format must be mp4 or gif")
         return v
 
 
@@ -450,7 +597,8 @@ async def health():
     }
 
 
-def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bucket: str) -> str:
+def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bucket: str,
+                 quality: str = DEFAULT_QUALITY) -> str:
     # Bucket included so an algorithm tweak (e.g. moving the goes19/goes16
     # boundary date) cleanly invalidates entries that would now resolve
     # differently. Same scan_start in goes19 and goes16 still produces
@@ -473,7 +621,21 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     # png key stays byte-identical (cache continuity across the deploy); png
     # and webp variants of the same scan cache as distinct entries.
     fmt_part = "" if body.format == "png" else f"|fmt={body.format}"
-    raw = f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}|{bucket}{storm_part}{fmt_part}"
+    # Resolution tier keys the custom-zoom (png) path so the three tiers cache
+    # separately; the webp LOOP path (poller frames) is unaffected -> frame-cache
+    # continuity. Coastline / gridline toggles join the key ONLY when turned OFF,
+    # so every default-on render keeps its existing key (cache continuity).
+    q_part = "" if body.format == "webp" else f"|q={quality}"
+    overlay_part = ""
+    if not body.coastlines:
+        overlay_part += "|nocoast"
+    if not body.gridlines:
+        overlay_part += "|nogrid"
+    # PART 4: the bare grayscale backdrop is a DISTINCT artifact from the chromed
+    # render at the same bbox/channel -> its own cache slot (never clobbers it).
+    backdrop_part = "|bd" if body.backdrop else ""
+    raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
+           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -501,20 +663,62 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # surface the factor on every response (HIT and MISS) so the frontend
     # can show the "auto-downsampled Nx" badge. True color is gated by its
     # 0.5 km red band, so size it off visible_red.
+    # Resolution tier -> pixel budget + output format. The webp LOOP path
+    # (pollers) keeps the full budget + webp frame; the custom-zoom png path
+    # honors low/default/high (low re-encodes to lossy WebP).
+    budget, out_format = resolve_quality(body.format, body.quality)
     downsample = compute_downsample_factor(
-        body.bbox, "visible_red" if is_true_color else generic_channel
+        body.bbox, "visible_red" if is_true_color else generic_channel, budget
     )
 
     # Pick the satellite that can see this bbox at this time. CoverageError
     # surfaces as 422 with a message that names the right satellite for the
     # region (e.g. Himawari for Western Pacific).
     parsed_time, _ = parse_request_time(body.time)
-    try:
-        satellite: Satellite = pick_satellite(
-            body.bbox, parsed_time, family_hint=body.satellite
-        )
-    except (CoverageError, UnsupportedTimeError) as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    # ARCHIVE TIERS (Time Machine) — best available for the requested date:
+    #   >= 2017-03      native GOES-R / Himawari archives (unchanged path)
+    #   2000-02..2017   NASA MergIR (4 km / 30-min, 11 µm) — needs Earthdata
+    #                   credentials (NO anonymous path exists, verified:
+    #                   the AWS Open Data listing is the controlled
+    #                   requester-pays GES DISC bucket); falls back to
+    #                   GridSat HONESTLY when creds are absent or the
+    #                   channel is WV (MergIR carries no WV)
+    #   1980..2000      NOAA GridSat-B1 CDR (~8 km / 3-hourly)
+    # ADDITIVE: pre-2017 dates previously 502'd; every "latest" / 2017+
+    # request takes the unchanged native path below.
+    use_archive = (not is_latest) and parsed_time < gridsat.ABI_CUTOVER
+    use_mergir = (use_archive and parsed_time >= mergir.MERGIR_START
+                  and generic_channel in mergir.MergIRSatellite.generic_to_band
+                  and mergir.have_credentials())
+    use_gridsat = use_archive and not use_mergir
+    if use_mergir:
+        satellite: Satellite = mergir.MERGIR
+        downsample = 1                 # ~4 km native — never stride the archive
+    elif use_gridsat:
+        if generic_channel not in gridsat.GridSatB1Satellite.generic_to_band:
+            raise HTTPException(
+                status_code=422,
+                detail="multi-band fields are not available before 2017 — the "
+                       "deep archive (GridSat-B1) is a single-channel record: "
+                       "use the 11 µm IR window (clean_ir) or 6.7 µm water "
+                       "vapor (wv_upper)")
+        satellite = gridsat.GRIDSAT
+        # ~8 km native — the archive is already far below the pixel budget;
+        # never stride it further
+        downsample = 1
+    else:
+        try:
+            satellite = pick_satellite(
+                body.bbox, parsed_time, family_hint=body.satellite
+            )
+        except (CoverageError, UnsupportedTimeError) as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+    if body.format == "btpng" and not (use_gridsat or use_mergir):
+        raise HTTPException(
+            status_code=422,
+            detail="format=btpng (calibrated-BT raster) is currently served "
+                   "for the archive tiers (GridSat-B1 / MergIR) only — the "
+                   "live suites publish per-frame bt.png beside their tiles")
 
     # Resolve which file we'll use; this gives us the snapped scan time which
     # is part of the cache key. For "latest" we don't snap to file precision
@@ -539,7 +743,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     else:
         snapped = resolved.scan_start.isoformat()
 
-    cache_key = _request_key(body, generic_channel, snapped, resolved.bucket)
+    cache_key = _request_key(body, generic_channel, snapped, resolved.bucket, body.quality)
     native_band = (
         satellite.truecolor_bands["red"] if is_true_color
         else satellite.generic_to_band[generic_channel]
@@ -559,10 +763,17 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             "X-Sub-Sat-Lon": f"{resolved.sub_sat_lon:g}",
             "X-Generic-Channel": generic_channel,
             "X-Native-Band": str(native_band),
+            # Resolution tier the frontend echoes in the result meta (and uses,
+            # with the media type, to pick the .png/.webp download extension).
+            "X-Quality": body.quality if body.format != "webp" else "loop",
+            # Runtime diagnostic: did the vendored admin_1 state-line layer load
+            # on this host? (verifies the deploy + the geojson availability)
+            "X-State-Lines": state_lines_status(),
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
-        media_type = "image/webp" if body.format == "webp" else "image/png"
+        media_type = ("image/webp" if (out_format == "webp" or body.backdrop)
+                      else "image/png")
         return Response(content=content, media_type=media_type, headers=headers)
 
     cached = cache.get(cache_key)
@@ -578,26 +789,56 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             return _response(cached, "HIT", elapsed_ms)
 
+        # Output DPI is the tier knob (custom-zoom png path); the webp LOOP path
+        # always renders at the default 110 dpi (then transcodes to the fixed
+        # frame width), so poller frames are unaffected.
+        tier_dpi = pick_tier_dpi(body.format, body.quality)
         try:
             if is_true_color:
-                data = await satellite.fetch_true_color(body.bbox, resolved)
+                # Stride the bands BEFORE the per-pixel recipe (Rayleigh) inside
+                # the fetch -- byte-identical to striding after, but far cheaper
+                # (what makes low fast). render_png must then NOT stride again.
+                data = await satellite.fetch_true_color(body.bbox, resolved, downsample)
+                render_downsample = 1
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
+                render_downsample = downsample
             def _render_job() -> bytes:
+                if body.format == "btpng":
+                    # calibrated-BT u16 raster (objfix / TC-Diagnostics
+                    # archive reanalysis input) — chrome-free by design
+                    return gridsat.bt_png_from_fetch(data)
+                if body.backdrop:
+                    # PART 4: bare grayscale Clean-IR backdrop for the ASCAT
+                    # viewer (already WebP; skip the chromed render + transcode).
+                    # Enhancement is forced to a gray palette regardless of input.
+                    bd_enh = (body.enhancement
+                              if body.enhancement in ("grayscale", "ir_gray")
+                              else "grayscale")
+                    return render_backdrop_webp(
+                        data, body.bbox, enhancement=bd_enh,
+                        downsample=render_downsample, dpi=tier_dpi,
+                    )
                 out = render_png(
                     data,
                     body.bbox,
                     native_band,
                     resolved.scan_start.strftime("%Y-%m-%d %H:%M"),
                     body.enhancement,
-                    downsample,
+                    render_downsample,
                     storm=body.storm.model_dump() if body.storm is not None else None,
+                    coastlines=body.coastlines,
+                    gridlines=body.gridlines,
+                    dpi=tier_dpi,
                 )
-                # webp loop frames transcode inside the same executor job so
-                # the render semaphore covers the whole CPU burst and the
-                # cache below stores the final (already-encoded) bytes.
+                # webp LOOP frames (floater/meso pollers): downscale the 1320 px
+                # render to the fixed frame width -- UNCHANGED. The custom-zoom
+                # "low" tier instead re-encodes its already-small native render as
+                # lossy WebP with NO downscale, so the chrome stays crisp.
                 if body.format == "webp":
                     out = transcode_frame(out, WEBP_FRAME_WIDTH, WEBP_QUALITY)
+                elif out_format == "webp":   # quality == "low"
+                    out = encode_webp(out, LOWRES_WEBP_QUALITY)
                 return out
 
             frame_bytes = await asyncio.get_event_loop().run_in_executor(
@@ -627,3 +868,183 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         len(frame_bytes),
     )
     return _response(frame_bytes, "MISS", elapsed_ms)
+
+
+# ---------------------------------------------------------------------------
+# Loop export (POST /export): ffmpeg mp4 (primary) + global-palette gif.
+# Export-only -- the webp LOOP poller path + live /render are untouched.
+# ---------------------------------------------------------------------------
+def _export_vf(dwell_s: float, interpolate: bool, target_fps: int,
+               for_mp4: bool) -> str:
+    """The ffmpeg -vf chain shared by the mp4 + gif encoders (so the gif palette
+    is generated from the SAME frames it's applied to). Order: optional motion
+    interpolation -> last-frame dwell -> even-dim pad (mp4 only, for yuv420p)."""
+    parts = []
+    if interpolate:
+        parts.append(
+            f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir")
+    # dwell is always present (>=0.1s) so the chain is never empty -> no leading
+    # comma when spliced before palettegen/paletteuse.
+    parts.append(f"tpad=stop_mode=clone:stop_duration={dwell_s:.3f}")
+    if for_mp4:
+        parts.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+    return ",".join(parts)
+
+
+def _run_ffmpeg(args: list, timeout: float) -> None:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+        capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace")[-600:] or "ffmpeg failed"
+        raise RuntimeError(f"ffmpeg: {tail}")
+
+
+def _encode_export(tmp: str, fmt: str, fps: int, interpolate: bool,
+                   target_fps: int) -> tuple[bytes, str]:
+    """Encode the numbered PNGs in ``tmp`` (f_%05d.png) to mp4 or gif. Returns
+    (bytes, media_type)."""
+    pat = os.path.join(tmp, "f_%05d.png")
+    dwell_s = min(1.5, max(0.1, EXPORT_DWELL_FRAMES / float(fps)))
+    if fmt == "mp4":
+        out = os.path.join(tmp, "out.mp4")
+        vf = _export_vf(dwell_s, interpolate, target_fps, for_mp4=True)
+        # libx264 -crf 18 yuv420p = broadly-playable, near-lossless, small.
+        _run_ffmpeg(["-framerate", str(fps), "-i", pat, "-vf", vf,
+                     "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                     "-movflags", "+faststart", out], EXPORT_FFMPEG_TIMEOUT_S)
+        return _read(out), "video/mp4"
+    # gif: TWO-PASS GLOBAL palette so ALL frames share ONE palette (kills the
+    # per-frame NeuQuant shimmer of the old client gif.js path).
+    chain = _export_vf(dwell_s, interpolate, target_fps, for_mp4=False)
+    palette = os.path.join(tmp, "palette.png")
+    out = os.path.join(tmp, "out.gif")
+    _run_ffmpeg(["-framerate", str(fps), "-i", pat, "-vf",
+                 f"{chain},palettegen=stats_mode=full", palette],
+                EXPORT_FFMPEG_TIMEOUT_S)
+    _run_ffmpeg(["-framerate", str(fps), "-i", pat, "-i", palette, "-lavfi",
+                 f"{chain}[x];[x][1:v]paletteuse=dither=sierra2_4a", out],
+                EXPORT_FFMPEG_TIMEOUT_S)
+    return _read(out), "image/gif"
+
+
+def _read(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _fetch_frames_to_dir(urls: list, tmp: str) -> int:
+    """Fetch each frame URL (host-allowlisted: SSRF guard) and normalize it to a
+    same-size RGB PNG numbered f_00000.png.. so ffmpeg's %05d input + the gif
+    palette stay uniform. Raises HTTPException on a disallowed host / unreadable
+    or oversized frame. Returns the count written."""
+    import io as _io
+
+    import requests
+    from PIL import Image
+
+    ref = None
+    n = 0
+    for i, url in enumerate(urls):
+        host = (urlparse(url).hostname or "").lower()
+        if host not in EXPORT_ALLOWED_HOSTS:
+            raise HTTPException(status_code=400,
+                                detail=f"frame host not allowed: {host or '?'}")
+        try:
+            # allow_redirects=False: the host allowlist is checked on the URL we
+            # send, so a 3xx to an off-allowlist (internal) host must NOT be
+            # followed -- that would be an SSRF bypass. stream + a wire-byte cap
+            # bound memory; the lazy header dims are checked BEFORE the full RGB
+            # decode so a decompression bomb can't blow up RAM.
+            r = requests.get(url, timeout=EXPORT_FETCH_TIMEOUT_S,
+                             allow_redirects=False, stream=True)
+            if 300 <= r.status_code < 400:
+                raise HTTPException(status_code=502,
+                                    detail=f"frame {i} redirected (not allowed)")
+            r.raise_for_status()
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf.extend(chunk)
+                if len(buf) > EXPORT_MAX_FRAME_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"frame {i} exceeds {EXPORT_MAX_FRAME_BYTES} bytes")
+            im = Image.open(_io.BytesIO(bytes(buf)))   # lazy: dims from header
+            if max(im.size) > EXPORT_MAX_DIM:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"frame {i} {im.size[0]}x{im.size[1]} exceeds "
+                           f"{EXPORT_MAX_DIM}px")
+            im = im.convert("RGB")                     # decode now (dims bounded)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502,
+                                detail=f"could not fetch frame {i}: {e}") from e
+        if ref is None:
+            ref = im.size
+        elif im.size != ref:
+            im = im.resize(ref, Image.LANCZOS)   # keep the ffmpeg input uniform
+        im.save(os.path.join(tmp, f"f_{n:05d}.png"))
+        n += 1
+    return n
+
+
+EXPORT_RATE_LIMIT = os.getenv("EXPORT_RATE_LIMIT", RATE_LIMIT)
+export_limiter = SlidingWindowLimiter(EXPORT_RATE_LIMIT)
+
+
+@app.post("/export")
+async def export(request: Request, body: ExportRequest = Body(...)):
+    # same explicit sliding-window limiter as /render (this branch replaced
+    # slowapi -- see SlidingWindowLimiter's note); exports get their OWN
+    # window so a loop export never eats the render quota
+    retry_after = export_limiter.check(real_ip(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit exceeded: {EXPORT_RATE_LIMIT}",
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+    if not FFMPEG_AVAILABLE:
+        raise HTTPException(status_code=503,
+                            detail="export encoder (ffmpeg) unavailable")
+    step = body.skip + 1
+    urls = body.frames[::step]                       # honor skip: every (skip+1)th
+    if len(urls) < 2:
+        raise HTTPException(status_code=400, detail="need >= 2 frames after skip")
+    if len(urls) > EXPORT_MAX_FRAMES:                # belt-and-suspenders bound
+        urls = urls[-EXPORT_MAX_FRAMES:]
+    if body.interpolate:
+        target_fps = min(60, max(body.fps, body.target_fps or body.fps * 2))
+    else:
+        target_fps = body.fps                        # unused (no minterpolate)
+    t0 = time.perf_counter()
+    tmp = tempfile.mkdtemp(prefix="export-")
+    try:
+        async with export_semaphore:
+            def _job():
+                _fetch_frames_to_dir(urls, tmp)
+                return _encode_export(tmp, body.format, body.fps,
+                                      body.interpolate, target_fps)
+            data, media_type = await asyncio.get_event_loop().run_in_executor(
+                None, _job)
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="export encode timed out")
+    except Exception as e:  # noqa: BLE001
+        log.exception("export failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"export failed: {e}") from e
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        gc.collect()
+    ms = int((time.perf_counter() - t0) * 1000)
+    ext = "mp4" if body.format == "mp4" else "gif"
+    log.info("export ok fmt=%s frames=%d fps=%d interp=%s ms=%d bytes=%d",
+             body.format, len(urls), body.fps, body.interpolate, ms, len(data))
+    return Response(content=data, media_type=media_type, headers={
+        "X-Export-Ms": str(ms),
+        "X-Export-Frames": str(len(urls)),
+        "Content-Disposition": f'attachment; filename="tat_loop.{ext}"',
+    })

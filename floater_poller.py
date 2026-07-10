@@ -59,6 +59,8 @@ import boto3
 import requests
 from botocore.config import Config as BotoConfig
 
+from storm_ids import is_real_storm_name
+
 # ---------------------------------------------------------------------------
 # Config (env-driven; safe defaults)
 # ---------------------------------------------------------------------------
@@ -136,9 +138,75 @@ BBOX_DEG = float(_env("BBOX_DEG", "12"))           # square floater width (deg)
 CADENCE_TARGET_S = float(_env("CADENCE_TARGET_S", "60"))   # hot-band target
 TRACKS_REFRESH_S = float(_env("TRACKS_REFRESH_S", "600"))  # storms update every 6 h
 RATE_MIN_SPACING_S = float(_env("RATE_MIN_SPACING_S", "1.0"))  # min gap between /render calls
-ACTIVE_WINDOW_HOURS = float(_env("ACTIVE_WINDOW_HOURS", "60"))
+# Recency gate for "this storm still floats". A genuinely active storm gets
+# b-deck fixes every ~6 h, so 24 h = four missed cycles; the old 60 h kept a
+# dissipated storm's floater on /satellite/ for 2.5 days (the upstream feed's
+# is_active degrades to ITS 60 h staleness window whenever a storm's b-deck
+# simply stops without a terminal EX/DS row -- CRISTINA's final fix was a
+# TD 30 kt still marked nature=TS).
+ACTIVE_WINDOW_HOURS = float(_env("ACTIVE_WINDOW_HOURS", "24"))
+# Prompt NHC retirement: a named AL/EP/CP storm ABSENT from a successfully
+# fetched CurrentStorms.json (NHC drops a storm there the moment advisories
+# end -- the authoritative final-advisory signal) is retired once its latest
+# fix is older than this grace window. The grace keeps a storm with FRESH
+# fixes afloat through a transient CurrentStorms listing hiccup.
+NHC_RETIRE_GRACE_H = float(_env("NHC_RETIRE_GRACE_H", "12"))
 NIGHT_ZENITH_DEG = float(_env("NIGHT_ZENITH_DEG", "85"))   # >= this => skip daytime-only bands
 EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapolation
+
+# Basin/regional Vis/SWIR backdrops (basin views). ONE clean per-extent render
+# per basin (NOT a global mosaic: a basin must fit within a single satellite
+# disk, so out-of-coverage basins are skipped). Keyed by the region slug the
+# viewers look up in floaters/backdrops.json; bboxes are [W,S,E,N], env-tunable
+# cadence. Off-disk corners (a basin reaches the satellite limb) render
+# transparent via render_backdrop_webp's NaN-coord mask. Hemisphere/global (and
+# antimeridian-wide) views are served separately by the day-Vis/night-SWIR mosaic.
+# Every regional (non-hemisphere) TATRegions extent that a SINGLE geostationary
+# disk (GOES-East -75.2, GOES-West -137.2, Himawari 140.7) can cover. call_render
+# auto-selects the disk for each bbox; a region with no single-disk coverage (the
+# Africa/Europe/W-Indian-Ocean gap with no Meteosat in the registry, or an extent
+# too wide / antimeridian-spanning for one disk: npac, tpac) raises RenderSkip and
+# is simply omitted from backdrops.json -- those wide/gap views are served by the
+# day-Vis/night-SWIR MOSAIC (hemisphere/global) instead. Bboxes are [W,S,E,N],
+# ALIGNED to models/regions.js extentOf so the backdrop covers exactly the framed
+# region (swpac uses E=200 = 160W so the box is contiguous across the dateline).
+BASIN_BACKDROP_REGIONS = {
+    # --- GOES-East (Atlantic + the Americas) ---
+    "atlantic": [-100.0, 0.0, -5.0, 55.0],
+    "watl":     [-100.0, 7.0, -55.0, 45.0],
+    "eatl":     [-65.0, 0.0, 0.0, 35.0],
+    "us":       [-125.0, 24.0, -66.0, 50.0],
+    "eus":      [-100.0, 24.0, -66.0, 50.0],
+    "samer":    [-85.0, -56.0, -34.0, 13.0],
+    # --- GOES-West (E-Pac + W North America + central Pacific) ---
+    "epac":     [-140.0, 5.0, -80.0, 35.0],
+    "nepac":    [-180.0, 15.0, -110.0, 60.0],
+    "wus":      [-125.0, 30.0, -100.0, 50.0],
+    "namer":    [-170.0, 10.0, -50.0, 75.0],
+    # --- Himawari (W-Pac + Australia + E Asia / E Indian Ocean) ---
+    "wpac":     [100.0, 0.0, 180.0, 45.0],
+    "twpac":    [100.0, 0.0, 180.0, 35.0],
+    "swpac":    [140.0, -35.0, 200.0, 5.0],
+    "aus":      [110.0, -45.0, 155.0, -8.0],
+    "asia":     [40.0, 5.0, 150.0, 75.0],
+    "io":       [30.0, -35.0, 110.0, 30.0],
+}
+BASIN_BACKDROP_REFRESH_S = float(_env("FLOATER_BASIN_BACKDROP_REFRESH_S", "1800"))
+# Wide-area (hemisphere/global) day-Vis/night-SWIR multi-sat mosaic (mosaic.py):
+# heavier than a basin render (3 disks), so a slower cadence. Kill switch
+# FLOATER_MOSAIC_ENABLED=false leaves the wide views greyed (no mosaic published).
+MOSAIC_ENABLED = (_env("FLOATER_MOSAIC_ENABLED", "1") or "1").lower() \
+    not in ("0", "false", "no")
+MOSAIC_REFRESH_S = float(_env("FLOATER_MOSAIC_REFRESH_S", "2700"))   # 45 min
+# The ASCAT + MW canvas viewers draw their map pane at a FIXED pixel aspect
+# (figW : figW*0.6  ->  W/H = 1.667) and fit the plot frame to the backdrop's
+# WGS84 bounds, then expand to that aspect (cos-lat corrected). A SQUARE backdrop
+# therefore leaves bare basemap in the lon-margins of the wide frame. We render
+# the backdrop pre-widened to this aspect so the viewer's expansion is a no-op
+# and the imagery fills the frame edge-to-edge. Keep in sync with ascat.js /
+# microwave.js _layout() (mapH = figW*0.6) and _aspectExtent().
+BACKDROP_VIEW_ASPECT = float(_env("FLOATER_BACKDROP_VIEW_ASPECT", "1.667"))
+BACKDROP_MAX_LON_SPAN = float(_env("FLOATER_BACKDROP_MAX_LON_SPAN", "150"))
 
 # Retention (R2) -- native recent + thinned history.
 RECENT_WINDOW_H = float(_env("RECENT_WINDOW_H", "6"))      # keep native cadence within this
@@ -153,6 +221,16 @@ DEACTIVATE_GRACE_H = float(_env("DEACTIVATE_GRACE_H", "24"))  # keep frames afte
 # predates the format param -- or a rollback flip -- stays self-consistent:
 # whatever /render actually sent is what gets keyed and served.
 FRAME_FORMAT = (_env("FRAME_FORMAT", "webp") or "webp").strip().lower()
+
+# PART 4 - clean Clean-IR BACKDROP for the ASCAT viewer. For the IR band only,
+# the poller renders a SECOND, bare GRAYSCALE raster (no chrome) at the same
+# bbox/time and stamps it on the IR frame as bd_key + bounds [W,S,E,N]. Purely
+# additive: the chromed floater frame, the floater viewer, and /satellite/ are
+# byte-identical. FLOATER_BACKDROP_ENABLED=false is the instant rollback (no
+# emission); the consumer falls back to the chromed key when bd_key is absent.
+FLOATER_BACKDROP_ENABLED = (_env("FLOATER_BACKDROP_ENABLED", "1") or "1") \
+    .strip().lower() not in ("0", "false", "no")
+FLOATER_BACKDROP_BAND = (_env("FLOATER_BACKDROP_BAND", "ir") or "ir").strip().lower()
 
 # HTTP timeouts / retries
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
@@ -269,12 +347,48 @@ def solar_zenith_deg(lat: float, lon: float, when: dt.datetime) -> float:
     return math.degrees(math.acos(cos_zen))
 
 
+def backdrop_band(lat: float, lon: float, when: dt.datetime) -> tuple:
+    """Pick the satellite-backdrop band by day/night at (lat, lon): day (solar
+    zenith < NIGHT_ZENITH_DEG, i.e. sun a few deg up) -> day VISIBLE; night ->
+    SHORT-WAVE IR. Returns (generic_channel, product_label) -> the consumer header
+    shows the true product. The render service delivers visible as reflectance
+    (units '1') and SWIR as brightness temperature; render_backdrop_webp grayscales
+    either, chrome-free."""
+    if solar_zenith_deg(lat, lon, when) < NIGHT_ZENITH_DEG:
+        return "visible_red", "Vis"
+    return "shortwave_ir", "SWIR"
+
+
 def norm_lon(lon: float) -> float:
     while lon > 180:
         lon -= 360
     while lon < -180:
         lon += 360
     return lon
+
+
+def widen_bbox_to_view(bbox: list[float]) -> list[float]:
+    """Widen a ``[W, S, E, N]`` bbox in LONGITUDE so its on-screen aspect matches
+    the canvas viewers' map pane (BACKDROP_VIEW_ASPECT), keeping the latitude span
+    and center. cos-lat corrects the PlateCarree stretch (the viewers do the same
+    in _aspectExtent), so the widened box projects to exactly the viewer aspect
+    and fills the frame with no bare-basemap margins. Never SHRINKS lon (a box
+    already wider than the aspect is kept), and clamps the span so a high-lat box
+    never explodes. Edges are kept continuous around norm_lon(center) (E may
+    exceed +180 across the dateline) -- the viewers project in that same unwrapped
+    frame, matching the per-storm bounds contract."""
+    w, s, e, n = bbox
+    lat_span = float(n) - float(s)
+    clat = (float(s) + float(n)) / 2.0
+    clon = norm_lon((float(w) + float(e)) / 2.0)
+    cur_lon = float(e) - float(w)
+    cosl = max(0.30, math.cos(math.radians(clat)))   # clamp: high-lat boxes stay sane
+    want_lon = lat_span * BACKDROP_VIEW_ASPECT / cosl
+    # Widen only -- a box already wider than the aspect (a basin extent) is never
+    # shrunk; the absolute cap only catches a degenerate high-lat widening.
+    lon_span = max(cur_lon, min(BACKDROP_MAX_LON_SPAN, want_lon))
+    half = lon_span / 2.0
+    return [round(clon - half, 3), round(s, 3), round(clon + half, 3), round(n, 3)]
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +894,47 @@ def fetch_current_named(session: requests.Session) -> Optional[dict[str, Storm]]
     return out
 
 
+def retire_dissipated_named(
+    named: "dict[str, Storm]",
+    current_named: "dict[str, Storm]",
+    nhc_list_fresh: bool,
+    now: dt.datetime,
+) -> "dict[str, Storm]":
+    """Drop named NHC-basin storms whose advisories have ENDED.
+
+    NHC removes a storm from CurrentStorms.json with its final advisory
+    (dissipated / post-tropical / remnant low) -- the authoritative signal.
+    The tracks feed's is_active can't see that: a dissipating TD's b-deck
+    often just STOPS while its last row still reads a tropical nature, so
+    is_active degrades to a 60 h staleness window and the dead storm's
+    floater lingered for days (CRISTINA).
+
+    A storm is retired iff ALL of: its basin is NHC's (AL/EP/CP -- WP/JTWC
+    has no CurrentStorms coverage and rides ACTIVE_WINDOW_HOURS instead);
+    CurrentStorms fetched cleanly THIS cycle (``nhc_list_fresh`` -- never
+    mass-retire on a fetch failure) and doesn't list it; and its latest fix
+    is older than NHC_RETIRE_GRACE_H (so a transient listing hiccup can't
+    drop a storm with fresh fixes). Invests never pass through here -- they
+    are a separate source with their own lifecycle.
+    """
+    if not nhc_list_fresh:
+        return named
+    nhc_basins = set(NHC_BASIN_PREFIXES.values())
+    grace = dt.timedelta(hours=NHC_RETIRE_GRACE_H)
+    kept: dict[str, Storm] = {}
+    for slug, s in named.items():
+        if s.basin in nhc_basins and slug not in current_named:
+            fix_t = parse_iso(s.last_fix)
+            if fix_t is None or now - fix_t > grace:
+                log.info(
+                    "retiring %s/%s: absent from NHC CurrentStorms, last fix "
+                    "%s -- advisories have ended", s.name, slug,
+                    s.last_fix or "(unknown)")
+                continue
+        kept[slug] = s
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # R2 client
 # ---------------------------------------------------------------------------
@@ -862,13 +1017,19 @@ class RenderSkip(Exception):
 
 
 def call_render(session: requests.Session, bbox: list[float], channel: str,
-                enhancement: str, storm: Optional[dict] = None) -> tuple[bytes, dict]:
+                enhancement: str, storm: Optional[dict] = None,
+                backdrop: bool = False) -> tuple[bytes, dict]:
     body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
                   "enhancement": enhancement, "format": FRAME_FORMAT}
-    # When supplied, /render burns a color-coded intensity badge into the
-    # rendered frame's title strip (left side). Only sent from the poller path;
-    # legacy draw-a-box /satellite/ UI omits it and gets the plain title.
-    if storm is not None:
+    if backdrop:
+        # PART 4: bare grayscale Clean-IR backdrop (WebP, no chrome, no badge).
+        body["backdrop"] = True
+        body["enhancement"] = "grayscale"
+    elif storm is not None:
+        # When supplied, /render burns a color-coded intensity badge into the
+        # rendered frame's title strip (left side). Only sent from the poller
+        # path; legacy draw-a-box /satellite/ UI omits it and gets the plain
+        # title. Never sent on the bare backdrop path.
         body["storm"] = storm
     last_exc: Exception | None = None
     for attempt in range(RENDER_MAX_RETRIES):
@@ -952,6 +1113,8 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
         t = parse_iso(f["t"])
         if t is None or t < history_cut:
             deleted.append(f["key"])
+            if f.get("bd_key"):
+                deleted.append(f["bd_key"])   # PART 4: drop the backdrop sibling
             continue
         if t >= recent_cut:
             kept.append(f)
@@ -963,6 +1126,8 @@ def prune_frames(frames: list[dict], now: dt.datetime) -> tuple[list[dict], list
             last_kept_t = t
         else:
             deleted.append(f["key"])
+            if f.get("bd_key"):
+                deleted.append(f["bd_key"])   # PART 4: drop the backdrop sibling
     return kept, deleted
 
 
@@ -995,6 +1160,11 @@ class Poller:
         self.retired_invests: dict[str, dt.datetime] = {}
         self.current_named: dict[str, Storm] = {}  # slug -> NHC named (last-known-good)
         self._last_tracks_refresh = 0.0
+        self._last_basin_backdrop = 0.0
+        self._last_mosaic = 0.0
+        # region -> backdrops.json entry; basin refresh + mosaic refresh both
+        # update this single dict and republish the union (no cross-clobber).
+        self._backdrop_index: dict = {}
         self._consec_render_fail = 0
         self._circuit_open_until = 0.0
 
@@ -1091,8 +1261,24 @@ class Poller:
 
         # Named = tracks-feed named, with CurrentStorms overriding/adding the
         # authoritative NHC TCs (One-E shows the cycle it is designated, with its
-        # real TD/TS status rather than waiting on the derived feed).
-        named_combined: dict[str, Storm] = {**self.named, **self.current_named}
+        # real TD/TS status rather than waiting on the derived feed) -- EXCEPT it
+        # must never DEMOTE a storm the derived tracks feed has already resolved
+        # to a REAL name back to CurrentStorms' lagging depression designation:
+        # after a synoptic-time upgrade the b-deck/feed carries "DOUGLAS" while
+        # CurrentStorms still shows "Four-E" (2026-07-01). Where the feed already
+        # has the real name it is the authoritative fresh b-deck track, so it
+        # wins; CurrentStorms still ADDS systems the feed lacks and NAMES one the
+        # feed still shows as a designation.
+        named_combined: dict[str, Storm] = dict(self.current_named)
+        for slug, s in self.named.items():
+            if slug not in named_combined or is_real_storm_name(s.name):
+                named_combined[slug] = s
+
+        # PROMPT RETIREMENT of dissipated NHC storms (see NHC_RETIRE_GRACE_H):
+        # only when CurrentStorms fetched cleanly THIS cycle (current is not
+        # None) -- a fetch failure must never mass-retire on stale knowledge.
+        named_combined = retire_dissipated_named(
+            named_combined, self.current_named, current is not None, utcnow())
 
         # Designated-invest handoff (the 90E -> One-E pattern), two signals,
         # uniform across basins. Keep every invest that is STILL an invest --
@@ -1187,7 +1373,9 @@ class Poller:
         self.r2.put_json(top_manifest_key(), obj, CACHE_MANIFEST)
 
     def append_frame(self, storm: Storm, band: Band, key: str, ts: dt.datetime,
-                     content_hash: str) -> None:
+                     content_hash: str, bd_key: str | None = None,
+                     bounds: list[float] | None = None,
+                     bd_product: str | None = None) -> None:
         mkey = storm_manifest_key(storm.slug)
         man = self.r2.get_json(mkey) or {
             "id": storm.sid, "slug": storm.slug, "name": storm.name,
@@ -1200,7 +1388,18 @@ class Poller:
         bands = man.setdefault("bands", {})
         b = bands.setdefault(band.key, {"label": band.label, "frames": []})
         b["label"] = band.label
-        b["frames"].append({"t": iso_z(ts), "key": key})
+        # PART 4: stamp the bare grayscale backdrop sibling onto the SAME frame
+        # (bd_key = its R2 key, bounds = [W,S,E,N]) so the ASCAT viewer can draw
+        # a chrome-free, georeferenced backdrop. Absent -> the consumer falls
+        # back to the chromed `key`.
+        fr = {"t": iso_z(ts), "key": key}
+        if bd_key:
+            fr["bd_key"] = bd_key
+        if bounds:
+            fr["bounds"] = bounds
+        if bd_product:
+            fr["bd_product"] = bd_product   # "Vis" | "SWIR" -> consumer header
+        b["frames"].append(fr)
         kept, deleted = prune_frames(b["frames"], utcnow())
         b["frames"] = kept
         b["latest"] = kept[-1]["key"] if kept else key
@@ -1266,7 +1465,36 @@ class Poller:
         key = frame_key(storm.slug, band.key, ts, ext)
         if not self.r2.put_bytes(key, frame, ctype, CACHE_FRAME):
             return  # upload failed -> do NOT touch manifest; retry next slot
-        self.append_frame(storm, band, key, ts, h)
+        # Once per storm (on the gate band's slot), render+upload a bare GRAYSCALE
+        # VIS (day) / SWIR (night) backdrop at the same storm box/time and stamp it
+        # on the frame (bd_key + bounds + bd_product). Best effort: any failure
+        # here NEVER blocks the chromed frame just uploaded.
+        bd_key: str | None = None
+        bounds: list[float] | None = None
+        bd_product: str | None = None
+        if FLOATER_BACKDROP_ENABLED and band.key == FLOATER_BACKDROP_BAND:
+            try:
+                bd_channel, bd_product = backdrop_band(storm.lat, storm.lon, ts)
+                # Widen the backdrop box to the viewer map aspect so it fills the
+                # plot edge-to-edge (the square chromed-frame bbox would leave bare
+                # basemap in the wide frame's lon-margins). Separate from the
+                # chromed frame's bbox; the viewer frames to THESE bounds.
+                bd_bbox = widen_bbox_to_view(bbox)
+                self.limiter.acquire()
+                bd_frame, _bd_headers = call_render(
+                    self.session, bd_bbox, bd_channel, "grayscale", backdrop=True,
+                )
+                bd_candidate = frame_key(storm.slug, band.key + "/backdrop", ts, ".webp")
+                if self.r2.put_bytes(bd_candidate, bd_frame, "image/webp", CACHE_FRAME):
+                    bd_key = bd_candidate
+                    bounds = bd_bbox
+                else:
+                    bd_product = None
+            except Exception as e:  # noqa: BLE001 - backdrop is best-effort
+                log.warning("backdrop %s/%s skipped: %s", storm.slug, band.key, e)
+                bd_product = None
+        self.append_frame(storm, band, key, ts, h, bd_key=bd_key, bounds=bounds,
+                          bd_product=bd_product)
         u.last_hash = h
         log.info("uploaded %s (%d B, %s)", key, len(frame),
                  header_get(headers, "X-Satellite") or "?")
@@ -1299,6 +1527,83 @@ class Poller:
 
     # ---- main loop ------------------------------------------------------
 
+    def refresh_basin_backdrops(self) -> None:
+        """Render a bare grayscale VIS (day) / SWIR (night) backdrop for each basin
+        region's extent and publish ``floaters/backdrops.json`` (region -> {product,
+        t, bounds:[W,S,E,N], key}) so the ASCAT/MW viewers can show a backdrop in
+        BASIN views, not just storm-centered. One per-extent render per basin,
+        day/night chosen at the basin center; best-effort — a basin outside a single
+        satellite's disk (RenderSkip) is simply omitted. R2 keys:
+        floaters/backdrops/{region}/{ts}.webp + the floaters/backdrops.json index."""
+        if not FLOATER_BACKDROP_ENABLED:
+            return
+        now = utcnow()
+        done = []
+        for region, bbox in BASIN_BACKDROP_REGIONS.items():
+            try:
+                clat = (bbox[1] + bbox[3]) / 2.0
+                clon = (bbox[0] + bbox[2]) / 2.0
+                channel, product = backdrop_band(clat, clon, now)
+                # NB: basins are rendered at their NATIVE region extent -- NOT
+                # widened to the map aspect like the per-storm box. A basin already
+                # reaches the satellite disk limb; widening it pushes more of the
+                # frame off-disk (transparent) and can cross the dateline, so we
+                # keep the disk-centred extent for maximum real coverage and let
+                # the composite view's aspect margins be basemap.
+                self.limiter.acquire()
+                frame, _hdr = call_render(self.session, bbox, channel, "grayscale",
+                                          backdrop=True)
+                key = f"{R2_PREFIX}/backdrops/{region}/{now:%Y%m%dT%H%MZ}.webp"
+                if self.r2.put_bytes(key, frame, "image/webp", CACHE_FRAME):
+                    self._backdrop_index[region] = {
+                        "product": product, "t": iso_z(now),
+                        "bounds": bbox, "key": key}
+                    done.append(region)
+            except RenderSkip as e:
+                log.info("basin backdrop %s: no single-disk coverage (%s)", region, e)
+            except Exception as e:  # noqa: BLE001 - best effort per basin
+                log.warning("basin backdrop %s failed: %s", region, e)
+        if done:
+            self._publish_backdrops(now)
+            log.info("basin backdrops published: %s", ", ".join(done))
+
+    def _publish_backdrops(self, now: dt.datetime) -> None:
+        """Write the merged backdrops.json (basin regions + the wide-area mosaic
+        entries). Both refreshers update ``self._backdrop_index`` and call this, so
+        neither clobbers the other's keys (the poller loop is single-threaded)."""
+        if self._backdrop_index:
+            self.r2.put_json(f"{R2_PREFIX}/backdrops.json",
+                             {"generated_utc": iso_z(now),
+                              "backdrops": self._backdrop_index},
+                             CACHE_MANIFEST)
+
+    def refresh_global_mosaic(self) -> None:
+        """Build the wide-area day-Vis/night-SWIR MULTI-SAT mosaic (GOES-E/W +
+        Himawari, per-pixel terminator, transparent gap) and point the global,
+        nhem and shem viewer regions at it in backdrops.json. Fail-safe: any error
+        leaves the prior entries (or none) in place -- the wide views just stay on
+        their last-known-good / greyed state, no regression. Heavy (multi-disk
+        fetch) so it runs on its own slow cadence."""
+        if not (FLOATER_BACKDROP_ENABLED and MOSAIC_ENABLED):
+            return
+        now = utcnow()
+        try:
+            import mosaic
+            webp, bounds, n_disks = mosaic.build_global_mosaic(now)
+        except Exception as e:  # noqa: BLE001 - never kill the poller loop
+            log.warning("global mosaic build failed: %s", e)
+            return
+        key = f"{R2_PREFIX}/backdrops/mosaic/{now:%Y%m%dT%H%MZ}.webp"
+        if not self.r2.put_bytes(key, webp, "image/webp", CACHE_FRAME):
+            return
+        entry = {"product": "Vis/SWIR", "t": iso_z(now), "bounds": bounds,
+                 "key": key, "sat": "GOES + Himawari", "disks": n_disks,
+                 "mosaic": True}
+        for region in ("global", "nhem", "shem"):
+            self._backdrop_index[region] = dict(entry)
+        self._publish_backdrops(now)
+        log.info("global mosaic published (%d disks, %d KB)", n_disks, len(webp) // 1024)
+
     def run(self) -> None:
         log.info("floater poller starting | render=%s | bucket=%s | bbox=%g deg | spacing=%gs",
                  RENDER_URL, R2_BUCKET, BBOX_DEG, RATE_MIN_SPACING_S)
@@ -1308,6 +1613,15 @@ class Poller:
                         or not self.units:
                     self.refresh_storms()
                     self._last_tracks_refresh = time.monotonic()
+                # Basin backdrops refresh on their own cadence, independent of
+                # whether any storms are active (basin views exist with no storms).
+                if time.monotonic() - self._last_basin_backdrop >= BASIN_BACKDROP_REFRESH_S:
+                    self.refresh_basin_backdrops()
+                    self._last_basin_backdrop = time.monotonic()
+                # Wide-area mosaic on its own (slower) cadence, also storm-agnostic.
+                if time.monotonic() - self._last_mosaic >= MOSAIC_REFRESH_S:
+                    self.refresh_global_mosaic()
+                    self._last_mosaic = time.monotonic()
                 if not self.units:
                     time.sleep(min(TRACKS_REFRESH_S, 60))  # idle: low CPU
                     continue

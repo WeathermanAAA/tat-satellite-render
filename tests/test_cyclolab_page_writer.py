@@ -59,6 +59,33 @@ class TestPageLifecycle(unittest.TestCase):
         self.assertEqual(len(self.sink.writes), 2)
         self.assertIn('data-cat="C5"', self.sink.writes[1][1])
 
+    def test_rebake_on_name_change_same_fix_cat(self):
+        # A pure NAME change (ONE -> ARTHUR) on the SAME fix + category must
+        # re-bake: NHC's CurrentStorms override (restamp) renames without a new
+        # fix, and the static page (no-JS / OG / first-paint) has to follow.
+        self.w.update("ep", feed([SYNTH]))
+        renamed = {**SYNTH, "name": "RENAMED"}      # identical fix + cat
+        self.w.update("ep", feed([renamed]))
+        self.assertEqual(len(self.sink.writes), 2)
+        self.assertIn('id="storm-name">RENAMED', self.sink.writes[1][1])
+
+    def test_rebake_on_ptc_flip_same_fix(self):
+        # The PTC->named upgrade: a designated PTC ("ONE", is_ptc true) is named
+        # ARTHUR and reclassified a TS on the SAME fix. cat + fix are unchanged,
+        # but is_ptc flips and the page must shed the baked PTC dress.
+        ptc = {**SYNTH, "sid": "NHC_AL012026", "name": "ONE",
+               "current_category": "TS", "is_ptc": True}
+        self.w.update("al", feed([ptc], basin="al"))
+        self.assertEqual(len(self.sink.writes), 1)
+        self.assertIn("var IS_PTC = true", self.sink.writes[0][1])
+        named = {**ptc, "name": "ARTHUR", "is_ptc": False}  # same cat + fix
+        self.w.update("al", feed([named], basin="al"))
+        self.assertEqual(len(self.sink.writes), 2)          # re-baked
+        html = self.sink.writes[1][1]
+        self.assertIn("var IS_PTC = false", html)
+        self.assertNotIn('<html lang="en" data-ptc', html)
+        self.assertIn('id="storm-name">ARTHUR', html)
+
     def test_ended_after_debounce_only(self):
         self.w.update("ep", feed([SYNTH]))
         for i in range(ENDED_DEBOUNCE_POLLS - 1):
@@ -95,19 +122,56 @@ class TestPageLifecycle(unittest.TestCase):
         return (dt.datetime.now(dt.timezone.utc)
                 - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def test_invest_skipped_but_recent_inactive_rebirths(self):
-        # invests never get a page; a RECENTLY-ended inactive DESIGNATED storm
-        # gets its frozen archive page re-birthed ("shared links never die").
+    def test_recent_inactive_invest_and_tc_both_rebirth(self):
+        # Stage C: invests ARE page-able. A RECENTLY-ended inactive invest gets
+        # its frozen grey/red-X archive page re-birthed, same as a designated
+        # storm ("shared links never die" - now for invests too).
         invest = {**SYNTH, "sid": "NHC_EP902026", "is_active": False,
                   "latest_fix_valid_utc": self._recent_fix()}
         inactive_recent = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,
                            "latest_fix_valid_utc": self._recent_fix()}
         self.w.update("ep", feed([invest, inactive_recent]))
-        self.assertEqual(len(self.sink.writes), 1)               # only the TC
+        self.assertEqual(len(self.sink.writes), 2)
+        by_key = dict(self.sink.writes)
+        self.assertIn("shadow/cyclolab/NHC_EP902026/index.html", by_key)
+        self.assertIn("shadow/cyclolab/NHC_EP072026/index.html", by_key)
+        ih = by_key["shadow/cyclolab/NHC_EP902026/index.html"]
+        self.assertIn("data-invest", ih[ih.index("<html"):ih.index("<head")])
+        self.assertIn("data-ended", ih[ih.index("<html"):ih.index("<head")])
+
+    def test_active_invest_renders_live_not_ended(self):
+        # PART 1A: an invest is NEVER ace_core-is_active (its DB/DS nature fails
+        # the tropical gate), but a fresh fix sets recent_invest=True. The
+        # lifecycle must render such an invest as a LIVE page (grey/red-X invest
+        # identity, NO "ended/archive" frame) - the 95W-rendered-as-dead bug.
+        invest = {**SYNTH, "sid": "NHC_EP952026", "is_active": False,
+                  "is_invest": True, "recent_invest": True,
+                  "latest_fix_valid_utc": self._recent_fix()}
+        self.w.update("ep", feed([invest]))
+        self.assertEqual(len(self.sink.writes), 1)
         key, html = self.sink.writes[0]
-        self.assertEqual(key, "shadow/cyclolab/NHC_EP072026/index.html")
-        self.assertIn("data-ended", html[html.index("<html"):html.index("<head")])
-        self.assertIn("THIS STORM HAS ENDED", html)
+        self.assertEqual(key, "shadow/cyclolab/NHC_EP952026/index.html")
+        head = html[html.index("<html"):html.index("<head")]
+        self.assertIn("data-invest", head)          # grey/red-X invest identity
+        self.assertNotIn("data-ended", head)        # NOT frozen as a dead archive
+
+    def test_active_invest_ends_only_after_it_stops_being_recent(self):
+        # The same invest must still END properly once it stops getting fixes
+        # (recent_invest False) - via the normal debounced dissipation sweep,
+        # not immediately. Guards against the fix leaving invests "live forever".
+        invest = {**SYNTH, "sid": "NHC_EP952026", "is_active": False,
+                  "is_invest": True, "recent_invest": True,
+                  "latest_fix_valid_utc": self._recent_fix()}
+        self.w.update("ep", feed([invest]))                       # live birth
+        live_head = self.sink.writes[-1][1]
+        self.assertNotIn("data-ended",
+                         live_head[live_head.index("<html"):live_head.index("<head")])
+        stale = {**invest, "recent_invest": False}
+        for _ in range(ENDED_DEBOUNCE_POLLS):
+            self.w.update("ep", feed([stale]))                   # no longer recent
+        end_html = self.sink.writes[-1][1]
+        self.assertIn("data-ended",
+                      end_html[end_html.index("<html"):end_html.index("<head")])
 
     def test_recent_inactive_rebirths_only_once(self):
         inactive = {**SYNTH, "sid": "NHC_EP072026", "is_active": False,

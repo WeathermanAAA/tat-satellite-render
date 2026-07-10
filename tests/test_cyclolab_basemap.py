@@ -22,20 +22,24 @@ CASES = [("near-land", 11.2, -87.5, "EP"),
 
 
 class TestBasemapBake(unittest.TestCase):
-    def test_emits_coast_land_borders_keys(self):
+    def test_emits_land_borders_keys(self):
+        # v3 dedup: 'coast' is no longer a bake key - it is derived from 'land'
+        # at render time (coast_from_land / the JS mirror).
         bm = cb.basemap_for(11.2, -87.5, "EP")
-        for k in ("land", "coast", "borders"):
+        for k in ("land", "borders"):
             self.assertIn(k, bm)
             self.assertIsInstance(bm[k], list)
+        self.assertNotIn("coast", bm)
 
-    def test_coast_vertices_are_a_subset_of_land(self):
-        # round-2 #2: the coast is DERIVED from the land-fill rings (minus the
-        # window-edge segments), so every coast vertex is a land vertex - the
-        # thick white coast can NEVER misalign with the fill into a sliver.
+    def test_derived_coast_vertices_are_a_subset_of_land(self):
+        # the coast is DERIVED from the land-fill rings (minus the window-edge
+        # segments), so every coast vertex is a land vertex - the white coast can
+        # NEVER misalign with the fill into a sliver. v3: derived (not stored).
         for nm, lat, lon, basin in CASES:
             bm = cb.basemap_for(lat, lon, basin)
             land = {tuple(p) for r in bm["land"] for p in r}
-            coast = {tuple(p) for r in bm["coast"] for p in r}
+            coast = {tuple(p) for r in cb.coast_from_land(bm["land"], bm["window"])
+                     for p in r}
             self.assertTrue(coast <= land,
                             f"{nm}: {len(coast - land)} coast pts not in land")
 
@@ -54,6 +58,47 @@ class TestBasemapBake(unittest.TestCase):
             self.assertGreaterEqual(area, cb.AREA_MIN - 1e-9,
                                     "near-collinear sliver kept")
 
+    def test_borders_and_states_are_clipped_to_land(self):
+        # v2 #1: the country/state border polylines are clipped to the BAKED
+        # land rings, so NO border vertex is ever out over open water (the old
+        # window-only clip let a coast-following border dangle into the ocean).
+        # Every border/state vertex must be inside land OR on the coast (a
+        # clipped vertex sits exactly on a land edge).
+        def near_land(pt, rings, tol=0.06):
+            if cb._point_in_land(pt, rings):
+                return True
+            x, y = pt
+            for r in rings:
+                for i in range(len(r)):
+                    ax, ay = r[i]
+                    bx, by = r[(i + 1) % len(r)]
+                    dx, dy = bx - ax, by - ay
+                    d2 = dx * dx + dy * dy
+                    t = 0.0 if d2 == 0 else max(0.0, min(
+                        1.0, ((x - ax) * dx + (y - ay) * dy) / d2))
+                    cx, cy = ax + t * dx, ay + t * dy
+                    if (x - cx) ** 2 + (y - cy) ** 2 <= tol * tol:
+                        return True
+            return False
+
+        bm = cb.basemap_for(28.6, -93.6, "AL")   # TX/LA coast - dense borders
+        land = bm["land"]
+        self.assertTrue(land, "near-land bake must have land to clip against")
+        for key in ("borders", "states"):
+            off = [v for line in bm[key] for v in line
+                   if not near_land(v, land)]
+            self.assertEqual(off, [], f"{key}: {len(off)} verts off water")
+
+    def test_clip_line_to_land_keeps_only_inland_part(self):
+        # a unit square of "land"; a horizontal line crossing it keeps only the
+        # inside run, dropping the parts that exit into "water".
+        sq = [[[0, 0], [10, 0], [10, 10], [0, 10]]]
+        runs = cb._clip_line_to_land([[-5, 5], [15, 5]], sq)
+        self.assertEqual(len(runs), 1)
+        (x0, _), (x1, _) = runs[0][0], runs[0][-1]
+        self.assertAlmostEqual(min(x0, x1), 0.0, places=6)
+        self.assertAlmostEqual(max(x0, x1), 10.0, places=6)
+
     def test_coast_lines_have_at_least_two_points(self):
         # coastlines are drawn as open polylines (M..L.., no trailing Z).
         # A mainland-coast segment is open; an ISLAND coast is a naturally
@@ -61,16 +106,19 @@ class TestBasemapBake(unittest.TestCase):
         # just never appends a Z, so a closed island line still draws as a
         # loop. The contract is only ">= 2 points".
         bm = cb.basemap_for(11.2, -87.5, "EP")
-        self.assertGreater(len(bm["coast"]), 0, "near-land bake has coast")
-        for line in bm["coast"]:
+        coast = cb.coast_from_land(bm["land"], bm["window"])
+        self.assertGreater(len(coast), 0, "near-land bake has coast")
+        for line in coast:
             self.assertGreaterEqual(len(line), 2)
 
     def test_all_geometry_inside_window(self):
         for nm, lat, lon, basin in CASES:
             bm = cb.basemap_for(lat, lon, basin)
             la0, la1, lo0, lo1 = bm["window"]
-            for layer in ("land", "coast"):
-                for ring in bm[layer]:
+            layers = {"land": bm["land"],
+                      "coast": cb.coast_from_land(bm["land"], bm["window"])}
+            for layer, geom in layers.items():
+                for ring in geom:
                     for x, y in ring:
                         self.assertTrue(lo0 - 1 <= x <= lo1 + 1,
                                         f"{nm} {layer} lon {x} out of window")
@@ -83,14 +131,19 @@ class TestBasemapBake(unittest.TestCase):
         # per-storm page). Gulf-of-Mexico landfall is the densest case.
         bm = cb.basemap_for(27.0, -90.0, "AL")
         raw = json.dumps(bm, separators=(",", ":"))
-        self.assertLess(len(raw), 200_000,
+        # The window was widened (+-50 lon / +-26 lat default) so wide / ultrawide
+        # monitors fill with land to the panel edge (the China-cutoff fix); the
+        # dense Gulf bake grows from ~181 KB to ~242 KB. The far periphery is
+        # heavily DP-coarsened (TOL_FAR), so it does not balloon linearly with the
+        # window. 280 KB fits the new default + still guards a DP regression.
+        self.assertLess(len(raw), 280_000,
                         f"Gulf bake {len(raw)} bytes - DP simplify regressed")
 
     def test_antimeridian_does_not_crash_or_leak(self):
         bm = cb.basemap_for(18.0, 178.0, "WP")
         self.assertEqual(bm["ocean"], "PACIFIC OCEAN")
         # no land/coast band should span the whole window (the torn-ring bug)
-        for ring in bm["land"] + bm["coast"]:
+        for ring in bm["land"] + cb.coast_from_land(bm["land"], bm["window"]):
             xs = [p[0] for p in ring]
             self.assertLess(max(xs) - min(xs), 65,
                             "geometry spans >65 deg lon - antimeridian tear")
@@ -156,10 +209,10 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         self.assertIn(".ac-coast { fill: none; stroke: #ffffff;", self.html)
         self.assertIn(".ac-frame { fill: none; stroke: none; }", self.html)
 
-    def test_coast_is_drawn_in_both_furniture_sites(self):
-        # mapFurniture (track + swath) AND the cone inline both emit the
-        # white coast polylines (open - the builder string is present).
-        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 2)
+    def test_coast_is_drawn_in_all_furniture_sites(self):
+        # all THREE basemap sites (guidance gBasemap, mapFurniture track+swath,
+        # and the cone inline) emit the white coast polylines.
+        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 3)
 
     def test_cone_is_blue_glass_with_solid_white_centerline(self):
         self.assertIn('<linearGradient id="cone-glass"', self.html)
@@ -178,12 +231,25 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         # legibility: NOW dominates; R3 #1 bumped the forecast glyph to 0.98.
         self.assertIn("var scale = (i === 0 ? 1.9 : 0.98)", self.html)
 
-    def test_country_borders_drawn_in_both_furniture_sites(self):
-        # round-2 #3: thin white internal borders (ne_10m boundary_lines),
-        # drawn in BOTH mapFurniture (track+swath) and the cone inline.
-        self.assertEqual(self.html.count('<path class="ac-border" d="'), 2)
-        self.assertIn(".ac-border { fill: none; stroke: rgba(255,255,255,0.72)",
+    def test_country_borders_drawn_in_all_furniture_sites(self):
+        # thin SLATE internal country borders (ne_10m boundary_lines), drawn in
+        # all THREE basemap sites: the guidance gBasemap, mapFurniture
+        # (track+swath), and the cone inline. Phase-4 C: slate, not white -
+        # furniture recedes behind the subject layer.
+        self.assertEqual(self.html.count('<path class="ac-border" d="'), 3)
+        self.assertIn(".ac-border { fill: none; stroke: rgba(71,85,105,0.92)",
                       self.html)
+
+    def test_state_borders_drawn_in_all_furniture_sites(self):
+        # ne_10m admin_1 state/province lines, dimmer than the country border,
+        # drawn UNDER it in all three basemap sites (guidance + track/swath +
+        # cone). A dim SLATE .ac-state stroke; the maps degrade gracefully if an
+        # old baked basemap lacks the 'states' key.
+        self.assertEqual(self.html.count('<path class="ac-state" d="'), 3)
+        # v3: state borders are BOLDER (the v2 thinning left them too faint).
+        self.assertIn(".ac-state { fill: none; stroke: rgba(71,85,105,0.9)",
+                      self.html)
+        self.assertIn("stroke-width: 0.9", self.html)
 
     def test_lockup_is_a_top_left_html_overlay(self):
         # R3 #2: the lockup is an HTML overlay PINNED to the panel's top-left

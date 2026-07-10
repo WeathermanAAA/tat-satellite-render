@@ -244,6 +244,38 @@ HTML_TEMPLATE = r"""<!doctype html>
     font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     border: 1px solid rgba(255,255,255,0.4);
     text-shadow: 0 1px 1px rgba(0,0,0,0.5); }
+  /* ---- Stage C: NHC formation-chance pill (invests) ----
+     The KEY invest metric: 48-hour + 7-day genesis odds, colour-coded by the
+     canonical NHC low/medium/high scheme (<=30 yellow, 40-60 orange, >=70 red)
+     - a pop of forecast colour on the otherwise-grey invest banner. */
+  .formation-pill { display: inline-flex; align-items: center; gap: 8px;
+    margin-top: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+    border: 1px solid currentColor; width: fit-content; }
+  /* The genesis-odds pill is invest/PTC-only. For a designated storm it is
+     left [hidden] + empty, but the .formation-pill display above outranks the
+     [hidden] attribute, leaving a stray empty capsule (the "blank pill"). Hide
+     it whenever it carries no odds; a populated invest pill (not empty, not
+     hidden) still shows. */
+  .formation-pill[hidden], .formation-pill:empty { display: none; }
+  /* "FORMATION" with "chance" stacked beneath it */
+  .formation-pill .fp-eyebrow { display: inline-flex; flex-direction: column;
+    line-height: 1.04; font-size: 9px; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase; opacity: 0.95; }
+  .formation-pill .fp-eyebrow .fp-e2 { font-size: 8px; font-weight: 700; opacity: 0.8; }
+  /* the two windows sit CLOSE together with a thin vertical divider between them */
+  .formation-pill .fp-wins { display: inline-flex; align-items: center; gap: 6px; }
+  .formation-pill .fp-div { flex: 0 0 auto; width: 1px; align-self: stretch;
+    background: currentColor; opacity: 0.5; }
+  /* both windows (48h left, 7-day right) styled IDENTICALLY */
+  .formation-pill .fp-win { color: #f3f7fc; font-weight: 700; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
+  .formation-pill .fp-win b { font-weight: 800; }
+  .formation-pill .fp-dot { flex: 0 0 auto; width: 6px; height: 6px;
+    border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }
+  .formation-pill[data-level="low"]    { color: #f5c842; background: rgba(245,200,66,0.14); }
+  .formation-pill[data-level="medium"] { color: #ff9a4d; background: rgba(255,140,61,0.16); }
+  .formation-pill[data-level="high"]   { color: #ff6b6b; background: rgba(255,77,77,0.18); }
   /* glyph box is OVERSIZED relative to the ink (viewBox ±44 vs path
      reach ~41.4 when rotated) so a full 360° spin never clips the
      swirl tails; position compensates to keep the ink center put. */
@@ -262,6 +294,38 @@ HTML_TEMPLATE = r"""<!doctype html>
     paint-order: stroke; }
   @keyframes lab-spin { from { transform: rotate(360deg); }
                         to { transform: rotate(0deg); } }
+  /* ---- Stage C: INVEST + PTC grey identity + giant red X ----
+     data-invest (a 90-99 invest) AND data-ptc (a Potential Tropical Cyclone:
+     a DESIGNATED system NHC is advising on while still a DB/DS disturbance)
+     SHARE the grey identity: both OVERRIDE the category vars to grey, so the
+     banner ramp, accent, sec-btn, vitals, chips - everything keyed on --cat-* -
+     reads grey with no per-element edits, and both swap the spinning cyclone
+     glyph for the red X. They DIVERGE on official products: an invest has none,
+     so it hides the cone/advisories section + nav button and the next-advisory
+     vital; a PTC KEEPS them (NHC is actively advising). Both hide the ACE vital
+     (a PTC accrues no ACE; an invest none either). The Models tab is shown for
+     BOTH (guidance lives there now - Phase 3b); HAFS degrades gracefully when a
+     storm has no run. */
+  .banner .glyph .invest-x { display: none; }
+  html[data-invest], html[data-ptc] {
+    --cat-ramp: linear-gradient(180deg,#2a2f3a,#8b95a5,#2a2f3a);
+    --cat-accent: #9aa6b6; --cat-ink: #ffffff; }
+  html[data-invest] .banner .glyph,
+  html[data-ptc] .banner .glyph { filter: drop-shadow(0 0 7px rgba(255,59,59,0.55))
+    drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
+  html[data-invest] .banner .glyph .spin,
+  html[data-invest] .banner .glyph #glyph-cat,
+  html[data-ptc] .banner .glyph .spin,
+  html[data-ptc] .banner .glyph #glyph-cat { display: none; }
+  html[data-invest] .banner .glyph .invest-x,
+  html[data-ptc] .banner .glyph .invest-x { display: block; }
+  /* INVEST-ONLY: no official cone/advisories + no next-advisory countdown. */
+  html[data-invest] [data-sec="advisories"] { display: none; }
+  html[data-invest] #sec-advisories { display: none !important; }
+  html[data-invest] #vrow-next { display: none; }
+  /* SHARED: neither an invest nor a PTC accrues ACE. */
+  html[data-invest] #vrow-ace,
+  html[data-ptc] #vrow-ace { display: none; }
   .banner::after { content: ""; position: absolute; top: 0; bottom: 0;
     width: 55%; left: -60%; transform: skewX(-18deg);
     background: linear-gradient(90deg, transparent,
@@ -551,6 +615,37 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-color: var(--cat-accent); font-weight: 700; }
   .hafs-caption { color: var(--muted); font-size: 12px; line-height: 1.5;
     margin: 8px 0 0; }
+  /* --- Model guidance (Stage B; merged into the Models tab in Phase 3b, so
+         the guidance SVGs are now scoped by id rather than by #sec-guidance) --- */
+  #gtracks, #gintensity { width: 100%; height: auto; display: block;
+    background: #101a2c; border-radius: 10px; }
+  .g-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 9px;
+    font-size: 11.5px; color: var(--muted); font-weight: 600; align-items: center; }
+  .g-legend .lg { display: inline-flex; align-items: center; gap: 5px; }
+  .g-legend .lg b { color: var(--fg); }
+  .g-legend .sw { width: 15px; height: 3px; border-radius: 2px; display: inline-block; }
+  .g-ships-head { display: flex; flex-wrap: wrap; gap: 7px 10px; margin-bottom: 10px; }
+  .g-chip { background: var(--navy-deep); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 9px; font-size: 12px; color: var(--muted);
+    font-weight: 600; font-variant-numeric: tabular-nums; }
+  .g-chip b { color: var(--fg); font-weight: 800; }
+  .g-chip.ri b { color: var(--cat-accent); }
+  .g-sm-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .g-sm { background: var(--navy-deep); border: 1px solid var(--border);
+    border-radius: 9px; padding: 8px 8px 4px; }
+  .g-sm .t { font-size: 11px; font-weight: 700; color: var(--fg); }
+  .g-sm .v { font-size: 10.5px; color: var(--muted); font-weight: 600; }
+  .g-sm svg { background: none; margin-top: 2px; }
+  .g-ri { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 11.5px;
+    font-variant-numeric: tabular-nums; }
+  .g-ri th, .g-ri td { padding: 5px 6px; text-align: center;
+    border-bottom: 1px solid var(--border); }
+  .g-ri th { color: var(--muted); font-weight: 700; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .03em; }
+  .g-ri td.rn { text-align: left; color: var(--fg); font-weight: 700; }
+  .g-ri caption { text-align: left; font-size: 12px; font-weight: 800;
+    color: var(--fg); padding-bottom: 6px; }
+  @media (max-width: 720px) { .g-sm-grid { grid-template-columns: repeat(2, 1fr); } }
   .hafs-footer { display: flex; align-items: center; gap: 10px;
     flex-wrap: wrap; color: var(--muted); font-size: 11.5px;
     padding-top: 6px; }
@@ -668,6 +763,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   .sst-hero img { position: absolute; inset: 0; width: 100%;
     height: 100%; object-fit: cover; user-select: none;
     pointer-events: none; }
+  /* PART D: lat/long lattice over the storm-centered CRW raster. The SST box
+     is exactly 16:9.2 (== the container), so object-fit:cover does not crop and
+     a linear lat/lon->px overlay registers. Reuses the cone graticule styling
+     (.ac-graticule .grat-* below). Sits over the raster, under the title/scrim. */
+  .sst-grat { position: absolute; inset: 0; width: 100%; height: 100%;
+    pointer-events: none; }
   .sst-hero-layers { position: absolute; top: 10px; right: 10px; }
   .sst-hero-layers .hafs-seg { font-size: 10.5px; font-weight: 700;
     padding: 4px 10px; background: rgba(10,16,25,0.78);
@@ -708,12 +809,32 @@ HTML_TEMPLATE = r"""<!doctype html>
      ne_10m coastline polylines. Land paints OVER the graticule, so the
      graticule only shows on open water. */
   .ac-land { fill: #a7b2c4; stroke: none; }
-  /* maps-pass R2: THICK white coast (was a too-thin 1.1) + a slightly
-     thinner white internal-border stroke (drawn UNDER the coast). */
-  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 2.6;
+  /* PART 2: the guidance forecast-tracks graphic uses a RECESSIVE dark-slate
+     land (recon-V2 aesthetic) instead of the bright light-gray .ac-land - the
+     white land blobs fought the colored track aids for attention. gBasemap is
+     the gTracks-only emitter, so the cone / overview maps keep .ac-land. The
+     white coast + slate borders read crisply over this dark land. */
+  .gt-land { fill: #19314e; stroke: none; }
+  /* coast + borders are FINE HAIRLINES (phase-4 v2 #3), retuned together: the
+     old 2.6 coast / 1.4 border / 0.8 state read as heavy clutter at the cone
+     auto-fit zoom. Now coast 1.3, country 0.7, state 0.5 - clean lines that
+     read without burying the subject. (The borders are clipped to land in the
+     bake so they never run into the water - cyclolab_basemap._clip_lines_to_land.) */
+  .ac-coast { fill: none; stroke: #ffffff; stroke-width: 1.3;
     stroke-linejoin: round; stroke-linecap: round; }
-  .ac-border { fill: none; stroke: rgba(255,255,255,0.72);
-    stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+  /* country + state borders are SLATE, not white (phase-4 C): a bright white
+     internal border fought the white coast and the subject layer for
+     attention; slate keeps them legible over the light land yet recessive -
+     furniture, not subject. ONE shared rule -> every CycloLab map (cone /
+     guidance track / overview track+swath) inherits it, no per-map fork. */
+  .ac-border { fill: none; stroke: rgba(71,85,105,0.92);
+    stroke-width: 0.7; stroke-linejoin: round; stroke-linecap: round; }
+  /* state/province boundaries (ne_10m admin_1). v3: the v2 thinning made these
+     too faint - BOLDER now (width 0.5 -> 0.9, opacity 0.60 -> 0.9) so the
+     landfall state lines read clearly. The country border + coast stay thin
+     (the "too thick" feedback still holds for those - this is ONLY the states). */
+  .ac-state { fill: none; stroke: rgba(71,85,105,0.9);
+    stroke-width: 0.9; stroke-linejoin: round; stroke-linecap: round; }
   /* maps-pass R3 #3: a CASING/HALO graticule - a dark hairline UNDER a light
      line - so every line reads over BOTH the light-gray land AND the dark
      ocean (a flat light line vanished over the light land). Labels get the
@@ -740,6 +861,26 @@ HTML_TEMPLATE = r"""<!doctype html>
                       to { transform: scale(1); opacity: 1; } }
   .ac-spin { transform-box: fill-box; transform-origin: center;
     animation: lab-spin 3.2s linear infinite; }
+  /* ---- Phase 4: coastal watches/warnings overlay control + legend ----
+     Official NHC data (windWatchesWarnings KMZ); no derived disclosure.
+     ART-GATED palette - canonical NHC TCWW colors, awaiting sign-off. */
+  .ac-ww-bar { display: flex; flex-wrap: wrap; align-items: center;
+    gap: 6px 16px; margin: 9px 0 0; }
+  .ac-ww-toggle { display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; font-size: 12px; font-weight: 700; color: #cfe0f2;
+    letter-spacing: 0.3px; user-select: none; }
+  .ac-ww-toggle input { accent-color: #9fc6f5; cursor: pointer; }
+  .ac-ww-legend { display: flex; flex-wrap: wrap; gap: 5px 14px;
+    align-items: center; font-size: 11.5px; color: var(--muted);
+    font-weight: 600; }
+  .ac-ww-legend .ww-lg { display: inline-flex; align-items: center; gap: 5px; }
+  .ac-ww-legend .ww-sw { width: 16px; height: 4px; border-radius: 2px;
+    display: inline-block; box-shadow: 0 0 0 1px rgba(6,12,22,0.7); }
+  .ac-ww .ww-cas { fill: none; stroke: rgba(6,12,22,0.72);
+    stroke-linecap: round; stroke-linejoin: round; }
+  .ac-ww .ww-lin { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  /* (the v2 inland county/zone FILL layer was removed in v3 - the W/W presence
+     is now only the coastal breakpoint lines above.) */
   .adv-method { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
   .adv-method summary { cursor: pointer; color: #9fc6f5;
     font-weight: 600; font-size: 12px; letter-spacing: 0.4px; }
@@ -876,8 +1017,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     .nav-secs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
       flex-direction: row; background: var(--navy-deep);
       border-top: 1px solid var(--border); padding: 0; }
-    .sec-btn { flex: 1 1 25%; justify-content: center; padding: 12px 4px;
-      min-height: 52px; font-size: 10.5px; border-left: 0;
+    .sec-btn { flex: 1 1 20%; justify-content: center; padding: 12px 3px;
+      min-height: 52px; font-size: 10px; border-left: 0;
       border-top: 3px solid transparent; }
     .sec-btn.active { border-left: 0; border-top-color: var(--cat-accent); }
     .side-foot { padding: 8px 12px; }
@@ -914,6 +1055,20 @@ HTML_TEMPLATE = r"""<!doctype html>
     .banner .glyph .spin, .loader .eye .spin { animation: none !important; }
     .odo.odo-swap { animation: none !important; }
   }
+
+  /* Right-click "copy as PNG" affordance (overview plots) + the result toast. */
+  .cl-copyable { cursor: context-menu; -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none; }  /* svg, img, stage divs;
+    callout:none suppresses the iOS image menu during a long-press copy */
+  .cl-toast { position: fixed; left: 50%; bottom: 26px;
+    transform: translateX(-50%) translateY(10px);
+    background: #0d1626; color: #eaf2ff; border: 1px solid #2b3b57;
+    border-radius: 9px; padding: 9px 16px; z-index: 9999;
+    font: 600 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .45); opacity: 0; pointer-events: none;
+    transition: opacity .18s ease, transform .18s ease; }
+  .cl-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  @media (prefers-reduced-motion: reduce) { .cl-toast { transition: opacity .1s; } }
 </style>
 </head>
 <body>
@@ -927,6 +1082,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       <svg class="glyph" viewBox="-44 -44 88 88" aria-hidden="true">
         <g class="spin"><path d="__HPATH__" fill="#ffffff"
           stroke="rgba(0,0,0,0.30)" stroke-width="1"/></g>
+        <!-- Stage C: invests show a GIANT RED X here instead of the spinning
+             cyclone glyph + category label (CSS toggles on html[data-invest]). -->
+        <g class="invest-x"><path d="M -22,-22 L 22,22 M 22,-22 L -22,22"
+          fill="none" stroke="#ff3b3b" stroke-width="11"
+          stroke-linecap="round"/></g>
         <!-- canonical icon label (tracks-map / storm-card canon:
              generate_tracks_plot.py sshs_label + spinnerSvg) - D / S /
              1-5, stationary while only the path spins. Weight 800, not
@@ -943,6 +1103,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="storm-type" id="storm-type">__TYPE_WORD__</div>
         <div class="storm-name" id="storm-name">__NAME__</div>
         <span class="chip" id="chip"__CHIP_STYLE__>__CHIP__</span>
+        <!-- Stage C: NHC formation-chance pill (invests only; populated by
+             loadFormation() from cyclolab/{sid}/formation.json). -->
+        <div class="formation-pill" id="formation-pill" hidden></div>
       </div>
     </div>
     <div class="bug-body">
@@ -964,6 +1127,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     <nav class="nav-secs" id="secnav">
       <button class="sec-btn active" data-sec="overview">Overview</button>
       <button class="sec-btn" data-sec="satellite">Satellite</button>
+      <button class="sec-btn" data-sec="recon">Recon</button>
+      <button class="sec-btn" data-sec="ascat">ASCAT</button>
       <button class="sec-btn" data-sec="models">Models</button>
       <button class="sec-btn" data-sec="advisories">Advisories</button>
     </nav>
@@ -982,11 +1147,18 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="stage">
     <section class="sec active" id="sec-overview">
       <div class="wipe">
+        <div class="card" id="card-map" style="grid-column:1/-1">
+          <h3>Storm map</h3>
+          <div id="overview-map"></div>
+          <div class="note" id="overview-map-note">Interactive track &amp; layers. Satellite and model imagery stack in as layers when published.</div>
+        </div>
         <div class="ov-col ov-left">
         <div class="card" id="card-hero">
           <div class="sst-hero" id="sst-hero">
             <img id="sst-hero-img" alt="Sea-surface temperature around the storm"
                  draggable="false">
+            <svg class="sst-grat ac-graticule" id="sst-grat"
+                 preserveAspectRatio="none" aria-hidden="true"></svg>
             <div class="sst-hero-scrim"></div>
             <div class="sst-hero-title">
               <div class="hero-rail"></div>
@@ -1111,6 +1283,31 @@ HTML_TEMPLATE = r"""<!doctype html>
           floater is active.</p>
       </div>
     </div></section>
+    <section class="sec" id="sec-recon"><div class="wipe">
+      <h2 class="sec-title">Recon</h2>
+      <div class="card" id="recon-viewer" tabindex="0">
+        <div id="recon-status" class="hafs-statusbox">
+          <div class="hafs-spinner"></div><span>Loading recon&#8230;</span></div>
+      </div>
+      <p class="hafs-caption">Hurricane-hunter aircraft observations (HDOB
+        flight-level + SFMR surface wind, vortex fixes, dropsondes) for this
+        storm. SFMR is unreliable in heavy rain and at very high wind; obs are
+        point-in-time.</p>
+    </div></section>
+    <section class="sec" id="sec-ascat"><div class="wipe">
+      <h2 class="sec-title">ASCAT</h2>
+      <div class="card" id="ascat-viewer" tabindex="0">
+        <div id="ascat-status" class="hafs-statusbox">
+          <div class="hafs-spinner"></div><span>Loading ASCAT&#8230;</span></div>
+      </div>
+      <p class="hafs-caption">ASCAT-B / ASCAT-C scatterometer ocean-surface winds
+        for the passes that overflew this storm. ASCAT is a C-band scatterometer:
+        it resolves the broad gale-force wind field well but underestimates the
+        extreme winds in a tropical cyclone's core (saturation and rain) - a
+        wind-field tool, not a peak-intensity tool. Rain- and quality-flagged cells
+        are removed; swaths are intermittent. Same renders as the site-wide
+        <a href="/ascat/">/ascat/</a> viewer. &#169; EUMETSAT.</p>
+    </div></section>
     <section class="sec" id="sec-models"><div class="wipe">
       <h2 class="sec-title">Models</h2>
       <div class="card vw-grid" id="cl-hafs-root" tabindex="0">
@@ -1165,6 +1362,38 @@ HTML_TEMPLATE = r"""<!doctype html>
           <span id="cl-hafs-badge" class="hafs-badge" style="display:none"></span>
         </div>
       </div>
+      <!-- Model guidance (merged into Models - Phase 3b): named storms get
+           HAFS above + guidance here; invests + PTCs get guidance with HAFS
+           gracefully absent (cl-hafs-empty). -->
+      <div class="card">
+        <h3>Model forecast tracks</h3>
+        <svg id="gtracks" viewBox="0 0 1000 560"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Model forecast track guidance"></svg>
+        <div class="g-legend" id="gtracks-legend"></div>
+        <p class="hafs-caption">Operational track aids, NHC ATCF aid_public.
+          Colored by each model's peak forecast wind (SSHWS category).
+          Consensus aids (TVCN, HCCA) are drawn heavier.</p>
+        <div id="gtracks-empty" class="stub" style="display:none">No model
+          guidance for this storm yet.</div>
+      </div>
+      <div class="card">
+        <h3>Model forecast intensity</h3>
+        <svg id="gintensity" viewBox="0 0 1000 380"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Model forecast intensity guidance"></svg>
+        <div class="g-legend" id="gintensity-legend"></div>
+        <p class="hafs-caption">Intensity aids vs forecast hour over the SSHWS
+          category bands. Regional hurricane models are emphasized; the global
+          and statistical aids are drawn lighter.</p>
+        <div id="gintensity-empty" class="stub" style="display:none"></div>
+      </div>
+      <div class="card">
+        <h3>SHIPS output diagram</h3>
+        <div id="gships-root"></div>
+        <p class="hafs-caption">Statistical Hurricane Intensity Prediction
+          Scheme: environment, rapid-intensification probabilities, annularity.</p>
+      </div>
     </div></section>
     <section class="sec" id="sec-advisories"><div class="wipe">
       <h2 class="sec-title">Advisories</h2>
@@ -1178,6 +1407,11 @@ HTML_TEMPLATE = r"""<!doctype html>
           <svg id="advcone" viewBox="0 0 1000 620"
                preserveAspectRatio="xMidYMid meet" role="img"
                aria-label="Forecast track and uncertainty cone"></svg>
+        </div>
+        <div class="ac-ww-bar" id="advcone-ww" hidden>
+          <label class="ac-ww-toggle"><input type="checkbox" id="advcone-ww-chk" checked>
+            <span>Watches &amp; warnings</span></label>
+          <div class="ac-ww-legend" id="advcone-ww-legend"></div>
         </div>
         <p class="hafs-caption" id="advcone-note"></p>
         <details class="adv-method" id="advcone-method">
@@ -1226,6 +1460,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="seg-units" id="settings-units" role="radiogroup"
            aria-label="Wind units"></div>
     </div>
+    <div class="settings-row">
+      <div class="settings-lbl">Map time</div>
+      <div class="seg-units" id="settings-maptime" role="radiogroup"
+           aria-label="Map time mode"></div>
+    </div>
     <p class="settings-note">Display only. Agency forecasts are issued in
       knots; other units are converted here.</p>
   </div>
@@ -1235,6 +1474,79 @@ HTML_TEMPLATE = r"""<!doctype html>
 (function () {
   "use strict";
   var SID = "__SID__";
+  var IS_INVEST = __IS_INVEST__;     // Stage C: grey/red-X subset page
+  var IS_PTC = __IS_PTC__;           // Potential Tropical Cyclone: grey/red-X
+                                     // identity but KEEPS cone/advisories/Models
+  var SPAWN_SID = "__SPAWN_SID__";   // PTC: sid of the invest it spawned (the
+                                     // NHC TWO formation odds live there)
+  // ---- live PTC identity (durable) -----------------------------------------
+  // The PTC "dress" (grey scheme, red-X glyph, formation-chance pill, hidden
+  // ACE row) is a TRANSIENT pre-genesis state, NOT a value frozen at page
+  // birth. NHC designates a disturbance as a Potential Tropical Cyclone, then
+  // NAMES it the moment it becomes a TS+ - at which point the page must SHED
+  // the dress and wear the real category (and, the reverse, re-wear it if a
+  // system ever drops back). We re-evaluate this EVERY poll off the LIVE feed
+  // (is_ptc + name + current_category), never off __IS_PTC__ alone. IS_PTC is
+  // a `var` so setPtc() can flip it live; PTC_BAKED keeps the birth value as a
+  // feed-omitted fallback.
+  var PTC_BAKED = IS_PTC;
+  // NHC's spelled-out designation numbers ("ONE".."FIFTY-NINE") - the
+  // placeholder name a depression/PTC carries before it is named. A real name
+  // (ARTHUR) is none of these.
+  var NUMBER_NAME = (function () {
+    var ones = ["", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN",
+      "EIGHT", "NINE", "TEN", "ELEVEN", "TWELVE", "THIRTEEN", "FOURTEEN",
+      "FIFTEEN", "SIXTEEN", "SEVENTEEN", "EIGHTEEN", "NINETEEN"];
+    var tens = ["", "", "TWENTY", "THIRTY", "FORTY", "FIFTY"];
+    var s = {};
+    for (var n = 1; n < 60; n++) {
+      s[n < 20 ? ones[n]
+        : tens[Math.floor(n / 10)] + (n % 10 ? "-" + ones[n % 10] : "")] = true;
+    }
+    return s;
+  })();
+  function isNamedTC(storm) {
+    // A genuine named/designated TC: TS-or-stronger SSHWS AND a REAL NHC name
+    // (not the "ONE"/"TWO" designation placeholder, an invest, or the raw sid).
+    var cat = (storm && storm.current_category) || "";
+    if (cat !== "TS" && !/^C[1-5]$/.test(cat)) return false;
+    var nm = ((storm && storm.name) || "").trim().toUpperCase();
+    if (!nm || !/^[A-Z][A-Z'\- ]*$/.test(nm)) return false;   // letters -> a name
+    // The ace_core v0.8.2 numeric designations ("01E"/"10W", the ##X relabel of
+    // a spelled "ONE") are digit-leading, so the letters-only regex above already
+    // rejects them; NUMBER_NAME only needs the spelled forms that pass that gate.
+    if (NUMBER_NAME[nm]) return false;                        // "ONE".."FIFTY-NINE"
+    return nm !== "INVEST" && nm !== "UNNAMED" && nm !== "NAMELESS";
+  }
+  function ptcNow(storm) {
+    // A named TS+ system is, by definition, no longer "potential" - veto any
+    // feed/bake lag (the operational b-deck NATURE can trail the classification).
+    if (isNamedTC(storm)) return false;
+    // Otherwise trust the LIVE feed's flag; fall back to the page-birth value
+    // only when the feed omits it (older feeds / a fetch gap).
+    return (storm && storm.is_ptc != null) ? !!storm.is_ptc : PTC_BAKED;
+  }
+  function setPtc(on, storm) {
+    // Idempotent: act ONLY on a true transition. Returns whether the identity
+    // flipped, so apply() can force the plots to re-render (their titles/colors
+    // follow the identity, and a name->TC relabel can land on the same fix).
+    if (on === IS_PTC) return false;
+    IS_PTC = on;
+    if (on) document.documentElement.setAttribute("data-ptc", "");
+    else document.documentElement.removeAttribute("data-ptc");
+    // Force setCategory() to FULLY re-apply (ramp + glyph letter + Category
+    // hero + type word): the baked data-cat can already equal the live category
+    // (a PTC with TS winds), so setCategory's no-op guard would otherwise leave
+    // the frozen "PTC" dress. apply() calls setCategory right after us, by which
+    // point IS_PTC is updated and these labels resolve to the real category.
+    curCat = null;
+    var pill = document.getElementById("formation-pill");
+    if (pill) {
+      if (on) { loadFormation(); }       // reverse edge: re-arm the chance pill
+      else { pill.hidden = true; pill.innerHTML = ""; }
+    }
+    return true;
+  }
   var FEED_URL = "__FEED_URL__";
   var ADV_URL = "__ADV_URL__";
   // per-storm SST hero layer base (final-gate-2 #1): meta.json +
@@ -1243,7 +1555,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   var ENDED = __ENDED__;
   var BASIN = "__BASIN__";
   var HAFS_ID = "__HAFS_ID__";        // storm_ids join: 01e
-  var FLOATER_ID = "__ATCF_LONG__";   // storm_ids join: ep012026
+  var FLOATER_ID = "__ATCF_LONG__";   // storm_ids join: ep012026 / wp072026
+  var FLOATER_SLUG = "__FLOATER_SLUG__"; // floater index slug: wp07 / ep01 / wp91
   var CDN = "https://cdn.triple-a-tropics.com";
   // Per-basin published intensity-error entry (null = the honesty-guard
   // case: a labeled "no published statistics" panel, never a borrowed
@@ -1252,6 +1565,43 @@ HTML_TEMPLATE = r"""<!doctype html>
   // Storm-window basemap (S4-AD1 #2): vendored Natural Earth land,
   // clipped + antimeridian-normalized at bake time. No runtime fetch.
   var BASEMAP = __BASEMAP__;
+  // v3 dedup: the coast is DERIVED from the land rings (their boundary MINUS the
+  // window-edge segments) instead of being stored in the bake - so the GSHHG
+  // high-res coast costs nothing beyond the land it already shares vertices
+  // with. Byte-for-byte mirror of cyclolab_basemap.coast_from_land / _ring_coast.
+  // Computed ONCE here; all three basemap render sites draw BASEMAP_COAST.
+  function coastFromLand(land, win) {
+    if (!win || !land) return [];
+    var la0 = win[0], la1 = win[1], lo0 = win[2], lo1 = win[3], eps = 0.02;
+    function onEdge(a, b) {
+      return (Math.abs(a[0] - lo0) < eps && Math.abs(b[0] - lo0) < eps) ||
+             (Math.abs(a[0] - lo1) < eps && Math.abs(b[0] - lo1) < eps) ||
+             (Math.abs(a[1] - la0) < eps && Math.abs(b[1] - la0) < eps) ||
+             (Math.abs(a[1] - la1) < eps && Math.abs(b[1] - la1) < eps);
+    }
+    var out = [];
+    land.forEach(function (ring) {
+      var n = ring.length, cur = [];
+      for (var i = 0; i < n; i++) {
+        var a = ring[i], b = ring[(i + 1) % n];
+        if (a[0] === b[0] && a[1] === b[1]) continue;
+        if (onEdge(a, b)) {
+          if (cur.length >= 2) out.push(cur);
+          cur = [];
+        } else if (cur.length &&
+                   cur[cur.length - 1][0] === a[0] &&
+                   cur[cur.length - 1][1] === a[1]) {
+          cur.push(b);
+        } else {
+          if (cur.length >= 2) out.push(cur);
+          cur = [a, b];
+        }
+      }
+      if (cur.length >= 2) out.push(cur);
+    });
+    return out;
+  }
+  var BASEMAP_COAST = coastFromLand(BASEMAP.land, BASEMAP.window);
   // Python-derived category ramp tokens (THE approved gloss recipe -
   // same edge/mid/accent stops as the banner ramps and LIVE STATUS
   // chrome; one canon, baked not re-derived).
@@ -1296,7 +1646,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     kmh: { label: "km/h", conv: function (kt) { return kt * 1.852; } }
   };
   var SETTINGS_KEY = "cyclolab:settings";
-  var settings = { windUnits: "kt" };
+  var settings = { windUnits: "kt", mapTime: "synced" };
   function loadSettings() {
     var s = {};
     try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {}; }
@@ -1309,6 +1659,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var u = (q && WIND_UNITS[q]) ? q
           : (WIND_UNITS[s.windUnits] ? s.windUnits : "kt");
     settings.windUnits = u;
+    settings.mapTime = (s.mapTime === "independent") ? "independent" : "synced";
     if (q) saveSettings();
   }
   function saveSettings() {
@@ -1348,6 +1699,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     rerenderUnits();
     syncSettingsUI();
   }
+  function setMapTime(m) {
+    var mode = (m === "independent") ? "independent" : "synced";
+    settings.mapTime = mode;
+    saveSettings();
+    if (clMap && clMap.setTimeMode) clMap.setTimeMode(mode);
+    syncSettingsUI();
+  }
   function rerenderUnits() {
     // DISPLAY-ONLY: re-render every wind surface from the retained data.
     // apply() refreshes the hero + vitals; the W&P chart and the
@@ -1363,12 +1721,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   function syncSettingsUI() {
     var host = document.getElementById("settings-units");
-    if (!host) return;
-    for (var i = 0; i < host.children.length; i++) {
-      var b = host.children[i];
-      b.setAttribute("aria-checked",
-        b.getAttribute("data-unit") === settings.windUnits
-          ? "true" : "false");
+    if (host) {
+      for (var i = 0; i < host.children.length; i++) {
+        var b = host.children[i];
+        b.setAttribute("aria-checked",
+          b.getAttribute("data-unit") === settings.windUnits ? "true" : "false");
+      }
+    }
+    var mt = document.getElementById("settings-maptime");
+    if (mt) {
+      for (var j = 0; j < mt.children.length; j++) {
+        var c = mt.children[j];
+        c.setAttribute("aria-checked",
+          c.getAttribute("data-maptime") === settings.mapTime ? "true" : "false");
+      }
     }
   }
   function buildSettingsUI() {
@@ -1386,6 +1752,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
       host.appendChild(b);
     });
+    var mtHost = document.getElementById("settings-maptime");
+    if (mtHost) {
+      mtHost.innerHTML = "";
+      [["synced", "Synced"], ["independent", "Independent"]].forEach(function (m) {
+        var mb = document.createElement("button");
+        mb.type = "button"; mb.className = "seg-unit";
+        mb.setAttribute("role", "radio");
+        mb.setAttribute("data-maptime", m[0]);
+        mb.textContent = m[1];
+        mb.addEventListener("click", function () { setMapTime(this.getAttribute("data-maptime")); });
+        mtHost.appendChild(mb);
+      });
+    }
     syncSettingsUI();
     var pop = document.getElementById("settings-pop");
     var btn = document.getElementById("settings-btn");
@@ -1453,6 +1832,225 @@ HTML_TEMPLATE = r"""<!doctype html>
     }, hold);
   })();
 
+  // ===================== Model guidance (Stage B) ==========================
+  // Three renderers hydrating from the live Stage-A JSON (cyclolab/{SID}/
+  // guidance.json + ships.json). REUSE, no forks: fitProjection + graticule
+  // (the cone's projection math), BASEMAP (baked), SSHS + sshsCat (ace_core
+  // single source), the cone basemap classes (.ac-*). Track color = SSHWS
+  // category of each model's PEAK forecast wind (Andrew's pick, palette B).
+  var GDATA = null, SHDATA = null, gDrawn = false;
+  function gPeak(pts) { var m = null; pts.forEach(function (p) {
+    if (p.vmax != null && (m == null || p.vmax > m)) m = p.vmax; }); return m; }
+  function gEsc(s) { return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+  function gBasemap(pr) {
+    function pathOf(rings, close) {
+      return rings.map(function (r) {
+        return "M" + r.map(function (p) {
+          return pr.X(p[0]).toFixed(1) + "," + pr.Y(p[1]).toFixed(1);
+        }).join("L") + (close ? "Z" : "");
+      }).join("");
+    }
+    return '<rect class="ac-ocean-fill" x="0" y="0" width="' + pr.W +
+      '" height="' + pr.H + '"/>' +
+      '<path class="gt-land" d="' + pathOf(BASEMAP.land, true) + '"/>' +
+      '<path class="ac-state" d="' + pathOf(BASEMAP.states || [], false) + '"/>' +
+      '<path class="ac-border" d="' + pathOf(BASEMAP.borders, false) + '"/>' +
+      '<path class="ac-coast" d="' + pathOf(BASEMAP_COAST, false) + '"/>';
+  }
+  var G_TAUS = [0, 24, 48, 72, 96, 120];
+  function gTracks() {
+    var svg = document.getElementById("gtracks"),
+        empty = document.getElementById("gtracks-empty"),
+        leg = document.getElementById("gtracks-legend");
+    var taids = (GDATA && GDATA.track_aids) || [], aids = (GDATA && GDATA.aids) || {};
+    var cons = {}; ((GDATA && GDATA.consensus) || []).forEach(function (c) { cons[c] = 1; });
+    var ext = [];
+    taids.forEach(function (t) { (aids[t] || []).forEach(function (p) {
+      if (p.lat != null) ext.push({ lat: p.lat, lon: p.lon }); }); });
+    if (ext.length < 2) {                       // fresh invest / no dynamical tracks
+      svg.innerHTML = ""; if (leg) leg.innerHTML = "";
+      empty.style.display = "block";
+      empty.textContent = GDATA ? "No track aids yet (statistical-only / fresh invest)."
+                                : "No model guidance for this storm yet.";
+      return;
+    }
+    empty.style.display = "none";
+    // PART 2: aspect-FILL the panel so the tracks fill the frame. The shared
+    // fitProjection fits-to-CONTAIN and centers, which letterboxes a tall/narrow
+    // or wide/short track envelope into a corner with big empty-ocean dead space.
+    // gFitFrame pads the track bbox then expands it to the panel aspect (cos-lat
+    // correct) so both axes fill edge-to-edge.
+    var pr = gFitFrame(ext);
+    svg.setAttribute("viewBox", "0 0 " + pr.W + " " + pr.H);
+    var body = [gBasemap(pr), graticule(pr)];
+    var ordered = taids.slice().sort(function (a, b) { return (cons[a] ? 1 : 0) - (cons[b] ? 1 : 0); });
+    ordered.forEach(function (t) {
+      var pts = (aids[t] || []).filter(function (p) { return p.lat != null; });
+      if (pts.length < 2) return;
+      var col = SSHS[sshsCat(gPeak(pts))] || "#8ea2bd", isC = cons[t];
+      var d = "M" + pts.map(function (p) { return pr.X(p.lon).toFixed(1) + "," + pr.Y(p.lat).toFixed(1); }).join("L");
+      if (isC) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="6" stroke-linejoin="round" stroke-linecap="round" stroke-opacity="0.85"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + (isC ? 3.4 : 1.7) + '" stroke-opacity="' + (isC ? 1 : 0.82) + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function (p) { body.push('<circle cx="' + pr.X(p.lon).toFixed(1) + '" cy="' + pr.Y(p.lat).toFixed(1) + '" r="' + (isC ? 2.4 : 1.5) + '" fill="' + col + '"/>'); });
+    });
+    var spine = aids.TVCN || aids.HCCA || aids[taids[0]] || [];
+    spine.forEach(function (p) {
+      if (p.lat == null || G_TAUS.indexOf(p.tau) < 0) return;
+      var x = pr.X(p.lon), y = pr.Y(p.lat);
+      body.push('<g><rect x="' + (x + 5).toFixed(1) + '" y="' + (y - 8).toFixed(1) + '" width="' + (p.tau >= 100 ? 23 : 17) + '" height="13" rx="3" fill="rgba(7,16,28,0.86)" stroke="rgba(120,140,170,0.4)" stroke-width="0.7"/><text x="' + (x + 7).toFixed(1) + '" y="' + (y + 1.5).toFixed(1) + '" fill="#e8eef5" font-size="9.5" font-weight="700">' + p.tau + '</text></g>');
+    });
+    var c0 = (aids.TVCN || aids[taids[0]] || []).filter(function (p) { return p.tau === 0 && p.lat != null; })[0];
+    if (c0) body.push('<circle cx="' + pr.X(c0.lon).toFixed(1) + '" cy="' + pr.Y(c0.lat).toFixed(1) + '" r="4.5" fill="#fff" stroke="#0a1320" stroke-width="1.5"/>');
+    svg.innerHTML = body.join("");
+    if (leg) leg.innerHTML = taids.map(function (t) {
+      var isC = cons[t]; return '<span class="lg"><span class="sw" style="background:' + (SSHS[sshsCat(gPeak(aids[t] || []))] || "#8ea2bd") + ';height:' + (isC ? 4 : 3) + 'px"></span>' + (isC ? '<b>' + gEsc(t) + '</b> (consensus)' : gEsc(t)) + '</span>'; }).join("");
+  }
+  var G_SSHS_BANDS = [[0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"], [83, 96, "C2"], [96, 113, "C3"], [113, 137, "C4"], [137, 999, "C5"]];
+  function gIntensity() {
+    var svg = document.getElementById("gintensity"),
+        leg = document.getElementById("gintensity-legend"),
+        empty = document.getElementById("gintensity-empty");
+    var iaids = (GDATA && GDATA.intensity_aids) || [], aids = (GDATA && GDATA.aids) || {};
+    var W = 1000, H = 380, mL = 46, mR = 16, mT = 14, mB = 30, pw = W - mL - mR, ph = H - mT - mB;
+    var taus = [], vs = [];
+    iaids.forEach(function (t) { (aids[t] || []).forEach(function (p) { if (p.vmax != null) { taus.push(p.tau); vs.push(p.vmax); } }); });
+    if (!taus.length) { svg.innerHTML = ""; if (leg) leg.innerHTML = ""; empty.style.display = "block"; empty.textContent = GDATA ? "No intensity aids yet." : ""; return; }
+    empty.style.display = "none";
+    var tmax = Math.max(120, Math.max.apply(null, taus)), vmax = Math.max(80, Math.ceil((Math.max.apply(null, vs) + 10) / 20) * 20);
+    function X(t) { return mL + (t / tmax) * pw; } function Y(v) { return mT + ph - (v / vmax) * ph; }
+    var body = ['<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#101a2c"/>'];
+    G_SSHS_BANDS.forEach(function (b) {
+      if (b[0] >= vmax) return;
+      var y1 = Y(Math.min(b[1], vmax)), y0 = Y(b[0]);
+      body.push('<rect x="' + mL + '" y="' + y1.toFixed(1) + '" width="' + pw + '" height="' + (y0 - y1).toFixed(1) + '" fill="' + SSHS[b[2]] + '" fill-opacity="0.12"/>');
+      if (b[0] > 0) body.push('<line x1="' + mL + '" y1="' + y0.toFixed(1) + '" x2="' + (mL + pw) + '" y2="' + y0.toFixed(1) + '" stroke="' + SSHS[b[2]] + '" stroke-opacity="0.3" stroke-width="1"/><text x="' + (mL + pw - 4) + '" y="' + (y0 - 3).toFixed(1) + '" text-anchor="end" fill="' + SSHS[b[2]] + '" font-size="9.5" font-weight="700" opacity="0.85">' + b[2] + '</text>');
+    });
+    for (var v = 0; v <= vmax; v += 20) body.push('<text x="' + (mL - 7) + '" y="' + (Y(v) + 3).toFixed(1) + '" text-anchor="end" fill="#8ea2bd" font-size="10" font-weight="600">' + v + '</text>');
+    body.push('<text x="14" y="' + (mT + 4) + '" fill="#8ea2bd" font-size="10" font-weight="700">kt</text>');
+    for (var t = 0; t <= tmax; t += 24) body.push('<line x1="' + X(t).toFixed(1) + '" y1="' + mT + '" x2="' + X(t).toFixed(1) + '" y2="' + (mT + ph) + '" stroke="rgba(150,170,200,0.12)" stroke-width="1"/><text x="' + X(t).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#8ea2bd" font-size="10" font-weight="600">' + t + '</text>');
+    body.push('<text x="' + (mL + pw / 2) + '" y="' + (H - 0.5) + '" text-anchor="middle" fill="#8ea2bd" font-size="9.5" font-weight="600">forecast hour</text>');
+    var HIRES = { HFAI: "#46c56a", HFBI: "#2bd4c0", HWFI: "#ffe14d", HMNI: "#ff9a2f" };
+    function st(t) {
+      if (t === "IVCN") return { c: "#ffffff", w: 3.2, op: 1, dash: "", cons: 1, tier: "consensus" };
+      if (HIRES[t]) return { c: HIRES[t], w: 2.2, op: 0.95, dash: "", tier: "hi-res" };
+      if (t === "DSHP" || t === "LGEM" || t === "SHIP") return { c: "#8ea2bd", w: 1.4, op: 0.85, dash: "3,3", tier: "statistical" };
+      return { c: "#5d6b80", w: 1.2, op: 0.7, dash: "", tier: "global" };
+    }
+    var ordered = iaids.slice().sort(function (a, b) { return (a === "IVCN" ? 1 : 0) - (b === "IVCN" ? 1 : 0); });
+    ordered.forEach(function (t) {
+      var pts = (aids[t] || []).filter(function (p) { return p.vmax != null; }); if (pts.length < 2) return;
+      var s = st(t), d = "M" + pts.map(function (p) { return X(p.tau).toFixed(1) + "," + Y(p.vmax).toFixed(1); }).join("L");
+      if (s.cons) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="5.4" stroke-linejoin="round" stroke-opacity="0.8"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + s.c + '" stroke-width="' + s.w + '" stroke-opacity="' + s.op + '" stroke-dasharray="' + s.dash + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function (p) { body.push('<circle cx="' + X(p.tau).toFixed(1) + '" cy="' + Y(p.vmax).toFixed(1) + '" r="' + (s.cons ? 2.2 : 1.4) + '" fill="' + s.c + '"/>'); });
+    });
+    body.push('<rect x="' + mL + '" y="' + mT + '" width="' + pw + '" height="' + ph + '" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>');
+    svg.innerHTML = body.join("");
+    if (leg) leg.innerHTML = ordered.slice().reverse().map(function (t) { var s = st(t); return '<span class="lg"><span class="sw" style="background:' + s.c + ';height:' + Math.max(3, s.w) + 'px"></span>' + (s.cons ? '<b>' + gEsc(t) + '</b>' : gEsc(t)) + ' (' + s.tier + ')</span>'; }).join("");
+  }
+  function gSpark(vals, taus, w, h, color) {
+    var ok = []; vals.forEach(function (v, i) { if (v != null) ok.push({ v: v, t: taus[i] }); });
+    if (ok.length < 2) return '<svg viewBox="0 0 ' + w + ' ' + h + '"><text x="' + (w / 2) + '" y="' + (h / 2) + '" text-anchor="middle" fill="#566b80" font-size="9">no data</text></svg>';
+    var vv = ok.map(function (o) { return o.v; }), lo = Math.min.apply(null, vv), hi = Math.max.apply(null, vv);
+    if (hi === lo) { hi += 1; lo -= 1; }
+    var tmax = Math.max.apply(null, taus), mb = 11, mt = 4;
+    function X(t) { return 2 + (t / tmax) * (w - 4); } function Y(v) { return mt + (h - mt - mb) * (1 - (v - lo) / (hi - lo)); }
+    var d = "M" + ok.map(function (o) { return X(o.t).toFixed(1) + "," + Y(o.v).toFixed(1); }).join("L");
+    return '<svg viewBox="0 0 ' + w + ' ' + h + '"><line x1="2" y1="' + (h - mb).toFixed(1) + '" x2="' + (w - 2) + '" y2="' + (h - mb).toFixed(1) + '" stroke="rgba(150,170,200,0.18)"/><path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round"/><circle cx="' + X(ok[0].t).toFixed(1) + '" cy="' + Y(ok[0].v).toFixed(1) + '" r="2" fill="' + color + '"/><text x="2" y="' + (h - 2) + '" fill="#566b80" font-size="8">' + lo.toFixed(0) + '</text><text x="' + (w - 2) + '" y="' + (h - 2) + '" text-anchor="end" fill="#566b80" font-size="8">' + hi.toFixed(0) + '</text></svg>';
+  }
+  function gShips() {
+    var root = document.getElementById("gships-root"); if (!root) return;
+    var s = SHDATA;
+    if (!s || s.available === false) { root.innerHTML = '<div class="stub">SHIPS unavailable for this system' + (s && s.reason ? " (" + gEsc(s.reason) + ")" : "") + ".</div>"; return; }
+    var taus = s.taus || [], env = s.env_series || {}, head = [];
+    head.push('<span class="g-chip"><b>' + gEsc((s.header || {}).id_line || s.sid || "") + '</b></span>');
+    if (s.ahi) head.push('<span class="g-chip">Annularity (AHI) <b>' + gEsc(s.ahi.value) + '</b>' + (s.ahi.verdict ? " &middot; " + gEsc(String(s.ahi.verdict).split(",")[0]) : "") + '</span>');
+    if (s.prelim_ri_prob != null) head.push('<span class="g-chip ri">Prelim RI prob <b>' + gEsc(s.prelim_ri_prob) + '%</b></span>');
+    var stype = (s.storm_type || [])[0]; if (stype) head.push('<span class="g-chip">Storm type <b>' + gEsc(stype) + '</b></span>');
+    var WANT = [["SHEAR (KT)", "#ffd24d"], ["SST (C)", "#ff7a59"], ["700-500 MB RH", "#46c56a"], ["POT. INT. (KT)", "#5aa9ff"], ["HEAT CONTENT", "#ff9a2f"], ["200 MB DIV", "#7aa0ff"], ["STM SPEED (KT)", "#8ea2bd"], ["V (KT) NO LAND", "#e8eef5"], ["TH_E DEV (C)", "#c08bff"]];
+    var cells = WANT.filter(function (p) { return env[p[0]]; }).map(function (p) {
+      var v = env[p[0]], cur = null; for (var i = 0; i < v.length; i++) { if (v[i] != null) { cur = v[i]; break; } }
+      return '<div class="g-sm"><div class="t">' + gEsc(p[0]) + '</div><div class="v">now ' + (cur == null ? "n/a" : cur) + '</div>' + gSpark(v, taus, 200, 60, p[1]) + '</div>';
+    }).join("");
+    var rm = s.ri_matrix || { cols: [], rows: {} }, tbl = "";
+    if (rm.cols && rm.cols.length) {
+      tbl = '<table class="g-ri"><caption>RI probability matrix (% in next, vs threshold/hours)</caption><tr><th>RI (kt/h)</th>' + rm.cols.map(function (c) { return '<th>' + gEsc(c) + '</th>'; }).join("") + '</tr>' +
+        Object.keys(rm.rows).map(function (rn) { return '<tr><td class="rn">' + gEsc(rn) + '</td>' + rm.cols.map(function (c) { var val = rm.rows[rn][c]; return '<td>' + (val == null ? "&middot;" : gEsc(val) + "%") + '</td>'; }).join("") + '</tr>'; }).join("") + '</table>';
+    }
+    root.innerHTML = '<div class="g-ships-head">' + head.join("") + '</div><div class="g-sm-grid">' + cells + '</div>' + tbl;
+  }
+  function gRenderAll() { try { gTracks(); } catch (e) {} try { gIntensity(); } catch (e2) {} try { gShips(); } catch (e3) {} }
+  function initGuidance() {
+    if (gDrawn) return; gDrawn = true;
+    var base = CDN + "/cyclolab/" + encodeURIComponent(SID) + "/";
+    Promise.all([fetchJson(base + "guidance.json"), fetchJson(base + "ships.json")])
+      .then(function (r) { GDATA = r[0]; SHDATA = r[1]; gRenderAll(); })
+      .catch(function () { gRenderAll(); });
+  }
+  // expose for tests/manual re-render
+  window.__gRenderAll = gRenderAll;
+
+  // NHC formation-chance pill (invests only) - eager (not lazy): the genesis
+  // odds belong in the banner, not behind a tab. Reads cyclolab/{SID}/
+  // formation.json (the poller's parse of the Tropical Weather Outlook).
+  function loadFormation() {
+    // Invests AND Potential Tropical Cyclones carry the NHC formation-chance
+    // pill (same TWO source). For a PTC the TWO may have transitioned it out
+    // once advisories began — fetchJson + the null-guard degrade gracefully
+    // (the pill simply stays hidden); we NEVER fabricate odds.
+    if (!IS_INVEST && !IS_PTC) return;
+    var pill = document.getElementById("formation-pill");
+    if (!pill) return;
+    // Freshness guard: the poller re-stamps formation.json's generated_at every
+    // poll while the system is live, so a PROVABLY-stale timestamp means the
+    // poller stopped (or NHC dropped the system from the TWO) - a genuinely
+    // FROZEN pill must HIDE rather than show stale odds. An ABSENT/unparseable
+    // timestamp cannot disprove freshness, so it stays lenient (shows) - the
+    // poller always writes generated_at, so this only loosens for legacy/edge.
+    var STALE_MS = 12 * 3600 * 1000;   // 2 TWO cycles
+    function fresh(ts) {
+      if (!ts) return true;
+      var t = Date.parse(ts);
+      if (isNaN(t)) return true;
+      return (Date.now() - t) < STALE_MS;
+    }
+    function render(f) {
+      // Never paint the chance pill once the system is a named/designated TC -
+      // a late-resolving fetch (kicked off while still a PTC) must not re-show
+      // the pill after setPtc() shed the dress. IS_PTC is live.
+      if (!IS_PTC && !IS_INVEST) return false;
+      if (!f || (f.p48 == null && f.p7 == null)) return false;
+      if (!fresh(f.generated_at)) return false;   // frozen pill -> hide, not stale
+      var p7 = (f.p7 != null) ? f.p7 + "%" : "n/a";
+      var p48 = (f.p48 != null) ? f.p48 + "%" : "n/a";
+      pill.setAttribute("data-level", f.level || "low");
+      pill.innerHTML = '<span class="fp-dot"></span>' +
+        '<span class="fp-eyebrow"><span>Formation</span>' +
+          '<span class="fp-e2">chance</span></span>' +
+        '<span class="fp-wins">' +
+          '<span class="fp-win">48h <b>' + p48 + '</b></span>' +
+          '<span class="fp-div"></span>' +
+          '<span class="fp-win">7-day <b>' + p7 + '</b></span>' +
+        '</span>';
+      pill.hidden = false;
+      return true;
+    }
+    function tryUrl(sid) {
+      return fetchJson(CDN + "/cyclolab/" +
+                       encodeURIComponent(sid) + "/formation.json");
+    }
+    // A PTC's OWN formation.json usually 404s — once NHC designates the
+    // system the TWO odds stay under the INVEST it spawned (SPAWN_SID). Try
+    // own first, then fall back to the spawning invest. Invests read their
+    // own. Always graceful: no data anywhere -> the pill stays hidden.
+    tryUrl(SID).then(function (f) {
+      if (render(f)) return;
+      if (IS_PTC && SPAWN_SID) tryUrl(SPAWN_SID).then(render);
+    });
+  }
+  window.__loadFormation = loadFormation;
+
   // ---- section nav (lazy init on first open) ------------------------------
   var inited = {};
   function openSec(name) {
@@ -1463,11 +2061,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.querySelectorAll(".sec-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-sec") === name);
     });
+    if (name === "overview" && clMap) clMap.resize();
     if (!inited[name]) {
       inited[name] = true;
       // Stage 3: nothing is fetched until the tab opens (lazy mounts).
-      if (name === "models") initModels();
+      // Phase 3b: the Models tab now hosts BOTH HAFS and the model guidance
+      // (the standalone Guidance tab is gone), so opening Models hydrates both.
+      if (name === "models") { initModels(); initGuidance(); }
       else if (name === "satellite") initSatellite();
+      else if (name === "recon") initRecon();
+      else if (name === "ascat") initAscat();
     }
     // THE CONE reveal plays once per tab OPEN (not once per session):
     // rebuilding the SVG re-arms every CSS animation naturally.
@@ -1483,6 +2086,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (name !== "models" && hafsViewer && hafsViewer._pause) {
       hafsViewer._pause();
     }
+    // recon viewer polls current.json; only let it run while its tab is up
+    if (reconViewer) {
+      if (name === "recon" && reconViewer._resume) reconViewer._resume();
+      else if (reconViewer._pause) reconViewer._pause();
+    }
+    // same tab-gated polling for the ASCAT viewer (hydrates from CDN/ascat/)
+    if (ascatViewer) {
+      if (name === "ascat" && ascatViewer._resume) ascatViewer._resume();
+      else if (ascatViewer._pause) ascatViewer._pause();
+    }
     var w = document.querySelector("#sec-" + name + " .wipe");
     if (w) { w.style.animation = "none"; void w.offsetWidth; w.style.animation = ""; }
   }
@@ -1494,8 +2107,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   // resume the manifest poll on return if the Satellite tab is still active.
   if (typeof document !== "undefined" && document.addEventListener) {
     document.addEventListener("visibilitychange", function () {
-      if (document.hidden) { satStopPoll(); satPause(); }
-      else satStartPoll();
+      if (document.hidden) { satStopPoll(); satPause(); if (clMap) clMap._pause(); }
+      else { satStartPoll(); if (clMap) clMap._resume(); }
     });
   }
 
@@ -1531,6 +2144,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     { id: "next", lbl: "Next advisory", unit: "" },
   ];
   function buildVitals() {
+    // Stage C: an invest has no advisory and no ACE; those rows are HIDDEN via
+    // CSS (html[data-invest] #vrow-ace/#vrow-next) rather than dropped, so
+    // apply()'s odometer writes still find every element.
     document.getElementById("vitals").innerHTML = VITALS.map(function (s) {
       return '<div class="vrow" id="vrow-' + s.id + '">' +
         '<span class="lbl">' + s.lbl + '</span>' +
@@ -1611,12 +2227,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       chipEl.style.display = "";
       chipEl.textContent = CHIP_LABEL[cat] || cat;
     }
-    // the canon label rides the corner glyph + the Category hero.
-    document.getElementById("glyph-cat").textContent = sshsLabel(cat);
-    odoSet(document.getElementById("odo-cat"), sshsLabel(cat));
+    // the canon label rides the corner glyph + the Category hero. A PTC shows
+    // "PTC" (no category accrues); a real TC shows its SSHWS letter. IS_PTC is
+    // LIVE (setPtc flips it), so the label follows the identity automatically -
+    // once shed, this re-applies the real category in place of the baked "PTC".
+    var catLbl = IS_PTC ? "PTC" : sshsLabel(cat);
+    document.getElementById("glyph-cat").textContent = catLbl;
+    odoSet(document.getElementById("odo-cat"), catLbl);
     if (!advTypeWord) {
       document.getElementById("storm-type").textContent =
-        catWord(cat).toUpperCase();
+        (IS_PTC ? "POTENTIAL TROPICAL CYCLONE" : catWord(cat).toUpperCase());
     }
     curCat = cat;
     if (reduced) return;
@@ -1652,6 +2272,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     img.removeAttribute("data-url");
     img.style.display = "none";
     document.getElementById("sst-hero-layers").innerHTML = "";
+    var g = document.getElementById("sst-grat");
+    if (g) g.innerHTML = "";          // PART D: clear the lattice with the raster
     heroNote(msg);
   }
   function heroLayerEntry(slug) {
@@ -1701,6 +2323,33 @@ HTML_TEMPLATE = r"""<!doctype html>
         (L.title || L.label || "Sea surface temperature").toUpperCase();
     }
     heroCaption();
+    renderSstGraticule();
+  }
+  // PART D: lat/long lattice over the storm-centered CRW raster, via the SAME
+  // graticule() helper as the cone/track/swath (one source). The SST meta
+  // carries center + box{hw_lon,hw_lat}; the render is a PlateCarree box
+  // [clon+-hw_lon, clat+-hw_lat] at 16:9.2 == the container, so a linear
+  // lat/lon->px projection adapter registers exactly. Degrades to empty (no
+  // crash) when the meta lacks center/box.
+  function renderSstGraticule() {
+    var el = document.getElementById("sst-grat");
+    if (!el) return;
+    if (!heroMeta || !heroMeta.center || !heroMeta.box) { el.innerHTML = ""; return; }
+    var clon = heroMeta.center.lon, clat = heroMeta.center.lat;
+    var hwLon = heroMeta.box.hw_lon, hwLat = heroMeta.box.hw_lat;
+    if (!(hwLon > 0 && hwLat > 0)) { el.innerHTML = ""; return; }
+    var W = (heroMeta.px && heroMeta.px[0]) || 1000;
+    var H = (heroMeta.px && heroMeta.px[1]) || Math.round(W * hwLat / hwLon);
+    el.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var pr = {
+      W: W, H: H, x0: 0, y0: 0, x1: W, y1: H,
+      X: function (lon) { return (lon - (clon - hwLon)) / (2 * hwLon) * W; },
+      Y: function (lat) { return ((clat + hwLat) - lat) / (2 * hwLat) * H; },
+      lonAt: function (x) { return (clon - hwLon) + x / W * 2 * hwLon; },
+      latAt: function (y) { return (clat + hwLat) - y / H * 2 * hwLat; }
+    };
+    try { el.innerHTML = graticule(pr); }
+    catch (e) { el.innerHTML = ""; }
   }
   function heroBuildPicker() {
     var host = document.getElementById("sst-hero-layers");
@@ -1725,16 +2374,20 @@ HTML_TEMPLATE = r"""<!doctype html>
       ((document.getElementById("storm-type") || {}).textContent || "")
         .toUpperCase() + " " + (storm.name || "").toUpperCase();
     // glyph: the cone-hero treatment - spinning path, stationary label;
-    // ALWAYS at the panel center (the render is storm-centered).
+    // ALWAYS at the panel center (the render is storm-centered). A PTC is NOT
+    // a depression: the glyph reads GREY with "PTC" (not a category color +
+    // "D"), matching the storm's grey invest identity.
     var cat = storm.current_category || "TD";
+    var gFill = IS_PTC ? "#9aa6b6" : (SSHS[cat] || SSHS.TD);
+    var gLabel = IS_PTC ? "PTC" : sshsLabel(cat);
+    var gSize = IS_PTC ? 25 : 34;   // "PTC" (3 glyphs) needs a smaller size
     document.getElementById("sst-hero-glyph").innerHTML =
       '<svg viewBox="-62 -62 124 124">' +
-      '<g class="ac-spin"><path d="__HPATH__" fill="' +
-      (SSHS[cat] || SSHS.TD) +
+      '<g class="ac-spin"><path d="__HPATH__" fill="' + gFill +
       '" stroke="rgba(0,0,0,0.35)" stroke-width="2"/></g>' +
-      '<text class="ac-cat" y="12" text-anchor="middle" font-size="34" ' +
-      'font-weight="800" fill="#ffffff" stroke="rgba(0,0,0,0.45)" ' +
-      'stroke-width="1">' + sshsLabel(cat) + "</text></svg>";
+      '<text class="ac-cat" y="11" text-anchor="middle" font-size="' + gSize +
+      '" font-weight="800" fill="#ffffff" stroke="rgba(0,0,0,0.45)" ' +
+      'stroke-width="1">' + gLabel + "</text></svg>";
     var fixKey = (last.t || "") + "|" + cat;
     if (heroMeta && heroFixKey === fixKey) { heroCaption(); return; }
     fetchJson(SST_BASE + "/meta.json").then(function (m) {
@@ -2068,6 +2721,60 @@ HTML_TEMPLATE = r"""<!doctype html>
     };
   }
 
+  // PART 2: aspect-FILL projection for the guidance forecast-tracks graphic.
+  // fitProjection fits-to-contain + centers (correct for the cone, whose H can
+  // grow), but a PANEL caps H, so a tall/narrow or wide/short track envelope
+  // gets letterboxed into a corner with big empty-ocean dead space. gFitFrame
+  // pads the track bbox, widens a too-small (single-aid) window to a sane floor,
+  // then EXPANDS the short axis to the panel aspect (cos-lat correct via the same
+  // K fitProjection uses) so spanX:spanY matches the frame -> offX=offY=0, the
+  // tracks fill edge-to-edge. Returns a normal fitProjection result (hMin==hMax
+  // pins H to the fixed panel height).
+  function gFitFrame(points) {
+    var FW = 1000, FH = 540, M = 18, MINDEG = 6;
+    var lats = points.map(function (p) { return p.lat; });
+    var lons = points.map(function (p) { return p.lon; });
+    var loLat = Math.min.apply(null, lats), hiLat = Math.max.apply(null, lats);
+    var loLon = Math.min.apply(null, lons), hiLon = Math.max.apply(null, lons);
+    var padLat = Math.max((hiLat - loLat) * 0.12, 0.6);
+    var padLon = Math.max((hiLon - loLon) * 0.12, 0.6);
+    loLat -= padLat; hiLat += padLat; loLon -= padLon; hiLon += padLon;
+    var cLat = (loLat + hiLat) / 2, cLon = (loLon + hiLon) / 2;
+    if (hiLat - loLat < MINDEG) { loLat = cLat - MINDEG / 2; hiLat = cLat + MINDEG / 2; }
+    if (hiLon - loLon < MINDEG) { loLon = cLon - MINDEG / 2; hiLon = cLon + MINDEG / 2; }
+    var K = Math.max(0.2, Math.cos(cLat * Math.PI / 180));
+    var spanLon = hiLon - loLon, spanLat = hiLat - loLat;
+    var target = ((FW - 2 * M) / (FH - 2 * M)) / K;   // desired lonSpan : latSpan
+    if (spanLon / spanLat < target) {                 // too tall -> widen lon
+      var nl = spanLat * target; loLon = cLon - nl / 2; hiLon = cLon + nl / 2;
+    } else {                                           // too wide -> heighten lat
+      var nh = spanLon / target; loLat = cLat - nh / 2; hiLat = cLat + nh / 2;
+    }
+    return fitProjection([{ lat: loLat, lon: loLon }, { lat: hiLat, lon: hiLon }],
+                         FW, FH, FH, M);
+  }
+
+  // Sparse-track fallback (PART D): a single-fix (or near-zero-extent) track
+  // projects to a degenerate sub-degree window - no land, no graticule lines
+  // (the blank Track History a fresh JTWC TD showed). Pad a too-small extent to
+  // >= minDeg around its center so the basemap + graticule always draw. Shared
+  // by the track + swath maps; the data points are unchanged (only the
+  // projection window widens to a sensible storm-centered default).
+  function ensureMinExtent(extent, minDeg) {
+    minDeg = minDeg || 8;
+    if (!extent || !extent.length) return extent;
+    var lats = extent.map(function (p) { return p.lat; });
+    var lons = extent.map(function (p) { return p.lon; });
+    var loLat = Math.min.apply(null, lats), hiLat = Math.max.apply(null, lats);
+    var loLon = Math.min.apply(null, lons), hiLon = Math.max.apply(null, lons);
+    if ((hiLat - loLat) >= minDeg && (hiLon - loLon) >= minDeg) return extent;
+    var cLat = (loLat + hiLat) / 2, cLon = (loLon + hiLon) / 2, h = minDeg / 2;
+    return extent.concat([{ lat: cLat + h, lon: cLon },
+                          { lat: cLat - h, lon: cLon },
+                          { lat: cLat, lon: cLon + h },
+                          { lat: cLat, lon: cLon - h }]);
+  }
+
   // 5-deg graticule (maps-pass R3 #3): drawn as the TOP-MOST layer with a
   // CASING/HALO - a dark hairline UNDER a light line - so every line reads
   // over BOTH the light-gray land AND the dark ocean (a flat light line
@@ -2208,6 +2915,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
+    // state/province lines UNDER the country borders (dimmer .ac-state).
+    (BASEMAP.states || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
+          pr.Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-state" d="' + d + '"/>');
+    });
     // maps-pass R2: thin white country borders UNDER the thick white coast
     // (both open ne_10m polylines, no trailing Z), over the land fill.
     (BASEMAP.borders || []).forEach(function (line) {
@@ -2217,7 +2932,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-border" d="' + d + '"/>');
     });
-    (BASEMAP.coast || []).forEach(function (line) {
+    (BASEMAP_COAST || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + pr.X(c[0]).toFixed(1) + "," +
           pr.Y(c[1]).toFixed(1);
@@ -2460,7 +3175,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         { lat: last.lat, lon: last.lon - pad /
           Math.max(0.2, Math.cos(last.lat * Math.PI / 180)) }]);
     }
-    var pr = fitProjection(extent, 1000, 440, 760, 92);
+    var pr = fitProjection(ensureMinExtent(extent, 8), 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
     // maps-pass R4 #1: aspect-fill - the SHARED basemap rule (same as the
     // cone): expand the viewBox to the card aspect so the basemap + graticule
@@ -2543,6 +3258,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     var shapesSeen = {};
     pts.forEach(function (p, i) {
       var isNow = (i === pts.length - 1);
+      // Stage C: an invest's CURRENT-position marker is a RED X (matching the
+      // banner identity), not the wind-coloured hurricane dot. Historical track
+      // dots are unchanged; named-storm now-markers are unchanged.
+      if (isNow && IS_INVEST) {
+        var nx = tp[i][0], ny = tp[i][1], s = 10;
+        parts.push('<path d="M' + (nx - s).toFixed(1) + ',' + (ny - s).toFixed(1) +
+          'L' + (nx + s).toFixed(1) + ',' + (ny + s).toFixed(1) + 'M' +
+          (nx + s).toFixed(1) + ',' + (ny - s).toFixed(1) + 'L' + (nx - s).toFixed(1) +
+          ',' + (ny + s).toFixed(1) + '" stroke="#ff3b3b" stroke-width="3.6" ' +
+          'stroke-linecap="round" fill="none" ' +
+          'style="filter:drop-shadow(0 0 5px rgba(255,59,59,0.7));"/>');
+        return;
+      }
       var col = sshsDotColor(p.wind_kt);
       var shape = natureShape(p.nature);
       shapesSeen[shape] = 1;
@@ -2653,7 +3381,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         }
       });
     });
-    var pr = fitProjection(extent, 1000, 440, 760, 92);
+    var pr = fitProjection(ensureMinExtent(extent, 8), 1000, 440, 760, 92);
     var W = pr.W, H = pr.H;
     // maps-pass R4 #1: aspect-fill (shared basemap rule) - basemap + graticule
     // full-bleed; the wind swath (in [0,W]x[0,H]) is never cropped.
@@ -2777,6 +3505,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   var lastStorm = null;
   function apply(storm) {
     lastStorm = storm;
+    // PTC identity is LIVE (see setPtc): shed the grey/red-X dress the moment
+    // the feed shows a named/designated TC, re-wear it on the reverse. MUST run
+    // before setCategory so the ramp/label/type-word re-apply under the new
+    // identity. A flip forces the Overview/SST plots to re-render below even
+    // when the fix is unchanged (a name->TC relabel can land on the same fix).
+    var ptcFlip = setPtc(ptcNow(storm), storm);
     setCategory(storm.current_category || "TD");
     document.getElementById("storm-name").textContent =
       (storm.name || SID).toUpperCase();
@@ -2794,7 +3528,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     odoSet(document.getElementById("odo-move"), movement(pts));
     odoSet(document.getElementById("odo-fix"),
            fixKey ? fixKey.slice(5, 16).replace("T", " ") : "—");
-    if (fixKey !== lastFixKey) {
+    if (fixKey !== lastFixKey || ptcFlip) {
       // ISOLATED (the final-gate #3 lesson): one renderer's throw must
       // never starve the next.
       try { renderHero(storm); } catch (e) {
@@ -2882,8 +3616,13 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   buildVitals();
   buildSettingsUI();
+  loadFormation();          // Stage C: eager NHC formation pill (invests only)
   var BAKED = __BAKED__;
   if (BAKED) apply(BAKED);
+  // Mount the Overview stacking map once the DOM is ready (IIFE-A scope).
+  if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", initOverviewMap);
+  else initOverviewMap();
   // ENDED pages used to skip the fetch entirely, which left advFull
   // null FOREVER - no cone, no intensity chart, blank advisory text on
   // every dead-storm page (final-gate-3 #4, the latent variant of the
@@ -2932,6 +3671,21 @@ HTML_TEMPLATE = r"""<!doctype html>
   // else (EX/PT/LO/DB/remnants) is the user-ordered WHITE emphasis -
   // "white = forecast non-tropical" (S4-AD1 #4).
   var TROPICAL_DEV = { TD: 1, TS: 1, HU: 1, TY: 1, ST: 1, SD: 1, SS: 1 };
+
+  // ---- Phase 4: coastal watches/warnings overlay (NHC AL/EP/CP only) ------
+  // adv.ww = [{type, geometry:[[lon,lat],...]}], parsed from the official NHC
+  // windWatchesWarnings KMZ (kml_advisories.parse_ww_kmz). Canonical NHC TCWW
+  // colors keyed by type. ART-GATED: exact hues await sign-off. Storm-surge
+  // types ride the same overlay if/when their geometry is present.
+  var WW_STYLE = {
+    TS_WATCH:   { color: "#ffe14d", label: "TS Watch" },             // yellow
+    TS_WARNING: { color: "#3a8bff", label: "TS Warning" },           // blue
+    HU_WATCH:   { color: "#ff8cf0", label: "Hurricane Watch" },      // pink
+    HU_WARNING: { color: "#ff3b3b", label: "Hurricane Warning" },    // red
+    SS_WATCH:   { color: "#c89bff", label: "Storm Surge Watch" },    // lt purple
+    SS_WARNING: { color: "#ff3bd4", label: "Storm Surge Warning" }   // magenta
+  };
+  var wwShown = true;   // overlay visibility (toggle); default ON.
   function pointCat(p) {
     if (p.dev_label && SSHS[p.dev_label]) return p.dev_label;
     return catForKt(p.intensity_kt);
@@ -3013,6 +3767,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ") + " Z";
       parts.push('<path class="ac-land" d="' + d + '"/>');
     });
+    // state/province lines UNDER the country borders (dimmer .ac-state).
+    (BASEMAP.states || []).forEach(function (line) {
+      var d = line.map(function (c, i) {
+        return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
+          Y(c[1]).toFixed(1);
+      }).join(" ");
+      parts.push('<path class="ac-state" d="' + d + '"/>');
+    });
     (BASEMAP.borders || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
@@ -3020,13 +3782,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       }).join(" ");
       parts.push('<path class="ac-border" d="' + d + '"/>');
     });
-    (BASEMAP.coast || []).forEach(function (line) {
+    (BASEMAP_COAST || []).forEach(function (line) {
       var d = line.map(function (c, i) {
         return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
           Y(c[1]).toFixed(1);
       }).join(" ");
       parts.push('<path class="ac-coast" d="' + d + '"/>');
     });
+
+    // The INLAND county/zone FILL layer was REMOVED in v3 - the W/W presence on
+    // the cone is now ONLY the official NHC coastal breakpoint LINES (the ww
+    // array) below, which hug the terrain-accurate coast. wwTypes is declared
+    // here for the coastal-line block to populate (the legend).
+    var wwTypes = {};
     // (the graticule is pushed AFTER the cone group below, so it sits ABOVE
     // the cone too - maps-pass R3 #3 top-most layer.)
 
@@ -3059,7 +3827,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     var firstSeg = tp.length > 1 ? [tp[1][0] - tp[0][0],
                                     tp[1][1] - tp[0][1]] : lastSeg;
     var fsLen = Math.max(1e-6, Math.hypot(firstSeg[0], firstSeg[1]));
-    var ringPx = coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; });
+    // SMOOTH the cone ring ONCE: derive_cone returns the union-of-disks
+    // boundary already resampled to a dense polyline, but re-densify it here
+    // with a CLOSED centripetal Catmull-Rom (passes THROUGH every vertex,
+    // wraps the seam) so the displayed boundary is uniformly smooth at canvas
+    // scale and on-curve. CRITICAL: this same dense smooth ring feeds BOTH the
+    // rendered cone path (dC) AND the reveal corridor (ringEdgesAt) below, so
+    // the corridor contains the cone exactly (no settle-frame pop-in) and the
+    // geometry test reads real on-curve vertices. catmullRomClosed is hoisted.
+    var ringPx = catmullRomClosed(
+      coneRing.map(function (c) { return [X(c[0]), Y(c[1])]; }), 3.5);
     // rear/forward extents: how far the ring reaches BEHIND the first
     // track point / BEYOND the last one (signed projection onto the
     // end-segment directions).
@@ -3111,6 +3888,59 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       return out;
     }
+    // Closed-ring CENTRIPETAL Catmull-Rom densifier (alpha = 0.5). Centripetal
+    // knot spacing (chord^0.5) is overshoot- and cusp-free, unlike the uniform
+    // form which spikes where the envelope pinches (the tiny tau-0 apex cap) or
+    // turns sharply. Consecutive near-coincident vertices are de-duplicated first
+    // (the small apex arc clusters them, and zero-length knots would divide by
+    // zero) and a closing duplicate dropped, then the spline wraps the seam.
+    // Returns an OPEN dense point list (the caller closes it with Z). Passes
+    // THROUGH every surviving vertex, so the corridor built from the same dense
+    // list contains it exactly.
+    function catmullRomClosed(poly, spacing) {
+      var P = [];
+      for (var k = 0; k < poly.length; k++) {
+        var q = poly[k];
+        if (!P.length ||
+            Math.hypot(q[0] - P[P.length - 1][0],
+                       q[1] - P[P.length - 1][1]) > 0.4) P.push(q);
+      }
+      if (P.length > 1 &&
+          Math.hypot(P[0][0] - P[P.length - 1][0],
+                     P[0][1] - P[P.length - 1][1]) < 0.4) P.pop();
+      var n = P.length;
+      if (n < 3) return poly.slice();
+      function at(j) { return P[((j % n) + n) % n]; }
+      function knot(ti, a, b) {
+        return ti + Math.sqrt(Math.hypot(b[0] - a[0], b[1] - a[1]));
+      }
+      var out = [];
+      for (var i = 0; i < n; i++) {
+        var p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+        var t0 = 0, t1 = knot(t0, p0, p1), t2 = knot(t1, p1, p2),
+            t3 = knot(t2, p2, p3);
+        // ADAPTIVE: emit ~one sample per `spacing` px of this segment, so the
+        // long tangent chords (the facets) get many points while the already-
+        // fine arc steps get few - uniform ~spacing-px point density, no sub-
+        // pixel clutter (which toFixed(1) rounding would turn into false kinks).
+        var m = Math.max(1, Math.round(
+          Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / spacing));
+        for (var s = 0; s < m; s++) {
+          var t = t1 + (t2 - t1) * s / m;
+          // Barry-Goldman pyramid (de Boor for non-uniform Catmull-Rom)
+          var A1 = _lrp(p0, p1, t0, t1, t), A2 = _lrp(p1, p2, t1, t2, t),
+              A3 = _lrp(p2, p3, t2, t3, t);
+          var B1 = _lrp(A1, A2, t0, t2, t), B2 = _lrp(A2, A3, t1, t3, t);
+          out.push(_lrp(B1, B2, t1, t2, t));
+        }
+      }
+      return out;
+    }
+    function _lrp(a, b, ta, tb, t) {
+      if (tb - ta < 1e-9) return [a[0], a[1]];
+      var u = (t - ta) / (tb - ta);
+      return [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u];
+    }
     tpExt = catmullRom(tpExt, PER_SEG);
     var cum = [0];
     for (var ci = 1; ci < tpExt.length; ci++) {
@@ -3130,11 +3960,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     // when the front tip passes them; index 0 of cum is the rear point)
     var cumIcons = pts.map(function (_, i) { return cum[(i + 1) * PER_SEG]; });
     var HOLD_MS = 1000, GROW_MS = 4000;
-    // exact local cone half-width at a canvas point P with normal n:
-    // max |t| over intersections of the perpendicular line P + t*n
-    // with the ring's edges.
-    function ringHalfAt(px3, py3, nx3, ny3) {
-      var w = 0;
+    // local cone edges at a canvas point P with normal n: the distance to
+    // the NEAREST ring crossing in the +n direction and in the -n direction,
+    // returned as [wPos, wNeg] (0 if that side has no crossing). NEAREST, not
+    // farthest: on a recurve the perpendicular from a centerline sample also
+    // stabs the cone's FAR limb, and the old max|t| latched onto it - so the
+    // corridor ballooned across open water and the far end of the cone was
+    // uncovered (revealed) before the growth front ever reached it. Stopping
+    // at the first boundary on each side keeps the band hugging the LOCAL
+    // cone, so the reveal stays one connected shape growing from the storm.
+    function ringEdgesAt(px3, py3, nx3, ny3) {
+      var wp = Infinity, wn = Infinity;
       for (var ri = 0; ri < ringPx.length; ri++) {
         var a = ringPx[ri];
         var b = ringPx[(ri + 1) % ringPx.length];
@@ -3144,9 +3980,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         var rx = a[0] - px3, ry = a[1] - py3;
         var t3 = (ex2 * ry - ey2 * rx) / det;
         var s3 = (nx3 * ry - ny3 * rx) / det;
-        if (s3 >= 0 && s3 <= 1) w = Math.max(w, Math.abs(t3));
+        if (s3 < 0 || s3 > 1) continue;
+        if (t3 >= 0) { if (t3 < wp) wp = t3; }
+        else if (-t3 < wn) wn = -t3;
       }
-      return w;
+      return [wp === Infinity ? 0 : wp, wn === Infinity ? 0 : wn];
     }
     // resample the (now arc-smooth) extended track at uniform arc steps -
     // more samples than the coarse era so the corridor chains hug the
@@ -3171,113 +4009,125 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       return { x: tpExt[0][0], y: tpExt[0][1], nx: 0, ny: -1 };
     }
-    // per-sample corridor half-width = the cone's REAL local width
-    // (probed at the sample and half a step either side - the ring can
-    // bulge between samples) + margin, so the clip edge always rides
-    // OUTSIDE the casing where the cone has been revealed.
+    // per-sample corridor half-widths = the cone's REAL local edges on EACH
+    // side (wL on the +n side, wR on the -n side), probed at the sample and
+    // half a step either side (the ring can bulge between samples) + margin,
+    // so the clip edge always rides just OUTSIDE the casing where the cone is
+    // revealed. Per-side (asymmetric) is required: a symmetric max-of-both
+    // band would, on the concave flank of a recurve, reach back across the
+    // gap to the far limb - the very balloon ringEdgesAt avoids.
     var CORR_PAD = 16, CORR_MIN = 32;
     var samples = [];
     var sampStep = Ltot / (SAMP - 1);
     for (var sj = 0; sj < SAMP; sj++) {
       var sd = Ltot * sj / (SAMP - 1);
       var sp = pointAt(sd);
-      var wMax = 0;
+      var wLmax = 0, wRmax = 0;
       [-0.5, 0, 0.5].forEach(function (frac) {
         var q = pointAt(sd + frac * sampStep);
-        wMax = Math.max(wMax, ringHalfAt(q.x, q.y, q.nx, q.ny));
+        var e = ringEdgesAt(q.x, q.y, q.nx, q.ny);
+        wLmax = Math.max(wLmax, e[0]);
+        wRmax = Math.max(wRmax, e[1]);
       });
       samples.push({ d: sd, x: sp.x, y: sp.y, nx: sp.nx, ny: sp.ny,
-                     w: Math.max(CORR_MIN, wMax + CORR_PAD) });
+                     wL: Math.max(CORR_MIN, wLmax + CORR_PAD),
+                     wR: Math.max(CORR_MIN, wRmax + CORR_PAD) });
     }
     function halfAt(d) {
-      if (!(sampStep > 0)) return CORR_MIN;  // degenerate-track guard
+      if (!(sampStep > 0)) return [CORR_MIN, CORR_MIN];  // degenerate guard
       d = Math.max(0, Math.min(Ltot, d));
       var j3 = Math.min(SAMP - 2, Math.floor(d / sampStep));
       var f3 = (d - samples[j3].d) / sampStep;
-      return samples[j3].w + (samples[j3 + 1].w - samples[j3].w) * f3;
+      return [samples[j3].wL + (samples[j3 + 1].wL - samples[j3].wL) * f3,
+              samples[j3].wR + (samples[j3 + 1].wR - samples[j3].wR) * f3];
     }
-    var CAPV = 5;                       // leading-edge cap vertices
-    function polyAt(d) {
-      // corridor polygon: left chain forward, leading-edge cap, right
-      // chain back. THE CAP'S MAXIMUM FORWARD EXTENT IS EXACTLY d -
-      // shoulders sit BEHIND at d - 0.45w and the arc rises to the tip
-      // at d. (The first cut bulged the tip 0.55w BEYOND d; the
-      // high-contrast 1.8px boundary line painting inside that bulge
-      // read as an outline ghosting ahead of the pops - the final-gate
-      // bug. Now ink and pops share one front.) Beyond-front samples
-      // collapse onto the shoulders so interpolation unfolds them.
-      var w = halfAt(d);
-      var back = 0.45 * w;
-      var f = pointAt(Math.max(0, d - back));   // shoulder base
-      var ft = pointAt(d);                       // the tip - AT d
-      var shL = [f.x + f.nx * w, f.y + f.ny * w];
-      var shR = [f.x - f.nx * w, f.y - f.ny * w];
+    // REVEAL CLIP corridor vertices (canvas px) revealed from the rear up to
+    // arc d: the L rail forward, the FLAT perpendicular FRONT CUT at d, then
+    // the R rail back. The band is intentionally WIDER than the cone (the
+    // cone's OWN smooth cased edge shows through, never the clip edge); the
+    // lateral edges are static, only the straight front cut advances, so the
+    // growing edge cannot wiggle - the finished cone is simply uncovered.
+    function corridorVerts(d) {
       var L = [], R = [];
       for (var j2 = 0; j2 < SAMP; j2++) {
         var s2 = samples[j2];
-        if (s2.d <= d) {
-          var wj = s2.w;
-          L.push((s2.x + s2.nx * wj).toFixed(1) + " " +
-                 (s2.y + s2.ny * wj).toFixed(1));
-          R.push((s2.x - s2.nx * wj).toFixed(1) + " " +
-                 (s2.y - s2.ny * wj).toFixed(1));
-        } else {
-          L.push(shL[0].toFixed(1) + " " + shL[1].toFixed(1));
-          R.push(shR[0].toFixed(1) + " " + shR[1].toFixed(1));
-        }
+        if (s2.d > d) break;            // samples are arc-ordered
+        L.push([s2.x + s2.nx * s2.wL, s2.y + s2.ny * s2.wL]);
+        R.push([s2.x - s2.nx * s2.wR, s2.y - s2.ny * s2.wR]);
       }
-      var cap = [];
-      for (var cv = 0; cv < CAPV; cv++) {
-        var th = Math.PI * (cv + 1) / (CAPV + 1);
-        // ellipse arc from the LEFT shoulder rising to the TIP AT d,
-        // back down to the RIGHT shoulder - never past d
-        var fwd = Math.sin(th) * back;
-        var lat2 = Math.cos(th) * w;
-        var tx = f.ny, ty = -f.nx;      // (nx,ny) rotated -90 = tangent
-        cap.push((f.x + f.nx * lat2 + tx * fwd).toFixed(1) + " " +
-                 (f.y + f.ny * lat2 + ty * fwd).toFixed(1));
-      }
-      // an SVG path (M..L..Z), not a CSS polygon: Chromium never
-      // repaints style clip-path mutations on SVG containers (probe:
-      // interpolated computed values, 108 painted px mid-growth) -
-      // updating a real <clipPath><path d> invalidates reliably.
-      return "M" + L.concat(cap, R.reverse()).join(" L ") + " Z";
+      var ft = pointAt(d), w = halfAt(d);
+      return L.concat([[ft.x + ft.nx * w[0], ft.y + ft.ny * w[0]],
+                       [ft.x - ft.nx * w[1], ft.y - ft.ny * w[1]]],
+                      R.reverse());
     }
-    // TRAPEZOID ease (S4-AD2 #1): quadratic accel/decel over the first
-    // and last 15%, LINEAR plateau between - the sine ease's peak
-    // velocity (1.57x average) measured 1.63%/frame against the 1.5%
-    // smoothness budget once vsync jitter stacked on it; the trapezoid
-    // plateau holds ~0.98%/frame nominal with gentle ends.
-    var EASE_A = 0.15;
-    var EASE_V = 1 / (1 - EASE_A);          // plateau velocity
+    function polyAt(d) {
+      // An SVG <clipPath><path d>, mutated via setAttribute each tick:
+      // Chromium repaints that reliably, unlike CSS/WAAPI clip animation on
+      // SVG containers.
+      return "M" + corridorVerts(d).map(function (p) {
+        return p[0].toFixed(1) + " " + p[1].toFixed(1);
+      }).join(" L ") + " Z";
+    }
+    function pointInPoly(poly, qx, qy) {
+      var inside = false, n = poly.length, j = n - 1;
+      for (var i = 0; i < n; i++) {
+        var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+        if (((yi > qy) !== (yj > qy)) &&
+            (qx < (xj - xi) * (qy - yi) / (yj - yi + 1e-12) + xi))
+          inside = !inside;
+        j = i;
+      }
+      return inside;
+    }
+    // LOOP/CUSP GUARD: the flat-front corridor can only enclose a TUBE-LIKE
+    // cone. A track that loops back on itself within ~120 h makes the union
+    // cone SELF-OVERLAP (late large disks engulf the early track), and no
+    // single L/front/R band contains it - some cone vertices would stay
+    // clipped through the whole reveal and POP IN at settle. Detect it (cone
+    // vertices outside the FULL-extent corridor) and, like a degenerate
+    // track, ship the finished cone UNCLIPPED - a static cone never pops.
+    // Real JTWC 120 h forecasts are monotone-ish and never trip this.
+    if (!revealDegenerate) {
+      var fullCorr = corridorVerts(Ltot);
+      var outTol = Math.max(2, ringPx.length * 0.01), outN = 0;
+      for (var rg = 0; rg < ringPx.length && outN <= outTol; rg++) {
+        if (!pointInPoly(fullCorr, ringPx[rg][0], ringPx[rg][1])) outN++;
+      }
+      if (outN > outTol) revealDegenerate = true;   // self-overlap -> static
+    }
+    // EASE-OUT (cubic): the front advances quickest just after the hold and
+    // decelerates into the settle, so the cone "draws in" briskly then eases to
+    // rest. Paired with the fixed-timestep accumulator below, the per-frame arc
+    // advance is uniform regardless of vsync jitter (the same de-choppy approach
+    // as the satellite playback). invEaseS is the exact inverse, used to time the
+    // icon pops to the wavefront. Monotonic on [0,1] with easeS(0)=0, easeS(1)=1.
     function easeS(t) {
       t = Math.max(0, Math.min(1, t));
-      if (t < EASE_A) return EASE_V * t * t / (2 * EASE_A);
-      if (t > 1 - EASE_A) {
-        var u = 1 - t;
-        return 1 - EASE_V * u * u / (2 * EASE_A);
-      }
-      return EASE_V * (t - EASE_A / 2);
+      var u = 1 - t;
+      return 1 - u * u * u;
     }
     function invEaseS(f) {
       f = Math.max(0, Math.min(1, f));
-      var fa = EASE_V * EASE_A / 2;         // progress at the corners
-      if (f < fa) return Math.sqrt(2 * EASE_A * f / EASE_V);
-      if (f > 1 - fa) return 1 - Math.sqrt(2 * EASE_A * (1 - f) / EASE_V);
-      return f / EASE_V + EASE_A / 2;
+      return 1 - Math.pow(1 - f, 1 / 3);
     }
 
 
     // ---- the cone (S4-AD1 #8 restyle): crisp navy/white boundary,
     // subtle white-blue interior, NO glow filters -----------------------
-    var dC = coneRing.map(function (c, i) {
-      return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," +
-        Y(c[1]).toFixed(1);
-    }).join(" ") + " Z";
-    var dF = pts.map(function (p, i) {
-      return (i ? "L" : "M") + X(p.lon).toFixed(1) + "," +
-        Y(p.lat).toFixed(1);
-    }).join(" ");
+    // The cone boundary is the SMOOTH dense ring (catmullRomClosed, computed
+    // once above and shared with the reveal corridor) rendered as a fine
+    // polyline - visually a continuous curve through the recurve, no facets,
+    // and every vertex lies ON the curve so the corridor that contains it is
+    // exact. The centre track is densified the same way (open Catmull-Rom)
+    // so the forecast markers still sit exactly on a smoothly curving line.
+    var dC = "M" + ringPx.map(function (q) {
+      return q[0].toFixed(1) + "," + q[1].toFixed(1);
+    }).join(" L ") + " Z";
+    var dF = "M" + catmullRom(pts.map(function (p) {
+      return [X(p.lon), Y(p.lat)];
+    }), PER_SEG).map(function (q) {
+      return q[0].toFixed(1) + "," + q[1].toFixed(1);
+    }).join(" L ");
     // pill ramp gradients (final-gate #5): THE banner/LIVE-STATUS
     // chrome recipe (edge 0/mid 22/accent 50/mid 78/edge 100) as SVG
     // gradients - the pill is ONE rounded rect FILLED by the ramp, so
@@ -3335,6 +4185,32 @@ HTML_TEMPLATE = r"""<!doctype html>
     parts.push(graticule({ W: W, H: H, X: X, Y: Y,
                            lonAt: lonAt, latAt: latAt,
                            x0: fe.x0, y0: fe.y0, x1: fe.x1, y1: fe.y1 }));
+
+    // ---- Phase 4: coastal watches/warnings breakpoint LINES (NHC AL/EP/CP) --
+    // The official NHC TCWW segments (advFull.ww) drawn ABOVE the cone + the
+    // inland fills (which are on the basemap above), sharing the one palette +
+    // legend + toggle. The fills above already populated wwTypes; the lines add
+    // to it. A separate toggleable group outside the reveal clip.
+    // coastal breakpoint lines ON TOP of the fills.
+    var wwSegs = (advFull && advFull.ww) || [];
+    if (wwSegs.length) {
+      var wwParts = [];
+      wwSegs.forEach(function (seg) {
+        var st = WW_STYLE[seg.type] ||
+                 { color: "#cfd8e6", label: (seg.type || "Advisory area") };
+        var d = (seg.geometry || []).map(function (c, i) {
+          return (i ? "L" : "M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1);
+        }).join(" ");
+        if (!d) return;
+        wwTypes[seg.type] = st;   // legend advertises only types that drew a path
+        wwParts.push('<path class="ww-cas" d="' + d + '" stroke-width="7"/>');
+        wwParts.push('<path class="ww-lin" d="' + d + '" stroke="' +
+                     st.color + '" stroke-width="4"/>');
+      });
+      parts.push('<g class="ac-ww" id="ac-ww-group"' +
+                 (wwShown ? '' : ' style="display:none"') + '>' +
+                 wwParts.join("") + '</g>');
+    }
 
     // ---- icons + placards (S4-AD1 #4/5/6/7) --------------------------
     // collision-aware placard layout: alternate sides of the track,
@@ -3551,6 +4427,38 @@ HTML_TEMPLATE = r"""<!doctype html>
     svg.setAttribute("preserveAspectRatio", "xMidYMid slice");
     svg.innerHTML = parts.join("");
 
+    // Phase 4: WW legend + toggle - shown only when segments are present.
+    // onchange (not addEventListener) so re-rendering the tab never stacks
+    // duplicate handlers.
+    (function () {
+      var bar = document.getElementById("advcone-ww");
+      var leg = document.getElementById("advcone-ww-legend");
+      var chk = document.getElementById("advcone-ww-chk");
+      if (!bar || !leg || !chk) return;
+      var types = Object.keys(wwTypes);
+      if (!types.length) { bar.hidden = true; leg.innerHTML = ""; return; }
+      var ORDER = ["TS_WATCH", "TS_WARNING", "HU_WATCH", "HU_WARNING",
+                   "SS_WATCH", "SS_WARNING"];
+      types.sort(function (a, b) {
+        var ia = ORDER.indexOf(a), ib = ORDER.indexOf(b);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      leg.innerHTML = types.map(function (t) {
+        var st = wwTypes[t];
+        return '<span class="ww-lg"><span class="ww-sw" style="background:' +
+          st.color + '"></span>' + st.label + '</span>';
+      }).join("");
+      bar.hidden = false;
+      chk.checked = wwShown;
+      chk.onchange = function () {
+        wwShown = chk.checked;
+        // the toggle drives the coastal-line group (the inland fill layer was
+        // removed in v3).
+        var g = document.getElementById("ac-ww-group");
+        if (g) g.style.display = wwShown ? "" : "none";
+      };
+    })();
+
     // re-fit on resize / orientation change (the shared resize handler calls
     // svg._refit): recompute the fill extent + restyle the viewBox, ocean,
     // and graticule WITHOUT touching the cone reveal/icons.
@@ -3585,11 +4493,26 @@ HTML_TEMPLATE = r"""<!doctype html>
     } else if (!reduced && grp.animate) {
       revealPath.setAttribute("d", polyAt(0));
       grp.setAttribute("data-reveal", "animated");
-      var t0 = performance.now() + HOLD_MS;
-      var tickFn = function () {
-        var tt = (performance.now() - t0) / GROW_MS;
+      // FIXED-TIMESTEP reveal clock (same de-choppy approach as the satellite
+      // playback): accumulate real elapsed time and advance the simulated clock
+      // in fixed FRAME_MS chunks, so the eased arc progress advances by a uniform
+      // amount per step regardless of vsync jitter (the variable-timestep version
+      // read raw performance.now() and stepped under frame-interval noise). The
+      // accumulator is clamped so a tab-switch stall can't fast-forward / spiral.
+      // Only the clip's flat front moves; the cone geometry never rebuilds.
+      var FRAME_MS = 1000 / 60;
+      var simMs = -HOLD_MS;          // hold before the front starts to grow
+      var prevTs = null, acc = 0;
+      var tickFn = function (ts) {
+        if (prevTs === null) prevTs = ts;
+        acc += Math.min(100, ts - prevTs);   // clamp: never advance > ~6 frames at once
+        prevTs = ts;
+        while (acc >= FRAME_MS) { simMs += FRAME_MS; acc -= FRAME_MS; }
+        var tt = simMs / GROW_MS;
         if (tt >= 1) {
+          revealPath.setAttribute("d", polyAt(Ltot));   // pin the full cone first
           grp.removeAttribute("clip-path");
+          grp.setAttribute("data-reveal", "final");
           acRaf = null;
           return;
         }
@@ -3617,8 +4540,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         grp.setAttribute("clip-path", "url(#ac-reveal-clip)");
         revealPath.setAttribute("d", polyAt(d));
         var p = pointAt(d);
+        var hw = halfAt(d);            // [wL, wR] - report the wider side
         return { d: d, Ltot: Ltot, tipX: p.x, tipY: p.y,
-                 w: halfAt(d), W: W, H: H };
+                 w: Math.max(hw[0], hw[1]), W: W, H: H };
       },
       settle: function () {
         if (acRaf) { cancelAnimationFrame(acRaf); acRaf = null; }
@@ -3808,10 +4732,19 @@ HTML_TEMPLATE = r"""<!doctype html>
           "automatically within a few minutes)"
         : "(no advisory text product is published for this storm)");
     var host = document.getElementById("advtext-tabs");
+    // Source-aware product labels (CYCLOLAB_DESIGN §8.4): JTWC ships a Warning +
+    // Prognostic Reasoning; NHC a Public Advisory + Discussion. Same tcp/tcd
+    // slots + playback - only the button text differs.
+    var jtwc = !!(advFull && advFull.source === "jtwc");
     for (var i = 0; i < host.children.length; i++) {
       var b = host.children[i];
-      b.classList.toggle("active",
-                         b.getAttribute("data-prod") === advTextProd);
+      var prod = b.getAttribute("data-prod");
+      b.classList.toggle("active", prod === advTextProd);
+      if (prod === "tcp") {
+        b.textContent = jtwc ? "JTWC Warning" : "Public Advisory";
+      } else if (prod === "tcd") {
+        b.textContent = jtwc ? "Prognostic Reasoning" : "Discussion";
+      }
     }
   }
   document.getElementById("advtext-tabs").addEventListener("click",
@@ -3850,9 +4783,108 @@ HTML_TEMPLATE = r"""<!doctype html>
     s.onerror = onerr;
     document.head.appendChild(s);
   }
+
+  // ---- Recon mount (SAME viewer component as the main /recon/ page) -------
+  // Lazy-load the shared TATRegions basemap helper + the ReconViewer class
+  // from the main site, then mount it LOCKED to this storm (atcf_long matches
+  // the recon manifest slug; name is the fallback match). The viewer hydrates
+  // from CDN/recon/ - the isolated aircraft-recon feed.
+  var reconViewer = null;
+  var ascatViewer = null;
+  function _loadScript(src, ready, cb, onerr) {
+    if (ready()) { cb(); return; }
+    var s = document.createElement("script");
+    s.src = src;
+    s.onload = function () { ready() ? cb() : onerr(); };
+    s.onerror = onerr;
+    document.head.appendChild(s);
+  }
+  // ---- Overview stacking map (lazy-loaded reusable module) ----
+  var clMap = null;
+  function initOverviewMap() {
+    var root = document.getElementById("overview-map");
+    if (!root || clMap) return;
+    var storm = lastStorm || (typeof BAKED !== "undefined" ? BAKED : null);
+    if (!storm) return;
+    _loadScript(SITE_BASE + "/cyclolab_map.js",
+      function () { return !!window.CycloLabMap; },
+      function () {
+        try { clMap = new window.CycloLabMap(root, { storm: storm, timeMode: settings.mapTime }); }
+        catch (e) { if (window.console) console.warn("overview map failed", e); }
+      },
+      function () { if (window.console) console.warn("cyclolab_map.js failed to load"); });
+  }
+  function initRecon() {
+    var root = document.getElementById("recon-viewer");
+    var status = document.getElementById("recon-status");
+    function fail() {
+      if (status) status.querySelector("span").textContent =
+        "Recon viewer failed to load - reload to retry.";
+    }
+    _loadScript(SITE_BASE + "/models/regions.js",
+      function () { return !!window.TATRegions; },
+      function () {
+        _loadScript(SITE_BASE + "/recon/recon.js",
+          function () { return !!window.ReconViewer; },
+          function () {
+            try {
+              var nmEl = document.getElementById("storm-name");
+              reconViewer = new window.ReconViewer(root, {
+                base: CDN + "/recon",
+                stormLock: FLOATER_ID || SID,
+                stormName: nmEl ? (nmEl.textContent || "").trim() : "",
+                startTab: "storms"
+              });
+            } catch (e) { fail(); }
+          }, fail);
+      }, fail);
+  }
+  // ---- ASCAT mount (SAME viewer component as the main /ascat/ page) --------
+  // Lazy-load TATRegions + the shared AscatViewer from the main site, then mount
+  // it LOCKED to this storm (the viewer filters the manifest to passes tagged
+  // with this storm and centers on it). Hydrates from CDN/ascat/ - the isolated
+  // scatterometer feed; never touches the track/ACE/climatology pipeline.
+  function initAscat() {
+    var root = document.getElementById("ascat-viewer");
+    var status = document.getElementById("ascat-status");
+    function fail() {
+      if (status) status.querySelector("span").textContent =
+        "ASCAT viewer failed to load - reload to retry.";
+    }
+    _loadScript(SITE_BASE + "/models/regions.js",
+      function () { return !!window.TATRegions; },
+      function () {
+        _loadScript(SITE_BASE + "/ascat/ascat.js",
+          function () { return !!window.AscatViewer; },
+          function () {
+            try {
+              ascatViewer = new window.AscatViewer(root, {
+                base: CDN + "/ascat",
+                stormLock: FLOATER_ID || SID
+              });
+            } catch (e) { fail(); }
+          }, fail);
+      }, fail);
+  }
   function initModels() {
     function cl(id) { return document.getElementById("cl-hafs-" + id); }
     var status = cl("status");
+    // PART 1B - invests (and any system with no HAFS run) carry an empty
+    // HAFS_ID (storm_ids sets hafs_id="" for the 90-99 numbers). A null/empty
+    // stormLock is the /models/-page "show every storm" mode, so constructing
+    // the viewer here would silently mount the FIRST storm in the global HAFS
+    // manifest - i.e. ANOTHER storm's data. There is no HAFS for an invest, so
+    // show the empty stub and never build the viewer (the card's design
+    // contract: invests/PTCs get "HAFS gracefully absent"). A PTC keeps a real
+    // designated number, so HAFS_ID is non-empty and HAFS still runs for it.
+    if (!HAFS_ID) {
+      if (status) status.style.display = "none";
+      var clEmpty = cl("empty"); if (clEmpty) clEmpty.style.display = "block";
+      ["stage", "controls", "player", "caption", "hours"].forEach(function (id) {
+        var el = cl(id); if (el) el.style.display = "none";
+      });
+      return;
+    }
     status.style.display = "flex";
     function fail() {
       status.querySelector("span").textContent =
@@ -3900,7 +4932,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   var sat = { man: null, band: null, frames: [], idx: 0, playing: false,
               timer: null, gen: 0, preloaded: {},
               mode: null, bmp: {}, bmpKeys: [], raf: null, lastT: 0,
-              holdT0: 0, presented: [], speed: 1,
+              holdT0: 0, presented: [], speed: 2,
               // auto-refresh (the manifest re-poll): pollTimer = the next
               // scheduled fetch; inactive = the floater stopped producing
               // frames (storm dropped from the index OR newest frame stale).
@@ -3976,10 +5008,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   function satBlit(bm) {
     var cv = satEl("canvas");
-    if (cv.width !== bm.width || cv.height !== bm.height) {
+    // Pin the canvas to a STABLE size and SCALE each frame to fill it. The
+    // floater occasionally emits frames whose height wobbles by ~1px mid-loop
+    // (a render-extent rounding flip, e.g. 1056x1056 <-> 1056x1055 across a
+    // contiguous block, in every band) -- re-sizing the canvas to each frame's
+    // native dimensions made the live loop visibly resize/reflow + jump on
+    // those boundaries (the "seizure"). Re-fix the size only on a REAL change
+    // (band switch / >2px); a 1px wobble is then absorbed by a sub-pixel scale,
+    // never a layout resize. satFrameToCanvas already scale-fits, so the GIF
+    // export was immune -- this aligns the live loop with it.
+    if (!cv.width || Math.abs(cv.width - bm.width) > 2 ||
+        Math.abs(cv.height - bm.height) > 2) {
       cv.width = bm.width; cv.height = bm.height;
     }
-    cv.getContext("2d").drawImage(bm, 0, 0);
+    cv.getContext("2d").drawImage(bm, 0, 0, cv.width, cv.height);
   }
   function satReadout(i) {
     var f = sat.frames[i];
@@ -4170,7 +5212,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     resolve: function (top) {
       var storms = (top && top.storms) || [];
       for (var i = 0; i < storms.length; i++) {
-        if (String(storms[i].id).toLowerCase() === FLOATER_ID &&
+        // FLOATER_ID is the bare atcf_long (e.g. wp072026). The floater index
+        // keys NHC storms by that bare id but JTWC/WP storms by the agency-
+        // prefixed sid (JTWC_WP072026) and invests by an unprefixed sid
+        // (WP912026), so strip a leading agency token before comparing. The
+        // bare match alone left every WPAC/JTWC named storm's Satellite tab
+        // empty (it never resolved its live floater). Match on slug too as a
+        // belt-and-suspenders against any id-format drift.
+        var fid = String(storms[i].id).toLowerCase();
+        if ((fid === FLOATER_ID
+             || fid.replace(/^[a-z]+_/, "") === FLOATER_ID
+             || String(storms[i].slug || "").toLowerCase() === FLOATER_SLUG) &&
             storms[i].manifest) {
           return CDN + "/" + storms[i].manifest;
         }
@@ -4209,7 +5261,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
       host.appendChild(b);
     });
-    satSetSpeed(1);
+    satSetSpeed(2);   // default playback speed: 2x (matches the /satellite/ viewers)
   }
   function satNudgeSpeed(dir) {
     var i = SAT_SPEEDS.indexOf(sat.speed);
@@ -4657,7 +5709,337 @@ HTML_TEMPLATE = r"""<!doctype html>
                    renderTrackPlot: function (s) {
                      return renderTrackPlot(s || lastStorm); },
                    renderSwathPlot: function (s) {
-                     return renderSwathPlot(s || lastStorm); } };
+                     return renderSwathPlot(s || lastStorm); },
+                   // live PTC identity hooks (tests + ops)
+                   isPtc: function () { return IS_PTC; },
+                   ptcNow: function (s) { return ptcNow(s || lastStorm); } };
+})();
+
+// ---- Right-click -> copy an overview plot as a shareable PNG -----------------
+// Every hand-rolled SVG overview plot (cone, intensity, wind & pressure, track,
+// wind swath) + the SST hero image is copyable by RIGHT-CLICK: render to a @2x
+// PNG carrying a title header + the @WeathermanAAA mark, put it on the clipboard
+// as image/png (ClipboardItem), and toast "Copied". Safari (no image clipboard)
+// downloads the PNG + toasts "Downloaded" -- never a silent fail. cors-safe
+// (?cors=1, like the GIF export) so the canvas is not tainted. Only these plots
+// opt in (cl-copyable) -- normal right-click everywhere else is untouched.
+(function initPlotCopy() {
+  var MARK = "@WeathermanAAA";
+  var SITE = "cyclolab.triple-a-tropics.com";
+  var SC = 2;                  // @2x -- it's a shareable
+  var HEAD = 30, FOOT = 26;    // logical-px header/footer bands (x SC on canvas)
+  var FONT = "system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
+  // kind: "stage" = SVG + positioned HTML overlays (capture the whole stage so
+  // the title lockup / legends / stat box come along); "svg" = self-contained
+  // SVG (all chrome is in-SVG); "hero" = the SST hero (a baked <img> + overlays).
+  var PLOTS = [["advcone", "stage"], ["trackplot", "stage"], ["swathplot", "stage"],
+               ["intensity", "svg"], ["chart", "svg"], ["sst-hero-img", "hero"]];
+  // Clean section titles for the header band (track/swath have no card <h3> --
+  // their head lives in the in-stage lockup, which the band must not duplicate).
+  var TITLES = {advcone: "Forecast cone", intensity: "Intensity forecast",
+    chart: "Wind & pressure", trackplot: "Track history",
+    swathplot: "Wind swath", "sst-hero-img": "Sea surface temperature"};
+  var STYLE_PROPS = ["fill", "fill-opacity", "stroke", "stroke-width",
+    "stroke-dasharray", "stroke-linecap", "stroke-linejoin", "stroke-opacity",
+    "opacity", "font-family", "font-size", "font-weight", "font-style",
+    "text-anchor", "letter-spacing", "color", "paint-order"];
+
+  function toast(msg) {
+    var t = document.getElementById("cl-toast");
+    if (!t) {
+      t = document.createElement("div"); t.id = "cl-toast";
+      t.className = "cl-toast"; document.body.appendChild(t);
+    }
+    t.textContent = msg; t.classList.add("show");
+    clearTimeout(t._h);
+    t._h = setTimeout(function () { t.classList.remove("show"); }, 1900);
+  }
+  function titleFor(el) {
+    return TITLES[el.id] || el.getAttribute("aria-label") || "CycloLab";
+  }
+  function stageFor(el) {
+    return (el.closest && (el.closest(".adv-cone-stage") ||
+      el.closest(".map-stage") || el.closest(".sst-hero"))) || null;
+  }
+  // The page CSS, MINUS @font-face + @media (brace-balanced): no external font
+  // fetch (-> no canvas taint) and no responsive reflow inside the foreignObject.
+  function stripAt(css, at) {
+    var out = "", i = 0;
+    while (i < css.length) {
+      var idx = css.indexOf(at, i);
+      if (idx < 0) { out += css.slice(i); break; }
+      out += css.slice(i, idx);
+      var b = css.indexOf("{", idx);
+      if (b < 0) { i = idx + at.length; continue; }
+      var depth = 1, j = b + 1;
+      while (j < css.length && depth > 0) {
+        if (css[j] === "{") depth++; else if (css[j] === "}") depth--;
+        j++;
+      }
+      i = j;
+    }
+    return out;
+  }
+  var _css = null;
+  function pageCss() {
+    if (_css != null) return _css;
+    var raw = "", ss = document.querySelectorAll("style");
+    for (var i = 0; i < ss.length; i++) raw += ss[i].textContent + "\n";
+    _css = stripAt(stripAt(raw, "@font-face"), "@media");
+    return _css;
+  }
+  // Inline the live computed styles onto the clone -- the plots style via page
+  // CSS classes (fills/fonts), which a standalone serialized SVG would lose.
+  function inlineStyles(src, clone) {
+    if (src.nodeType !== 1) return;
+    var cs = window.getComputedStyle(src), st = "";
+    for (var i = 0; i < STYLE_PROPS.length; i++) {
+      var v = cs.getPropertyValue(STYLE_PROPS[i]);
+      if (v) st += STYLE_PROPS[i] + ":" + v + ";";
+    }
+    clone.setAttribute("style", st + (clone.getAttribute("style") || ""));
+    var sc = src.children || [], cc = clone.children || [];
+    for (var j = 0; j < sc.length && j < cc.length; j++) inlineStyles(sc[j], cc[j]);
+  }
+  function svgDims(svg) {
+    var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+    if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) return [vb[2], vb[3]];
+    var r = svg.getBoundingClientRect(); return [r.width || 1000, r.height || 600];
+  }
+  function compose(img, sw, sh, title, done, guard) {
+    var hb = HEAD * SC, fb = FOOT * SC, pw = sw * SC, ph = sh * SC;
+    var cv = document.createElement("canvas");
+    cv.width = pw; cv.height = hb + ph + fb;
+    var ctx = cv.getContext("2d");
+    ctx.fillStyle = "#0b1322"; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#eaf2ff"; ctx.textAlign = "left";
+    ctx.font = "700 " + (15 * SC) + "px " + FONT;
+    ctx.fillText(title, 11 * SC, hb / 2);
+    ctx.fillStyle = "#7fa6d8"; ctx.textAlign = "right";
+    ctx.font = "600 " + (11 * SC) + "px " + FONT;
+    ctx.fillText("CycloLab", pw - 11 * SC, hb / 2);
+    try { ctx.drawImage(img, 0, hb, pw, ph); } catch (e) { done(null); return; }
+    // guard (foreignObject path only): a Safari blank-render or a taint must NOT
+    // silently deliver a blank/failed PNG -- bail to the caller's fallback.
+    // getImageData throws on a tainted canvas; a uniform mid-strip = a blank
+    // render (a real plot's middle always crosses content).
+    if (guard) {
+      try {
+        var mid = ctx.getImageData(0, hb + Math.floor(ph / 2), pw, 2).data;
+        var uniform = true;
+        for (var k = 4; k < mid.length; k += 4) {
+          if (mid[k] !== mid[0] || mid[k + 1] !== mid[1] || mid[k + 2] !== mid[2]) {
+            uniform = false; break;
+          }
+        }
+        if (uniform) { done(null); return; }
+      } catch (e) { done(null); return; }
+    }
+    var fy = hb + ph + fb / 2;
+    ctx.fillStyle = "#7fa6d8"; ctx.textAlign = "left";
+    ctx.font = "600 " + (11 * SC) + "px " + FONT;
+    ctx.fillText(SITE, 11 * SC, fy);
+    ctx.fillStyle = "#eaf2ff"; ctx.textAlign = "right";
+    ctx.font = "700 " + (12 * SC) + "px " + FONT;
+    ctx.fillText(MARK, pw - 11 * SC, fy);
+    try { cv.toBlob(function (b) { done(b); }, "image/png"); }
+    catch (e) { done(null); }      // tainted canvas
+  }
+  function download(blob, title) {
+    if (!blob) { toast("Copy failed"); return; }
+    var name = "cyclolab_" + String(title).toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") + ".png";
+    var u = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = u; a.download = name; document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(u); }, 4000);
+    toast("Downloaded");
+  }
+  // One copy path for desktop right-click AND mobile long-press. The clipboard
+  // write is registered SYNCHRONOUSLY in the gesture with a Promise<Blob> (a lazy
+  // ClipboardItem): the render resolves async WITHOUT losing the user gesture,
+  // which is what makes image-copy work on iOS Safari + Android (and hardens
+  // desktop Safari). Where image-clipboard is unsupported, or it rejects, the
+  // same blob is downloaded -- so mobile always lands on copy OR download.
+  function doCopy(el, kind, stage) {
+    var title = titleFor(el), p;
+    try { p = pngBlob(el, kind, stage); } catch (e) { toast("Copy failed"); return; }
+    function dl() { p.then(function (b) { download(b, title); })
+      .catch(function () { toast("Copy failed"); }); }
+    if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+      navigator.clipboard.write([new ClipboardItem({ "image/png": p })])
+        .then(function () { toast("Copied"); })
+        .catch(dl);                       // unsupported/denied image write -> download
+    } else { dl(); }
+  }
+  // Produce the plot PNG as a Promise<Blob>: the rich foreignObject capture for
+  // overlay/hero plots, the self-contained SVG for the rest; on FO failure it
+  // falls back to the prior SVG-only / bare-img render so a copy is never WORSE
+  // than before. Rejects only on total failure.
+  function pngBlob(el, kind, stage) {
+    var title = titleFor(el);
+    return new Promise(function (resolve, reject) {
+      function ok(b) { if (b) resolve(b); else reject(new Error("copy failed")); }
+      if (kind === "hero")
+        heroBlob(stage || el, el, title, function (b) { if (b) resolve(b); else imgBlob(el, title, ok); });
+      else if (kind === "stage" && stage)
+        stageBlob(stage, title, null, function (b) { if (b) resolve(b); else svgBlob(el, title, ok); });
+      else
+        svgBlob(el, title, ok);
+    });
+  }
+  // --- blob producers: render the plot, then call done(blob|null). ---
+  function svgBlob(svg, title, done) {
+    var d = svgDims(svg), sw = d[0], sh = d[1];
+    var clone = svg.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    inlineStyles(svg, clone);
+    if (!clone.getAttribute("viewBox")) clone.setAttribute("viewBox", "0 0 " + sw + " " + sh);
+    clone.setAttribute("width", sw * SC); clone.setAttribute("height", sh * SC);
+    var xml = new XMLSerializer().serializeToString(clone);
+    var img = new Image();
+    img.onload = function () { compose(img, sw, sh, title, done); };
+    img.onerror = function () { done(null); };
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
+  }
+  function imgBlob(el, title, done) {
+    var src = el.currentSrc || el.src;
+    if (!src) { done(null); return; }
+    var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1";
+    var img = new Image(); img.crossOrigin = "anonymous";
+    img.onload = function () {
+      var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      compose(img, w / SC, h / SC, title, function (b) {
+        if (b) done(b);
+        else fetch(u, { mode: "cors" }).then(function (r) { return r.blob(); })
+          .then(function (b2) { done(b2); })   // tainted -> raw PNG blob
+          .catch(function () { done(null); });
+      });
+    };
+    img.onerror = function () { done(null); };
+    img.src = u;
+  }
+  // Capture the WHOLE stage (SVG + the positioned HTML overlays -- title lockup,
+  // wind-key/SSHS legend, stat box, marker glyphs) via a foreignObject clone, so
+  // the copied PNG matches what's on screen. prep(clone) may mutate the clone
+  // (the SST hero inlines its <img> as a data-URL). On ANY failure (Safari's
+  // foreignObject->canvas is unreliable; a taint; an empty stage) it calls
+  // done(null) so the caller can fall back to the prior SVG-only / bare-img path
+  // -- the copy is never WORSE than before, only better.
+  function stageBlob(stage, title, prep, done) {
+    var r = stage.getBoundingClientRect();
+    var W = Math.max(1, Math.round(r.width)), H = Math.max(1, Math.round(r.height));
+    if (W < 4 || H < 4) { done(null); return; }
+    var clone = stage.cloneNode(true);
+    if (prep) prep(clone);
+    // Pin the inner plot SVG to the stage box: #trackplot/#swathplot are sized in
+    // vh (clamp(...,56vh,...)), which re-resolves against the FO viewport (not the
+    // page) and would shrink the map away from its overlays. 100% tracks the
+    // pinned stage. (advcone is already height:100%; the SST hero has no inner svg.)
+    var isvg = clone.querySelector && clone.querySelector("svg");
+    if (isvg) isvg.style.cssText = "width:100%;height:100%;display:block;" + (isvg.style.cssText || "");
+    // Pin exact px so the foreignObject doesn't reflow on vh/clamp/% rules.
+    clone.style.cssText = "position:relative;width:" + W + "px;height:" + H +
+      "px;margin:0;overflow:hidden;" + (clone.style.cssText || "");
+    // Carry the live per-category custom props onto the wrapper: the cloned
+    // overlays use var(--cat-accent)/--ac-rail etc. (set on <html data-cat=...>),
+    // which would otherwise fall back to the :root default inside the FO.
+    var ds = window.getComputedStyle(document.documentElement), vars = "";
+    ["--cat-accent", "--cat-ink", "--cat-ramp", "--ac-rail"].forEach(function (k) {
+      var v = ds.getPropertyValue(k); if (v) vars += k + ":" + v.trim() + ";";
+    });
+    // Suppress animations/transitions: a data:-URL SVG renders CSS animations
+    // FROZEN at t=0, so entrance anims (.ac-icon ac-pop -> scale(0)/opacity(0))
+    // would capture INVISIBLE; the reduced-motion escape lives in a stripped
+    // @media. animation:none -> each element renders at its settled base.
+    var settle = "*{animation:none!important;transition:none!important}";
+    var body = '<div xmlns="http://www.w3.org/1999/xhtml" style="width:' + W +
+      'px;height:' + H + 'px;overflow:hidden;background:#101a2c;' + vars + '"><style>' +
+      pageCss() + settle + '</style>' + new XMLSerializer().serializeToString(clone) + '</div>';
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (W * SC) +
+      '" height="' + (H * SC) + '" viewBox="0 0 ' + W + ' ' + H +
+      '"><foreignObject width="' + W + '" height="' + H + '">' + body +
+      '</foreignObject></svg>';
+    var img = new Image();
+    img.onload = function () {
+      if (!img.naturalWidth || !img.naturalHeight) { done(null); return; }  // Safari blank-load
+      compose(img, W, H, title, done, true);
+    };
+    img.onerror = function () { done(null); };
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  }
+  // Hero (SST): inline the PNG as a data-URL so the foreignObject has no external
+  // fetch (a cross-origin <img> inside a foreignObject taints the canvas), then
+  // capture the stage. On any failure done(null) -> caller falls back to imgBlob.
+  function heroBlob(stage, imgEl, title, done) {
+    var src = imgEl.currentSrc || imgEl.src || "";
+    if (!src) { done(null); return; }
+    var u = src + (src.indexOf("?") >= 0 ? "&" : "?") + "cors=1";
+    fetch(u, { mode: "cors" }).then(function (r) {
+      if (!r.ok) throw new Error("hero fetch " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      var fr = new FileReader();
+      fr.onload = function () {
+        var dataUrl = fr.result;
+        stageBlob(stage, title, function (clone) {
+          var imgs = clone.querySelectorAll ? clone.querySelectorAll("img") : [];
+          for (var i = 0; i < imgs.length; i++) {
+            imgs[i].setAttribute("src", dataUrl);
+            imgs[i].removeAttribute("srcset");
+            imgs[i].removeAttribute("crossorigin");
+          }
+        }, done);
+      };
+      fr.onerror = function () { done(null); };
+      fr.readAsDataURL(blob);
+    }).catch(function () { done(null); });
+  }
+  function wire() {
+    PLOTS.forEach(function (p) {
+      var el = document.getElementById(p[0]);
+      if (!el) return;
+      var kind = p[1], stage = stageFor(el);
+      // Wire the gesture on the STAGE for overlay/hero plots (it catches a
+      // right-click anywhere in the stage, incl. one that falls THROUGH the
+      // pointer-events:none SST img); on the SVG itself for self-contained plots.
+      var target = (kind === "svg" || !stage) ? el : stage;
+      target.classList.add("cl-copyable");
+      // Desktop: right-click.
+      target.addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+        doCopy(el, kind, stage);
+      });
+      // Mobile: long-press (parallels right-click; no on-plot UI). Fire on
+      // touchend after a stationary >=450ms hold, so the clipboard write lands
+      // in a real user-gesture event -- a setTimeout fire would NOT count as
+      // one. A touchmove past a few px = a scroll/pan -> cancel. CSS
+      // (-webkit-touch-callout:none on .cl-copyable) hides the iOS image-callout
+      // during the hold.
+      var t0 = 0, x0 = 0, y0 = 0, moved = false;
+      target.addEventListener("touchstart", function (e) {
+        if (!e.touches || e.touches.length !== 1) { t0 = 0; return; }
+        moved = false; t0 = Date.now();
+        x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+      }, { passive: true });
+      target.addEventListener("touchmove", function (e) {
+        if (!t0 || !e.touches || !e.touches.length) return;
+        if (Math.abs(e.touches[0].clientX - x0) > 10 ||
+            Math.abs(e.touches[0].clientY - y0) > 10) { moved = true; t0 = 0; }
+      }, { passive: true });
+      target.addEventListener("touchend", function (e) {
+        var held = t0 && !moved && (Date.now() - t0) >= 450;
+        t0 = 0;
+        if (!held) return;
+        e.preventDefault();          // swallow the trailing click / ghost-tap
+        doCopy(el, kind, stage);
+      });
+      target.addEventListener("touchcancel", function () { t0 = 0; moved = false; });
+    });
+  }
+  if (document.readyState !== "loading") wire();
+  else document.addEventListener("DOMContentLoaded", wire);
 })();
 </script>
 </body>
@@ -4675,6 +6057,50 @@ def _type_word(cat: str, basin: str) -> str:
     if cat == "TS":
         return "Tropical Storm"
     return "Typhoon" if basin == "WP" else "Hurricane"
+
+
+_PTC_NUMBER_WORDS = None
+
+
+def _ptc_number_words() -> frozenset:
+    """NHC's spelled-out designation numbers ("ONE".."FIFTY-NINE") - the
+    placeholder name a depression/PTC wears before it is named."""
+    global _PTC_NUMBER_WORDS
+    if _PTC_NUMBER_WORDS is None:
+        ones = ["", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN",
+                "EIGHT", "NINE", "TEN", "ELEVEN", "TWELVE", "THIRTEEN",
+                "FOURTEEN", "FIFTEEN", "SIXTEEN", "SEVENTEEN", "EIGHTEEN",
+                "NINETEEN"]
+        tens = ["", "", "TWENTY", "THIRTY", "FORTY", "FIFTY"]
+        s = set()
+        for n in range(1, 60):
+            s.add(ones[n] if n < 20
+                  else tens[n // 10] + (("-" + ones[n % 10]) if n % 10 else ""))
+        _PTC_NUMBER_WORDS = frozenset(s)
+    return _PTC_NUMBER_WORDS
+
+
+def _is_named_tc(storm: dict) -> bool:
+    """A genuine named/designated tropical cyclone: TS-or-stronger SSHWS AND a
+    REAL NHC name (not the "ONE"/"TWO" designation placeholder, an invest, or
+    the raw sid). VETOES the is_ptc dress - a named TC is never "potential", so
+    a fresh bake follows NHC the moment it names a system even if ace_core's
+    is_ptc lags. Durable mirror of the inline JS isNamedTC() - keep in lock-step."""
+    cat = (storm.get("current_category") or "").upper()
+    if cat != "TS" and not (
+            len(cat) == 2 and cat[0] == "C" and cat[1] in "12345"):
+        return False
+    nm = (storm.get("name") or "").strip().upper()
+    if not nm or not nm[0].isalpha():
+        return False
+    # letters / space / hyphen / apostrophe only -> a real name (the raw sid
+    # carries digits + underscore and is excluded here; the ace_core v0.8.2
+    # numeric designations "01E"/"10W" are digit-leading -> excluded by the
+    # nm[0].isalpha() guard above, so they never read as a real name).
+    if not all(c.isalpha() or c in " -'" for c in nm):
+        return False
+    return (nm not in _ptc_number_words()
+            and nm not in {"INVEST", "UNNAMED", "NAMELESS"})
 
 
 def _sshs_label(cat: str) -> str:
@@ -4707,6 +6133,18 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     base of the per-storm SST hero layers (final-gate-2 #1); default =
     the live Worker path."""
     ids = parse_sid(storm["sid"])
+    is_invest = ids.is_invest or bool(storm.get("is_invest"))
+    # A Potential Tropical Cyclone (ace_core is_ptc): a DESIGNATED system NHC is
+    # advising on while still a DB/DS disturbance. It wears the INVEST visual
+    # identity (grey + red X + formation pill) under its REAL designation, but —
+    # unlike a 90-99 invest — KEEPS its cone + advisories + Models tab, because
+    # NHC is actively advising on it. is_invest and is_ptc are mutually exclusive.
+    # is_ptc follows the LIVE classification, never a stale flag: a NAMED TS+
+    # system is never "potential", so the bake sheds the PTC dress the moment
+    # NHC names it - even if the feed's is_ptc still lags (mirror of the inline
+    # JS ptcNow()/isNamedTC()).
+    is_ptc = (bool(storm.get("is_ptc")) and not is_invest
+              and not _is_named_tc(storm))
     cat = storm.get("current_category") or "TD"
     if cat not in CAT_TOKENS:
         cat = "TD"
@@ -4716,7 +6154,19 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     chip = {"TD": "Tropical Depression", "TS": "Tropical Storm",
             "C1": "Category 1", "C2": "Category 2", "C3": "Category 3",
             "C4": "Category 4", "C5": "Category 5"}.get(cat, cat)
-    type_word = _type_word(cat, ids.basin)
+    # Stage C - an invest gets a GREY identity (data-invest CSS overrides the
+    # category vars) + a red-X glyph; "INVEST AREA" not a category type word. A
+    # PTC reuses that grey/X identity (data-ptc) but its banner reads the NHC
+    # classification "POTENTIAL TROPICAL CYCLONE", NOT a category-derived word.
+    if is_ptc:
+        type_word = "POTENTIAL TROPICAL CYCLONE"
+    elif is_invest:
+        type_word = "INVEST AREA"
+    else:
+        type_word = _type_word(cat, ids.basin)
+    # No category chip for an invest OR a PTC (a PTC accrues no category), nor
+    # for a plain TD/TS (chip is reserved for hurricanes C1-C5).
+    chip_hidden = is_invest or is_ptc or cat in ("TD", "TS")
     og_title = f"{name} · {chip} · CycloLab"
     bits = []
     if wind is not None:
@@ -4735,8 +6185,10 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__CAT_CSS__", cat_css())
             .replace("__HPATH__", HURRICANE_PATH)
             .replace("__CAT__", cat)
-            .replace("__CAT_LABEL__", _esc(_sshs_label(cat)))
-            .replace("__CAT_ODO__", _odo_static(_sshs_label(cat)))
+            .replace("__CAT_LABEL__",
+                     _esc("PTC" if is_ptc else _sshs_label(cat)))
+            .replace("__CAT_ODO__",
+                     _odo_static("PTC" if is_ptc else _sshs_label(cat)))
             .replace("__VMAX_A11Y__", _esc(
                 round(float(wind)) if wind is not None else "—"))
             .replace("__VMAX_ODO__", _odo_static(
@@ -4745,11 +6197,14 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__TYPE_WORD__", _esc(type_word.upper()))
             .replace("__CHIP__", _esc(chip))
             .replace("__CHIP_STYLE__",
-                     ' style="display:none"' if cat in ("TD", "TS") else "")
+                     ' style="display:none"' if chip_hidden else "")
+            .replace("__IS_INVEST__", "true" if is_invest else "false")
+            .replace("__IS_PTC__", "true" if is_ptc else "false")
             .replace("__OG_TITLE__", _esc(og_title))
             .replace("__OG_DESC__", _esc(og_desc))
             .replace("__PAGE_PATH__", _esc(page_url_path(storm["sid"])))
             .replace("__SID__", _esc(storm["sid"]))
+            .replace("__SPAWN_SID__", _esc(storm.get("spawn_sid") or ""))
             .replace("__FEED_URL__", _esc(feed_url))
             .replace("__HAFS_ID__", _esc(ids.hafs_id))
             .replace("__OG_IMAGE__",
@@ -4771,6 +6226,8 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
                      json.dumps(basin_entry(ids.basin),
                                 separators=(",", ":")))
             .replace("__ATCF_LONG__", _esc(ids.atcf_long))
+            .replace("__FLOATER_SLUG__",
+                     _esc(f"{ids.basin.lower()}{ids.number:02d}"))
             .replace("__ADV_URL__", _esc(adv_url or adv_key(storm["sid"])))
             .replace("__SST_BASE__", _esc(
                 (sst_base or f"/cyclolab/{ids.sid}/sst").rstrip("/")))
@@ -4779,7 +6236,10 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
             .replace("__SSHS_JSON__", json.dumps(SSHS_COLORS))
             .replace("__ENDED__", "true" if ended else "false")
             .replace("__BAKED__", baked))
-    if ended:
+    attrs = (("data-invest " if is_invest else "")
+             + ("data-ptc " if is_ptc else "")
+             + ("data-ended " if ended else ""))
+    if attrs:
         html = html.replace("<html lang=\"en\" data-cat=",
-                            "<html lang=\"en\" data-ended data-cat=")
+                            f"<html lang=\"en\" {attrs}data-cat=")
     return html

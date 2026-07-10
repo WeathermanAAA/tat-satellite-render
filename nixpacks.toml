@@ -5,8 +5,13 @@
 # manylinux. We still pin Python 3.11 explicitly and add gcc/build-essential
 # as a safety net in case any sdist needs to compile.
 
+# ffmpeg powers the server-side loop export (POST /export): smooth mp4 (libx264)
+# + global-palette gif. This service builds with NIXPACKS, not a Dockerfile, so
+# ffmpeg is a nixPkg here rather than `apt-get install ffmpeg`. Verified on boot
+# (lifespan logs `ffmpeg -version`; /export 503s with a clear message if absent,
+# so the frontend falls back to its client-side gif.js path).
 [phases.setup]
-nixPkgs = ["python311", "gcc", "pkg-config"]
+nixPkgs = ["python311", "gcc", "pkg-config", "ffmpeg"]
 
 [phases.install]
 cmds = [

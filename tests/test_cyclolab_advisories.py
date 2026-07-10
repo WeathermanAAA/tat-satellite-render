@@ -42,7 +42,7 @@ TCD_BODY = ("<pre>Tropical Storm Amanda Discussion Number  13\n\n"
 
 
 def make_engine(sink, *, current_text=CURRENT, kmz=None, tcp_text=TCP_SHTML,
-                tcd_text=TCD_BODY, text_raises=None):
+                tcd_text=TCD_BODY, text_raises=None, fetch_alerts=None):
     kmz = kmz or {"CONE": CONE, "TRACK": TRACK}
 
     def fetch_text(url):
@@ -66,7 +66,8 @@ def make_engine(sink, *, current_text=CURRENT, kmz=None, tcp_text=TCP_SHTML,
         session=None, sink=sink, prefix="shadow/cyclolab",
         current_storms_url="fixture://CurrentStorms.json",
         policy=pf.FetchPolicy(),
-        fetch_text=fetch_text, fetch_bytes=fetch_bytes, clock=_clock)
+        fetch_text=fetch_text, fetch_bytes=fetch_bytes,
+        fetch_alerts=fetch_alerts or (lambda: None), clock=_clock)
     return pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
                            stale_after_s=60, clock=_clock)
 
@@ -253,7 +254,7 @@ class TestTextHealAndVerification(unittest.TestCase):
             session=None, sink=sink, prefix="shadow/cyclolab",
             current_storms_url="fixture://CurrentStorms.json",
             policy=pf.FetchPolicy(), fetch_text=fetch_text,
-            fetch_bytes=fetch_bytes, clock=_clock)
+            fetch_bytes=fetch_bytes, fetch_alerts=lambda: None, clock=_clock)
         eng = pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
                               stale_after_s=60, clock=_clock)
         return eng, avail
@@ -279,6 +280,56 @@ class TestTextHealAndVerification(unittest.TestCase):
                          "2026-06-06T01:00:00Z")
         # countdown healed along with the TCP
         self.assertIn("next_advisory_utc", p)
+
+    def test_text_urls_absent_at_first_advisory_keep_heal_open(self):
+        # NEGATIVE CONTROL (the PTC first-advisory blank-panel bug): at a
+        # storm's FIRST advisory CurrentStorms can carry the cone/track KMZ a
+        # poll or two BEFORE it populates the publicAdvisory/forecastDiscussion
+        # URLs. TCP+TCD are ALWAYS-EXPECTED for an NHC designated storm, so the
+        # heal debt must stay OPEN (text_done False) and the text must attach as
+        # soon as the URLs appear. Under the OLD vacuous-True behavior the pulse
+        # stopped and the panel stayed blank all cycle - and the poll-2 heal
+        # assertion below fails. This test guards the regression.
+        sink = pf.DictSink()
+        full = json.loads(CURRENT)
+        nourl = json.loads(CURRENT)
+        st = nourl["activeStorms"][0]
+        st["publicAdvisory"] = {"advNum": "013"}     # URLs not yet populated
+        st["forecastDiscussion"] = {"advNum": "013"}
+        state = {"current": json.dumps(nourl)}
+
+        def fetch_text(url):
+            if "TCP" in url:
+                return TCP_SHTML
+            if "TCD" in url:
+                return TCD_BODY
+            return state["current"]
+
+        def fetch_bytes(url):
+            return CONE if "CONE" in url else (
+                TRACK if "TRACK" in url else None)
+
+        src = ca.make_advisories_source(
+            session=None, sink=sink, prefix="shadow/cyclolab",
+            current_storms_url="fixture://CurrentStorms.json",
+            policy=pf.FetchPolicy(), fetch_text=fetch_text,
+            fetch_bytes=fetch_bytes, fetch_alerts=lambda: None, clock=_clock)
+        eng = pf.PollerEngine([src], name="t", sink=sink, interval_s=1,
+                              stale_after_s=60, clock=_clock)
+
+        eng.poll_once()                          # adv ships; text URLs absent
+        p = self._payload(sink)
+        self.assertNotIn("tcp", p["text"])       # nothing attached yet...
+        self.assertNotIn("tcd", p["text"])
+        self.assertGreaterEqual(len(p["cone"]), 1000)   # ...cone never blocked
+
+        state["current"] = json.dumps(full)      # NHC populates the text URLs
+        eng.poll_once()                          # heal pulse must still fire
+        p = self._payload(sink)
+        self.assertIn("BULLETIN", p["text"]["tcp"])     # healed once URLs exist
+        self.assertIn("TCD DISCUSSION BODY", p["text"]["tcd"])
+        self.assertEqual(p["text"]["tcp_url"],
+                         "https://www.nhc.noaa.gov/text/MIATCPEP1.shtml")
 
     def test_heal_settles_no_rewrites_after_complete(self):
         sink = pf.DictSink()
@@ -349,6 +400,92 @@ class TestTextHealAndVerification(unittest.TestCase):
             eng.poll_once()                   # storm left: debt closed
             eng.poll_once()                   # settled - no process churn
         self.assertEqual([k for k in writes if "/adv/" in k], [])
+
+
+class TestWWZones(unittest.TestCase):
+    """Inland county/zone FILLS (Phase 4 follow-up): the national NWS TC alerts
+    fetched once per poll and attributed to each storm by its cone bbox."""
+
+    def _payload(self, sink):
+        p = sink.store["shadow/cyclolab/adv/NHC_EP012026.json"]
+        return json.loads(p) if isinstance(p, str) else p
+
+    def test_far_alerts_not_attributed_to_this_storm(self):
+        # Amanda is an EP (Pacific) storm; the captured Gulf TC alerts are far
+        # from its cone, so cone-bbox attribution drops them -> ww_zones=[].
+        alerts = json.loads(
+            (FIX / "nws_tc_alerts_sample.json").read_text())
+        sink = pf.DictSink()
+        make_engine(sink, fetch_alerts=lambda: alerts).poll_once()
+        self.assertEqual(self._payload(sink)["ww_zones"], [])
+
+    def test_alert_inside_cone_attaches_as_fill(self):
+        # An alert whose polygon falls inside the cone bbox attaches as a fill.
+        # The polygon (not the UGC) drives placement; the UGC only gates the
+        # marine exclusion, so a land UGC + an in-cone polygon is the unit here.
+        import kml_advisories as K
+        cone = K.parse_cone_kmz(CONE)
+        xs = [c[0] for c in cone]
+        ys = [c[1] for c in cone]
+        cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+        poly = [[cx - 0.3, cy - 0.3], [cx + 0.3, cy - 0.3],
+                [cx + 0.3, cy + 0.3], [cx - 0.3, cy + 0.3], [cx - 0.3, cy - 0.3]]
+        alerts = {"features": [{"geometry": {"type": "Polygon",
+                  "coordinates": [poly]}, "properties": {
+                      "event": "Hurricane Warning", "areaDesc": "Test County",
+                      "geocode": {"UGC": ["TXZ001"]}}}]}
+        sink = pf.DictSink()
+        make_engine(sink, fetch_alerts=lambda: alerts).poll_once()
+        p = self._payload(sink)
+        self.assertEqual(len(p["ww_zones"]), 1)
+        self.assertEqual(p["ww_zones"][0]["type"], "HU_WARNING")
+        self.assertEqual(p["provenance"]["ww_zones_count"], 1)
+        self.assertGreaterEqual(len(p["cone"]), 1000)   # cone never displaced
+
+    def test_alerts_api_down_never_blocks_cone(self):
+        def boom():
+            raise RuntimeError("alerts api down")
+        sink = pf.DictSink()
+        make_engine(sink, fetch_alerts=boom).poll_once()
+        p = self._payload(sink)
+        self.assertEqual(p["ww_zones"], [])             # graceful empty
+        self.assertGreaterEqual(len(p["cone"]), 1000)   # cone written anyway
+
+    def test_alerts_fetched_once_per_poll(self):
+        calls = {"n": 0}
+
+        def counting():
+            calls["n"] += 1
+            return {"features": []}
+        sink = pf.DictSink()
+        eng = make_engine(sink, fetch_alerts=counting)
+        eng.poll_once()
+        # one storm in the fixture -> exactly one alerts fetch this poll
+        self.assertEqual(calls["n"], 1)
+
+    def test_alerts_fetched_once_per_poll_not_per_storm(self):
+        # TWO designated storms active in the SAME poll: the national NWS
+        # /alerts/active endpoint must be hit EXACTLY ONCE per poll (cached by
+        # poll seq), NOT once per storm - a per-storm fetch would hammer the API.
+        two = json.loads(CURRENT)
+        s2 = json.loads(json.dumps(two["activeStorms"][0]))
+        s2["id"] = "al022026"          # a second designated NHC storm, same KMZs
+        s2["name"] = "Two"
+        two["activeStorms"].append(s2)
+        calls = {"n": 0}
+
+        def counting():
+            calls["n"] += 1
+            return {"features": []}
+        sink = pf.DictSink()
+        eng = make_engine(sink, current_text=json.dumps(two),
+                          fetch_alerts=counting)
+        eng.poll_once()
+        # ONE fetch for the whole poll, though TWO storms were processed (a
+        # per-storm fetch would be 2). Both storms got their adv JSON.
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("shadow/cyclolab/adv/NHC_AL022026.json", sink.store)
+        self.assertIn("shadow/cyclolab/adv/NHC_EP012026.json", sink.store)
 
 
 if __name__ == "__main__":

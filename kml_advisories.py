@@ -375,21 +375,290 @@ def parse_track_kmz(kmz_bytes: bytes) -> dict:
 # ASSEMBLY
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WATCHES / WARNINGS (Phase 4) - the coastal tropical-cyclone watch/warning
+# line segments from the advisory GIS package's WW KMZ (CurrentStorms
+# windWatchesWarnings.kmzFile). NHC AL/EP/CP only; never JTWC/WP (we never
+# fabricate watches/warnings). Each Placemark/LineString connects the
+# breakpoints delimiting one watch/warning.
+# ---------------------------------------------------------------------------
+
+# NHC's watch/warning vocabulary -> our canonical type code. Keyed first by the
+# Placemark <name> (explicit, human-readable), then by the styleUrl id
+# (TWA/TWR/HWA/HWR observed in the wind WW KMZ; SSA/SSR for storm surge). An
+# unknown segment keeps its raw name so it is never silently dropped (the
+# renderer falls back to a neutral color).
+_WW_NAME_TO_TYPE = {
+    "TROPICAL STORM WATCH": "TS_WATCH",
+    "TROPICAL STORM WARNING": "TS_WARNING",
+    "HURRICANE WATCH": "HU_WATCH",
+    "HURRICANE WARNING": "HU_WARNING",
+    "STORM SURGE WATCH": "SS_WATCH",
+    "STORM SURGE WARNING": "SS_WARNING",
+}
+_WW_STYLE_TO_TYPE = {
+    "TWA": "TS_WATCH", "TWR": "TS_WARNING",
+    "HWA": "HU_WATCH", "HWR": "HU_WARNING",
+    "SSA": "SS_WATCH", "SSR": "SS_WARNING",
+}
+
+
+def _ww_type(name: str, style_id: str) -> str:
+    n = (name or "").strip().upper()
+    if n in _WW_NAME_TO_TYPE:
+        return _WW_NAME_TO_TYPE[n]
+    sid = (style_id or "").lstrip("#").strip().upper()
+    if sid in _WW_STYLE_TO_TYPE:
+        return _WW_STYLE_TO_TYPE[sid]
+    return n or sid or "UNKNOWN"
+
+
+def parse_ww_kmz(kmz_bytes: bytes) -> list[dict]:
+    """WW KMZ bytes -> coastal watch/warning segments::
+
+        [{"type": "TS_WATCH", "geometry": [[lon, lat], ...]}, ...]
+
+    Each segment is ONE Placemark/LineString (NHC connects the breakpoints
+    delimiting a watch/warning). ``type`` is the canonical code (see
+    ``_WW_NAME_TO_TYPE``). NO watches/warnings in effect -> ``[]``. Raises
+    :class:`AdvisoryParseError` on a malformed document so the caller degrades
+    gracefully (the cone is written WITHOUT a ``ww`` overlay rather than not at
+    all). Namespace-agnostic (localname matching) like the cone/track parsers.
+    """
+    root = _parse_xml(_read_kml(kmz_bytes))
+    out: list[dict] = []
+    for pm in _iter(root, "Placemark"):
+        ls = _first(pm, "LineString")
+        if ls is None:
+            continue                            # skip non-line placemarks
+        coords = _first(ls, "coordinates")
+        if coords is None or not (coords.text or "").strip():
+            continue
+        pts = _parse_coord_blob(coords.text)
+        if len(pts) < 2:                        # a segment needs >= 2 points
+            continue
+        _validate_lonlat(pts, "ww")
+        name_el = _first(pm, "name")
+        style_el = _first(pm, "styleUrl")
+        seg_type = _ww_type(
+            name_el.text if name_el is not None else "",
+            style_el.text if style_el is not None else "")
+        out.append({"type": seg_type, "geometry": pts})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# WATCHES / WARNINGS - INLAND county/zone FILLS (Phase 4 follow-up). The coastal
+# ``ww`` overlay above is the NHC TCWW breakpoint LINES; this is the INLAND
+# county/zone fill, from the NWS public alerts API (api.weather.gov/alerts/
+# active) rather than the NHC GIS KMZ. The two are complementary: lines hug the
+# coast, fills shade the watched/warned counties + forecast zones behind them.
+# NHC AL/EP/CP US only; ADDITIVE + GRACEFUL.
+# ---------------------------------------------------------------------------
+
+# NWS active-alert ``event`` -> our canonical WW type (same codes as the coastal
+# overlay so they SHARE the palette + legend in the renderer).
+_NWS_EVENT_TO_TYPE = {
+    "hurricane warning": "HU_WARNING",
+    "hurricane watch": "HU_WATCH",
+    "tropical storm warning": "TS_WARNING",
+    "tropical storm watch": "TS_WATCH",
+    "storm surge warning": "SS_WARNING",
+    "storm surge watch": "SS_WATCH",
+}
+# The SIX tropical-cyclone event types we fill (used for the upstream query too).
+NWS_TC_EVENTS = ("Hurricane Warning", "Hurricane Watch",
+                 "Tropical Storm Warning", "Tropical Storm Watch",
+                 "Storm Surge Warning", "Storm Surge Watch")
+# NWS MARINE UGC regions (the 2-letter region prefix). EXCLUDED - the fills are
+# INLAND county/zone areas; the coastal/marine watches read as the ``ww`` lines.
+_MARINE_UGC_REGIONS = {"AM", "GM", "PZ", "PK", "PH", "PM", "PS",
+                       "AN", "SL", "LH", "LM", "LS", "LE", "LO", "LC"}
+
+
+def _ugc_is_marine(ugc: str) -> bool:
+    u = (ugc or "").strip().upper()
+    return len(u) >= 2 and u[:2] in _MARINE_UGC_REGIONS
+
+
+def _zone_id_from_url(url: str) -> str:
+    """``.../zones/forecast/LAZ252`` -> ``LAZ252``."""
+    return (url or "").rstrip("/").rsplit("/", 1)[-1].upper()
+
+
+def _rings_from_geojson(geom: dict | None) -> list[list[list[float]]]:
+    """GeoJSON Polygon / MultiPolygon -> list of OUTER rings ``[[lon,lat],...]``
+    (holes dropped - the fill is a solid translucent area). Anything else -> []."""
+    if not isinstance(geom, dict):
+        return []
+    t, coords = geom.get("type"), geom.get("coordinates") or []
+    raw_rings: list = []
+    if t == "Polygon" and coords:
+        raw_rings = [coords[0]]
+    elif t == "MultiPolygon":
+        raw_rings = [poly[0] for poly in coords if poly]
+    elif t == "GeometryCollection":          # defensive: not a known NWS shape
+        out: list = []
+        for g in geom.get("geometries") or []:
+            out.extend(_rings_from_geojson(g))
+        return out
+    out: list[list[list[float]]] = []
+    for r in raw_rings:
+        ring: list[list[float]] = []
+        for pt in r or []:
+            try:
+                ring.append([float(pt[0]), float(pt[1])])
+            except (TypeError, ValueError, IndexError):
+                ring = []
+                break
+        if len(ring) >= 3:
+            out.append(ring)
+    return out
+
+
+def _rdp(ring: list[list[float]], tol: float) -> list[list[float]]:
+    """Douglas-Peucker on a [[lon,lat],...] ring (degrees), iterative (no
+    recursion-depth risk on a 1000-vtx county). Endpoints preserved; a ring
+    that collapses below 3 points is returned unsimplified by the caller."""
+    n = len(ring)
+    if n < 3 or tol <= 0:
+        return ring
+
+    def _pd(p, a, b):                       # perpendicular distance p->line ab
+        ax, ay = a; bx, by = b; px, py = p
+        dx, dy = bx - ax, by - ay
+        if dx == 0 and dy == 0:
+            return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+        t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        cx, cy = ax + t * dx, ay + t * dy
+        return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+
+    keep = [False] * n
+    keep[0] = keep[n - 1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        dmax, idx = 0.0, -1
+        for k in range(i + 1, j):
+            d = _pd(ring[k], ring[i], ring[j])
+            if d > dmax:
+                dmax, idx = d, k
+        if idx != -1 and dmax > tol:
+            keep[idx] = True
+            stack.append((i, idx))
+            stack.append((idx, j))
+    return [ring[k] for k in range(n) if keep[k]]
+
+
+def _ring_bbox(ring: list[list[float]]) -> tuple[float, float, float, float]:
+    xs = [c[0] for c in ring]; ys = [c[1] for c in ring]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _bbox_near(b: tuple, box: tuple, margin: float) -> bool:
+    """True iff bbox ``b`` is within ``margin`` degrees of bbox ``box``."""
+    return not (b[0] > box[2] + margin or b[2] < box[0] - margin or
+                b[1] > box[3] + margin or b[3] < box[1] - margin)
+
+
+def cone_bbox(cone_ring: list[list[float]]) -> tuple[float, float, float, float]:
+    """The lon/lat bbox of a cone ring, for per-storm zone attribution."""
+    return _ring_bbox(cone_ring)
+
+
+def parse_nws_alert_zones(alerts_obj: dict, *, cone_box: tuple | None = None,
+                          margin_deg: float = 2.5, simplify_tol: float = 0.01,
+                          resolve_zone=None) -> list[dict]:
+    """NWS ``/alerts/active`` FeatureCollection -> inland county/zone WW fills::
+
+        [{"type": "TS_WARNING", "geometry": [[lon,lat],...],
+          "ugc": "LAZ252", "area": "..."}]
+
+    Only the SIX tropical-cyclone event types; MARINE UGC regions excluded (the
+    fills are INLAND county/zone areas). Geometry comes from the alert Feature's
+    OWN embedded Polygon/MultiPolygon - the common case, since NWS merges the
+    affected-zone shapes into the alert geometry for land zones. When a feature
+    has NO embedded geometry and ``resolve_zone(zone_url) -> geojson_geometry``
+    is supplied, its land affected-zones are resolved (the caller caches - zone
+    shapes are static). Rings are DP-simplified (``simplify_tol`` deg) to keep
+    the adv JSON small. With ``cone_box`` given, only rings whose bbox is within
+    ``margin_deg`` of it are kept (per-storm attribution). ADDITIVE + GRACEFUL:
+    a malformed feature is skipped, never raised."""
+    out: list[dict] = []
+    for f in (alerts_obj or {}).get("features") or []:
+        try:
+            props = f.get("properties") or {}
+            typ = _NWS_EVENT_TO_TYPE.get(
+                str(props.get("event") or "").strip().lower())
+            if not typ:
+                continue
+            ugcs = ((props.get("geocode") or {}).get("UGC")) or []
+            land_ugcs = [u for u in ugcs if not _ugc_is_marine(u)]
+            if not land_ugcs:
+                continue                    # marine-only alert -> not inland
+            # When a land UGC is present the feature's embedded geometry is
+            # trusted to be the land county/zone shape: NWS issues TC alerts
+            # ONE FEATURE PER ZONE (verified on the live 2026-06-16 Gulf event -
+            # land TXZ/LAZ and marine GMZ arrive in separate features), so a
+            # single feature's geometry never mixes land + open water.
+            rings = _rings_from_geojson(f.get("geometry"))
+            if not rings and resolve_zone:
+                for zurl in (props.get("affectedZones") or []):
+                    if _ugc_is_marine(_zone_id_from_url(zurl)):
+                        continue
+                    try:
+                        rings += _rings_from_geojson(resolve_zone(zurl))
+                    except Exception:       # noqa: BLE001 - best-effort resolve
+                        continue
+            ugc_label = (land_ugcs[0] if len(land_ugcs) == 1
+                         else ",".join(land_ugcs[:3]))
+            area = props.get("areaDesc")
+            for ring in rings:
+                box = _ring_bbox(ring)
+                if cone_box and not _bbox_near(box, cone_box, margin_deg):
+                    continue
+                simp = _rdp(ring, simplify_tol)
+                if len(simp) < 3:
+                    simp = ring
+                if simp[0] != simp[-1]:     # close the ring for a clean fill
+                    simp = simp + [list(simp[0])]
+                out.append({"type": typ, "geometry": simp,
+                            "ugc": ugc_label, "area": area})
+        except Exception:                   # noqa: BLE001 - skip a bad feature
+            continue
+    return out
+
+
 def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
                         track_kmz_bytes: bytes,
-                        text_urls: dict | None = None) -> dict:
-    """Assemble the §8.3 cached-advisory contract from CONE + TRACK KMZs.
+                        text_urls: dict | None = None,
+                        ww_kmz_bytes: bytes | None = None,
+                        ww_zones: list[dict] | None = None) -> dict:
+    """Assemble the §8.3 cached-advisory contract from CONE + TRACK (+ WW) KMZs.
 
-    Returns a json-serializable dict with EXACTLY the contract keys::
+    Returns a json-serializable dict with the contract keys::
 
         {sid, advisory, issued_utc, source, method, cone, points, text,
-         provenance}
+         ww, provenance}
 
     source == "nhc", method == "official-cone". Validation (raises
     :class:`AdvisoryParseError`): the cone ring closes (>= 4 verts),
     points >= 2, taus strictly increasing, issued_utc parses. provenance
     carries the raw-bytes hashes/sizes; ``parsed_utc`` is left None for
     the caller to stamp (clock-free for testability).
+
+    ``ww`` (Phase 4) is the coastal watch/warning overlay from the optional
+    ``ww_kmz_bytes`` (CurrentStorms windWatchesWarnings.kmzFile): a list of
+    ``{type, geometry}`` segments, or ``[]`` when no WW KMZ is supplied OR it
+    fails to parse. ADDITIVE + GRACEFUL by construction: a missing/malformed
+    WW layer never raises here, so it can never break the cone the page needs.
+
+    ``ww_zones`` (Phase 4 follow-up) is the INLAND county/zone FILL list - the
+    caller pre-resolves it from the NWS alerts API via ``parse_nws_alert_zones``
+    (kept network-free in here so this stays a pure assembler) and passes the
+    finished ``[{type, geometry, ugc, area}]`` list, or ``None`` -> ``[]``. Same
+    ADDITIVE + GRACEFUL contract: it never blocks the cone.
     """
     cone = parse_cone_kmz(cone_kmz_bytes)
     track = parse_track_kmz(track_kmz_bytes)
@@ -426,6 +695,15 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
             "tcd_url": text_urls.get("tcd_url"),
         }
 
+    # Watches/warnings overlay - ADDITIVE + GRACEFUL. A malformed/absent WW
+    # layer degrades to [] and NEVER raises, so it can't break the cone.
+    ww: list[dict] = []
+    if ww_kmz_bytes:
+        try:
+            ww = parse_ww_kmz(ww_kmz_bytes)
+        except AdvisoryParseError:
+            ww = []
+
     provenance = {
         "cone_sha256": hashlib.sha256(cone_kmz_bytes).hexdigest(),
         "track_sha256": hashlib.sha256(track_kmz_bytes).hexdigest(),
@@ -433,6 +711,14 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
         "track_bytes": len(track_kmz_bytes),
         "parsed_utc": None,                     # caller stamps the clock
     }
+    if ww_kmz_bytes:
+        provenance["ww_sha256"] = hashlib.sha256(ww_kmz_bytes).hexdigest()
+        provenance["ww_bytes"] = len(ww_kmz_bytes)
+
+    # Inland county/zone fills - ADDITIVE + GRACEFUL: a non-list degrades to [].
+    zones = ww_zones if isinstance(ww_zones, list) else []
+    if zones:
+        provenance["ww_zones_count"] = len(zones)
 
     return {
         "sid": sid,
@@ -443,6 +729,8 @@ def build_advisory_json(sid: str, cone_kmz_bytes: bytes,
         "cone": cone,
         "points": points,
         "text": text,
+        "ww": ww,
+        "ww_zones": zones,
         "provenance": provenance,
     }
 

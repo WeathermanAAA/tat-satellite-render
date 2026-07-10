@@ -23,8 +23,9 @@ designated storm + NaN-safe NATURE).
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
@@ -195,16 +196,23 @@ def build_global_geojson_feed(storms_by_basin: dict[str, list],
 
 
 def recompute_tracks_feed(tracks_base: dict, live: Optional[pd.DataFrame],
-                          build_now: Optional[dt.datetime] = None) -> dict:
+                          build_now: Optional[dt.datetime] = None,
+                          nhc_active_sids: "set[str] | None" = None) -> dict:
     """Base + live -> the live tracks feed (exact current shape). Reuses
     ace_core.merge_and_extract_storms + compute_header_stats, so the tracks
-    storm set + header match the cron and ace == tracks holds by construction."""
+    storm set + header match the cron and ace == tracks holds by construction.
+
+    ``nhc_active_sids`` (ace_core.fetch_nhc_active_sids) enables the prompt
+    final-advisory retirement of is_active — STATUS ONLY (ace_core 0.7.0):
+    a dissipated NHC storm drops from active counts / live markers while its
+    track and season ACE stay byte-identical. None = no retirement."""
     build_now = build_now or pf.utcnow().replace(tzinfo=None)
     cfg = tracks_base["basin_cfg"]
     ibtracs_frame = _df_from_records(tracks_base["current_year_ibtracs"], _TRACKS_COLS)
     live_frame = live if live is not None else pd.DataFrame()
 
-    storms = ac.merge_and_extract_storms(ibtracs_frame, live_frame, cfg)
+    storms = ac.merge_and_extract_storms(ibtracs_frame, live_frame, cfg,
+                                         nhc_active_sids=nhc_active_sids)
     header = ac.compute_header_stats(storms)
 
     fix_times = [s["latest_fix_valid_utc"] for s in storms
@@ -223,3 +231,121 @@ def recompute_tracks_feed(tracks_base: dict, live: Optional[pd.DataFrame],
         "vocab": tracks_base["vocab"],
         "storms": storms,
     }
+
+
+def _merge_track_points(hwm_pts: list, cur_pts: list) -> list:
+    """Union the high-water-mark track with this poll's fresh points by fix time
+    ``t`` (the fresh poll wins on a shared t -> latest reanalysis + radii), so
+    the restored track keeps the full history AND the newest fix. Points without
+    a ``t`` are appended verbatim (defensive; real feed fixes always carry t)."""
+    by_t: dict = {}
+    extra: list = []
+    for p in list(hwm_pts) + list(cur_pts):   # cur after hwm -> cur overwrites
+        t = p.get("t") if isinstance(p, dict) else None
+        if t is None:
+            extra.append(p)
+        else:
+            by_t[t] = p
+    return [by_t[t] for t in sorted(by_t)] + extra
+
+
+def apply_never_regress(tracks_feed: dict, hwm: dict,
+                        is_designated: Callable[[dict], bool],
+                        max_misses: int = 12) -> int:
+    """NEVER-REGRESS guard (CycloLab cluster, the cure for the clobbered JTWC
+    Track History + Wind&Pressure). A transient JTWC b-deck/mirror failure (the
+    WP natyphoon mirror is SSL-fragile) collapses a fresh DESIGNATED storm to the
+    single live knackwx fix; published as-is that 1-point track CLOBBERS the full
+    track the per-basin map + CycloLab Track History/Wind&Pressure render (the
+    poller and cron share the wp_tracks_data.json key). This guard keeps the
+    track from regressing.
+
+    Per DESIGNATED storm (invests are left untouched -- Part E owns recycle-safe
+    invest accumulation): if this poll's track has FEWER points than its
+    last-known-good (the high-water-mark ``hwm``) and we have not exceeded
+    ``max_misses`` consecutive degraded polls, REPUBLISH the last-known-good full
+    storm (a coherent prior ace_core computation -- no field/point mixing);
+    otherwise adopt the fresh storm and reset the high-water-mark (so a genuine
+    shrink/end is not masked forever). Mutates ``tracks_feed['storms']`` and, when
+    anything was republished, re-derives the header + latest_fix from the
+    corrected set so the feed stays coherent.
+
+    ACE IS NOT TOUCHED: the ACE feed is a separate recompute_ace_feed() call off
+    the canon frame -- it never reads the tracks feed -- so this is ACE
+    byte-identical by construction. Returns the number of republished storms.
+
+    ``hwm`` is the caller's per-basin state: {sid: {"storm": dict, "n": int,
+    "miss": int}}. ``is_designated(storm)`` -> True for designated (non-invest).
+
+    Adversarial-review hardening (2026-06-19): on a sparse-but-present poll we
+    MERGE the last-known-good geometry (points + their radii) onto THIS poll's
+    FRESH storm rather than republishing the stale HWM dict wholesale -- so a
+    same-poll rename / category change / final-advisory retirement (is_active
+    flip) is NOT masked (the fresh scalar metadata is kept; only the track
+    geometry is restored). A designated storm that VANISHES entirely from the
+    poll (a total b-deck+knackwx miss on a fresh live-only storm -> absent, not
+    1-pt) is re-appended from the HWM (debounced) -- the per-storm loop alone
+    never sees it, so total disappearance is treated identically to sparseness."""
+    storms = tracks_feed.get("storms") or []
+    out, regressed = [], 0
+    present: set[str] = set()
+    for s in storms:
+        sid = s.get("sid") or ""
+        present.add(sid)
+        try:
+            designated = bool(is_designated(s))
+        except Exception:  # noqa: BLE001 - on doubt, never regress it
+            designated = False
+        if not designated:
+            out.append(s)
+            continue
+        cur_pts = s.get("points") or []
+        prev = hwm.get(sid)
+        if prev is not None and len(cur_pts) < prev["n"] and prev["miss"] < max_misses:
+            # Restore the fuller track + radii, keep ALL fresh scalar metadata
+            # (name / current_category / is_active / peak / ace ...) and the
+            # newest fix. ace_core's per-poll is_active/name (incl. the 0.7.0
+            # final-advisory retirement) is therefore never resurrected by the
+            # guard -- only the dropped track geometry is healed.
+            merged = _merge_track_points((prev["storm"].get("points") or []),
+                                         cur_pts)
+            s = dict(s)
+            s["points"] = merged
+            hwm[sid] = {"storm": copy.deepcopy(s), "n": len(merged),
+                        "miss": prev["miss"] + 1}
+            out.append(s)
+            regressed += 1
+        else:
+            hwm[sid] = {"storm": copy.deepcopy(s), "n": len(cur_pts), "miss": 0}
+            out.append(s)
+    # A designated storm present in the HWM but ABSENT this poll: re-append its
+    # last-known-good (debounced) so a total fetch miss is not a silent
+    # total-track clobber (review MAJOR). A genuinely-ended storm stays in the
+    # canon -> present with is_active=False -> never lands here; only a live-only
+    # fresh storm whose sources all transiently missed does, and the debounce
+    # bounds the brief stale-active window.
+    for sid, prev in hwm.items():
+        if sid in present or prev["miss"] >= max_misses:
+            continue
+        st = prev.get("storm")
+        if st is not None:
+            out.append(copy.deepcopy(st))
+            prev["miss"] += 1
+            regressed += 1
+    tracks_feed["storms"] = out
+    if regressed:
+        # Re-derive the coherent header + latest_fix from the corrected set.
+        # Best-effort: a header-recompute hiccup keeps the fresh header rather
+        # than failing the feed (the storms themselves are already corrected).
+        try:
+            tracks_feed["header"] = ac.compute_header_stats(out)
+        except Exception:  # noqa: BLE001
+            pass
+        fix_times = [x["latest_fix_valid_utc"] for x in out
+                     if x.get("latest_fix_valid_utc")]
+        lf = max(fix_times) if fix_times else None
+        tracks_feed["latest_fix_valid_utc"] = lf
+        tracks_feed["staleness_minutes"] = (
+            ac.staleness_minutes(_parse_naive(lf), pf.utcnow().replace(tzinfo=None))
+            if lf else None)
+    return regressed

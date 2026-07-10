@@ -7,16 +7,25 @@ h5netcdf==1.4.1
 h5py==3.12.1
 numpy==2.1.3
 matplotlib==3.9.3
+# derived_cone.py traces the WP cone's union-of-disks boundary with contourpy's
+# marching squares. It ships transitively with matplotlib, but derived_cone now
+# hard-imports it (the advisories poller would fail at startup if it were
+# missing), so pin it explicitly rather than inherit it.
+contourpy>=1.2
 cartopy==0.24.1
 Pillow==11.0.0
 s3fs==2024.10.0
 aiobotocore==2.15.2
 python-dateutil==2.9.0
-# Canonical shared color palettes — single source of truth in the main
-# Triple-A-Tropics Pages repo (palette/). Edit palettes there only; Railway
-# installs --no-cache-dir so @main refetches the latest on every deploy.
+# Canonical shared color palettes: single source of truth in the main
+# Triple-A-Tropics Pages repo (palette/). Edit palettes there only, then bump
+# palette/pyproject.toml + tag tat-palettes-vX.Y.Z and repin the tag here (the
+# ace-core pattern). An IMMUTABLE tag makes each palette change an explicit,
+# redeploy-triggering repin, so a color edit can never silently miss the render
+# path the way a bare @main pin does (@main only refetches when tsr happens to
+# rebuild for some other reason, which a TAT-only palette push does not cause).
 # https://github.com/WeathermanAAA/Triple-A-Tropics/tree/main/palette
-tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@main#subdirectory=palette
+tat-palettes @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@tat-palettes-v0.2.2#subdirectory=palette
 # True-color recipe: scipy for band co-registration (RegularGridInterpolator),
 # pyorbital for sun + geostationary-satellite geometry, pyspectral for Rayleigh
 # (atmospheric) correction. pyspectral pulls RSR + Rayleigh LUTs on first use
@@ -45,5 +54,14 @@ requests>=2.31
 # retired. Presentation-only: ACE math identical to v0.3.0.
 # v0.6.0: ATCF four-quadrant wind radii carried in the feed (FG-R3 #7/#8) +
 # CRW DOY-climatology support (#6a house-climo anomaly). ACE math unchanged.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.6.1#subdirectory=ace_core
+# v0.7.0: prompt ACTIVE-status retirement - merge_and_extract_storms accepts
+# nhc_active_sids (NHC CurrentStorms.json final-advisory signal, fetcher
+# fetch_nhc_active_sids) + ACTIVE_WINDOW_HOURS 60 -> 24. STATUS ONLY: a
+# dissipated storm keeps its track + season ACE, it just stops being
+# "active" (counts, live markers). ACE math unchanged.
+# v0.8.2: WPAC provisional-twin merge (USA_ATCF_ID sid-remap + live-first
+# union) + designated-but-unnamed relabel (a spelled ATCF cardinal "ONE" ->
+# the ATCF short id "01E"/"10W"). Kills the duplicate UNNAMED WPAC ghost on
+# the tracks/global map. DISPLAY-NAME only: ACE math byte-identical.
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.2#subdirectory=ace_core
 pandas>=2.0

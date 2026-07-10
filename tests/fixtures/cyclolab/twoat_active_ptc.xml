@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="https://purl.org/dc/elements/1.1/">
+  <channel>
+    <pubDate>Wed, 17 Jun 2026 00:43:54 +0000</pubDate>
+    <lastBuildDate>Wed, 17 Jun 2026 00:43:54 +0000</lastBuildDate>
+    <title>Atlantic Tropical Weather Outlook</title>
+    <description>National Hurricane Center - Atlantic Tropical Weather Outlook</description>
+    <link>https://www.nhc.noaa.gov/</link>
+    <copyright>none</copyright>
+    <managingEditor>nhcwebmaster@noaa.gov (nhcwebmaster)</managingEditor>
+    <language>en-us</language>
+    <webMaster>nhcwebmaster@noaa.gov (nhcwebmaster)</webMaster>
+    <image>
+      <url>https://www.nhc.noaa.gov/gifs/xml_logo_nhc.gif</url>
+      <link>https://www.nhc.noaa.gov/</link>
+      <description>NOAA logo</description>
+      <title>Atlantic Tropical Weather Outlook</title>
+      <width>95</width>
+      <height>45</height>
+    </image>
+    <item>
+      <title>Atlantic Tropical Weather Outlook</title>
+      <description>
+        <![CDATA[000<br />ABNT20 KNHC 162336<br />TWOAT <br /><br />Tropical Weather Outlook<br />NWS National Hurricane Center Miami FL<br />800 PM EDT Tue Jun 16 2026<br /><br />For the North Atlantic...Caribbean Sea and the Gulf of America:<br /><br />Active Systems:<br />The National Hurricane Center is issuing advisories on Potential <br />Tropical Cyclone One, located over south Texas.<br />* Formation chance through 48 hours...high...70 percent.<br />* Formation chance through 7 days...high...70 percent.<br /><br />&&<br />Public Advisories on Potential Tropical Cyclone One are issued <br />under WMO header WTNT31 KNHC and under AWIPS header MIATCPAT1.<br />Forecast/Advisories on Potential Tropical Cyclone One are issued <br />under WMO header WTNT21 KNHC and under AWIPS header MIATCMAT1.<br /><br />$$<br />Forecaster Adams/Pasch]]>
+      </description>
+      <pubDate>Tue, 16 Jun 2026 23:36:45 +0000</pubDate>
+      <link>https://www.nhc.noaa.gov/text/MIATWOAT.shtml</link>
+      <guid>202606162336</guid>
+      <author>nhcwebmaster@noaa.gov (nhcwebmaster)</author>
+    </item>
+  </channel>
+</rss>

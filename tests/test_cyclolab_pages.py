@@ -40,9 +40,11 @@ class TestEdgeContract(unittest.TestCase):
         self.assertEqual(page_url_path("NHC_EP012026"),
                          "/cyclolab/NHC_EP012026/")
 
-    def test_invests_cannot_get_page_keys(self):
-        with self.assertRaises(InvestSidError):
-            page_key("NHC_EP902026")
+    def test_invests_now_get_page_keys(self):
+        # Stage C: invests ARE page-able (grey / red-X subset page).
+        self.assertEqual(page_key("NHC_EP902026"),
+                         "cyclolab/NHC_EP902026/index.html")
+        self.assertEqual(page_url_path("NHC_EP902026"), "/cyclolab/NHC_EP902026/")
 
     def test_write_html_content_type_and_default_bucket(self):
         # R2Sink.write_html must PUT text/html to the Worker's bucket.

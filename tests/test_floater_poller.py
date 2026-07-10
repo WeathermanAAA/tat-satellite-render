@@ -262,6 +262,38 @@ class TestRefreshStorms(unittest.TestCase):
         self.assertEqual(by_slug["wp91"]["category"], "INVEST")
         self.assertEqual(by_slug["wp91"]["nature"], "DB")
 
+    def test_currentstorms_never_demotes_real_feed_name(self):
+        # THE DOUGLAS BUG (floater side): the EP tracks feed already resolved the
+        # real name DOUGLAS (fresh b-deck, last-wins) while CurrentStorms.json
+        # still lagged at the depression designation "Four-E". The
+        # CurrentStorms-override must NOT clobber the real feed name back to the
+        # designation -- the demote-guard keeps DOUGLAS.
+        p = _poller()
+        douglas = _named_storm(slug="ep04", basin="EP", name="DOUGLAS",
+                               lat=17.0, lon=-127.0)
+        four_e = _named_storm(slug="ep04", basin="EP", name="FOUR-E",
+                              lat=17.0, lon=-127.0)
+        _refresh(p, named={"wp": [], "al": [], "ep": [douglas]},
+                 nhc_invests=[], wp=([], set()), current={"ep04": four_e})
+        top = p.r2.json_puts[fp.top_manifest_key()]
+        by_slug = {s["slug"]: s for s in top["storms"]}
+        self.assertEqual(by_slug["ep04"]["name"], "DOUGLAS")   # real name kept
+
+    def test_currentstorms_promotes_feed_designation_to_real_name(self):
+        # The intended promotion still works (only DEMOTION is vetoed): the feed
+        # shows an unnamed depression "FIVE" while CurrentStorms has just named
+        # it AMANDA -> CurrentStorms' real name wins over the feed designation.
+        p = _poller()
+        five = _named_storm(slug="ep05", basin="EP", name="FIVE",
+                            lat=15.0, lon=-120.0)
+        amanda = _named_storm(slug="ep05", basin="EP", name="AMANDA",
+                              lat=15.0, lon=-120.0)
+        _refresh(p, named={"wp": [], "al": [], "ep": [five]},
+                 nhc_invests=[], wp=([], set()), current={"ep05": amanda})
+        top = p.r2.json_puts[fp.top_manifest_key()]
+        by_slug = {s["slug"]: s for s in top["storms"]}
+        self.assertEqual(by_slug["ep05"]["name"], "AMANDA")
+
     def test_explicit_transitioned_from_handoff(self):
         # 91W upgraded: knackwx named entry says transitioned_from=91W -> the
         # invest floater is dropped even before co-location could fire.
@@ -359,6 +391,76 @@ class TestRefreshStorms(unittest.TestCase):
                         nature="DB")
         _refresh(p, nhc_invests=[ep90], wp=([], {"90E"}), current={})
         self.assertEqual(set(p.storms), set())
+
+
+class TestBackdropEmission(unittest.TestCase):
+    """PART 4: for the IR band, process_unit also renders+uploads a bare
+    grayscale backdrop and stamps bd_key + bounds on the IR frame; best-effort,
+    gated by FLOATER_BACKDROP_ENABLED; chromed frame untouched."""
+
+    def _build(self):
+        rec = {"bytes": {}, "calls": []}
+
+        class RecR2(_FakeR2):
+            def put_bytes(self, key, data, content_type, cache):
+                rec["bytes"][key] = content_type
+                return True
+
+        with mock.patch.object(fp, "R2", RecR2):
+            p = fp.Poller()
+        p.limiter = mock.Mock()   # no real rate-limit sleeping
+
+        def fake_render(session, bbox, channel, enhancement, storm=None, backdrop=False):
+            rec["calls"].append({"backdrop": backdrop, "enh": enhancement})
+            payload = b"BDWEBP" if backdrop else b"CHROMEDWEBP"
+            return payload, {"Content-Type": "image/webp"}
+
+        return p, rec, fake_render
+
+    def _manifest(self, p):
+        return next(v for k, v in p.r2.json_puts.items()
+                    if k.endswith("/manifest.json"))
+
+    def test_ir_emits_backdrop_with_bd_key_and_bounds(self):
+        p, rec, fake_render = self._build()
+        u = fp.Unit(storm=_named_storm(slug="wp08", name="HIGOS"),
+                    band=fp.BANDS_BY_KEY["ir"])
+        with mock.patch.object(fp, "call_render", fake_render), \
+             mock.patch.object(fp, "FLOATER_BACKDROP_ENABLED", True), \
+             mock.patch.object(fp, "FLOATER_BACKDROP_BAND", "ir"):
+            p.process_unit(u)
+        # a grayscale backdrop render was requested
+        self.assertTrue(any(c["backdrop"] and c["enh"] == "grayscale"
+                            for c in rec["calls"]))
+        bd_keys = [k for k in rec["bytes"]
+                   if "/ir/backdrop/" in k and k.endswith(".webp")]
+        self.assertEqual(len(bd_keys), 1)
+        fr = self._manifest(p)["bands"]["ir"]["frames"][-1]
+        self.assertEqual(fr["bd_key"], bd_keys[0])
+        self.assertEqual(len(fr["bounds"]), 4)        # [W,S,E,N]
+        # chromed frame key intact + NOT the backdrop key
+        self.assertIn("key", fr)
+        self.assertNotIn("/backdrop/", fr["key"])
+
+    def test_disabled_emits_no_backdrop(self):
+        p, rec, fake_render = self._build()
+        u = fp.Unit(storm=_named_storm(slug="wp08", name="HIGOS"),
+                    band=fp.BANDS_BY_KEY["ir"])
+        with mock.patch.object(fp, "call_render", fake_render), \
+             mock.patch.object(fp, "FLOATER_BACKDROP_ENABLED", False):
+            p.process_unit(u)
+        self.assertFalse(any(c["backdrop"] for c in rec["calls"]))
+        self.assertFalse(any("/backdrop/" in k for k in rec["bytes"]))
+        self.assertNotIn("bd_key", self._manifest(p)["bands"]["ir"]["frames"][-1])
+
+    def test_prune_drops_backdrop_sibling(self):
+        now = fp.utcnow()
+        old = fp.iso_z(now - dt.timedelta(hours=fp.HISTORY_WINDOW_H + 5))
+        kept, deleted = fp.prune_frames(
+            [{"t": old, "key": "k.webp", "bd_key": "k_bd.webp"}], now)
+        self.assertEqual(kept, [])
+        self.assertIn("k.webp", deleted)
+        self.assertIn("k_bd.webp", deleted)
 
 
 if __name__ == "__main__":

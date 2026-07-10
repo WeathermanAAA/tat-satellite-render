@@ -9,7 +9,10 @@ footer credit.
 from __future__ import annotations
 
 import io
+import json
 import logging
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import matplotlib
@@ -20,12 +23,45 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from cartopy.feature import ShapelyFeature
 from matplotlib.colors import Normalize
+from shapely.geometry import shape
 
 from colormaps import get_enhancement, enhancement_norm, normalize_visible
 from satellites import FetchResult
 
 log = logging.getLogger("tat-satellite.render")
+
+# admin_1 state/province boundary LINES, vendored as NE 10m geojson (the same
+# asset the CycloLab basemap ships). Loaded locally instead of via cartopy's
+# runtime downloader, whose admin_1 URL 404s on the deploy host (coastline +
+# admin_0 borders download fine there; admin_1 does not).
+# .resolve() so a relative __file__ (uvicorn import from CWD) still yields the
+# absolute path next to render.py — mirrors cyclolab_basemap's proven pattern.
+_STATE_LINES_PATH = Path(__file__).resolve().with_name("cyclolab_ne_10m_states.geojson")
+
+
+@lru_cache(maxsize=1)
+def _state_lines_feature() -> Optional[ShapelyFeature]:
+    """admin_1 boundary LINES as a cartopy feature, read once from the vendored
+    geojson (no network). Returns None if the asset is missing/empty."""
+    if not _STATE_LINES_PATH.exists():
+        return None
+    gj = json.loads(_STATE_LINES_PATH.read_text(encoding="utf-8"))
+    geoms = [shape(f["geometry"]) for f in gj.get("features", []) if f.get("geometry")]
+    if not geoms:
+        return None
+    return ShapelyFeature(geoms, ccrs.PlateCarree())
+
+
+def state_lines_status() -> str:
+    """Diagnostic: did the vendored admin_1 layer load on this host? Surfaced
+    via the X-State-Lines response header to verify the deploy at runtime."""
+    p = _STATE_LINES_PATH
+    try:
+        return "loaded" if _state_lines_feature() is not None else f"absent(exists={p.exists()},p={p})"
+    except Exception as e:  # noqa: BLE001
+        return f"error:{type(e).__name__}:{e}"[:160]
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
@@ -172,7 +208,14 @@ def render_png(
     enhancement: str,
     downsample: int = 1,
     storm: Optional[dict] = None,
+    coastlines: bool = True,
+    gridlines: bool = True,
+    dpi: int = 110,
 ) -> bytes:
+    # ``coastlines`` draws coastlines + political borders; ``gridlines`` draws the
+    # labeled lat/lon graticule. Both default True (the standard look); the custom-
+    # zoom page can switch either off for clean imagery. (The floater/meso loop
+    # frames never pass them -> always on, unchanged.)
     # True-color composites carry an H×W×3 RGB array in ``cmi`` (units="rgb")
     # and don't go through the scalar normalize/cmap path.
     is_rgb = data.units == "rgb"
@@ -180,10 +223,11 @@ def render_png(
     enh = None if is_rgb else get_enhancement(enhancement)
 
     # Pixel-budget stride. App-layer (compute_downsample_factor) sets this
-    # based on raw bbox×channel so output_pixels ≤ PIXEL_BUDGET. This
-    # composes with the goes.py fetch-time stride: both layers cap output
-    # size, the more aggressive of the two wins. ``cmi[::d, ::d]`` strides the
-    # first two axes for both 2D (scalar) and 3D (RGB) arrays.
+    # based on raw bbox×channel so output_pixels ≤ the tier budget. For SCALAR
+    # products the stride happens HERE; for TRUE COLOR it is applied in the fetch
+    # (satellites._stride_tc_grids, before the per-pixel recipe) and this is
+    # called with downsample=1, so the RGB is never double-strided.
+    # ``cmi[::d, ::d]`` strides the first two axes for both 2D and 3D arrays.
     cmi = data.cmi
     lats = data.lats
     lons = data.lons
@@ -347,7 +391,12 @@ def render_png(
     lat_span = eff_lat_hi - eff_lat_lo
     aspect = lon_span / max(lat_span, 1e-6)
 
-    # Figure size: target ~1400 px wide, height by aspect, dpi=110
+    # Figure size: fixed 12 in wide, height by aspect. The OUTPUT RESOLUTION is
+    # the per-tier ``dpi`` at savefig (default 110 -> ~1320 px; low ~70 -> ~840 px;
+    # high ~200 -> ~2400 px). figsize is held constant so layout proportions +
+    # font sizes scale uniformly and ALL chrome (vector text/lines) renders crisp
+    # at the tier dpi -- never bitmap-resized. default dpi 110 == today (byte-
+    # identical); the webp LOOP path always passes 110 (then transcodes to 1056).
     fig_w = 12.0
     fig_h = max(4.0, fig_w / max(aspect, 0.3))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
@@ -418,42 +467,62 @@ def render_png(
     # Coastlines + borders. Resolution scales with bbox; zorder explicitly
     # above pcolormesh (which defaults to ~1.5 in cartopy) so cyan coast
     # never gets painted over by hot cloud tops; full alpha for legibility.
-    coast_scale = _coast_resolution(max(lon_span, lat_span))
-    ax.add_feature(
-        cfeature.COASTLINE.with_scale(coast_scale),
-        linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
-    )
-    ax.add_feature(
-        cfeature.BORDERS.with_scale(coast_scale),
-        linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
-    )
+    if coastlines:
+        coast_scale = _coast_resolution(max(lon_span, lat_span))
+        ax.add_feature(
+            cfeature.COASTLINE.with_scale(coast_scale),
+            linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
+        )
+        ax.add_feature(
+            cfeature.BORDERS.with_scale(coast_scale),
+            linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
+        )
+        # State/province (admin_1) boundary LINES — the internal-boundary-only
+        # dataset (not the admin_1 *lakes* polygons), so it never re-traces the
+        # coastline. One more feature layer in the SAME black as the coast +
+        # country borders, a touch thinner so US/MX/AU state lines read as
+        # subtle landfall context. Loaded from the vendored geojson (see
+        # _state_lines_feature) so it works on the deploy host. Guarded: a
+        # missing asset degrades to "no state lines" rather than a failed frame.
+        try:
+            states = _state_lines_feature()
+            if states is not None:
+                ax.add_feature(
+                    states, linewidth=0.5, edgecolor=BORDER_COLOR,
+                    facecolor="none", alpha=1.0, zorder=3,
+                )
+        except Exception as e:  # noqa: BLE001 — never let admin_1 break a frame
+            log.warning("state borders skipped: %s", e)
 
-    # Dashed gridlines auto-spaced over the EFFECTIVE extent. Crossing frames
-    # lay xlocs out on the unwrapped lon range then wrap to ±180 (true
-    # longitudes, so the gridliner labels them correctly in the re-centered
-    # frame); plain frames keep the raw values — wrapping would map a bbox
-    # edge at exactly 180 to -180 and silently drop that meridian's gridline.
-    step = _gridline_step(max(lon_span, lat_span))
-    xlocs = np.arange(
-        np.floor(eff_lo / step) * step, eff_hi + step, step
-    )
-    if crosses:
-        xlocs = ((xlocs + 180.0) % 360.0) - 180.0
-    gl = ax.gridlines(
-        crs=ccrs.PlateCarree(),
-        draw_labels=True,
-        linewidth=0.5,
-        linestyle="--",
-        color=GRID_COLOR,
-        alpha=0.7,
-        xlocs=xlocs,
-        ylocs=np.arange(np.floor(eff_lat_lo / step) * step,
-                        eff_lat_hi + step, step),
-    )
-    gl.top_labels = False
-    gl.right_labels = False
-    gl.xlabel_style = {"color": TEXT_COLOR, "size": 8}
-    gl.ylabel_style = {"color": TEXT_COLOR, "size": 8}
+    # Dashed gridlines auto-spaced (toggleable) over the EFFECTIVE extent;
+    # crossing frames lay xlocs on the unwrapped range then wrap to ±180.
+    if gridlines:
+        # Dashed gridlines auto-spaced over the EFFECTIVE extent. Crossing frames
+        # lay xlocs out on the unwrapped lon range then wrap to ±180 (true
+        # longitudes, so the gridliner labels them correctly in the re-centered
+        # frame); plain frames keep the raw values — wrapping would map a bbox
+        # edge at exactly 180 to -180 and silently drop that meridian's gridline.
+        step = _gridline_step(max(lon_span, lat_span))
+        xlocs = np.arange(
+            np.floor(eff_lo / step) * step, eff_hi + step, step
+        )
+        if crosses:
+            xlocs = ((xlocs + 180.0) % 360.0) - 180.0
+        gl = ax.gridlines(
+            crs=ccrs.PlateCarree(),
+            draw_labels=True,
+            linewidth=0.5,
+            linestyle="--",
+            color=GRID_COLOR,
+            alpha=0.7,
+            xlocs=xlocs,
+            ylocs=np.arange(np.floor(eff_lat_lo / step) * step,
+                            eff_lat_hi + step, step),
+        )
+        gl.top_labels = False
+        gl.right_labels = False
+        gl.xlabel_style = {"color": TEXT_COLOR, "size": 8}
+        gl.ylabel_style = {"color": TEXT_COLOR, "size": 8}
 
     # Right-side colorbar (every scalar product). Lives in the reserved right
     # margin; physical °C ticks for IR/WV, reflectance % for visible.
@@ -471,13 +540,27 @@ def render_png(
     title_ax.set_facecolor(DARK_BG)
     title_ax.axis("off")
     # Sensor label: read off FetchResult so it works for both ABI (GOES) and
-    # AHI (Himawari) without per-family branching here.
-    sensor_label = "AHI" if data.bucket.startswith("noaa-himawari") else "ABI"
-    center_title = (
-        f"{data.sat_name} {sensor_label} True Color · {time_str} UTC"
-        if is_rgb
-        else f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC"
-    )
+    # AHI (Himawari) without per-family branching here. The GridSat-B1 deep
+    # archive gets an HONEST era title — actual source, channel, cadence and
+    # resolution — so an old frame can never imply modern imagery.
+    is_gridsat = data.bucket.startswith("noaa-cdr-gridsat")
+    is_mergir = data.bucket == "gesdisc-mergir"
+    if is_mergir:
+        sensor_label = "merged geostationary IR"
+        center_title = (
+            f"NASA MergIR · 11 µm IR window · 30-min · ~4 km · {time_str} UTC")
+    elif is_gridsat:
+        sensor_label = "geostationary IR composite"
+        gs_chan = "11 µm IR window" if channel == 1 else "6.7 µm water vapor"
+        center_title = (
+            f"GridSat-B1 · {gs_chan} · 3-hourly · ~8 km · {time_str} UTC")
+    else:
+        sensor_label = "AHI" if data.bucket.startswith("noaa-himawari") else "ABI"
+        center_title = (
+            f"{data.sat_name} {sensor_label} True Color · {time_str} UTC"
+            if is_rgb
+            else f"{data.sat_name} {sensor_label} Channel {channel:02d} · {time_str} UTC"
+        )
     title_ax.text(
         0.5, 0.5,
         center_title,
@@ -525,7 +608,10 @@ def render_png(
     # Watermark: top-left of the map axes, mirroring the title strip's
     # right-aligned product label so the two corners balance visually.
     # Translucent dark backing rect keeps it legible over hot pixels.
-    source_label = "JMA" if data.bucket.startswith("noaa-himawari") else "NOAA"
+    source_label = ("NASA" if is_mergir
+                    else "NOAA CDR" if is_gridsat
+                    else "JMA" if data.bucket.startswith("noaa-himawari")
+                    else "NOAA")
     ax.text(
         0.01, 0.99,
         f"@WeathermanAAA_  ·  {source_label} {data.sat_name} {sensor_label}",
@@ -552,10 +638,154 @@ def render_png(
         )
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, facecolor=DARK_BG, edgecolor="none")
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG, edgecolor="none")
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
+
+def _erode1(mask: np.ndarray) -> np.ndarray:
+    """Erode a boolean mask by one 4-connected cell (True = keep). A kept cell
+    that touches a dropped cell in any of the 4 directions is itself dropped --
+    so the surviving cells never border the off-disk fill region (see
+    render_backdrop_webp). Pure numpy (no scipy)."""
+    e = mask.copy()
+    e[1:, :] &= mask[:-1, :]
+    e[:-1, :] &= mask[1:, :]
+    e[:, 1:] &= mask[:, :-1]
+    e[:, :-1] &= mask[:, 1:]
+    return e
+
+
+def render_backdrop_webp(
+    data,
+    bbox,
+    *,
+    enhancement: str = "grayscale",
+    downsample: int = 1,
+    dpi: int = 110,
+    quality: int = 82,
+) -> bytes:
+    """Bare GRAYSCALE Vis/SWIR satellite backdrop cutout for the ASCAT + MW viewers.
+
+    Day scenes arrive as a VISIBLE channel (reflectance, units "1") and render via
+    the sqrt-stretched grayscale recipe; night scenes arrive as SHORT-WAVE IR (or
+    clean IR, brightness temperature) and render via the gray BT table. The
+    day/night CHOICE of band is made upstream (pick_backdrop_band); only the units
+    distinguish the two paths here. ZERO baked chrome either way: ONE full-bleed
+    PlateCarree axes (set_aspect('auto') so the data fills the frame edge-to-edge),
+    and no coastlines / gridlines / colorbar / title strip / storm badge /
+    watermark / min-max overlay. Returns an OPAQUE WebP georeferenced to ``bbox``
+    ([W, S, E, N]); the consumer draws it into those exact WGS84 corner bounds and
+    owns the single shared graticule, coastline, colorbar, legend and watermark.
+    Grayscale ONLY so the colored barbs / MW over it stay legible. Raises
+    RuntimeError on a mostly-NaN (degenerate / partial-fetch) field and ValueError
+    on a non-gray enhancement on the thermal path.
+    """
+    cmi = data.cmi
+    lats = data.lats
+    lons = data.lons
+    if downsample > 1:
+        cmi = cmi[::downsample, ::downsample]
+        lats = lats[::downsample, ::downsample]
+        lons = lons[::downsample, ::downsample]
+
+    if getattr(data, "units", "") == "1":
+        # VIS (day): visible reflectance -> sqrt-stretched grayscale (mirror of
+        # render_png's is_visible branch).
+        field = np.asarray(normalize_visible(cmi), dtype=float)
+        plot_field = np.ma.masked_invalid(field)
+        plot_cmap = plt.get_cmap("gray")
+        plot_cnorm = Normalize(vmin=0.0, vmax=1.0)
+    else:
+        # SWIR / clean IR (night): brightness temperature in °C on the gray table.
+        enh = get_enhancement(enhancement)
+        if enh.get("kind") != "gray":
+            raise ValueError(
+                f"render_backdrop_webp requires a grayscale enhancement on the "
+                f"thermal path (got {enhancement!r}, kind={enh.get('kind')!r})"
+            )
+        bt = cmi
+        if data.units in ("C", "celsius", "degC"):
+            bt = bt + 273.15
+        field = np.asarray(bt - 273.15, dtype=float)
+        plot_field = np.ma.masked_invalid(field)
+        plot_cmap = enh["cmap"]
+        plot_cnorm = enhancement_norm(enhancement)  # fresh, not shared
+
+    nan_frac = float(np.isnan(field).mean()) if field.size else 1.0
+    if nan_frac > 0.55:
+        raise RuntimeError(
+            f"backdrop render produced a mostly-NaN field (nan={nan_frac:.0%}) "
+            "— bailing so a partial fetch never publishes a near-empty backdrop"
+        )
+
+    # Geostationary lat/lon grids carry NaN at the OFF-DISK limb. A storm box is
+    # well inside the disk so this never bites, but a BASIN-scale extent reaches
+    # the limb -- and pcolormesh REJECTS non-finite values in its x/y (coord)
+    # arrays (it raises "x and y arguments ... cannot have non-finite values").
+    # Mask the field at off-disk cells (-> transparent), replace the NaN coords
+    # with a finite in-extent fill so pcolormesh accepts the grid, and erode the
+    # valid region by one cell so an on-disk edge cell never stretches a quad out
+    # to a filled coord (shading="auto" averages neighbouring centres -> limb
+    # streaks otherwise). Without this, every basin backdrop 500s.
+    # Coerce coords to plain NaN-filled float arrays first -- a fetch may hand back
+    # MASKED lat/lon at the limb, and pcolormesh rejects BOTH non-finite values and
+    # masked-array coords, so np.where alone (which can stay masked) is not enough.
+    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
+    lats = np.asarray(np.ma.filled(lats, np.nan), dtype=float)
+    xy_ok = np.isfinite(lons) & np.isfinite(lats)
+    if not xy_ok.all():
+        valid = _erode1(xy_ok & ~np.ma.getmaskarray(plot_field))
+        plot_field = np.ma.masked_array(np.ma.getdata(plot_field), mask=~valid)
+        fill_lon = float(np.nanmean(lons)) if np.isfinite(lons).any() else 0.0
+        fill_lat = float(np.nanmean(lats)) if np.isfinite(lats).any() else 0.0
+        lons = np.where(xy_ok, lons, fill_lon)
+        lats = np.where(xy_ok, lats, fill_lat)
+
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lon_span = lon_max - lon_min
+    lat_span = lat_max - lat_min
+    aspect = lon_span / max(lat_span, 1e-6)
+
+    # Pixel proportions track the bbox aspect; set_aspect("auto") then fills the
+    # axes edge-to-edge so the image corners ARE the bbox corners (no letterbox).
+    fig_w = 10.0
+    fig_h = max(2.0, fig_w / max(aspect, 0.2))
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
+    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
+    ax.set_facecolor(DARK_BG)
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_aspect("auto")
+    ax.axis("off")
+    ax.pcolormesh(
+        lons, lats, plot_field,
+        cmap=plot_cmap, norm=plot_cnorm, shading="auto",
+        transform=ccrs.PlateCarree(), rasterized=True,
+    )
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG, edgecolor="none")
+    plt.close(fig)
+    return encode_webp(buf.getvalue(), quality)
+
+
+def encode_webp(png: bytes, quality: int) -> bytes:
+    """Re-encode a rendered PNG as lossy WebP at its NATIVE size (no resize).
+
+    The custom-zoom "low" tier uses this for a small download while keeping the
+    chrome crisp: the figure is already rendered small (low dpi), so there is no
+    bitmap downscale of the composited plot (that is what used to pixelate the
+    title/coastlines/colorbar). Only the codec changes. Distinct from
+    ``transcode_frame``, which DOWNSCALES the 1320 px loop render to the fixed
+    WEBP_FRAME_WIDTH and is the floater/meso poller path -- untouched here.
+    """
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    out = io.BytesIO()
+    im.save(out, "WEBP", quality=quality, method=6)
+    return out.getvalue()
 
 
 def transcode_frame(png: bytes, width: int, quality: int) -> bytes:
@@ -573,6 +803,17 @@ def transcode_frame(png: bytes, width: int, quality: int) -> bytes:
     im = Image.open(io.BytesIO(png)).convert("RGB")
     if width < im.width:
         height = max(1, round(im.height * width / im.width))
+        # Loop frames are square-by-design products (the 12deg storm floater, the
+        # square meso sectors). The upstream cartopy figure height occasionally
+        # rounds 1px off (a sub-0.1% bbox-aspect wobble as the storm drifts),
+        # flipping a frame between e.g. 1056x1056 and 1056x1055 for a multi-hour
+        # block. With the live player resizing its <canvas> to each frame's
+        # native size, that made the loop visibly jump every cycle (the
+        # "seizure"). Snap a near-square result to EXACTLY square so every frame
+        # of a loop matches: a <=3px nudge is sub-0.3% (imperceptible), while a
+        # genuinely non-square product (>3px off) is left untouched.
+        if abs(height - width) <= 3:
+            height = width
         im = im.resize((width, height), Image.LANCZOS)
     out = io.BytesIO()
     im.save(out, "WEBP", quality=quality, method=6)

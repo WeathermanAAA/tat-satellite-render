@@ -41,6 +41,8 @@ import datetime as dt
 import json
 import logging
 import os
+import re
+import threading
 import time
 from typing import Callable, Optional
 
@@ -50,6 +52,7 @@ import requests
 import ace_core as ac
 import poller_framework as pf
 import feed_recompute as fr
+import storm_ids
 
 # ---------------------------------------------------------------------------
 # Config (env-driven, safe defaults)
@@ -96,6 +99,11 @@ GLOBAL_GEOJSON_KEY = (_env("GLOBAL_GEOJSON_KEY",
 # Same placeholder set the invest path guards with (and ace_core's
 # _PLACEHOLDER_NAMES, which is private to the pinned package).
 _NAME_PLACEHOLDERS = {"", "INVEST", "NAMELESS", "UNNAMED"}
+# Designation-vs-real-name classifier - the SINGLE source in storm_ids, shared
+# with floater_poller so both live workers demote-guard identically. Kept as the
+# private module name apply_live_names already reads.
+_is_real_storm_name = storm_ids.is_real_storm_name
+
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
@@ -210,14 +218,32 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
         return pd.DataFrame()
     rows = []
     for it in data:
-        if (it.get("origin_basin") or "").upper() != letter:
+        atcf_id = (it.get("atcf_id") or "").strip().upper()
+        # Basin match off the ATCF id's trailing letter (the authoritative ATCF
+        # basin designator: "93E" -> E.Pac, "92W" -> W.Pac, "96P" -> S.Pac).
+        # knackwx's separate origin_basin field is sometimes null (observed on
+        # EP invests like 93E, which dropped them off the live tracks map), so
+        # deriving the basin from the id itself keeps EP/AL invests from being
+        # silently dropped; origin_basin is only a fallback when the id has no
+        # usable trailing letter. Mirrors generate_tracks_plot.fetch_live_invests.
+        id_letter = atcf_id[-1] if atcf_id[-1:].isalpha() else ""
+        basin_letter = id_letter or (it.get("origin_basin") or "").strip().upper()
+        if basin_letter != letter:
             continue
-        atcf_id = (it.get("atcf_id") or "").strip()
         try:
             storm_num = int(atcf_id[:-1])
         except (ValueError, IndexError):
             continue
-        if not (90 <= storm_num <= 99):
+        # JTWC has no CurrentStorms equivalent, so a JUST-designated JTWC TD
+        # (the former invest, before its b-deck BEST file is written) falls
+        # through both the b-deck sweep (file absent) and the 90-99 invest
+        # filter. Treat knackwx as the JTWC live-DESIGNATION source: accept
+        # designated numbers 1..49 too. NHC keeps CurrentStorms authoritative
+        # (no-op here when agency_name != JTWC). Mirror of generate_tracks_plot.
+        is_jtwc = (basin_cfg.get("agency_name") or "").strip().upper() == "JTWC"
+        is_invest_num = 90 <= storm_num <= 99
+        is_designated = is_jtwc and (1 <= storm_num <= 49)
+        if not (is_invest_num or is_designated):
             continue
         ts = it.get("analysis_time")
         if not ts:
@@ -247,12 +273,30 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
         name_raw = (it.get("storm_name") or "").strip()
         name = (name_raw if name_raw and name_raw not in {"INVEST", "NAMELESS", "UNNAMED"}
                 else f"{storm_num}{letter}")
+        # 92W->07W carry (mirror of the cron). knackwx gives the prior invest as
+        # transitioned_from ("92W"); feed its NUMBER as spawn_invest so ace_core's
+        # number-keyed superseding-invest dedup retires it the cycle the
+        # designation appears. FRAME-COINCIDENT (recycle-safe, stateless): carry
+        # only while the SAME payload still lists that 9x invest.
+        spawn_invest = None
+        if is_designated:
+            tf = (it.get("transitioned_from") or "").strip().upper()
+            mtf = re.fullmatch(r"(\d{1,2})[A-Z]", tf)
+            if mtf:
+                tf_num = int(mtf.group(1))
+                tf_letter = tf[-1] if tf[-1:].isalpha() else ""
+                if 90 <= tf_num <= 99 and tf_letter == letter and any(
+                    (str((d.get("atcf_id") or "")).strip().upper())
+                        == f"{tf_num:02d}{letter}"
+                    for d in data):
+                    spawn_invest = tf_num
         rows.append({
             "SID": f"{basin_cfg['agency_name']}_{basin_cfg['short'].upper()}"
                    f"{storm_num:02d}{year}",
             "NAME": name, "season": year, "time": t, "lat": lat, "lon": lon,
             "wind_kt": vmax, "pressure_mb": pres, "nature": nature,
-            "source": "live-knackwx", "storm_num": storm_num,
+            "source": "live-knackwx-designated" if is_designated else "live-knackwx",
+            "storm_num": storm_num, "spawn_invest": spawn_invest,
         })
     return pd.DataFrame(rows)
 
@@ -348,6 +392,19 @@ def apply_live_names(named: pd.DataFrame, live_names: dict[int, str],
         old = str(out.loc[mask, "NAME"].iloc[0] or "").strip().upper()
         if old == new:
             continue
+        # DIRECTIONAL GUARD. CurrentStorms LEADS the b-deck on the naming EVENT
+        # (its whole purpose: promote a depression "ONE"/"FOUR" to the real
+        # "AMANDA"/"DOUGLAS" the instant NHC names it). But it can also LAG:
+        # right after a synoptic-time upgrade the b-deck NAME column already
+        # carries the real name while CurrentStorms still shows the depression
+        # designation (bep042026.dat "DOUGLAS" vs CurrentStorms "Four-E",
+        # 2026-07-01). Only ever PROMOTE (designation -> real), NEVER DEMOTE
+        # (real -> designation): if CurrentStorms offers a designation while the
+        # b-deck already resolved a real name, keep the b-deck's real name.
+        # (designation -> designation, e.g. b-deck "FOUR" -> CurrentStorms
+        # "FOUR-E", still refreshes the display form for an unnamed depression.)
+        if not _is_real_storm_name(new) and _is_real_storm_name(old):
+            continue
         out.loc[mask, "NAME"] = new
         if old not in _NAME_PLACEHOLDERS:
             renames[old] = new
@@ -369,9 +426,98 @@ def apply_live_names(named: pd.DataFrame, live_names: dict[int, str],
 
 
 def _combine(named: pd.DataFrame, invests: pd.DataFrame) -> pd.DataFrame:
-    """named + invests for the TRACKS frame (ace gets named only)."""
+    """named + invests for the TRACKS frame (ace gets named only).
+
+    b-deck PRIMARY: a knackwx-DESIGNATED row (source 'live-knackwx-designated',
+    the JTWC live-designation fill for a fresh TD the b-deck has not yet
+    written) is dropped once the b-deck named frame carries the SAME SID -- the
+    b-deck is the authoritative 6-hourly track when present. 90-99 invests are
+    never JTWC-b-decked here, so they pass through untouched. Mirror of the
+    cron's fetch_live_season b-deck-primary reconciliation."""
     frames = [f for f in (named, invests) if f is not None and not f.empty]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    if named is not None and not named.empty and "source" in out.columns \
+            and "SID" in out.columns:
+        bdeck_sids = set(named["SID"])
+        drop = ((out["source"] == "live-knackwx-designated")
+                & out["SID"].isin(bdeck_sids))
+        if drop.any():
+            out = out[~drop].reset_index(drop=True)
+    return out
+
+
+# NHC CurrentStorms.json — the authoritative final-advisory signal feeding
+# ace_core 0.7.0's prompt is_active retirement (status only: a dissipated
+# NHC storm drops from active counts / live markers while its track and
+# season ACE stay byte-identical). One fetch per cycle shared across the
+# three basin sources via a short TTL cache; None (failed fetch) makes the
+# retirement a no-op for that build — ace_core's contract, never
+# mass-retire on missing information.
+_NHC_ACTIVE_TTL_S = 120.0
+_nhc_active_cache: dict = {"t": 0.0, "sids": None}
+_nhc_active_lock = threading.Lock()
+
+
+def _nhc_active_sids() -> "set[str] | None":
+    with _nhc_active_lock:
+        now = time.monotonic()
+        if now - _nhc_active_cache["t"] > _NHC_ACTIVE_TTL_S:
+            _nhc_active_cache["sids"] = ac.fetch_nhc_active_sids()
+            _nhc_active_cache["t"] = now
+        return _nhc_active_cache["sids"]
+
+
+# --- NHC formation chances (Tropical Weather Outlook) -----------------------
+# The genesis-odds pill on the invest/PTC CycloLab page reads
+# cyclolab/{sid}/formation.json. The cyclolab GUIDANCE poller writes it, but
+# ONLY for invests still in the ACTIVE feed — so once a system's invest is
+# dropped from the feed (the 90L->01L handoff hands a PTC its REAL id and drops
+# the invest), its formation.json FREEZES at its last value while the TWO keeps
+# updating (observed: 60% frozen while the live TWO read 70%). The always-on
+# poller refreshes formation.json for EVERY invest the TWO references, every
+# poll, independent of active-feed membership — so the PTC's pill (which reads
+# its spawning invest's formation.json) stays current. Same content + same key
+# as the guidance poller, so the two are idempotent. TTL-cached (the TWO moves
+# slowly; the poll cadence is ~60s). Kill-switch CYCLOLAB_FORMATION (default on).
+_NHC_TWO_BASINS = {"al", "ep", "cp"}
+_FORMATION_PREFIX = (_env("GUIDANCE_R2_PREFIX", "cyclolab") or "cyclolab").strip("/")
+_FORMATION_ON = (_env("CYCLOLAB_FORMATION", "1") or "1").lower() \
+    not in ("0", "false", "no")
+_TWO_TTL_S = float(_env("TWO_TTL_S", "300"))
+_two_cache: dict = {}            # basin -> (monotonic_t, {sid: formation})
+_two_lock = threading.Lock()
+
+
+def _formation_map(session, basin: str, year: int) -> dict:
+    """TTL-cached NHC TWO formation chances for a basin -> {sid: formation}.
+    Empty {} on a quiet outlook OR a transient fetch failure (best-effort)."""
+    key = basin.lower()
+    with _two_lock:
+        cached = _two_cache.get(key)
+        now = time.monotonic()
+        if cached and now - cached[0] < _TWO_TTL_S:
+            return cached[1]
+    from cyclolab_guidance_poller import fetch_two   # light; late import
+    fmap = fetch_two(session, basin, year)
+    with _two_lock:
+        _two_cache[key] = (time.monotonic(), fmap)
+    return fmap
+
+
+def _refresh_formation(sink, session, basin: str, now_naive) -> None:
+    """Write cyclolab/{sid}/formation.json for every TWO-referenced invest in
+    ``basin`` (NHC only). Best-effort; an empty map writes nothing (so a
+    transient TWO outage never blanks an existing pill). Idempotent with the
+    guidance poller (identical key + content)."""
+    if not _FORMATION_ON or basin.lower() not in _NHC_TWO_BASINS:
+        return
+    fmap = _formation_map(session, basin, now_naive.year)
+    for sid, fc in fmap.items():
+        formation = {**fc, "generated_at": ac.iso_z(now_naive),
+                     "source": "nhc-two"}
+        sink.write(f"{_FORMATION_PREFIX}/{sid}/formation.json", formation)
 
 
 class GlobalGeojsonComposer:
@@ -454,6 +600,24 @@ def make_basin_source(basin: str, session: requests.Session,
     of waiting for NHC to backfill the b-deck name column. ``invests`` = knackwx
     90-99 -> the TRACKS feed only (invests never enter ACE)."""
     year = clock().year
+    # NEVER-REGRESS high-water-mark (CycloLab cluster): per-basin, per-storm
+    # last-known-good full track, so a transient JTWC b-deck/mirror failure can
+    # never clobber a designated storm's track down to the lone live fix. In the
+    # Source closure (one per basin) -> no cross-basin leakage. ACE is untouched
+    # (the ACE feed is a separate recompute_ace_feed call).
+    _track_hwm: dict = {}
+
+    def _is_designated(storm: dict) -> bool:
+        """Designated (non-invest) storms get the never-regress guard; invests
+        are left as the live knackwx snapshot (Part E owns recycle-safe invest
+        accumulation). Uses ace_core's own is_invest flag, with a storm-number
+        backstop (90-99 = invest)."""
+        if storm.get("is_invest"):
+            return False
+        try:
+            return not (90 <= int(str(storm.get("sid") or "")[-6:-4]) <= 99)
+        except (ValueError, IndexError):
+            return not storm.get("is_invest", False)
 
     def _read_base(kind: str) -> dict:
         if base_reader is not None:
@@ -502,9 +666,44 @@ def make_basin_source(basin: str, session: requests.Session,
         # Tracks: named + invests (preserves the cron's invest cards).
         tracks_live = _combine(data["named"], data["invests"])
         tracks_feed = fr.recompute_tracks_feed(data["tracks_base"], tracks_live,
-                                               build_now=now_naive)
+                                               build_now=now_naive,
+                                               nhc_active_sids=_nhc_active_sids())
+        # NEVER-REGRESS (the cure for the clobbered JTWC Track History/Wind&Press
+        # + the sparse per-basin map): a transient b-deck/mirror miss must not
+        # collapse a designated storm's track to the lone live fix. ACE-safe by
+        # construction -- ace_feed above is already computed off the canon frame
+        # and is NOT touched here. Best-effort: a guard hiccup never blocks the
+        # feed write.
+        try:
+            n_rg = fr.apply_never_regress(tracks_feed, _track_hwm, _is_designated)
+            if n_rg:
+                log.info("%s: never-regress republished %d designated storm(s) "
+                         "(transient sparse track preserved)", basin, n_rg)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: never-regress skipped (%s)", basin, e)
         ctx.sink.write(f"feeds/{basin}_ace_data.json", ace_feed)
         ctx.sink.write(f"feeds/{basin}_tracks_data.json", tracks_feed)
+        # Hardening: a system present in a LIVE source (knackwx / b-deck) but
+        # absent from the published feed = the next discovery crack -> WARN
+        # loudly. A handoff legitimately retires the prior 9x invest once its
+        # designation appears (spawn_invest), so suppress those. Best-effort:
+        # a logging bug must NEVER stale the just-written live feed.
+        try:
+            if not tracks_live.empty and "SID" in tracks_live.columns:
+                feed_sids = {s.get("sid") for s in (tracks_feed.get("storms") or [])}
+                cfg = data["tracks_base"]["basin_cfg"]
+                superseded = set()
+                if "spawn_invest" in tracks_live.columns:
+                    for n in tracks_live["spawn_invest"].dropna().unique():
+                        superseded.add(f"{cfg['agency_name']}_"
+                                       f"{cfg['short'].upper()}{int(n):02d}{year}")
+                missing = (set(tracks_live["SID"]) - feed_sids) - superseded
+                if missing:
+                    log.warning("%s: %d system(s) present in a live source but "
+                                "absent from the published feed: %s",
+                                basin, len(missing), sorted(missing))
+        except Exception:  # noqa: BLE001
+            pass
         # Phase 3: feed the global-map composer AFTER the basin feeds are
         # safely written. Best-effort inside (a geojson blip never fails or
         # stales this basin's source); gated by GLOBAL_GEOJSON_KEY (default
@@ -517,6 +716,15 @@ def make_basin_source(basin: str, session: requests.Session,
         # raises); gated by CYCLOLAB_PAGES at engine assembly.
         if pages is not None:
             pages.update(basin, tracks_feed, now=ctx.now)
+        # Keep the formation-chance pill FRESH on the always-on cadence: refresh
+        # formation.json for every invest the NHC TWO references in this basin,
+        # regardless of active-feed membership (the guidance poller only covers
+        # active-feed invests, so a PTC's spawning invest — dropped by the
+        # handoff — would otherwise freeze). Best-effort; never fails the basin.
+        try:
+            _refresh_formation(ctx.sink, session, basin, now_naive)
+        except Exception as e:  # noqa: BLE001 - best-effort, never fail the feed
+            log.warning("formation refresh failed (%s): %s", basin, e)
 
     # restamp=True: re-emit the feeds EVERY cycle so generated_utc ticks on the
     # poll cadence (the "poller alive / last checked" stamp) and staleness_minutes
@@ -558,6 +766,14 @@ def build_engine(sink: pf.Sink, *, basins=BASINS,
     if cyclolab:
         from cyclolab_advisories import make_advisories_source
         sources.append(make_advisories_source(session, sink, clock=clock))
+    # JTWC/WP derived-cone Source (CYCLOLAB_DESIGN.md §8.4) - a SEPARATE,
+    # fully-isolated Source so a JTWC parse/fetch failure can never stale ACE/
+    # tracks NOR break the NHC cones. INDEPENDENT kill-switch
+    # (CYCLOLAB_ADVISORIES_JTWC), not gated by the NHC CYCLOLAB_ADVISORIES flag.
+    from cyclolab_advisories import CYCLOLAB_JTWC_ENABLED
+    if CYCLOLAB_JTWC_ENABLED:
+        from cyclolab_advisories import make_jtwc_advisories_source
+        sources.append(make_jtwc_advisories_source(session, sink, clock=clock))
     return pf.PollerEngine(
         sources, name="intensity-poller", interval_s=interval_s,
         stale_after_s=float(_env("STALE_AFTER_S", "1800")),
