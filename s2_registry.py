@@ -242,6 +242,10 @@ class ProductEntry:
     # product through the recipe engine (s2_imagery.produce_recipe_imagery)
     # instead of the single-band clean-IR path. None = pre-suite behavior.
     recipe_id: Optional[str] = None
+    # BT inspector raster long-edge override (0 = s2_imagery.BT_PX default).
+    # Raised on the himawari9-wpac clean-IR row so the objfix WP intensity
+    # path gets ~3.7 km calibrated input instead of ~7.4 km.
+    bt_px: int = 0
 
     # -- routing ------------------------------------------------------------
     def claims(self, slot: Optional[SatSlot]) -> bool:
@@ -640,7 +644,61 @@ def _fd_recipe_row(r) -> ProductEntry:
 
 FD_SUITE_ROWS: tuple[ProductEntry, ...] = tuple(
     _fd_recipe_row(r) for r in _rx.RECIPES if r.key != "truecolor")
-REGISTRY = REGISTRY + SUITE_ROWS + FD_SUITE_ROWS
+
+# ---------------------------------------------------------------------------
+# Himawari-9 imagery suite ("add a satellite = registry rows"): one tiled row
+# per AHI recipe (s2_recipes.AHI_RECIPES -- first-class AHI band numbers +
+# AHI-verified coefficients) for TWO domains:
+#   * fd   -- the full disk. The AHI disk CROSSES the antimeridian, so the
+#             bbox carries an UNWRAPPED east edge (E > 180); s2_webmerc and
+#             the viewer's BT probe unwrap accordingly.
+#   * wpac -- the W Pacific working domain (JTWC AOR-ish; the objfix WP
+#             live-BT input and the cockpit's Himawari home view).
+# Substrate = AHI-L1b FLDK segments (Himawari has NO MCMIP/CMIP analogue);
+# both domains render from the SAME 10-min FLDK scan. Full-disk truecolor is
+# EXCLUDED like goes19-fd (0.5 km B03 budget at disk scale); wpac carries it.
+# ---------------------------------------------------------------------------
+_HW_FD_BBOX = (60.0, -60.0, 221.0, 60.0)     # 140.7°E ± ~80°, lat clip like goes fd
+_HW_WPAC_BBOX = (95.0, -5.0, 180.0, 45.0)    # WP basin: S China Sea .. dateline
+_HW_FD_PX_BY_KM = {0.5: 6144, 1.0: 6144, 2.0: 5120}
+_HW_WPAC_PX_BY_KM = {0.5: 6144, 1.0: 6144, 2.0: 4608}
+
+
+def _hw_recipe_row(r, sector: str, bbox, px_by_km) -> ProductEntry:
+    # truecolor renders at the 2 km-class raster: the z0-5 cron tiles resolve
+    # nothing finer over these domains, and the frozen Rayleigh correction at
+    # a 0.5 km-class raster is minutes of CPU + GBs of transients per frame.
+    px = px_by_km[2.0] if r.key == "truecolor" else px_by_km[r.finest_km]
+    return ProductEntry(
+        product_id=f"himawari9-{sector}-{r.key}",
+        family="himawari", substrate="ahi_l1b", bucket="noaa-himawari9",
+        sat_num="09",
+        s3_prefix="AHI-L1b-FLDK/", sns_filter_prefixes=("AHI-L1b-FLDK/",),
+        accept_sectors=frozenset({"FLDK"}),
+        channels=(), bands=tuple(r.bands), ahi_segments=10,
+        sat_key="himawari9", sector_key=sector, band_key=r.key,
+        prod_meso_slug=None,
+        render_channel="recipe", render_enhancement=r.enhancement,
+        render_product_hint=sector, render_sat_hint="Himawari-Pacific",
+        cadence_s=600,
+        tiled=True, tile_size=512,
+        pyramid_px=px,
+        pyramid_scheme="webmercator-xyz",
+        sector_bbox=bbox,
+        recipe_id=r.key,
+        # objfix WP intensity input: the wpac clean-IR BT raster at ~3.7 km
+        bt_px=(2560 if (sector == "wpac" and r.key == "ir") else 0),
+    )
+
+
+HW_WPAC_ROWS: tuple[ProductEntry, ...] = tuple(
+    _hw_recipe_row(r, "wpac", _HW_WPAC_BBOX, _HW_WPAC_PX_BY_KM)
+    for r in _rx.AHI_RECIPES)
+HW_FD_ROWS: tuple[ProductEntry, ...] = tuple(
+    _hw_recipe_row(r, "fd", _HW_FD_BBOX, _HW_FD_PX_BY_KM)
+    for r in _rx.AHI_RECIPES if r.key != "truecolor")
+
+REGISTRY = REGISTRY + SUITE_ROWS + FD_SUITE_ROWS + HW_WPAC_ROWS + HW_FD_ROWS
 
 REGISTRY_BY_ID = {e.product_id: e for e in REGISTRY}
 
@@ -655,7 +713,12 @@ def build_products_index(sat_key: str, sector_key: str,
     for e in REGISTRY:
         if not (e.tiled and e.sat_key == sat_key and e.sector_key == sector_key):
             continue
-        r = _r.RECIPES_BY_KEY.get(e.recipe_id) if e.recipe_id else None
+        r = None
+        if e.recipe_id:
+            try:
+                r = _r.recipe_for(e.family, e.recipe_id)
+            except KeyError:
+                r = None
         prods.append({
             "id": e.product_id,
             "path": e.product_path,

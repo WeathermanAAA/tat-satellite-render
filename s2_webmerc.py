@@ -78,10 +78,17 @@ def native_max_zoom(bounds, image_px, tile_size: int = 512) -> int:
 def reproject_tile(rgba: np.ndarray, bounds, z: int, x: int, y: int,
                    tile_size: int = 512):
     """Reproject the equirectangular source into ONE Web-Mercator XYZ tile.
-    Returns a (T,T,4) uint8 RGBA, or None if the tile is entirely off-data."""
+    Returns a (T,T,4) uint8 RGBA, or None if the tile is entirely off-data.
+
+    ANTIMERIDIAN-crossing sources (Himawari full disk) carry an UNWRAPPED east
+    edge (E > 180); output tile longitudes west of W unwrap by +360 so they
+    sample the eastern lobe. E <= 180 sources (all GOES) are bit-identical to
+    the pre-wrap behavior (the unwrap condition can never hold)."""
     W, S, E, N = bounds
     sh, sw = rgba.shape[:2]
     lon, lat = _lonlat_axes(z, x, y, tile_size)
+    if E > 180.0:
+        lon = np.where((lon < W) & (lon + 360.0 <= E + 1e-9), lon + 360.0, lon)
     # Map lon->source column, lat->source row (row 0 = north = N). map_coordinates
     # samples at (row, col); shift by 0.5 so pixel centers align.
     src_col = (lon - W) / (E - W) * sw - 0.5
@@ -121,23 +128,34 @@ def cut_webmerc_pyramid(raster: np.ndarray, bounds, spec: PyramidSpec = PyramidS
     counts: dict = {}
     for z in range(spec.min_zoom, maxzoom + 1):
         nz = 2 ** z
-        # Only iterate the tile range that overlaps the data footprint.
-        x0 = max(0, int((w + 180.0) / 360.0 * nz))
-        x1 = min(nz - 1, int((e + 180.0) / 360.0 * nz))
+        # Only iterate the tile range that overlaps the data footprint. An
+        # antimeridian-crossing source (unwrapped e > 180) overlaps TWO x
+        # ranges of the global grid: [x(w)..nz-1] and [0..x(e-360)].
+        if e > 180.0:
+            x_ranges = [(max(0, int((w + 180.0) / 360.0 * nz)), nz - 1),
+                        (0, min(nz - 1, int((e - 360.0 + 180.0) / 360.0 * nz)))]
+        else:
+            x_ranges = [(max(0, int((w + 180.0) / 360.0 * nz)),
+                         min(nz - 1, int((e + 180.0) / 360.0 * nz)))]
         # y grows southward; north edge = smaller y (correct forward Mercator).
         y0 = max(0, int(lat_to_merc_y(min(n, WEBMERC_LAT_LIMIT)) * nz))
         y1 = min(nz - 1, int(lat_to_merc_y(max(s, -WEBMERC_LAT_LIMIT)) * nz))
         c = 0
-        for ty in range(y0, y1 + 1):
-            for tx in range(x0, x1 + 1):
-                tile = reproject_tile(rgba, cb, z, tx, ty, T)
-                if tile is None:
-                    continue
-                data = _encode_webp(tile, spec)
-                if data is None:
-                    continue
-                tiles[(z, tx, ty)] = data
-                c += 1
+        seen = set()
+        for x0, x1 in x_ranges:
+            for ty in range(y0, y1 + 1):
+                for tx in range(x0, x1 + 1):
+                    if (tx, ty) in seen:
+                        continue
+                    seen.add((tx, ty))
+                    tile = reproject_tile(rgba, cb, z, tx, ty, T)
+                    if tile is None:
+                        continue
+                    data = _encode_webp(tile, spec)
+                    if data is None:
+                        continue
+                    tiles[(z, tx, ty)] = data
+                    c += 1
         counts[z] = c
     return {"maxzoom": maxzoom, "image_px": [W, H], "tiles": tiles,
             "tile_counts": counts, "scheme": "webmercator-xyz"}

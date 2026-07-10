@@ -59,8 +59,10 @@ services:
   # Cron emitter: the Q7-tiered suite loop. z0-5 only (native z6 stays a manual
   # `run --rm emit --product ... ` on demand); duplicate scans dedup via the
   # per-frame ready marker, so the interval only bounds FRESHNESS, not writes.
-  # Knobs (set in .env to override): S2_CRON_SUITE, S2_CRON_MAX_ZOOM,
-  # S2_CRON_INTERVAL_S, S2_CRON_PREFIX.
+  # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list --
+  # e.g. "conus fd himawari9-wpac himawari9-fd"; falls back to the legacy
+  # single S2_CRON_SUITE), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
+  # S2_CRON_PREFIX. A failed suite never blocks the rest of the tick.
   emit-cron:
     build:
       context: .
@@ -69,13 +71,16 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "[s2-cron] suite=$${S2_CRON_SUITE:-conus} max-zoom=$${S2_CRON_MAX_ZOOM:-5} interval=$${S2_CRON_INTERVAL_S:-900}s"
+        SUITES="$${S2_CRON_SUITES:-$${S2_CRON_SUITE:-conus}}"
+        echo "[s2-cron] suites=$$SUITES max-zoom=$${S2_CRON_MAX_ZOOM:-5} interval=$${S2_CRON_INTERVAL_S:-900}s"
         while true; do
-          python s2_pyramid_emit.py \
-            --suite "$${S2_CRON_SUITE:-conus}" \
-            --store r2 --prefix "$${S2_CRON_PREFIX:-shadow}" \
-            --max-zoom "$${S2_CRON_MAX_ZOOM:-5}" \
-            || echo "[s2-cron] emit failed rc=$$? (next tick retries)"
+          for suite in $$SUITES; do
+            python s2_pyramid_emit.py \
+              --suite "$$suite" \
+              --store r2 --prefix "$${S2_CRON_PREFIX:-shadow}" \
+              --max-zoom "$${S2_CRON_MAX_ZOOM:-5}" \
+              || echo "[s2-cron] $$suite emit failed rc=$$? (next tick retries)"
+          done
           sleep "$${S2_CRON_INTERVAL_S:-900}"
         done
     env_file: .env

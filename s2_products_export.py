@@ -68,7 +68,12 @@ def render_refl_cbar_png(path: str):
 
 
 def product_row(e) -> dict:
-    r = X.RECIPES_BY_KEY.get(e.recipe_id) if e.recipe_id else None
+    r = None
+    if e.recipe_id:
+        try:
+            r = X.recipe_for(e.family, e.recipe_id)
+        except KeyError:
+            r = None
     if r is None:   # the pre-suite clean-IR row
         title, group, day_only, bt = "C13 · 10.3 µm (Clean IR)", "channel", False, True
         cbar_key = "rainbow_ir"
@@ -97,18 +102,28 @@ def product_row(e) -> dict:
             "cbar": cbar}
 
 
+def _sector_rows(sat_key: str, sector: str) -> list:
+    entries = [e for e in R.REGISTRY
+               if e.tiled and e.sat_key == sat_key and e.sector_key == sector]
+    # picker order: the clean-IR default first, then composites, RGBs, channels
+    order = {"channel": 2, "rgb": 1, "composite": 0}
+    rows = [product_row(e) for e in entries]
+    rows.sort(key=lambda p: (p["key"] != "ir", order[p["group"]], p["title"]))
+    return rows
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="main-repo satellite/explorer dir")
     ap.add_argument("--sector", default="conus")
     args = ap.parse_args(argv)
 
-    entries = [e for e in R.REGISTRY
-               if e.tiled and e.sector_key == args.sector and e.family == "goes"]
-    # picker order: the clean-IR default first, then composites, RGBs, channels
-    order = {"channel": 2, "rgb": 1, "composite": 0}
-    rows = [product_row(e) for e in entries]
-    rows.sort(key=lambda p: (p["key"] != "ir", order[p["group"]], p["title"]))
+    rows = _sector_rows("goes19", args.sector)
+    # Himawari-9 rides along as its own product set (wpac is the export
+    # sector; the cockpit swaps wpac<->fd in the path exactly like conus<->fd).
+    # TVProducts.products stays the goes19 list -- compare.html and any
+    # existing reader see an unchanged shape (additive key only).
+    hw_rows = _sector_rows("himawari9", "wpac")
 
     cdir = os.path.join(args.out, "cbars")
     os.makedirs(cdir, exist_ok=True)
@@ -125,10 +140,12 @@ def main(argv=None) -> int:
               "base": "https://cdn.triple-a-tropics.com/shadow/",
               "sector": args.sector,
               "products": rows,
+              "himawari9": {"sector": "wpac", "products": hw_rows},
           }, indent=2, ensure_ascii=False) + ";\n")
     with open(os.path.join(args.out, "products.js"), "w") as f:
         f.write(js)
-    print(f"wrote products.js ({len(rows)} products) + {len(CBARS)+1} colorbars -> {args.out}")
+    print(f"wrote products.js ({len(rows)} goes19 + {len(hw_rows)} himawari9 "
+          f"products) + {len(CBARS)+1} colorbars -> {args.out}")
     return 0
 
 

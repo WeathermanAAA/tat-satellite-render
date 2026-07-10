@@ -405,9 +405,13 @@ def produce_recipe_imagery(entry, time=None, nearest=True,
     """End-to-end recipe product: co-temporal band fetch -> one regular grid ->
     declarative band math (s2_recipes) -> chrome-free RGBA + optional BT raster.
     Same ImageryResult contract as produce_imagery, so the pyramid emitter and
-    Q7 --max-zoom tiering apply unchanged."""
+    Q7 --max-zoom tiering apply unchanged. Dispatches per family: GOES/ABI CMIP
+    crops below, Himawari/AHI L1b disks via produce_ahi_recipe_imagery."""
     if not entry.recipe_id:
         raise ValueError(f"{entry.product_id} has no recipe_id")
+    if entry.family == "himawari":
+        return produce_ahi_recipe_imagery(entry, time=time, nearest=nearest,
+                                          band_cache=band_cache)
     recipe = s2_recipes.RECIPES_BY_KEY[entry.recipe_id]
     if recipe.kind == "truecolor":
         return produce_truecolor(entry, time=time, nearest=nearest)
@@ -438,7 +442,8 @@ def produce_recipe_imagery(entry, time=None, nearest=True,
     if recipe.bt_band:
         try:
             res.bt_grid, res.bt_dims = _decimate_bt(
-                sampled[recipe.bt_band] - 273.15, bounds)
+                sampled[recipe.bt_band] - 273.15, bounds,
+                out_w=(getattr(entry, "bt_px", 0) or BT_PX))
         except Exception:   # noqa: BLE001  (inspector is best-effort, never blocks)
             res.bt_grid, res.bt_dims = None, None
     return res
@@ -485,3 +490,261 @@ def produce_truecolor(entry, time=None, nearest=True):
         product=r.product, bucket=r.bucket,
         s3_key=getattr(resolved, "s3_key", ""),
         generic_channel="truecolor", enhancement="tat_neon")
+
+
+# ============================================================================
+# Himawari-9 / AHI imagery suite ("add a satellite = registry rows").
+#
+# Same FROZEN-renderer-reuse contract as the ABI paths above, built from the
+# battle-tested AHI primitives that already feed the live WPAC floaters/meso:
+#   * vendor.ahi_loader.load_band_sync  -- HSD segment fetch/stitch/calibrate
+#     (BT [K] emissive, reflectance [0..1] visible), bbox segment+column
+#     filtered, now stride-decimating for wide-domain fetches.
+#   * satellites._ahi_latlon_to_xy_deg + _ahi_xy_deg_to_colline -- the shared
+#     band-independent geos trig + per-band linear scaling (the exact
+#     co-registration _compose_true_color_sync has always used).
+# Recipe math, palettes (frozen tat_palettes), the BT raster, the pyramid cut
+# and Q7 tiering are all sensor-agnostic and shared with GOES.
+#
+# ANTIMERIDIAN: the Himawari disk crosses ±180°, so full-disk bounds use an
+# UNWRAPPED east edge (E > 180, e.g. (60, -60, 221, 60)); target longitudes
+# are wrapped back to [-180, 180] for the projection + solar geometry, and
+# the manifest carries the unwrapped bounds (s2_webmerc + the viewer's BT
+# probe unwrap the same way).
+# ============================================================================
+
+# Per-(sector, native-resolution) load decimation. FD decimates the 0.5/1 km
+# bands to an effective ~2 km: the FD pyramid is ~2.9 km/px so nothing finer
+# survives to a tile anyway, and a native full-disk B03 stitch is ~1 GB u16.
+# WPAC keeps >= 1 km (its pyramid is ~1.5 km/px). 2 km bands always native.
+_AHI_SUITE_STRIDE = {
+    ("fd", "R05"): 4, ("fd", "R10"): 2, ("fd", "R20"): 1,
+    ("wpac", "R05"): 2, ("wpac", "R10"): 1, ("wpac", "R20"): 1,
+}
+
+
+def _ahi_stride(sector_key: str, band: int) -> int:
+    from vendor.ahi_loader import BAND_RES_SUFFIX
+    return _AHI_SUITE_STRIDE.get((sector_key, BAND_RES_SUFFIX[band]), 1)
+
+
+def fetch_ahi_band_disks(entry, bands, time=None, nearest=True, cache=None):
+    """AHI counterpart of fetch_band_crops: resolve ONE FLDK slot with a
+    COMPLETE segment set for every band (the loader's completeness probe --
+    NOAA uploads segments over minutes, and a half-published band stitches to
+    a short window), then load each band's CalibratedDisk bbox-filtered and
+    stride-decimated. `cache` memoizes disks across products of one suite
+    emit, keyed (sector, band, stamp). Returns (slot_dt, bucket, {band: disk}).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from satellites import HIMAWARI_PACIFIC, _get_fs
+    from vendor.ahi_loader import load_band_sync
+
+    sat = HIMAWARI_PACIFIC
+    t = time or dt.datetime.now(UTC)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+    bands = sorted(set(int(b) for b in bands))
+    bbox = tuple(entry.sector_bbox)
+
+    if time is not None:
+        # pinned scan (suite mode): snap to its 10-min block, trust the pin
+        # (the suite pinner already verified completeness for ALL bands)
+        slot = sat._snap_10min(t, True)
+    else:
+        base = t.replace(second=0, microsecond=0)
+        floored = base.replace(minute=(base.minute // 10) * 10)
+        slot = sat._first_available_fldk_slot_sync(floored, bands)
+        if slot is None:
+            raise RuntimeError(
+                f"no complete AHI FLDK slot for bands {bands} near {t.isoformat()}")
+    bucket = sat.resolve(slot).bucket
+    stamp = slot.strftime("%Y%m%dT%H%M%SZ")
+    fs = _get_fs()
+
+    disks, missing = {}, []
+    for b in bands:
+        got = cache.get(("ahi", entry.sector_key, b, stamp)) if cache is not None else None
+        if got is not None:
+            disks[b] = got
+        else:
+            missing.append(b)
+    if missing:
+        # concurrency knob: 4 suits the box (8 GB emit container); a smaller
+        # host caps it via env (each in-flight band holds its raw segments)
+        workers = max(1, int(os.getenv("S2_AHI_FETCH_WORKERS", "4")))
+        with ThreadPoolExecutor(max_workers=min(workers, len(missing))) as pool:
+            futs = {b: pool.submit(load_band_sync, fs, bucket, slot, b,
+                                   bbox=bbox,
+                                   stride=_ahi_stride(entry.sector_key, b))
+                    for b in missing}
+            for b, f in futs.items():
+                disks[b] = f.result()
+                if cache is not None:
+                    cache[("ahi", entry.sector_key, b, stamp)] = disks[b]
+    return slot, bucket, disks
+
+
+def _ahi_target_mesh(bbox, out_w, sub_lon):
+    """Regular lat/lon target grid over `bbox` (row 0 = north, the tile
+    origin) + the shared AHI scan angles for it (the expensive trig, computed
+    ONCE per mesh -- every band applies only its linear CFAC/COFF scaling).
+    `bbox` may carry an unwrapped east edge (E > 180) or the e<w wrap form.
+    float32 throughout: a 6144-px mesh is 4 arrays -- f64 would be ~0.7 GB of
+    pure mesh; f32 sub-pixel error at AHI grid scale is <0.01 px.
+    Returns (TLON wrapped, TLAT, x_deg, y_deg, bounds_unwrapped, (w, h))."""
+    from satellites import _ahi_latlon_to_xy_deg
+    W, S, E, N = bbox
+    E_uw = E if E >= W else E + 360.0
+    span_x = max(E_uw - W, 1e-6)
+    span_y = max(N - S, 1e-6)
+    out_h = max(1, round(out_w * span_y / span_x))
+    tgt_lons = (((np.linspace(W, E_uw, out_w) + 180.0) % 360.0) - 180.0).astype(np.float32)
+    tgt_lats = np.linspace(N, S, out_h).astype(np.float32)      # row 0 = north
+    TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+    x_deg, y_deg = _ahi_latlon_to_xy_deg(TLAT, TLON, sub_lon)
+    x_deg = np.asarray(x_deg, dtype=np.float32)
+    y_deg = np.asarray(y_deg, dtype=np.float32)
+    return TLON, TLAT, x_deg, y_deg, (W, S, E_uw, N), (out_w, out_h)
+
+
+def _ahi_sample_disk(x_deg, y_deg, disk):
+    """Sample one CalibratedDisk at the shared scan angles (bilinear, NaN
+    off-window). Local index = (global - offset) / stride -- the stride==1
+    form is character-for-character the frozen _compose_true_color_sync
+    consumer math, so co-registration semantics are unchanged.
+
+    CHUNKED: scipy's RegularGridInterpolator materializes ~10x the query size
+    in float64 intermediates -- one shot over a 6144-px mesh is a ~2 GB
+    transient (proven to thrash a small host and material even inside the
+    box's 8 GB emit container at FD scale). Row-chunking caps the transient
+    at ~a few hundred MB with identical output."""
+    from scipy.interpolate import RegularGridInterpolator
+    from satellites import _ahi_xy_deg_to_colline
+    col_g, line_g = _ahi_xy_deg_to_colline(
+        x_deg, y_deg, disk.cfac, disk.lfac, disk.coff, disk.loff)
+    st = getattr(disk, "stride", 1) or 1
+    line_local = ((line_g - disk.line_offset) / st).astype(np.float32, copy=False)
+    col_local = ((col_g - disk.col_offset) / st).astype(np.float32, copy=False)
+    del col_g, line_g
+    interp = RegularGridInterpolator(
+        (np.arange(disk.n_lines, dtype=np.float32),
+         np.arange(disk.n_columns, dtype=np.float32)),
+        disk.data, bounds_error=False, fill_value=np.nan, method="linear")
+    h, w = x_deg.shape
+    out = np.empty((h, w), np.float32)
+    chunk = max(1, int(4e6) // max(w, 1))          # ~4M points per chunk
+    for i0 in range(0, h, chunk):
+        sl = slice(i0, min(i0 + chunk, h))
+        pts = np.stack([line_local[sl].ravel(), col_local[sl].ravel()], axis=-1)
+        out[sl] = interp(pts).reshape(-1, w).astype(np.float32)
+    return out
+
+
+def _ahi_geom_valid(x_deg, y_deg, disk):
+    """Which target pixels are geometrically inside `disk`'s data window
+    (mirrors _compose_true_color_sync's geom_valid; disk-limb corners of a
+    wide bbox are honest off-data, not a broken fetch)."""
+    from satellites import _ahi_xy_deg_to_colline
+    col_g, line_g = _ahi_xy_deg_to_colline(
+        x_deg, y_deg, disk.cfac, disk.lfac, disk.coff, disk.loff)
+    st = getattr(disk, "stride", 1) or 1
+    col_local = (col_g - disk.col_offset) / st
+    line_local = (line_g - disk.line_offset) / st
+    return (np.isfinite(col_local) & np.isfinite(line_local)
+            & (col_local >= 0) & (col_local <= disk.n_columns - 1)
+            & (line_local >= 0) & (line_local <= disk.n_lines - 1))
+
+
+def _ahi_result(entry, rgba, bounds, slot, bucket, channel, enhancement):
+    return ImageryResult(
+        rgba=rgba, bounds=bounds, scan_start=slot, product="FLDK",
+        bucket=bucket,
+        s3_key=f"{bucket}/AHI-L1b-FLDK/{slot:%Y/%m/%d/%H%M}/",
+        generic_channel=channel, enhancement=enhancement)
+
+
+def produce_ahi_recipe_imagery(entry, time=None, nearest=True, band_cache=None):
+    """End-to-end AHI recipe product -- the Himawari mirror of the ABI path:
+    complete-slot band fetch -> one regular grid (shared trig) -> the SAME
+    declarative band math / frozen tat_palettes colorize -> chrome-free RGBA
+    (+ calibrated BT raster where the recipe carries a bt_band)."""
+    if not entry.recipe_id:
+        raise ValueError(f"{entry.product_id} has no recipe_id")
+    recipe = s2_recipes.recipe_for("ahi", entry.recipe_id)
+    if recipe.kind == "truecolor":
+        return produce_ahi_truecolor(entry, time=time, nearest=nearest,
+                                     band_cache=band_cache)
+
+    slot, bucket, disks = fetch_ahi_band_disks(
+        entry, recipe.bands, time=time, nearest=nearest, cache=band_cache)
+    d0 = next(iter(disks.values()))
+    TLON, TLAT, x_deg, y_deg, bounds, _dims = _ahi_target_mesh(
+        entry.sector_bbox, entry.pyramid_px, d0.sub_lon)
+    sampled = {}
+    for b in list(disks):
+        sampled[b] = _ahi_sample_disk(x_deg, y_deg, disks[b])
+        if band_cache is None:
+            del disks[b]     # uncached single-product run: free as we go
+
+    if recipe.kind == "rgb_guns":
+        rgb = s2_recipes.compute_rgb(recipe, sampled)
+    elif recipe.kind == "single_palette":
+        rgb = _colorize_bt(sampled[recipe.band], recipe.enhancement)
+    elif recipe.kind == "sandwich":
+        ir_rgb = _colorize_bt(sampled[13], "rainbow_ir")
+        rgb = s2_recipes.sandwich_rgb(sampled[recipe.vis_band], ir_rgb)
+    else:
+        raise ValueError(f"unknown recipe kind {recipe.kind!r}")
+    rgba = s2_recipes.rgba_from_rgb(rgb)
+
+    res = _ahi_result(entry, rgba, bounds, slot, bucket,
+                      recipe.key, recipe.enhancement or recipe.kind)
+    if recipe.bt_band:
+        try:
+            res.bt_grid, res.bt_dims = _decimate_bt(
+                sampled[recipe.bt_band] - 273.15, bounds,
+                out_w=(getattr(entry, "bt_px", 0) or BT_PX))
+        except Exception:   # noqa: BLE001  (inspector is best-effort)
+            res.bt_grid, res.bt_dims = None, None
+    return res
+
+
+def produce_ahi_truecolor(entry, time=None, nearest=True, band_cache=None):
+    """AHI true color for the tiled suite: the SAME band roles (native green
+    B02 -- no synthesis -- veggie B04 correction, clean-IR night fade) and the
+    SAME truecolor.assemble_truecolor as the frozen floater path
+    (HimawariPacificSatellite._compose_true_color_sync); only the band LOADS
+    go through the suite's strided fetch. Verbatim delegation isn't possible
+    here because the frozen compose always loads stride=1 -- a wide-domain
+    native 0.5 km B03 stitch is ~GBs and finer than any pyramid tile. The
+    stride is the one sanctioned, documented delta."""
+    import truecolor
+    from satellites import HIMAWARI_PACIFIC
+
+    sat = HIMAWARI_PACIFIC
+    roles = dict(sat.truecolor_bands)                 # red/green/blue/veggie
+    roles["ir"] = sat.generic_to_band["clean_ir"]     # GeoColor-lite night fade
+    slot, bucket, disks = fetch_ahi_band_disks(
+        entry, roles.values(), time=time, nearest=nearest, cache=band_cache)
+    d_red = disks[roles["red"]]
+    TLON, TLAT, x_deg, y_deg, bounds, _dims = _ahi_target_mesh(
+        entry.sector_bbox, entry.pyramid_px, d_red.sub_lon)
+
+    geom_valid = _ahi_geom_valid(x_deg, y_deg, d_red)   # needs red disk meta
+    sub_lon, sat_name = d_red.sub_lon, d_red.sat_name
+    grid = {}
+    for r, b in roles.items():
+        grid[r] = _ahi_sample_disk(x_deg, y_deg, disks[b])
+        if band_cache is None:
+            disks.pop(b, None)   # uncached single-product run: free as we go
+    d_red = None
+    lats = TLAT.astype(np.float32)
+    lons = TLON.astype(np.float32)                    # wrapped: solar geometry
+    rgb, _cos_sza = truecolor.assemble_truecolor(
+        grid["red"], grid["green"], grid["blue"], grid.get("veggie"),
+        lats, lons, when=slot, sub_sat_lon=sub_lon,
+        platform_name=sat_name, sensor="ahi", ir_bt=grid.get("ir"))
+    rgba = s2_recipes.rgba_from_rgb(np.asarray(rgb, dtype=np.float32),
+                                    valid=geom_valid)
+    return _ahi_result(entry, rgba, bounds, slot, bucket, "truecolor", "tat_neon")

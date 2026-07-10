@@ -117,6 +117,12 @@ class CalibratedDisk:
 
     obs_start_mjd: float
 
+    # Decimation factor of ``data`` vs the native grid (Stage-2 suite fetches
+    # only; the floater/meso paths always load stride=1). Local index of a
+    # global (col, line) = (global_0based - offset) / stride — the stride==1
+    # form is exactly the frozen consumer math, so nothing existing changes.
+    stride: int = 1
+
 
 def _list_segments(
     fs: s3fs.S3FileSystem, bucket: str, dt_floor10, band: int
@@ -248,18 +254,27 @@ def _download_and_parse(fs: s3fs.S3FileSystem, s3_path: str) -> HSDSegment:
     return parse_hsd_segment(raw)
 
 
-def _stitch(segments: list[HSDSegment]) -> tuple[np.ndarray, int, int, int]:
+def _stitch(segments: list[HSDSegment], stride: int = 1) -> tuple[np.ndarray, int, int, int]:
     """Stitch per-segment count arrays into a row-banded uint16 array.
 
     Spans from the first downloaded segment's start line to the last
     downloaded segment's end line. Gaps between non-contiguous segments
     are filled with the OUTSIDE_SCAN sentinel.
 
-    Returns (counts, n_lines_local, n_columns, line_offset_global) where
-    line_offset_global is the 0-based full-disk line index of local row 0.
+    ``stride`` > 1 decimates onto a GLOBAL stride grid (1-based lines/cols
+    L with (L-1) % stride == 0) while stitching, so a full-disk B03 never
+    materializes at native size (22000² u16 ≈ 1 GB); the decimated array is
+    built directly. Segments align to the same global grid regardless of
+    which segments were downloaded.
+
+    Returns (counts, n_lines_local, n_columns_local, line_offset_global)
+    where line_offset_global is the 0-based full-disk line index of local
+    row 0 (local row i ↔ global line index line_offset_global + i*stride).
     """
     if not segments:
         raise ValueError("no segments provided")
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
 
     segments = sorted(segments, key=lambda s: s.first_line_number)
 
@@ -272,16 +287,32 @@ def _stitch(segments: list[HSDSegment]) -> tuple[np.ndarray, int, int, int]:
 
     first_global = segments[0].first_line_number  # 1-based
     last_global_inclusive = segments[-1].first_line_number + segments[-1].n_lines - 1
-    n_lines_local = last_global_inclusive - first_global + 1
-    line_offset_global = first_global - 1  # 0-based global line for local row 0
 
-    full = np.full((n_lines_local, n_columns), COUNT_OUTSIDE_SCAN, dtype=np.uint16)
+    if stride == 1:
+        n_lines_local = last_global_inclusive - first_global + 1
+        line_offset_global = first_global - 1  # 0-based global line for local row 0
+        full = np.full((n_lines_local, n_columns), COUNT_OUTSIDE_SCAN, dtype=np.uint16)
+        for s in segments:
+            local_start = s.first_line_number - first_global
+            local_end = local_start + s.n_lines
+            full[local_start:local_end, :] = s.counts
+        return full, n_lines_local, n_columns, line_offset_global
+
+    # first kept 1-based global line at/after the window start, on the grid
+    first_kept = first_global + ((-(first_global - 1)) % stride)
+    if first_kept > last_global_inclusive:
+        raise ValueError("stride window is empty")
+    n_lines_local = (last_global_inclusive - first_kept) // stride + 1
+    n_cols_local = (n_columns - 1) // stride + 1
+    full = np.full((n_lines_local, n_cols_local), COUNT_OUTSIDE_SCAN, dtype=np.uint16)
     for s in segments:
-        local_start = s.first_line_number - first_global
-        local_end = local_start + s.n_lines
-        full[local_start:local_end, :] = s.counts
-
-    return full, n_lines_local, n_columns, line_offset_global
+        r0 = (-(s.first_line_number - 1)) % stride
+        rows = s.counts[r0::stride, ::stride]
+        if not rows.size:
+            continue
+        out_start = (s.first_line_number + r0 - first_kept) // stride
+        full[out_start:out_start + rows.shape[0], :rows.shape[1]] = rows
+    return full, n_lines_local, n_cols_local, first_kept - 1
 
 
 def _calibrate(meta: HSDSegment, counts_full: np.ndarray) -> tuple[np.ndarray, str]:
@@ -332,6 +363,7 @@ def load_band_sync(
     dt_floor10,
     band: int,
     bbox: Optional[tuple[float, float, float, float]] = None,
+    stride: int = 1,
 ) -> CalibratedDisk:
     """Download + parse + stitch + calibrate one (bucket, time slot, band).
 
@@ -340,6 +372,10 @@ def load_band_sync(
     segment is ~300 MB compressed. Stitched output covers only the
     downloaded segments; downstream consumers must rely on first_line_number
     metadata, not assume the array starts at line 1.
+
+    ``stride`` decimates onto the global stride grid while stitching (Stage-2
+    wide-domain suite fetches; see CalibratedDisk.stride). Default 1 =
+    byte-identical to the historical behavior.
 
     Synchronous; call via ``run_in_executor`` from async code.
     """
@@ -358,7 +394,7 @@ def load_band_sync(
     )
 
     segments = _download_all(fs, paths)
-    return _assemble_disk(segments, bbox=bbox)
+    return _assemble_disk(segments, bbox=bbox, stride=stride)
 
 
 def _download_all(fs: s3fs.S3FileSystem, paths: list[str]) -> list[HSDSegment]:
@@ -402,23 +438,28 @@ def _bbox_col_range(seg0: HSDSegment, bbox, n_columns: int) -> tuple[int, int]:
     return lo, hi
 
 
-def _assemble_disk(segments: list[HSDSegment], bbox=None) -> CalibratedDisk:
+def _assemble_disk(segments: list[HSDSegment], bbox=None, stride: int = 1) -> CalibratedDisk:
     """Stitch + calibrate downloaded HSD segments into a CalibratedDisk. Shared by
     the FLDK (load_band_sync) and Target (load_target_band_sync) loaders so both
     produce byte-identical disks; only the segment LISTING differs between them.
 
     When ``bbox`` is given, the stitched COUNTS are column-cropped to the
     bbox's window before calibration — calibrating full-disk-width rows for
-    a ~1/10-width bbox was most of a true-color frame's CPU."""
-    counts_local, n_lines_local, n_columns, line_offset = _stitch(segments)
+    a ~1/10-width bbox was most of a true-color frame's CPU. The column
+    window is computed on the NATIVE grid and snapped onto the stride grid,
+    so ``col_offset`` stays a native-grid index (see CalibratedDisk)."""
+    counts_local, n_lines_local, n_columns, line_offset = _stitch(segments, stride=stride)
     seg0 = segments[0]
     col_offset = 0
-    if bbox is not None and n_columns > 64:
-        col_lo, col_hi = _bbox_col_range(seg0, bbox, n_columns)
-        if (col_lo, col_hi) != (0, n_columns):
-            counts_local = counts_local[:, col_lo:col_hi]
-            col_offset = col_lo
-            n_columns = counts_local.shape[1]
+    if bbox is not None and seg0.n_columns > 64:
+        col_lo, col_hi = _bbox_col_range(seg0, bbox, seg0.n_columns)
+        if (col_lo, col_hi) != (0, seg0.n_columns):
+            dec_lo = (col_lo + stride - 1) // stride
+            dec_hi = min(counts_local.shape[1], (col_hi + stride - 1) // stride)
+            if dec_hi > dec_lo:
+                counts_local = counts_local[:, dec_lo:dec_hi]
+                col_offset = dec_lo * stride
+                n_columns = counts_local.shape[1]
     data, units = _calibrate(seg0, counts_local)
     return CalibratedDisk(
         sat_name=seg0.sat_name,
@@ -436,6 +477,7 @@ def _assemble_disk(segments: list[HSDSegment], bbox=None) -> CalibratedDisk:
         data=data,
         units=units,
         obs_start_mjd=seg0.obs_start_mjd,
+        stride=stride,
     )
 
 

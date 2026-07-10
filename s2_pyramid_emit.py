@@ -145,14 +145,33 @@ def _write_products_index(store, prefix: str, sat_key: str, sector_key: str):
 
 
 def _pin_suite_scan(entries, when):
-    """Resolve the clean-IR anchor ONCE so every suite product renders the SAME
+    """Resolve the scan anchor ONCE so every suite product renders the SAME
     scan (a 'latest' that drifts to a newer scan mid-suite would split the
-    suite across two times). fd sectors bypass find_file's CONUS-first pick."""
-    from satellites import GOESEastSatellite
-    sat = GOESEastSatellite()
+    suite across two times). GOES anchors on the clean-IR file (fd sectors
+    bypass find_file's CONUS-first pick); Himawari resolves the newest FLDK
+    slot with a COMPLETE segment set for EVERY band any suite product needs
+    (NOAA uploads segments over minutes -- pinning an incomplete slot would
+    stitch short windows)."""
     t = when or dt.datetime.now(UTC)
     e0 = entries[0]
     bbox = list(e0.sector_bbox)
+
+    if e0.family == "himawari":
+        from satellites import HIMAWARI_PACIFIC
+        sat = HIMAWARI_PACIFIC
+        need = sorted({b for e in entries for b in e.bands})
+        if when is not None:
+            return sat._snap_10min(t, True)
+        base = t.replace(second=0, microsecond=0)
+        floored = base.replace(minute=(base.minute // 10) * 10)
+        slot = sat._first_available_fldk_slot_sync(floored, need)
+        if slot is None:
+            sys.exit(f"ERROR: no complete AHI FLDK slot for bands {need} "
+                     f"near {t.isoformat()}")
+        return slot
+
+    from satellites import GOESEastSatellite
+    sat = GOESEastSatellite()
     if (e0.render_product_hint or "").lower() == "fd":
         resolved = asyncio.run(sat._pick_full_disk(e0.bucket, bbox, 13, t, True))
         if resolved is None:
@@ -167,7 +186,10 @@ def main(argv=None) -> int:
     ap.add_argument("--product", default=None,
                     help="tiled ProductEntry id, e.g. goes19-conus-ir | goes19-conus-airmass")
     ap.add_argument("--suite", default=None, metavar="SECTOR",
-                    help="emit EVERY tiled product of a sector (e.g. 'conus') off one scan")
+                    help="emit EVERY tiled product of a sector off one scan. "
+                         "Bare sectors are goes19 ('conus', 'fd'); other "
+                         "satellites qualify with the sat key "
+                         "('himawari9-fd', 'himawari9-wpac')")
     ap.add_argument("--time", default="latest",
                     help="'latest' or an ISO UTC time (nearest scan is used)")
     ap.add_argument("--prefix", default="shadow", help="R2 prefix (default: shadow)")
@@ -222,10 +244,22 @@ def main(argv=None) -> int:
         return 0
 
     # ---- suite mode: every tiled product of the sector, ONE pinned scan ----
+    # bare sector = goes19 (back-compat with the box cron); '<sat>-<sector>'
+    # qualifies another satellite (himawari9-fd, himawari9-wpac).
+    sat_keys = sorted({e.sat_key for e in R.REGISTRY if e.tiled})
+    suite_sat, suite_sector = "goes19", args.suite
+    for sk in sat_keys:
+        if args.suite.startswith(sk + "-"):
+            suite_sat, suite_sector = sk, args.suite[len(sk) + 1:]
+            break
     entries = [e for e in R.REGISTRY
-               if e.tiled and e.sector_key == args.suite and e.family == "goes"]
+               if e.tiled and e.sat_key == suite_sat
+               and e.sector_key == suite_sector]
     if not entries:
-        sys.exit(f"ERROR: no tiled products for sector {args.suite!r}")
+        sys.exit(f"ERROR: no tiled products for suite {args.suite!r}. Suites: "
+                 + ", ".join(sorted({("%s-%s" % (e.sat_key, e.sector_key))
+                                     if e.sat_key != "goes19" else e.sector_key
+                                     for e in R.REGISTRY if e.tiled})))
     pinned = _pin_suite_scan(entries, when)
     print(f"[suite] {args.suite}: {len(entries)} products @ scan {pinned.isoformat()}")
     band_cache: dict = {}
@@ -239,14 +273,14 @@ def main(argv=None) -> int:
             failed.append(entry.product_id)
             print(f"[FAIL] {entry.product_id}: {e}")
             traceback.print_exc()
-    _write_products_index(store, args.prefix, entries[0].sat_key, args.suite)
+    _write_products_index(store, args.prefix, suite_sat, suite_sector)
 
     print("\n=== SUITE EMIT SUMMARY ===")
     print(f" scan   : {pinned.isoformat()}")
     print(f" ok     : {len(ok)}  {ok}")
     print(f" failed : {len(failed)}  {failed}")
     if is_r2 and ok:
-        print(f" index  : {CDN}/{R.products_index_key(args.prefix, entries[0].sat_key, args.suite)}")
+        print(f" index  : {CDN}/{R.products_index_key(args.prefix, suite_sat, suite_sector)}")
     if failed and not ok:
         return 1          # total failure aborts (mirror the HAFS total-failure rule)
     return 0
