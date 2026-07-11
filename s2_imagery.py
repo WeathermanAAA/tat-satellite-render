@@ -548,9 +548,19 @@ def fetch_ahi_band_disks(entry, bands, time=None, nearest=True, cache=None):
     bbox = tuple(entry.sector_bbox)
 
     if time is not None:
-        # pinned scan (suite mode): snap to its 10-min block, trust the pin
-        # (the suite pinner already verified completeness for ALL bands)
+        # pinned scan (suite mode): snap to its 10-min block and trust the pin
+        # WHEN it is actually complete on the bucket (the himawari suite pinner
+        # pre-verified completeness, so this stays byte-identical for it). A
+        # pin that is absent/incomplete -- the geo-ring composite pins to the
+        # GOES cadence, which can land on AHI housekeeping gaps (the daily
+        # 0240/1440 FLDK skips) or a mid-upload slot -- falls back to the
+        # newest COMPLETE earlier slot instead of failing the whole member.
         slot = sat._snap_10min(t, True)
+        fallback = sat._first_available_fldk_slot_sync(slot, bands)
+        if fallback is not None and fallback != slot:
+            print(f"[ahi] pinned FLDK slot {slot:%H%M} incomplete/absent -- "
+                  f"falling back to {fallback:%H%M} (newest complete slot)")
+            slot = fallback
     else:
         base = t.replace(second=0, microsecond=0)
         floored = base.replace(minute=(base.minute // 10) * 10)
