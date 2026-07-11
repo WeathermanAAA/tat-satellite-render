@@ -54,7 +54,8 @@ class ImageryResult:
     """A chrome-free equirectangular RGBA raster + the geo/time metadata the
     pyramid emitter needs."""
     __slots__ = ("rgba", "bounds", "scan_start", "product", "bucket", "s3_key",
-                 "generic_channel", "enhancement", "bt_grid", "bt_dims")
+                 "generic_channel", "enhancement", "bt_grid", "bt_dims",
+                 "members")   # geo-ring: [{'name','t'}] per delivering satellite
 
     def __init__(self, rgba, bounds, scan_start, product, bucket, s3_key,
                  generic_channel, enhancement):
@@ -798,6 +799,15 @@ _GEO_RING = (
      "window": (-140.2, -10.2)},
     {"name": "GOES-West", "kind": "goes_west", "sub": -137.2,
      "window": (-180.0, -72.2)},
+    # Meteosat SEVIRI members (s2_meteosat.py): creds-gated -- without
+    # EUMETSAT_CONSUMER_KEY/SECRET (+ satpy) each degrades honestly and the
+    # Africa/Europe/IO wedge stays the labeled transparent gap. Fetched at a
+    # licence-compliant >= 60 min delay (free Meteosat >=1h-latency licence);
+    # per-member valid times ride the manifest so the skew is never hidden.
+    {"name": "Meteosat-0deg", "kind": "seviri", "sub": 0.0,
+     "window": (-65.0, 65.0), "collection": "EO:EUM:DAT:MSG:HRSEVIRI"},
+    {"name": "Meteosat-IODC", "kind": "seviri", "sub": 45.5,
+     "window": (-19.5, 110.5), "collection": "EO:EUM:DAT:MSG:HRSEVIRI-IODC"},
     {"name": "Himawari-9", "kind": "ahi", "sub": 140.7,
      "window": (75.7, 205.7)},   # unwrapped east edge (crosses 180)
 )
@@ -898,6 +908,21 @@ def produce_global_composite(entry, time=None, nearest=True, band_cache=None):
                 bt = _ahi_sample_disk(np.asarray(x_deg, np.float32),
                                       np.asarray(y_deg, np.float32), d)
                 stamp_dt = slot
+            elif member["kind"] == "seviri":
+                import s2_meteosat as MET
+                if not MET.available():
+                    raise RuntimeError(
+                        "EUMETSAT credentials/satpy absent -- Meteosat sector "
+                        "stays the honest gap until the one-time key lands")
+                ck = ("seviri", member["collection"])
+                disk = band_cache.get(ck) if band_cache is not None else None
+                if disk is None:
+                    disk = MET.fetch_seviri_disk(member["collection"], time=time)
+                    if band_cache is not None:
+                        band_cache[ck] = disk
+                bt = disk.sample_bt(MET.SEVIRI_DATASETS[entry.band_key],
+                                    TLAT, TLON)
+                stamp_dt = disk.scan_end
             else:
                 cmi, x, y, proj, resolved = _fetch_goes_disk_bt(
                     member["kind"], field["goes_band"], member["window"],
@@ -931,6 +956,10 @@ def produce_global_composite(entry, time=None, nearest=True, band_cache=None):
         product="GEO-RING", bucket="geo-ring",
         s3_key=" + ".join(u[0] for u in used),
         generic_channel=entry.band_key, enhancement=field["enhancement"])
+    # per-member valid times (honesty: Meteosat rides >=1 h behind by licence;
+    # the viewer surfaces the skew instead of implying one synchronous scan)
+    res.members = [{"name": n, "t": s.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                   for n, s in used]
     try:
         res.bt_grid, res.bt_dims = _decimate_bt(
             bt_k - 273.15, (W, S, E, N),

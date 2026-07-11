@@ -408,7 +408,8 @@ class ProductEntry:
     def build_tiled_latest_times(self, stamps: Iterable[str], *, bounds,
                                  image_px, maxzoom: int, as_of: dt.datetime,
                                  tile_size: int = 512, min_zoom: int = 0,
-                                 scheme: str = TILE_SCHEME, bt: Optional[dict] = None) -> dict:
+                                 scheme: str = TILE_SCHEME, bt: Optional[dict] = None,
+                                 members: Optional[list] = None) -> dict:
         """The §4.1 slider manifest, tiled variant (superset of the single-frame
         shape: keeps product/path/tile/times/latest/as_of/count with path=None +
         tile populated, adds scheme/projection/tile_size/minzoom/maxzoom/
@@ -427,6 +428,10 @@ class ProductEntry:
             "image_px": [int(image_px[0]), int(image_px[1])] if image_px else None,
             "bounds": [float(b) for b in bounds] if bounds is not None else None,
             "bt": bt,                             # calibrated BT data-raster block (inspector) or None
+            # geo-ring only: [{'name','t'}] per delivering satellite of the
+            # LATEST frame -- the honest per-member valid-time skew (Meteosat
+            # rides >= 1 h behind by licence). None everywhere else.
+            "members": members,
             "times": times,
             "latest": times[-1] if times else None,
             "as_of": as_of.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),

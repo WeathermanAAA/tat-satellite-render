@@ -133,7 +133,8 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
     manifest = P.write_tiled_manifest(entry, store, args.prefix, times,
                                       img.bounds, image_px, maxzoom,
                                       dt.datetime.now(UTC), spec=spec, scheme=scheme,
-                                      bt=bt_desc)
+                                      bt=bt_desc,
+                                      members=getattr(img, "members", None))
     print(f"[done] {entry.product_id}: frames={manifest['count']} "
           f"latest={manifest['latest']} zoom={manifest['minzoom']}..{manifest['maxzoom']}")
     return manifest

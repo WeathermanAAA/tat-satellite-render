@@ -278,7 +278,8 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
                          bounds, image_px, maxzoom: int, as_of, *,
                          spec: PyramidSpec = PyramidSpec(),
                          scheme: str = "flat-native-xyz",
-                         bt: Optional[dict] = None) -> dict:
+                         bt: Optional[dict] = None,
+                         members: Optional[list] = None) -> dict:
     """Build + PUT the tiled slider manifest (§4.1 tiled variant, superset).
 
     The viewer NEVER lists the bucket: `tile` is a product-relative path
@@ -287,7 +288,8 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
     """
     lt = entry.build_tiled_latest_times(
         stamps, bounds=bounds, image_px=image_px, maxzoom=maxzoom, as_of=as_of,
-        tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme, bt=bt)
+        tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme, bt=bt,
+        members=members)
     store.put_json(entry.latest_times_key(prefix), lt, CACHE_MANIFEST)
     return lt
 

@@ -1,0 +1,7 @@
+# Extra deps for the GEO-RING Meteosat members (s2_meteosat.py) ONLY.
+# The member is lazy-imported and creds-gated: without these packages (or
+# without EUMETSAT_CONSUMER_KEY/SECRET) the Meteosat sectors degrade to the
+# honest transparent gap and every other suite is unaffected. Keep these OUT
+# of requirements.txt so Railway services never pull satpy.
+#   pip install -r requirements.txt -r requirements-s2-geo.txt
+satpy>=0.53,<1.0          # seviri_l1b_native reader (pulls pyresample, dask)

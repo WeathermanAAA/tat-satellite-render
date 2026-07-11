@@ -100,3 +100,28 @@ curl -s https://cdn.triple-a-tropics.com/shadow/sat/goes19/conus/ir/latest_times
 Then open **https://triple-a-tropics.com/satellite/explorer/** (product picker
 top-left; compare panes at `/satellite/explorer/compare.html`). Products the
 box hasn't emitted yet show "no data yet" and appear as they land.
+
+## Meteosat members (GEO-RING gap fill) — one-time setup
+
+The global composite's Africa/Europe/Indian-Ocean wedge fills from two SEVIRI
+services (`s2_meteosat.py`: Meteosat 0° `EO:EUM:DAT:MSG:HRSEVIRI` + IODC 45.5°E
+`EO:EUM:DAT:MSG:HRSEVIRI-IODC`). Creds-gated: until set up, both members
+degrade honestly and the wedge stays the labeled transparent gap.
+
+1. Free account at user.eumetsat.int; consumer key/secret from
+   https://api.eumetsat.int/api-key/.
+2. On user.eumetsat.int accept the **"Meteosat Level 1 data with latency
+   ≥ 1 hour"** licence (free, self-service; takes ~1 h to activate — log out
+   and back in). This allows any-purpose use of DERIVED imagery with
+   attribution; we never republish the .nat source data. Do NOT rely on the
+   <1 h NRT licence (paid tier for service providers) — the fetcher enforces
+   a ≥60 min delay (`EUMETSAT_DELAY_MIN`, default 60) to stay compliant.
+3. Box `.env`: add `EUMETSAT_CONSUMER_KEY=...` and
+   `EUMETSAT_CONSUMER_SECRET=...`.
+4. Image deps: `pip install -r requirements-s2-geo.txt` (satpy for the
+   seviri_l1b_native reader) — add to the s2 image build.
+5. Attribution (licence requirement) rides the viewer's source line:
+   "Contains EUMETSAT Meteosat data".
+
+Per-member valid times ride `latest_times.json` as `members[]` — the ~1 h
+Meteosat skew is surfaced, never hidden.
