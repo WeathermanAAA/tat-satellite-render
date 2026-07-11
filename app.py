@@ -605,18 +605,21 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                        "/ 11 µm IR (GridSat-GOES 1994-2017) and 11 µm IR + WV "
                        "(GridSat-B1, 1980+)")
         downsample = 1                 # archives are already ≤ native budget
-    if body.format == "btpng" and not use_archive:
-        raise HTTPException(
-            status_code=422,
-            detail="format=btpng (calibrated-BT raster) is currently served "
-                   "for the archive tiers (GridSat-GOES / MergIR / GridSat-B1) "
-                   "only — the live suites publish per-frame bt.png beside "
-                   "their tiles")
     if not use_archive:
         try:
             satellite = pick_satellite(body.bbox, parsed_time)
         except (CoverageError, UnsupportedTimeError) as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
+    if body.format == "btpng" and not use_archive:
+        # NATIVE era: served where the family regrids to a bbox-regular grid
+        # (GOES fetch_regular; the frontend btpng decoder assumes regularity)
+        if is_true_color or not hasattr(satellite, "fetch_regular"):
+            raise HTTPException(
+                status_code=422,
+                detail="format=btpng (calibrated-BT raster) is served for the "
+                       "archive tiers and single-band GOES native fetches — "
+                       "not RGB composites"
+                )
 
     # Resolve which file we'll use; this gives us the snapped scan time which
     # is part of the cache key. For "latest" we don't snap to file precision
@@ -713,6 +716,12 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 # the fetch -- byte-identical to striding after, but far cheaper
                 # (what makes low fast). render_png must then NOT stride again.
                 data = await satellite.fetch_true_color(body.bbox, resolved, downsample)
+                render_downsample = 1
+            elif body.format == "btpng" and hasattr(satellite, "fetch_regular"):
+                # native-era btpng: regular-grid single band (the archive
+                # tiers have no fetch_regular — their grids are already
+                # regular and take the plain fetch below)
+                data = await satellite.fetch_regular(resolved, body.bbox, generic_channel)
                 render_downsample = 1
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)

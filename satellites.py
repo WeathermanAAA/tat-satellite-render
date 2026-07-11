@@ -853,6 +853,49 @@ class GOESBaseSatellite(Satellite):
             sub_sat_lon=resolved.sub_sat_lon,
             units=units,
         )
+
+    async def fetch_regular(
+        self, resolved: ResolvedFile, bbox: list[float], generic_channel: str
+    ) -> FetchResult:
+        """One band on a REGULAR lat/lon grid over the bbox (the truecolor
+        target-grid pattern applied to a single band): forward-project the
+        regular mesh to scan angles and bilinear-sample the geos crop. This
+        is the format=btpng path for the NATIVE ABI era — the frontend's
+        objfix / Hovmöller / DAV decoder assumes a bbox-regular grid, which
+        the plain fetch (curvilinear geos mesh) is not."""
+        return await _to_thread(self._fetch_regular_sync, resolved, bbox, generic_channel)
+
+    def _fetch_regular_sync(self, resolved, bbox, generic_channel) -> FetchResult:
+        ds, tmp_dir = self.open(resolved)
+        try:
+            cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol = self._crop_to_bbox(ds, bbox)
+            units = ds["CMI"].attrs.get("units", "")
+        finally:
+            ds.close()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        H_pix, W_pix = cmi.shape
+        lon_min, lat_min, lon_max, lat_max = bbox
+        lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
+        tgt_lons = ((np.linspace(lon_min, lon_max_uw, W_pix) + 180.0) % 360.0) - 180.0
+        tgt_lats = np.linspace(lat_max, lat_min, H_pix)   # row 0 = north
+        TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+        TX, TY = _latlon_to_xy(TLAT, TLON, lon_origin, H, r_eq, r_pol)
+        grid = _sample_geos(cmi, x_sub, y_sub, TX, TY)
+        return FetchResult(
+            cmi=grid,
+            lats=TLAT.astype(np.float32),
+            lons=TLON.astype(np.float32),
+            channel=self.generic_to_band[generic_channel],
+            generic_channel=generic_channel,
+            scan_start=resolved.scan_start,
+            product=resolved.product,
+            bucket=resolved.bucket,
+            sat_name=resolved.sat_name,
+            sub_sat_lon=resolved.sub_sat_lon,
+            units=units,
+        )
+
+
 class GOESEastSatellite(GOESBaseSatellite):
     """GOES-East satellite (sub-sat -75.2°W).
     Resolves to GOES-19 for time >= 2025-04-04; GOES-16 otherwise. The
