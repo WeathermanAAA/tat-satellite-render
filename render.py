@@ -332,6 +332,10 @@ def render_png(
             zorder=1,
         )
     else:
+        # Masked / non-finite geolocation (off-disk limb; early-era ABI
+        # sectors) would raise inside pcolormesh -- same guard as the
+        # backdrop path (one guard, both call sites).
+        lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
         mesh = ax.pcolormesh(
             lons,
             lats,
@@ -543,13 +547,44 @@ def _erode1(mask: np.ndarray) -> np.ndarray:
     """Erode a boolean mask by one 4-connected cell (True = keep). A kept cell
     that touches a dropped cell in any of the 4 directions is itself dropped --
     so the surviving cells never border the off-disk fill region (see
-    render_backdrop_webp). Pure numpy (no scipy)."""
+    _guard_mesh_coords). Pure numpy (no scipy)."""
     e = mask.copy()
     e[1:, :] &= mask[:-1, :]
     e[:-1, :] &= mask[1:, :]
     e[:, 1:] &= mask[:, :-1]
     e[:, :-1] &= mask[:, 1:]
     return e
+
+
+def _guard_mesh_coords(lons, lats, plot_field):
+    """Make (lons, lats, plot_field) safe for pcolormesh when the geolocation
+    carries masked / non-finite cells.
+
+    Geostationary lat/lon grids carry NaN at the OFF-DISK limb (and early-era
+    ABI sectors -- e.g. GOES-16 CONUS from the 89.5W checkout slot in 2017 --
+    carry off-earth pixels INSIDE the sector), and pcolormesh REJECTS
+    non-finite values in its x/y (coord) arrays ("x and y arguments ... cannot
+    have non-finite values or be of type numpy.ma.MaskedArray"). Mask the
+    field at those cells (-> transparent), replace the bad coords with a
+    finite in-extent fill so pcolormesh accepts the grid, and erode the valid
+    region by one cell so an on-disk edge cell never stretches a quad out to a
+    filled coord (shading="auto" averages neighbouring centres -> limb streaks
+    otherwise). Coords are coerced to plain NaN-filled float arrays FIRST -- a
+    fetch may hand back MASKED lat/lon, and pcolormesh rejects both masked
+    coords and non-finite values, so np.where alone (which can stay masked) is
+    not enough. Shared by the main scalar render and the backdrop render (one
+    guard, both call sites)."""
+    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
+    lats = np.asarray(np.ma.filled(lats, np.nan), dtype=float)
+    xy_ok = np.isfinite(lons) & np.isfinite(lats)
+    if not xy_ok.all():
+        valid = _erode1(xy_ok & ~np.ma.getmaskarray(plot_field))
+        plot_field = np.ma.masked_array(np.ma.getdata(plot_field), mask=~valid)
+        fill_lon = float(np.nanmean(lons)) if np.isfinite(lons).any() else 0.0
+        fill_lat = float(np.nanmean(lats)) if np.isfinite(lats).any() else 0.0
+        lons = np.where(xy_ok, lons, fill_lon)
+        lats = np.where(xy_ok, lats, fill_lat)
+    return lons, lats, plot_field
 
 
 def render_backdrop_webp(
@@ -615,28 +650,9 @@ def render_backdrop_webp(
             "— bailing so a partial fetch never publishes a near-empty backdrop"
         )
 
-    # Geostationary lat/lon grids carry NaN at the OFF-DISK limb. A storm box is
-    # well inside the disk so this never bites, but a BASIN-scale extent reaches
-    # the limb -- and pcolormesh REJECTS non-finite values in its x/y (coord)
-    # arrays (it raises "x and y arguments ... cannot have non-finite values").
-    # Mask the field at off-disk cells (-> transparent), replace the NaN coords
-    # with a finite in-extent fill so pcolormesh accepts the grid, and erode the
-    # valid region by one cell so an on-disk edge cell never stretches a quad out
-    # to a filled coord (shading="auto" averages neighbouring centres -> limb
-    # streaks otherwise). Without this, every basin backdrop 500s.
-    # Coerce coords to plain NaN-filled float arrays first -- a fetch may hand back
-    # MASKED lat/lon at the limb, and pcolormesh rejects BOTH non-finite values and
-    # masked-array coords, so np.where alone (which can stay masked) is not enough.
-    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
-    lats = np.asarray(np.ma.filled(lats, np.nan), dtype=float)
-    xy_ok = np.isfinite(lons) & np.isfinite(lats)
-    if not xy_ok.all():
-        valid = _erode1(xy_ok & ~np.ma.getmaskarray(plot_field))
-        plot_field = np.ma.masked_array(np.ma.getdata(plot_field), mask=~valid)
-        fill_lon = float(np.nanmean(lons)) if np.isfinite(lons).any() else 0.0
-        fill_lat = float(np.nanmean(lats)) if np.isfinite(lats).any() else 0.0
-        lons = np.where(xy_ok, lons, fill_lon)
-        lats = np.where(xy_ok, lats, fill_lat)
+    # Off-disk / masked geolocation guard -- shared with the main scalar
+    # render (see _guard_mesh_coords; without it every basin backdrop 500s).
+    lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
 
     lon_min, lat_min, lon_max, lat_max = bbox
     lon_span = lon_max - lon_min
