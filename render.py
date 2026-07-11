@@ -406,7 +406,20 @@ def render_png(
     # resolution — so an old frame can never imply modern imagery.
     is_gridsat = data.bucket.startswith("noaa-cdr-gridsat")
     is_mergir = data.bucket == "gesdisc-mergir"
-    if is_mergir:
+    is_gg = data.bucket == "ncei-gridsat-goes"
+    if is_gg:
+        # per-satellite GOES-era tier: name the ACTUAL satellite + channel +
+        # cadence + resolution (native 1 km GVAR is order-staged only — never
+        # imply it; the visible channel says its 4 km is subsampled)
+        sensor_label = "GOES Imager (GridSat-GOES)"
+        gg_chan = {1: "0.65 µm visible (4 km, from 1 km)",
+                   2: "3.9 µm shortwave IR",
+                   3: "6.5 µm water vapor",
+                   4: "10.7 µm IR window"}.get(channel, f"ch{channel}")
+        center_title = (
+            f"{data.sat_name} · GridSat-GOES · {gg_chan} · hourly · ~4 km "
+            f"· {time_str} UTC")
+    elif is_mergir:
         sensor_label = "merged geostationary IR"
         center_title = (
             f"NASA MergIR · 11 µm IR window · 30-min · ~4 km · {time_str} UTC")
@@ -470,6 +483,7 @@ def render_png(
     # right-aligned product label so the two corners balance visually.
     # Translucent dark backing rect keeps it legible over hot pixels.
     source_label = ("NASA" if is_mergir
+                    else "NOAA NCEI" if is_gg
                     else "NOAA CDR" if is_gridsat
                     else "JMA" if data.bucket.startswith("noaa-himawari")
                     else "NOAA")

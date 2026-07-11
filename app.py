@@ -39,6 +39,7 @@ from poller_framework import process_mem_mb
 from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
 import gridsat
+import gridsat_goes
 import mergir
 from satellites import (
     ALL_SATELLITES,
@@ -582,36 +583,40 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # ADDITIVE: pre-2017 dates previously 502'd; every "latest" / 2017+
     # request takes the unchanged native path below.
     use_archive = (not is_latest) and parsed_time < gridsat.ABI_CUTOVER
-    use_mergir = (use_archive and parsed_time >= mergir.MERGIR_START
-                  and generic_channel in mergir.MergIRSatellite.generic_to_band
-                  and mergir.have_credentials())
-    use_gridsat = use_archive and not use_mergir
-    if use_mergir:
-        satellite: Satellite = mergir.MERGIR
-        downsample = 1                 # ~4 km native — never stride the archive
-    elif use_gridsat:
-        if generic_channel not in gridsat.GridSatB1Satellite.generic_to_band:
+    archive_tiers: list = []
+    if use_archive:
+        # ordered best-first; each tier claims the render only if it can
+        # actually resolve a covering file — resolve failures fall THROUGH so
+        # the burned-in header always names the record that truly drew it.
+        if (gridsat_goes.GG_START <= parsed_time < gridsat_goes.GG_END
+                and generic_channel in gridsat_goes.GridSatGoesSatellite.generic_to_band):
+            archive_tiers.append(gridsat_goes.GRIDSAT_GOES)
+        if (parsed_time >= mergir.MERGIR_START
+                and generic_channel in mergir.MergIRSatellite.generic_to_band
+                and mergir.have_credentials()):
+            archive_tiers.append(mergir.MERGIR)
+        if generic_channel in gridsat.GridSatB1Satellite.generic_to_band:
+            archive_tiers.append(gridsat.GRIDSAT)
+        if not archive_tiers:
             raise HTTPException(
                 status_code=422,
-                detail="multi-band fields are not available before 2017 — the "
-                       "deep archive (GridSat-B1) is a single-channel record: "
-                       "use the 11 µm IR window (clean_ir) or 6.7 µm water "
-                       "vapor (wv_upper)")
-        satellite = gridsat.GRIDSAT
-        # ~8 km native — the archive is already far below the pixel budget;
-        # never stride it further
-        downsample = 1
-    else:
+                detail="that field is not available for this archive date — "
+                       "the deep tiers carry visible / 3.9 µm / 6.5-6.7 µm WV "
+                       "/ 11 µm IR (GridSat-GOES 1994-2017) and 11 µm IR + WV "
+                       "(GridSat-B1, 1980+)")
+        downsample = 1                 # archives are already ≤ native budget
+    if body.format == "btpng" and not use_archive:
+        raise HTTPException(
+            status_code=422,
+            detail="format=btpng (calibrated-BT raster) is currently served "
+                   "for the archive tiers (GridSat-GOES / MergIR / GridSat-B1) "
+                   "only — the live suites publish per-frame bt.png beside "
+                   "their tiles")
+    if not use_archive:
         try:
             satellite = pick_satellite(body.bbox, parsed_time)
         except (CoverageError, UnsupportedTimeError) as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-    if body.format == "btpng" and not (use_gridsat or use_mergir):
-        raise HTTPException(
-            status_code=422,
-            detail="format=btpng (calibrated-BT raster) is currently served "
-                   "for the archive tiers (GridSat-B1 / MergIR) only — the "
-                   "live suites publish per-frame bt.png beside their tiles")
 
     # Resolve which file we'll use; this gives us the snapped scan time which
     # is part of the cache key. For "latest" we don't snap to file precision
@@ -621,13 +626,31 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # RGB bands); the composite fetch reuses that resolved file.
     nearest_to_target = not is_latest
     resolve_channel = "visible_red" if is_true_color else generic_channel
-    try:
-        resolved = await satellite.find_file(
-            parsed_time, resolve_channel, body.bbox, nearest_to_target
-        )
-    except Exception as e:
-        log.exception("resolve failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"could not resolve satellite file: {e}") from e
+    if use_archive:
+        resolved = None
+        tier_errs = []
+        for tier in archive_tiers:
+            try:
+                resolved = await tier.find_file(
+                    parsed_time, resolve_channel, body.bbox, nearest_to_target)
+                satellite = tier
+                break
+            except Exception as e:  # noqa: BLE001 — fall through, keep reason
+                tier_errs.append(f"{tier.family}: {e}")
+                log.info("archive tier %s passed: %s", tier.family, e)
+        if resolved is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no archive record covers this box/time — "
+                       + " | ".join(tier_errs)[:400])
+    else:
+        try:
+            resolved = await satellite.find_file(
+                parsed_time, resolve_channel, body.bbox, nearest_to_target
+            )
+        except Exception as e:
+            log.exception("resolve failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"could not resolve satellite file: {e}") from e
 
     if is_latest:
         bucket_id = int(time.time() // LATEST_CACHE_TTL)
