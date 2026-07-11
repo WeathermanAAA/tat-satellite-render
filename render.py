@@ -65,8 +65,14 @@ def state_lines_status() -> str:
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
-COAST_COLOR = "#000000"   # deep bold black — landmass outlines (Andrew's pref)
-BORDER_COLOR = "#000000"  # black — political borders, to match the coastlines
+# Coast/border style (2026-07-11, Andrew): solid black mudded the storm on
+# rainbow_ir (black lines vanish into the dark maroon/purple cold tops) —
+# now a light cyan/white main stroke over a THIN dark halo, legible on both
+# dark IR tops and bright daytime scenes. The halo is drawn as a slightly
+# wider under-stroke of the same geometry.
+COAST_COLOR = "#8ee6ff"   # light cyan — landmass outlines
+BORDER_COLOR = "#dce8f0"  # off-white — political borders
+LINE_HALO = "#10141b"     # near-black halo under both (thin: +~1.2 px)
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
@@ -342,27 +348,41 @@ def render_png(
     # never gets painted over by hot cloud tops; full alpha for legibility.
     if coastlines:
         coast_scale = _coast_resolution(max(lon_span, lat_span))
+        # halo under-strokes first (same geometry, slightly wider, below)…
         ax.add_feature(
             cfeature.COASTLINE.with_scale(coast_scale),
-            linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
+            linewidth=2.2, edgecolor=LINE_HALO, alpha=0.9, zorder=3,
         )
         ax.add_feature(
             cfeature.BORDERS.with_scale(coast_scale),
-            linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
+            linewidth=1.6, edgecolor=LINE_HALO, alpha=0.9, zorder=3,
+        )
+        # …then the legible light strokes on top
+        ax.add_feature(
+            cfeature.COASTLINE.with_scale(coast_scale),
+            linewidth=1.0, edgecolor=COAST_COLOR, alpha=1.0, zorder=3.02,
+        )
+        ax.add_feature(
+            cfeature.BORDERS.with_scale(coast_scale),
+            linewidth=0.7, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3.02,
         )
         # State/province (admin_1) boundary LINES — the internal-boundary-only
         # dataset (not the admin_1 *lakes* polygons), so it never re-traces the
-        # coastline. One more feature layer in the SAME black as the coast +
-        # country borders, a touch thinner so US/MX/AU state lines read as
-        # subtle landfall context. Loaded from the vendored geojson (see
-        # _state_lines_feature) so it works on the deploy host. Guarded: a
-        # missing asset degrades to "no state lines" rather than a failed frame.
+        # coastline. Same halo'd off-white as the country borders, a touch
+        # thinner so US/MX/AU state lines read as subtle landfall context.
+        # Loaded from the vendored geojson (see _state_lines_feature) so it
+        # works on the deploy host. Guarded: a missing asset degrades to "no
+        # state lines" rather than a failed frame.
         try:
             states = _state_lines_feature()
             if states is not None:
                 ax.add_feature(
-                    states, linewidth=0.5, edgecolor=BORDER_COLOR,
-                    facecolor="none", alpha=1.0, zorder=3,
+                    states, linewidth=1.1, edgecolor=LINE_HALO,
+                    facecolor="none", alpha=0.9, zorder=3,
+                )
+                ax.add_feature(
+                    states, linewidth=0.45, edgecolor=BORDER_COLOR,
+                    facecolor="none", alpha=1.0, zorder=3.02,
                 )
         except Exception as e:  # noqa: BLE001 — never let admin_1 break a frame
             log.warning("state borders skipped: %s", e)
