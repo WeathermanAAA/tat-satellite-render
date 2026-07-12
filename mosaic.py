@@ -36,7 +36,9 @@ import gc
 import io
 import math
 import datetime as dt
-from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+import queue as queue_mod
+import time as _time
 
 import numpy as np
 from PIL import Image
@@ -58,7 +60,9 @@ PIVOT_DEG = 85.0
 FEATHER_DEG = 8.0
 
 SRC_STRIDE = 2                 # source downsample (limb coverage thins with stride)
-PER_DISK_TIMEOUT_S = 200.0     # a hung S3 fetch never blocks the whole build
+PER_DISK_TIMEOUT_S = 200.0     # hard wall-clock cap per disk (child is KILLED at it)
+PER_LAYER_TIMEOUT_S = 90.0     # in-child cap per channel fetch (best-effort; the
+                               # parent-side kill above is the load-bearing bound)
 
 # The three disks + a generous fetch bbox per disk (the projection masks off-disk;
 # GOES-West / Himawari cross +-180 so their bboxes are given in crossing form w>e).
@@ -161,7 +165,13 @@ def _disk_grids(sat_idx: int, when: dt.datetime):
             layers.append((VIS_CHANNEL, True, gv, cv))
         for channel, is_vis, acc, cnt in layers:
             try:
-                data = await _fetch_layer(sat, channel, bbox, when)
+                # Best-effort in-child bound. A fetch that hangs in a worker
+                # THREAD (run_in_executor) survives this cancel and can still
+                # wedge the child's asyncio.run() cleanup - the parent's
+                # kill-at-PER_DISK_TIMEOUT_S is the guarantee, not this.
+                data = await asyncio.wait_for(
+                    _fetch_layer(sat, channel, bbox, when),
+                    timeout=PER_LAYER_TIMEOUT_S)
             except Exception as e:  # noqa: BLE001
                 print(f"mosaic: {sat.__class__.__name__} {channel} fetch failed: "
                       f"{type(e).__name__}: {e}", flush=True)
@@ -184,6 +194,75 @@ def _disk_grids(sat_idx: int, when: dt.datetime):
     return gv, cv, gs, cs
 
 
+def _disk_grids_child(sat_idx: int, when: dt.datetime, out_q) -> None:
+    """Spawned-process entry: run ``_disk_grids`` and ship the result back on
+    ``out_q``. Any failure ships ``None`` (the parent skips the disk either
+    way); a HANG is the parent's problem - it kills this process at
+    ``PER_DISK_TIMEOUT_S`` (see ``_disk_grids_bounded``)."""
+    try:
+        out_q.put(_disk_grids(sat_idx, when))
+    except Exception as e:  # noqa: BLE001
+        print(f"mosaic: disk child failed: {type(e).__name__}: {e}", flush=True)
+        try:
+            out_q.put(None)
+        except Exception:  # noqa: BLE001 - parent may already have given up
+            pass
+
+
+def _disk_grids_bounded(sat_idx: int, when: dt.datetime):
+    """Fetch one disk in a fresh SPAWNED process under a hard wall-clock cap.
+
+    2026-07-12 box floater-poller stall, root cause: the previous
+    ``ProcessPoolExecutor`` + ``future.result(timeout=...)`` shape looked
+    bounded but was not - on timeout the child keeps running and the
+    ``with``-block exit calls ``shutdown(wait=True)``, which blocks the MAIN
+    POLLER LOOP forever behind the hung S3 fetch (a stalled TLS read in s3fs
+    has no total-timeout). The long-lived box poller wedged there (the GH
+    stopgap never showed it because its 45-min chained runs are externally
+    reaped). This shape has no wait-on-exit: q.get(timeout) then KILL.
+
+    spawn (not fork): the parent holds a requests.Session, boto3 client and
+    live log handlers; forking under those invites inherited-lock deadlocks -
+    the previous fork-safety comment was optimistic. Returns the grids tuple,
+    or None (disk failed / timed out - caller skips the disk)."""
+    ctx = mp.get_context("spawn")
+    out_q = ctx.Queue(maxsize=1)
+    proc = ctx.Process(target=_disk_grids_child, args=(sat_idx, when, out_q),
+                       daemon=True)
+    proc.start()
+    grids = None
+    try:
+        # Short-poll gets so a CRASHED child (import error, OOM-kill) is
+        # noticed in ~2 s instead of burning the whole disk budget waiting on
+        # a queue nothing will ever feed.
+        deadline = _time.monotonic() + PER_DISK_TIMEOUT_S
+        while _time.monotonic() < deadline:
+            try:
+                grids = out_q.get(timeout=2.0)
+                break
+            except queue_mod.Empty:
+                if not proc.is_alive():
+                    try:
+                        # drain a result whose queue flush raced the exit
+                        grids = out_q.get(timeout=1.0)
+                    except queue_mod.Empty:
+                        print(f"mosaic: disk {sat_idx} child died without a "
+                              f"result (exit {proc.exitcode})", flush=True)
+                    break
+        else:
+            print(f"mosaic: disk {sat_idx} exceeded {PER_DISK_TIMEOUT_S:.0f}s"
+                  " - killing the fetch process", flush=True)
+    finally:
+        if proc.is_alive():
+            proc.kill()          # SIGKILL - a wedged TLS read ignores SIGTERM
+        proc.join(timeout=10.0)
+        out_q.close()
+        # never join_thread(): a queue feeder mid-pickle after a kill could
+        # block; cancel lets interpreter exit collect it
+        out_q.cancel_join_thread()
+    return grids
+
+
 def _view_quality(lat_grid: np.ndarray, lon_grid: np.ndarray,
                   subsat: float) -> np.ndarray:
     """cos of the great-circle angle from the sub-sat point (0,subsat), clipped
@@ -193,10 +272,13 @@ def _view_quality(lat_grid: np.ndarray, lon_grid: np.ndarray,
     return np.clip(cosc, 0.0, 1.0) ** 2
 
 
-def build_global_mosaic(when: dt.datetime):
+def build_global_mosaic(when: dt.datetime, progress=None):
     """Build the day/night composite, return (webp_bytes, bounds[W,S,E,N],
     n_disks). Each disk is fetched+scattered in a FRESH subprocess (bounded
-    memory). Raises if NO disk could be used (caller keeps last-known-good)."""
+    memory, hard-killed at PER_DISK_TIMEOUT_S - see ``_disk_grids_bounded``).
+    ``progress`` (optional zero-arg callable) is invoked between disks so a
+    caller's stall watchdog sees liveness through a full 3-disk build.
+    Raises if NO disk could be used (caller keeps last-known-good)."""
     lon_1d = (np.arange(TARGET_W) + 0.5) / TARGET_W * 360.0
     lat_1d = LAT_LIM - (np.arange(TARGET_H) + 0.5) / TARGET_H * (2 * LAT_LIM)
     lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
@@ -209,15 +291,15 @@ def build_global_mosaic(when: dt.datetime):
     n_ok = 0
 
     for sat_idx, (sat, _bbox, _fv) in enumerate(MOSAIC_SATS):
+        if progress is not None:
+            progress()
         try:
-            # A fresh single-task process per disk -> its entire fetch footprint is
-            # freed on exit (a 3-disk build in one process fragments past the
-            # memory ceiling). fork is safe here: the poller is single-threaded
-            # (only a RateLimiter Lock, never held across this call), and each
-            # child resets its own S3 filesystem (_disk_grids).
-            with ProcessPoolExecutor(max_workers=1) as ex:
-                grids = ex.submit(_disk_grids, sat_idx, when).result(
-                    timeout=PER_DISK_TIMEOUT_S)
+            # A fresh single-task SPAWNED process per disk -> its entire fetch
+            # footprint is freed on exit (a 3-disk build in one process
+            # fragments past the memory ceiling), and a hung fetch is KILLED at
+            # PER_DISK_TIMEOUT_S instead of wedging the poller loop (the
+            # 2026-07-12 box stall - full story on _disk_grids_bounded).
+            grids = _disk_grids_bounded(sat_idx, when)
         except Exception as e:  # noqa: BLE001 — best effort per disk
             print(f"mosaic: {sat.__class__.__name__} subprocess failed: "
                   f"{type(e).__name__}: {e}", flush=True)

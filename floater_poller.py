@@ -232,6 +232,16 @@ FLOATER_BACKDROP_ENABLED = (_env("FLOATER_BACKDROP_ENABLED", "1") or "1") \
     .strip().lower() not in ("0", "false", "no")
 FLOATER_BACKDROP_BAND = (_env("FLOATER_BACKDROP_BAND", "ir") or "ir").strip().lower()
 
+# Stall watchdog: if the main loop makes NO progress for this long, the
+# process hard-exits so the supervisor (compose restart:unless-stopped / the
+# GH stopgap's next chained run) brings up a fresh one. Progress is beaten at
+# every loop turn, per tick() unit, and between mosaic disks - the longest
+# LEGITIMATE un-beaten span is one mosaic disk fetch (~200 s hard cap), so
+# 900 s only ever fires on a genuine wedge (2026-07-12: the box poller hung
+# ~15 h behind a stuck mosaic subprocess shutdown; freshness never recovered
+# until a human noticed). 0 disables.
+WATCHDOG_STALL_S = float(_env("FLOATER_WATCHDOG_STALL_S", "900"))
+
 # HTTP timeouts / retries
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
 RENDER_MAX_RETRIES = int(_env("RENDER_MAX_RETRIES", "3"))
@@ -986,6 +996,62 @@ class R2:
 
 
 # ---------------------------------------------------------------------------
+# Stall watchdog (process-level self-heal)
+# ---------------------------------------------------------------------------
+
+class Watchdog:
+    """Hard-exit the process if the main loop stops making progress.
+
+    Why this exists (2026-07-12): the box floater poller wedged inside a hung
+    mosaic subprocess shutdown and sat "healthy" for ~15 h - a hang is
+    invisible to `restart:` policies, which only see exits. The poller's
+    per-call timeouts make hangs RARE, not impossible; this is the backstop
+    that turns any future wedge, whatever its cause, into a ~15-min blip.
+
+    ``beat()`` is called wherever forward progress is real (loop turn, per
+    tick() unit, between mosaic disks). The monitor is a daemon thread; on a
+    stall it logs CRITICAL and ``os._exit(86)`` - deliberately NOT sys.exit,
+    which a wedged main thread would never process."""
+
+    def __init__(self, stall_s: float) -> None:
+        self.stall_s = stall_s
+        self._last = time.monotonic()
+        self._stop = False
+        self._thread: Optional[threading.Thread] = None
+
+    def beat(self) -> None:
+        self._last = time.monotonic()
+
+    def stop(self) -> None:          # tests / orderly shutdown
+        self._stop = True
+
+    def start(self) -> None:
+        if self.stall_s <= 0:
+            log.info("stall watchdog disabled (FLOATER_WATCHDOG_STALL_S=0)")
+            return
+        self._thread = threading.Thread(target=self._watch,
+                                        name="stall-watchdog", daemon=True)
+        self._thread.start()
+        log.info("stall watchdog armed: exit after %.0fs without progress",
+                 self.stall_s)
+
+    def _watch(self) -> None:
+        while not self._stop:
+            time.sleep(min(30.0, self.stall_s / 4))
+            if self._stop:
+                return
+            idle = time.monotonic() - self._last
+            if idle > self.stall_s:
+                log.critical(
+                    "WATCHDOG: no main-loop progress for %.0fs (> %.0fs) - "
+                    "hard-exiting so the supervisor restarts the poller",
+                    idle, self.stall_s)
+                logging.shutdown()
+                os._exit(86)
+                return   # unreachable in prod; ends the thread under test
+
+
+# ---------------------------------------------------------------------------
 # Rate limiter (global min spacing between /render calls)
 # ---------------------------------------------------------------------------
 
@@ -1135,6 +1201,7 @@ class Poller:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "tat-floater-poller/1.0"
         self.limiter = RateLimiter(RATE_MIN_SPACING_S)
+        self.wd = Watchdog(WATCHDOG_STALL_S)
         self.units: dict[tuple[str, str], Unit] = {}
         self.storms: dict[str, Storm] = {}     # slug -> storm (combined active set)
         self.named: dict[str, Storm] = {}      # slug -> named storm (last-known-good)
@@ -1506,6 +1573,7 @@ class Poller:
         for u in due:
             if time.monotonic() < self._circuit_open_until:
                 break
+            self.wd.beat()   # each unit is bounded work - real progress
             cadence = CADENCE_TARGET_S if u.band.hot else cold_c
             self.process_unit(u)
             u.next_due = time.monotonic() + cadence
@@ -1525,7 +1593,8 @@ class Poller:
         now = utcnow()
         done = []
         for region, bbox in BASIN_BACKDROP_REGIONS.items():
-            try:
+            self.wd.beat()   # per-basin: a retry-storm across all basins can
+            try:             # legitimately outlast the stall window otherwise
                 clat = (bbox[1] + bbox[3]) / 2.0
                 clon = (bbox[0] + bbox[2]) / 2.0
                 channel, product = backdrop_band(clat, clon, now)
@@ -1574,7 +1643,8 @@ class Poller:
         now = utcnow()
         try:
             import mosaic
-            webp, bounds, n_disks = mosaic.build_global_mosaic(now)
+            webp, bounds, n_disks = mosaic.build_global_mosaic(
+                now, progress=self.wd.beat)
         except Exception as e:  # noqa: BLE001 - never kill the poller loop
             log.warning("global mosaic build failed: %s", e)
             return
@@ -1592,7 +1662,9 @@ class Poller:
     def run(self) -> None:
         log.info("floater poller starting | render=%s | bucket=%s | bbox=%g deg | spacing=%gs",
                  RENDER_URL, R2_BUCKET, BBOX_DEG, RATE_MIN_SPACING_S)
+        self.wd.start()
         while True:
+            self.wd.beat()
             try:
                 if time.monotonic() - self._last_tracks_refresh >= TRACKS_REFRESH_S \
                         or not self.units:

@@ -96,6 +96,35 @@ content-hash dedup), so there is NO rush — but once box `/render` + pollers
 are verified, disable its `schedule:` block (keep `workflow_dispatch` for
 emergencies), per the header comment in that file.
 
+### 4a. 2026-07-12 floater-poller stall — root cause + the Q17 session
+
+The first box bring-up's floater poller wedged ~05:42Z and sat "healthy"
+for hours: a hung S3 fetch inside the global-mosaic disk subprocess, plus
+the old `ProcessPoolExecutor` shape whose `with`-exit ran
+`shutdown(wait=True)` — the timeout on `future.result()` fired, but the
+context exit then blocked the MAIN LOOP forever behind the still-hung
+child. A hang is invisible to `restart:` policies (they only see exits).
+
+Fixed on main: the disk fetch is a spawned process that is **killed** at
+`PER_DISK_TIMEOUT_S` (no wait-on-exit anywhere), and the poller carries a
+**stall watchdog** (`FLOATER_WATCHDOG_STALL_S`, default 900 s) that
+hard-exits on any future wedge so compose restarts it — self-healing by
+construction, whatever the cause.
+
+The Q17 box session is therefore a PULL + REBUILD, not just a restart:
+
+```bash
+cd ~/tat-satellite-render     # or wherever the render repo lives
+git pull                      # picks up the mosaic-kill + watchdog fix
+docker compose -p tat-render -f docker-compose.render.yml up -d --build \
+  render floater-poller intensity-poller guidance-poller ens-watchdog
+docker compose -p tat-render -f docker-compose.render.yml logs --tail 20 floater-poller
+# expect: "stall watchdog armed: exit after 900s without progress"
+```
+
+Then watch `floaters/{slug}/manifest.json` `generated_utc` advance for
+~an hour of box-only operation and retire the stopgap schedule per above.
+
 ## 5. HAFS worker — deliberately NOT auto-started
 
 Peak RSS ~23 GB for a full HAFS-A+B cycle (2026-06 Railway telemetry; the

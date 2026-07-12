@@ -463,5 +463,46 @@ class TestBackdropEmission(unittest.TestCase):
         self.assertIn("k_bd.webp", deleted)
 
 
+class TestStallWatchdog(unittest.TestCase):
+    """The 2026-07-12 box stall: a wedged loop must self-exit (so the
+    supervisor restarts the process) - and a HEALTHY loop must never fire."""
+
+    def test_fires_on_stall(self):
+        import time
+        from unittest import mock
+        wd = fp.Watchdog(stall_s=0.4)
+        with mock.patch("os._exit") as ex, \
+             mock.patch("logging.shutdown"):
+            wd.start()
+            time.sleep(1.3)     # monitor polls every stall/4 = 0.1 s
+            wd.stop()
+            wd._thread.join(timeout=2.0)
+        ex.assert_called_with(86)
+
+    def test_beats_keep_it_quiet(self):
+        import time
+        from unittest import mock
+        wd = fp.Watchdog(stall_s=0.6)
+        with mock.patch("os._exit") as ex, \
+             mock.patch("logging.shutdown"):
+            wd.start()
+            for _ in range(12):     # 1.2 s of steady progress
+                wd.beat()
+                time.sleep(0.1)
+            wd.stop()
+            wd._thread.join(timeout=2.0)
+        ex.assert_not_called()
+
+    def test_disabled_never_starts(self):
+        import time
+        from unittest import mock
+        wd = fp.Watchdog(stall_s=0)
+        with mock.patch("os._exit") as ex:
+            wd.start()
+            time.sleep(0.3)
+        ex.assert_not_called()
+        self.assertIsNone(wd._thread)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
