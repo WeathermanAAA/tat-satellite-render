@@ -65,14 +65,13 @@ def state_lines_status() -> str:
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
-# Coast/border style (2026-07-11, Andrew): solid black mudded the storm on
-# rainbow_ir (black lines vanish into the dark maroon/purple cold tops) —
-# now a light cyan/white main stroke over a THIN dark halo, legible on both
-# dark IR tops and bright daytime scenes. The halo is drawn as a slightly
-# wider under-stroke of the same geometry.
-COAST_COLOR = "#8ee6ff"   # light cyan — landmass outlines
-BORDER_COLOR = "#dce8f0"  # off-white — political borders
-LINE_HALO = "#10141b"     # near-black halo under both (thin: +~1.2 px)
+# Coast/border style (2026-07-12, Andrew's call — OVERRIDES the 2026-07-11
+# cyan/white restyle): coastlines, borders, state lines and the halo are all
+# BLACK. The halo under-stroke geometry is kept (it just reads as a slightly
+# heavier black line), so a future restyle is a constants-only change again.
+COAST_COLOR = "#000000"   # black — landmass outlines
+BORDER_COLOR = "#000000"  # black — political borders
+LINE_HALO = "#000000"     # black halo under both (thin: +~1.2 px)
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
