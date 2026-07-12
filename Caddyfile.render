@@ -1,0 +1,12 @@
+# Caddyfile.render -- TLS edge for the box-hosted render API.
+# Caddy provisions + renews Let's Encrypt automatically via HTTP-01, which
+# needs: (a) the render.triple-a-tropics.com DNS record pointing at the box
+# IP as DNS-ONLY (grey cloud -- a Cloudflare-proxied orange cloud breaks the
+# ACME challenge with this simple setup), (b) ports 80+443 open on the box.
+# CORS/preflight/X-* headers are answered by the FastAPI app itself; this
+# file only terminates TLS and forwards a correct X-Forwarded-For (caddy
+# default), which the app's rate limiter keys on.
+render.triple-a-tropics.com {
+    encode gzip
+    reverse_proxy render:8080
+}
