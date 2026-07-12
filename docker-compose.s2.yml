@@ -59,11 +59,19 @@ services:
   # Cron emitter: the Q7-tiered suite loop. z0-5 only (native z6 stays a manual
   # `run --rm emit --product ... ` on demand); duplicate scans dedup via the
   # per-frame ready marker, so the interval only bounds FRESHNESS, not writes.
+  # Each pass BACKFILLS every missing S2_CRON_STEP_MIN-minute slot in the
+  # trailing S2_CRON_BACKFILL_MIN window (default 10-min steps / 90-min
+  # lookback), so loop cadence is the SLOT GRID, not the pass duration --
+  # a slow multi-suite pass no longer stretches frame spacing to ~30 min,
+  # and a killed pass self-heals next tick. Set S2_CRON_STEP_MIN=0 for the
+  # legacy newest-scan-only behavior (or 5 to chase CONUS native cadence if
+  # the box keeps up -- watch a full pass stay under the interval first).
   # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list;
   # DEFAULTS to the FULL set -- conus fd himawari9-wpac himawari9-fd
   # geo-global -- so a bare `up` runs everything; the legacy single
   # S2_CRON_SUITE still overrides), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
-  # S2_CRON_PREFIX. A failed suite never blocks the rest of the tick.
+  # S2_CRON_PREFIX, S2_CRON_STEP_MIN, S2_CRON_BACKFILL_MIN. A failed suite
+  # never blocks the rest of the tick.
   emit-cron:
     build:
       context: .
@@ -73,13 +81,17 @@ services:
     command:
       - |
         SUITES="$${S2_CRON_SUITES:-$${S2_CRON_SUITE:-conus fd himawari9-wpac himawari9-fd geo-global}}"
-        echo "[s2-cron] suites=$$SUITES max-zoom=$${S2_CRON_MAX_ZOOM:-5} interval=$${S2_CRON_INTERVAL_S:-900}s"
+        STEP="$${S2_CRON_STEP_MIN:-10}"
+        STEPARGS=""
+        [ "$$STEP" != "0" ] && STEPARGS="--step $$STEP --backfill $${S2_CRON_BACKFILL_MIN:-90}"
+        echo "[s2-cron] suites=$$SUITES max-zoom=$${S2_CRON_MAX_ZOOM:-5} interval=$${S2_CRON_INTERVAL_S:-900}s step=$${STEP}m"
         while true; do
           for suite in $$SUITES; do
             python s2_pyramid_emit.py \
               --suite "$$suite" \
               --store r2 --prefix "$${S2_CRON_PREFIX:-shadow}" \
               --max-zoom "$${S2_CRON_MAX_ZOOM:-5}" \
+              $$STEPARGS \
               || echo "[s2-cron] $$suite emit failed rc=$$? (next tick retries)"
           done
           sleep "$${S2_CRON_INTERVAL_S:-900}"

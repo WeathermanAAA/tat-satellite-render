@@ -47,6 +47,50 @@ UTC = dt.timezone.utc
 CDN = "https://cdn.triple-a-tropics.com"
 
 
+def _parse_stamp(s: str) -> dt.datetime:
+    return dt.datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+
+
+def _backfill_slots(step_min: int, backfill_min: int,
+                    now: dt.datetime | None = None) -> list:
+    """The step-minute slot grid covering the trailing backfill window,
+    oldest first. Slots are grid times (:00/:10/:20 for step 10); the actual
+    scan each slot renders is resolved nearest-to-slot by the fetchers."""
+    now = now or dt.datetime.now(UTC)
+    newest = now.replace(second=0, microsecond=0)
+    newest -= dt.timedelta(minutes=newest.minute % step_min)
+    slots, t = [], newest
+    floor = now - dt.timedelta(minutes=backfill_min)
+    while t >= floor:
+        slots.append(t)
+        t -= dt.timedelta(minutes=step_min)
+    return list(reversed(slots))
+
+
+def _covered_times(entries, store, prefix: str) -> list:
+    """Per entry: the sorted datetimes of its COMPLETE frames in the store."""
+    out = []
+    for e in entries:
+        ts = []
+        for s, _mz in P.complete_stamps(e, store, prefix):
+            try:
+                ts.append(_parse_stamp(s))
+            except ValueError:
+                pass                     # legacy/foreign stamp shape: ignore
+        out.append(sorted(ts))
+    return out
+
+
+def _slot_missing(slot: dt.datetime, covered: list, tol: dt.timedelta) -> bool:
+    """A slot is DONE only when EVERY entry has a complete frame within tol
+    of it (per-product isolation: one lagging product keeps its slot open
+    without forcing re-renders of the healthy ones -- dedup skips those)."""
+    for ts in covered:
+        if not any(abs(t - slot) <= tol for t in ts):
+            return True
+    return False
+
+
 def _make_store(spec: str):
     if spec == "r2":
         import s1_ingest  # lazy: only import boto3/R2 when actually writing R2
@@ -216,6 +260,15 @@ def main(argv=None) -> int:
     ap.add_argument("--keep", type=int, default=90,
                     help="manifest lists only the newest N frames (default 90, the "
                          "export window; older tiles stay until the R2 lifecycle TTL)")
+    ap.add_argument("--step", type=int, default=None, metavar="MIN",
+                    help="target loop cadence: instead of emitting ONLY the newest "
+                         "scan, emit every missing MIN-minute slot in the trailing "
+                         "--backfill window (oldest first). A slot already covered "
+                         "by a complete frame within MIN/2 is skipped, so re-runs "
+                         "are cheap and a slow/killed pass self-heals next tick. "
+                         "Without --step the old newest-scan-only behavior holds.")
+    ap.add_argument("--backfill", type=int, default=None, metavar="MIN",
+                    help="lookback window for --step, minutes (default 6x step)")
     ap.add_argument("--allow-geometry-change", action="store_true",
                     help="permit an emit whose maxzoom differs from the prefix's "
                          "existing frames (drops them from the manifest); without "
@@ -224,6 +277,11 @@ def main(argv=None) -> int:
 
     if bool(args.product) == bool(args.suite):
         sys.exit("ERROR: pass exactly one of --product or --suite SECTOR")
+    if args.step and args.time != "latest":
+        sys.exit("ERROR: --step (slot backfill) and --time are mutually "
+                 "exclusive -- a pinned time IS a single slot")
+    if args.step and args.step <= 0:
+        sys.exit("ERROR: --step must be a positive number of minutes")
 
     when = None
     if args.time != "latest":
@@ -242,6 +300,32 @@ def main(argv=None) -> int:
             sys.exit(f"ERROR: {args.product} is not a tiled product (tiled=False)")
         if args.pyramid_px:
             entry = dataclasses.replace(entry, pyramid_px=args.pyramid_px)
+        if args.step:
+            slots = _backfill_slots(args.step, args.backfill or args.step * 6)
+            tol = dt.timedelta(minutes=args.step / 2.0)
+            covered = _covered_times([entry], store, args.prefix)
+            todo = [s for s in slots if _slot_missing(s, covered, tol)]
+            print(f"[backfill] {entry.product_id}: {len(todo)}/{len(slots)} "
+                  f"slot(s) missing at step {args.step}m")
+            n_ok = n_fail = 0
+            for slot in todo:
+                # re-check against frames written THIS run: two adjacent slots
+                # can resolve to the same scan near the sat's native cadence
+                covered = _covered_times([entry], store, args.prefix) if n_ok else covered
+                if not _slot_missing(slot, covered, tol):
+                    print(f"[backfill] {slot.isoformat()} now covered -- skip")
+                    continue
+                try:
+                    emit_one(entry, slot, store, args)
+                    n_ok += 1
+                except Exception as e:   # noqa: BLE001 -- one bad slot must not
+                    n_fail += 1          # kill the rest of the window
+                    print(f"[FAIL] {entry.product_id} @ {slot.isoformat()}: {e}")
+                    traceback.print_exc()
+            _write_products_index(store, args.prefix, entry.sat_key, entry.sector_key)
+            print(f"\n=== BACKFILL SUMMARY === ok={n_ok} failed={n_fail} "
+                  f"skipped={len(slots) - len(todo)}")
+            return 1 if (n_fail and not n_ok) else 0
         manifest = emit_one(entry, when, store, args)
         _write_products_index(store, args.prefix, entry.sat_key, entry.sector_key)
         mkey = entry.latest_times_key(args.prefix)
@@ -269,28 +353,39 @@ def main(argv=None) -> int:
                  + ", ".join(sorted({("%s-%s" % (e.sat_key, e.sector_key))
                                      if e.sat_key != "goes19" else e.sector_key
                                      for e in R.REGISTRY if e.tiled})))
-    pinned = _pin_suite_scan(entries, when)
-    print(f"[suite] {args.suite}: {len(entries)} products @ scan {pinned.isoformat()}")
-    band_cache: dict = {}
-    ok, failed = [], []
-    for entry in entries:
-        try:
-            emit_one(entry, pinned, store, args, band_cache=band_cache)
-            ok.append(entry.product_id)
-        except Exception as e:   # noqa: BLE001  (per-product isolation: one bad
-            # band/recipe never kills the rest of the suite; non-zero exit below)
-            failed.append(entry.product_id)
-            print(f"[FAIL] {entry.product_id}: {e}")
-            traceback.print_exc()
+    if args.step:
+        slots = _backfill_slots(args.step, args.backfill or args.step * 6)
+        tol = dt.timedelta(minutes=args.step / 2.0)
+        covered = _covered_times(entries, store, args.prefix)
+        todo = [s for s in slots if _slot_missing(s, covered, tol)]
+        print(f"[backfill] suite {args.suite}: {len(todo)}/{len(slots)} "
+              f"slot(s) missing at step {args.step}m")
+    else:
+        todo = [when]                     # legacy: one tick, newest (or --time)
+
+    ok_all, failed_all = [], []
+    for slot in todo:
+        pinned = _pin_suite_scan(entries, slot)
+        print(f"[suite] {args.suite}: {len(entries)} products @ scan {pinned.isoformat()}")
+        band_cache: dict = {}             # per-scan: bands download once per slot
+        for entry in entries:
+            try:
+                emit_one(entry, pinned, store, args, band_cache=band_cache)
+                ok_all.append(entry.product_id)
+            except Exception as e:   # noqa: BLE001  (per-product isolation: one bad
+                # band/recipe never kills the rest of the suite; non-zero exit below)
+                failed_all.append(entry.product_id)
+                print(f"[FAIL] {entry.product_id}: {e}")
+                traceback.print_exc()
     _write_products_index(store, args.prefix, suite_sat, suite_sector)
 
     print("\n=== SUITE EMIT SUMMARY ===")
-    print(f" scan   : {pinned.isoformat()}")
-    print(f" ok     : {len(ok)}  {ok}")
-    print(f" failed : {len(failed)}  {failed}")
-    if is_r2 and ok:
+    print(f" slots  : {len(todo)}")
+    print(f" ok     : {len(ok_all)}  {sorted(set(ok_all))}")
+    print(f" failed : {len(failed_all)}  {sorted(set(failed_all))}")
+    if is_r2 and ok_all:
         print(f" index  : {CDN}/{R.products_index_key(args.prefix, suite_sat, suite_sector)}")
-    if failed and not ok:
+    if failed_all and not ok_all:
         return 1          # total failure aborts (mirror the HAFS total-failure rule)
     return 0
 
