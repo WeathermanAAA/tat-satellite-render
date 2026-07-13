@@ -279,11 +279,14 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
         name = (name_raw if name_raw and name_raw not in {"INVEST", "NAMELESS", "UNNAMED"}
                 else f"{storm_num}{basin_letter}")
         # 92W->07W carry (mirror of the cron). knackwx gives the prior invest as
-        # transitioned_from ("92W"); feed its NUMBER as spawn_invest so ace_core's
-        # number-keyed superseding-invest dedup retires it the cycle the
-        # designation appears. FRAME-COINCIDENT (recycle-safe, stateless): carry
+        # transitioned_from ("92W"); feed its NUMBER + letter as
+        # spawn_invest(_letter) so ace_core's letter-aware superseding-invest
+        # dedup (ace-core-v0.8.3) retires it the cycle the designation appears
+        # without ever touching a same-numbered invest in the other basin
+        # sharing the page. FRAME-COINCIDENT (recycle-safe, stateless): carry
         # only while the SAME payload still lists that 9x invest.
         spawn_invest = None
+        spawn_invest_letter = None
         if is_designated:
             tf = (it.get("transitioned_from") or "").strip().upper()
             mtf = re.fullmatch(r"(\d{1,2})[A-Z]", tf)
@@ -295,6 +298,7 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
                         == f"{tf_num:02d}{tf_letter}"
                     for d in data):
                     spawn_invest = tf_num
+                    spawn_invest_letter = tf_letter
         # SID basin token follows the row's OWN ATCF letter ("C" -> CP) so a
         # 90C never shares a SID with a simultaneous 90E. Mirror of the cron.
         sid_basin = {"L": "AL", "E": "EP", "C": "CP", "W": "WP"}.get(
@@ -306,6 +310,7 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
             "wind_kt": vmax, "pressure_mb": pres, "nature": nature,
             "source": "live-knackwx-designated" if is_designated else "live-knackwx",
             "storm_num": storm_num, "spawn_invest": spawn_invest,
+            "spawn_invest_letter": spawn_invest_letter,
         })
     return pd.DataFrame(rows)
 
