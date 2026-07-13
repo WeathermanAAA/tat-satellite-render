@@ -154,38 +154,43 @@ def fetch_live_bdecks(session: requests.Session, basin_cfg: dict, year: int,
     """Fetch + parse the current-season named b-decks via the proxy chain. Same
     chain + same parser (ace_core.parse_bdeck) as the main-repo generators, so a
     named storm yields the IDENTICAL canonical track. Returns a (possibly empty)
-    live frame; stops after 3 consecutive missing storm numbers."""
-    patterns = basin_cfg["atcf_patterns"]
+    live frame; stops after 3 consecutive missing storm numbers (per deck-
+    prefix chain — EP's base also carries the CPHC bcp chain in
+    atcf_patterns_extra, so designated Central Pacific systems are swept
+    too; ace_core >=0.8.3's parse_bdeck keys their SIDs off the deck rows'
+    own basin field, NHC_CP##<year>)."""
     yy = year % 100
     frames = []
-    misses = 0
-    for nn in range(1, max_storm_num + 1):
-        text = None
-        for pat in patterns:
-            url = pat.format(nn=f"{nn:02d}", yy=f"{yy:02d}", year=year)
-            try:
-                t = _get_text(session, url, policy)
-            except (pf.TransientFetchError, pf.PermanentFetchError,
-                    requests.exceptions.RequestException) as e:
-                # A single bad mirror (SSL/connection/timeout/HTTP error) must
-                # NEVER crash the whole basin fetch and discard storms already
-                # collected this pass - that is what lost EP01 tonight when the
-                # WP-only natyphoon mirror SSL-failed (TLSV1_UNRECOGNIZED_NAME)
-                # in the AL/EP chain. resilient_fetch already retried this mirror
-                # per policy; fall through to the NEXT mirror in the chain.
-                log.debug("b-deck mirror failed (%s): %s -- trying next mirror",
-                          url, type(e).__name__)
-                continue            # try the next mirror in the chain
-            if t and "BEST" in t:
-                text = t
-                break
-        if text is not None:
-            frames.append(ac.parse_bdeck(text, year, basin_cfg))
-            misses = 0
-        else:
-            misses += 1
-            if misses >= 3:
-                break
+    for patterns in ([basin_cfg["atcf_patterns"]]
+                     + list(basin_cfg.get("atcf_patterns_extra") or [])):
+        misses = 0
+        for nn in range(1, max_storm_num + 1):
+            text = None
+            for pat in patterns:
+                url = pat.format(nn=f"{nn:02d}", yy=f"{yy:02d}", year=year)
+                try:
+                    t = _get_text(session, url, policy)
+                except (pf.TransientFetchError, pf.PermanentFetchError,
+                        requests.exceptions.RequestException) as e:
+                    # A single bad mirror (SSL/connection/timeout/HTTP error) must
+                    # NEVER crash the whole basin fetch and discard storms already
+                    # collected this pass - that is what lost EP01 tonight when the
+                    # WP-only natyphoon mirror SSL-failed (TLSV1_UNRECOGNIZED_NAME)
+                    # in the AL/EP chain. resilient_fetch already retried this mirror
+                    # per policy; fall through to the NEXT mirror in the chain.
+                    log.debug("b-deck mirror failed (%s): %s -- trying next mirror",
+                              url, type(e).__name__)
+                    continue            # try the next mirror in the chain
+                if t and "BEST" in t:
+                    text = t
+                    break
+            if text is not None:
+                frames.append(ac.parse_bdeck(text, year, basin_cfg))
+                misses = 0
+            else:
+                misses += 1
+                if misses >= 3:
+                    break
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
