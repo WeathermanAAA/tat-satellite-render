@@ -76,7 +76,10 @@ services:
     command: python floater_poller.py
     environment:
       RENDER_BASE_URL: http://render:8080   # compose network, not the public host
-      RATE_MIN_SPACING_S: "1.0"             # co-located: no public rate limiter
+      # Co-located callers are auto-detected by the render service (private
+      # peer + no X-Forwarded-For) and get RATE_LIMIT_INTERNAL (600/min
+      # default) instead of the public 10/min — 1 s spacing is self-pacing.
+      RATE_MIN_SPACING_S: "1.0"
       LOG_LEVEL: INFO
     depends_on:
       render:

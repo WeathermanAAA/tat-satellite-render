@@ -115,8 +115,19 @@ async def _to_thread(fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 def _bbox_overlaps(a: list[float], b: tuple[float, float, float, float]) -> bool:
+    # ``a`` may cross the antimeridian (a[2] < a[0], the normalized crossing
+    # convention) — split it at ±180 and test both lobes. ``b`` (a disk /
+    # sector footprint) never crosses.
+    if a[2] < a[0]:
+        return (_bbox_overlaps([a[0], a[1], 180.0, a[3]], b)
+                or _bbox_overlaps([-180.0, a[1], a[2], a[3]], b))
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 def _bbox_inside(inner: list[float], outer: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
+    if inner[2] < inner[0]:
+        # An antimeridian-crossing bbox is never inside a non-crossing sector
+        # footprint (CONUS/PACUS/meso) — without this guard the raw compares
+        # can accidentally pass and select a sector with a no-data wedge.
+        return False
     return (
         inner[0] >= outer[0] - buffer
         and inner[1] >= outer[1] - buffer
@@ -775,9 +786,15 @@ class GOESBaseSatellite(Satellite):
         x = ds["x"].values  # radians
         y = ds["y"].values
         # Sample bbox corners + center to get xy span (use a denser grid for safety)
+        # Antimeridian-safe: a crossing bbox (lon_max < lon_min) samples the
+        # unwrapped span — _latlon_to_xy is trig-periodic in (lon - lambda_0),
+        # so unwrapped longitudes project identically to wrapped ones. Matters
+        # for GOES-West, whose disk reaches across ±180 (e.g. a storm box
+        # straddling the dateline near 175°W).
         lon_min, lat_min, lon_max, lat_max = bbox
+        lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
         n_sample = 16
-        sample_lons = np.linspace(lon_min, lon_max, n_sample)
+        sample_lons = np.linspace(lon_min, lon_max_uw, n_sample)
         sample_lats = np.linspace(lat_min, lat_max, n_sample)
         LON, LAT = np.meshgrid(sample_lons, sample_lats)
         sx, sy = _latlon_to_xy(LAT, LON, lon_origin, H, r_eq, r_pol)

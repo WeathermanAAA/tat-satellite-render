@@ -17,6 +17,7 @@ import gc
 import hashlib
 import json
 import logging
+import ipaddress
 import math
 import os
 import shutil
@@ -205,7 +206,11 @@ def compute_downsample_factor(bbox: list[float], channel, budget: int = PIXEL_BU
     ``budget`` defaults to the full PIXEL_BUDGET; the custom-zoom resolution
     tiers pass a smaller budget (QUALITY_BUDGETS) to cap the output dimension.
     """
-    lon_w_deg = bbox[2] - bbox[0]
+    # % 360 handles the antimeridian-crossing convention (lon_max < lon_min);
+    # a normal bbox's positive span passes through unchanged. `or 360.0`:
+    # a legal full-globe box ([-180, S, 180, N]) lands exactly on 0 here and
+    # would otherwise dodge the pixel budget entirely (unstrided full disk).
+    lon_w_deg = (bbox[2] - bbox[0]) % 360.0 or 360.0
     lat_h_deg = bbox[3] - bbox[1]
     km_per_px = _native_km_per_pixel(channel)
     px_w = (lon_w_deg * DEG_TO_KM) / km_per_px
@@ -288,11 +293,61 @@ def normalize_channel(raw) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 # slowapi keyed on real client IP (X-Forwarded-For first hop)
 # ---------------------------------------------------------------------------
+# Trusted-internal callers (the co-located poller fleet on the compose network,
+# or the GH stopgap's localhost uvicorn) get RATE_LIMIT_INTERNAL instead of the
+# public RATE_LIMIT. Without this the pollers share the public 10/min budget
+# and the 16-region basin-backdrop sweep starves its own tail (observed on the
+# box: "basin backdrop wpac failed: 429 rate limited" — wpac is region #11 in
+# the sweep, right past the 10-req window).
+# Trust rule: NO X-Forwarded-For header AND a loopback/private peer address.
+# The public path always traverses caddy, which appends XFF — an external
+# client cannot reach this branch by spoofing (a forged XFF still carries the
+# header, so the request takes the public limit on its claimed first hop).
+RATE_LIMIT_INTERNAL = os.getenv("RATE_LIMIT_INTERNAL", "600/minute")
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private  # loopback counts as private
+    except ValueError:
+        return False
+
+
+def _is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
 def real_ip(request: Request) -> str:
+    """Rate-limit key. The ``internal|`` prefix is minted ONLY here, on the
+    no-XFF + private-peer branch — any request carrying X-Forwarded-For takes
+    a PUBLIC key. XFF content is attacker text, so the first hop is used only
+    when it parses as an IP address; a non-IP first hop (including a forged
+    "internal|..." — the injection an adversarial review demonstrated against
+    the naive split) falls back to the last hop caddy appended (which the
+    client cannot control) and then to the socket peer. Neither fallback can
+    reach the internal branch."""
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
-    return get_remote_address(request)
+        hops = [h.strip() for h in xff.split(",")]
+        for hop in (hops[0], hops[-1]):
+            if _is_ip(hop):
+                return hop
+        return get_remote_address(request)
+    ip = get_remote_address(request)
+    if _is_private_ip(ip):
+        return f"internal|{ip}"
+    return ip
+
+
+def rate_limit_for(key: str) -> str:
+    """Dynamic slowapi limit provider. The parameter MUST be named ``key`` —
+    slowapi 0.1.9 inspects the signature and, seeing ``key``, calls this with
+    real_ip(request)'s value per request (see slowapi.wrappers.LimitGroup)."""
+    return RATE_LIMIT_INTERNAL if key.startswith("internal|") else RATE_LIMIT
 
 
 limiter = Limiter(key_func=real_ip)
@@ -417,12 +472,44 @@ class RenderRequest(BaseModel):
         # handles oversized bboxes by auto-downsampling rather than rejecting.
         # Disk-overlap check moved to pick_satellite() — out-of-coverage bboxes
         # surface as a 422 CoverageError that names the missing region/satellite.
+        #
+        # ANTIMERIDIAN: two dateline-crossing input forms are accepted and both
+        # normalize to the ONE internal convention (lon_max < lon_min, both in
+        # [-180, 180] — the convention satellites.py already speaks):
+        #   * unwrapped   [140, -35, 200, 5]   (E > 180; the basin-backdrop /
+        #     widen_bbox_to_view form — "E=200 = 160°W")      -> [140, -35, -160, 5]
+        #   * pre-wrapped [172, -6, -176, 6]   (the poller's norm_lon storm box)
+        # Every downstream consumer (pick_satellite, geos crops, render extents,
+        # downsample budget) is crossing-aware; true color is gated at the
+        # endpoint (regular-grid composite doesn't cross yet).
         lon_min, lat_min, lon_max, lat_max = v
-        if not (-180 <= lon_min < lon_max <= 180):
+        if not (-360 <= lon_min <= 360 and -360 <= lon_max <= 360):
             raise ValueError("invalid longitude range")
+        # Edge-preserving wrap into [-180, 180], applied ONLY to out-of-range
+        # edges: in-range longitudes pass through byte-identical (float mod
+        # perturbs fractional values, which would churn every existing cache
+        # key), and today's legal exact-dateline boxes ([100, 0, 180, 45])
+        # stay NON-crossing instead of flipping convention.
+        if not -180.0 <= lon_min <= 180.0:
+            lon_min = ((lon_min + 180.0) % 360.0) - 180.0
+        if not -180.0 <= lon_max <= 180.0:
+            lon_max = ((lon_max + 180.0) % 360.0) - 180.0
+        if lon_max == -180.0:
+            # An east edge of exactly -180 always means the dateline itself:
+            # prefer the +180 (non-crossing) form, wrapped or not.
+            lon_max = 180.0
+        if lon_min == lon_max:
+            raise ValueError("invalid longitude range")
+        if lon_max < lon_min and (lon_max - lon_min) % 360.0 > 180.0:
+            # No real storm box or basin backdrop crosses the dateline with
+            # more than half the globe; a >180-deg "crossing" box is almost
+            # certainly reversed west/east edges, which used to 422 loudly.
+            raise ValueError(
+                "antimeridian-crossing bbox spans more than 180 degrees of "
+                "longitude (reversed west/east edges?)")
         if not (-90 <= lat_min < lat_max <= 90):
             raise ValueError("invalid latitude range")
-        return v
+        return [lon_min, lat_min, lon_max, lat_max]
 
     @field_validator("channel")
     @classmethod
@@ -543,7 +630,7 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
 
 
 @app.post("/render")
-@limiter.limit(RATE_LIMIT)
+@limiter.limit(rate_limit_for)
 async def render(request: Request, body: RenderRequest = Body(...)):
     t0 = time.perf_counter()
     is_latest = body.time == "latest"
@@ -553,6 +640,16 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # deprecation header on the response when numeric was used.
     generic_channel, channel_was_numeric = normalize_channel(body.channel)
     is_true_color = generic_channel == "true_color"
+    # True color composes onto a REGULAR lat/lon grid built with plain
+    # linspace(lon_min, lon_max) in every family and renders via imshow —
+    # neither leg is antimeridian-aware yet. Refuse crossing bboxes honestly
+    # (422 -> the poller's RenderSkip path) instead of composing a wrong grid.
+    if is_true_color and body.bbox[2] < body.bbox[0]:
+        raise HTTPException(
+            status_code=422,
+            detail="true color across the antimeridian is not supported yet; "
+                   "use a scalar channel or split the bbox at 180",
+        )
 
     # Pixel-budget downsample is deterministic from bbox+channel so the
     # cache key (already keyed on bbox+channel) implicitly covers it. We
@@ -914,7 +1011,7 @@ def _fetch_frames_to_dir(urls: list, tmp: str) -> int:
 
 
 @app.post("/export")
-@limiter.limit(RATE_LIMIT)
+@limiter.limit(rate_limit_for)
 async def export(request: Request, body: ExportRequest = Body(...)):
     if not FFMPEG_AVAILABLE:
         raise HTTPException(status_code=503,

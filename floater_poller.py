@@ -169,7 +169,10 @@ EXTRAPOLATE_MAX_H = float(_env("EXTRAPOLATE_MAX_H", "6"))  # cap motion extrapol
 # is simply omitted from backdrops.json -- those wide/gap views are served by the
 # day-Vis/night-SWIR MOSAIC (hemisphere/global) instead. Bboxes are [W,S,E,N],
 # ALIGNED to models/regions.js extentOf so the backdrop covers exactly the framed
-# region (swpac uses E=200 = 160W so the box is contiguous across the dateline).
+# region (swpac uses E=200 = 160W so the box is contiguous across the dateline —
+# /render accepts that unwrapped E>180 form and normalizes it to its internal
+# antimeridian-crossing convention; the published backdrops.json bounds keep
+# E=200, which is the frame the viewers project in).
 BASIN_BACKDROP_REGIONS = {
     # --- GOES-East (Atlantic + the Americas) ---
     "atlantic": [-100.0, 0.0, -5.0, 55.0],
@@ -245,6 +248,18 @@ WATCHDOG_STALL_S = float(_env("FLOATER_WATCHDOG_STALL_S", "900"))
 # HTTP timeouts / retries
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
 RENDER_MAX_RETRIES = int(_env("RENDER_MAX_RETRIES", "3"))
+# 429s get their OWN retry budget with longer, Retry-After-honoring waits:
+# the render service's public limiter is a 60 s moving window, so the old
+# 6/10 s sleeps landed every retry back inside the same crowded window and
+# the whole call failed ("basin backdrop wpac failed: 429 rate limited").
+# Defaults clear a 10/min window by the 2nd-3rd wait (15 -> 30 -> 60 s).
+# Bounded: worst case ~105 s per call, and the poller loop beats the stall
+# watchdog between basins, so a sweep-wide retry storm can't trip it.
+# (Co-located pollers should no longer 429 at all — app.py now grants
+# trusted-internal callers RATE_LIMIT_INTERNAL — this is defense in depth.)
+RENDER_429_RETRIES = int(_env("RENDER_429_RETRIES", "3"))
+RENDER_429_BASE_S = float(_env("RENDER_429_BASE_S", "15"))
+RENDER_429_MAX_WAIT_S = float(_env("RENDER_429_MAX_WAIT_S", "60"))
 CIRCUIT_TRIP_FAILS = int(_env("CIRCUIT_TRIP_FAILS", "8"))   # consecutive fails -> cool down
 CIRCUIT_COOLDOWN_S = float(_env("CIRCUIT_COOLDOWN_S", "60"))
 
@@ -388,10 +403,17 @@ def widen_bbox_to_view(bbox: list[float]) -> list[float]:
     exceed +180 across the dateline) -- the viewers project in that same unwrapped
     frame, matching the per-storm bounds contract."""
     w, s, e, n = bbox
+    # A pre-wrapped crossing box (E < W: the norm_lon storm box for a storm
+    # straddling the dateline) must be lifted into the CONTINUOUS frame before
+    # midpointing — the raw (W+E)/2 midpoint of [171, -175] is -2, the exact
+    # ANTIPODE of the storm, and the widened Gulf-of-Guinea box is perfectly
+    # valid so /render would happily publish a wrong-side backdrop
+    # (adversarial-review catch, two lenses independently).
+    e_uw = float(e) + 360.0 if float(e) < float(w) else float(e)
     lat_span = float(n) - float(s)
     clat = (float(s) + float(n)) / 2.0
-    clon = norm_lon((float(w) + float(e)) / 2.0)
-    cur_lon = float(e) - float(w)
+    clon = norm_lon((float(w) + e_uw) / 2.0)
+    cur_lon = e_uw - float(w)
     cosl = max(0.30, math.cos(math.radians(clat)))   # clamp: high-lat boxes stay sane
     want_lon = lat_span * BACKDROP_VIEW_ASPECT / cosl
     # Widen only -- a box already wider than the aspect (a basin extent) is never
@@ -1098,16 +1120,21 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
         # title. Never sent on the bare backdrop path.
         body["storm"] = storm
     last_exc: Exception | None = None
-    for attempt in range(RENDER_MAX_RETRIES):
+    attempt = 0
+    hits_429 = 0
+    # 429s consume their own budget (RENDER_429_RETRIES) so a rate-limited call
+    # still gets its full RENDER_MAX_RETRIES for genuine transport errors.
+    while attempt < RENDER_MAX_RETRIES:
         try:
             r = session.post(RENDER_URL, json=body, timeout=RENDER_TIMEOUT_S)
             if r.status_code == 422:
                 raise RenderSkip(r.text[:200])
             if r.status_code == 429:
-                # Public limiter tripped (shouldn't happen on private net) --
-                # back off hard and retry.
-                time.sleep(6 + attempt * 4)
                 last_exc = RenderError("429 rate limited")
+                if hits_429 >= RENDER_429_RETRIES:
+                    break
+                time.sleep(_backoff_429(r.headers.get("Retry-After"), hits_429))
+                hits_429 += 1
                 continue
             r.raise_for_status()
             return r.content, dict(r.headers)
@@ -1115,8 +1142,22 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
             raise
         except Exception as e:  # noqa: BLE001
             last_exc = e
-            time.sleep((2 ** attempt) + random.uniform(0, 0.5))
+            attempt += 1
+            if attempt < RENDER_MAX_RETRIES:
+                time.sleep((2 ** attempt) + random.uniform(0, 0.5))
     raise RenderError(str(last_exc))
+
+
+def _backoff_429(retry_after: str | None, prior_429s: int) -> float:
+    """Wait before re-trying a 429: the server's Retry-After when it says one,
+    never less than an exponential floor (15/30/60 s by default) that clears a
+    one-minute moving-window limiter, capped + jittered."""
+    try:
+        hinted = float(retry_after) if retry_after else 0.0
+    except ValueError:
+        hinted = 0.0
+    wait = max(hinted, RENDER_429_BASE_S * (2 ** prior_429s))
+    return min(wait, RENDER_429_MAX_WAIT_S) + random.uniform(0, 2)
 
 
 # ---------------------------------------------------------------------------

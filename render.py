@@ -77,6 +77,18 @@ ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
 
 
+def _gridline_xlocs(lon_min: float, lon_max_uw: float, step: float) -> np.ndarray:
+    """Meridian locations for the graticule. ``lon_max_uw`` may exceed 180 (the
+    unwrapped east edge of an antimeridian-crossing bbox) — locs are generated
+    in unwrapped space so the sequence is continuous across the dateline, then
+    wrapped into [-180, 180] for cartopy's Gridliner (which speaks wrapped
+    PlateCarree longitudes). Non-crossing boxes reproduce the legacy arange."""
+    locs = np.arange(np.floor(lon_min / step) * step, lon_max_uw + step, step)
+    if lon_max_uw > 180.0:
+        locs = np.unique(((locs + 180.0) % 360.0) - 180.0)
+    return locs
+
+
 def _gridline_step(span: float) -> float:
     """Pick a sane gridline interval (degrees) for the given bbox span."""
     if span <= 2:
@@ -88,6 +100,47 @@ def _gridline_step(span: float) -> float:
     if span <= 25:
         return 5.0
     return 10.0
+
+
+def _map_geometry(bbox: list[float]):
+    """Crossing-aware map geometry for a ``[W, S, E, N]`` bbox.
+
+    Returns ``(projection, extent, lon_span, crossing)``:
+      * ``projection`` — the AXES projection. PlateCarree(central_longitude=180)
+        when the bbox crosses the antimeridian (normalized convention:
+        lon_max < lon_min), so the extent is continuous in axes space; the
+        plain PlateCarree otherwise (existing behavior, byte-identical).
+      * ``extent`` — [lon_min, lon_max_unwrapped, lat_min, lat_max] to pass to
+        ``set_extent(..., crs=ccrs.PlateCarree())``; cartopy transforms the
+        unwrapped east edge into the crossing projection correctly.
+      * ``lon_span`` — positive unwrapped span (drives aspect / coast scale /
+        gridline step).
+    Data plotting stays ``transform=ccrs.PlateCarree()`` in both cases: with a
+    180-centered axes projection the transformed mesh is continuous across the
+    dateline (the ±180 jump in wrapped source longitudes lands at the axes
+    center, not at a seam), so pcolormesh needs no special handling.
+    """
+    lon_min, lat_min, lon_max, lat_max = bbox
+    crossing = lon_max < lon_min
+    lon_max_uw = lon_max + 360.0 if crossing else lon_max
+    proj = ccrs.PlateCarree(central_longitude=180.0) if crossing else ccrs.PlateCarree()
+    extent = [lon_min, lon_max_uw, lat_min, lat_max]
+    return proj, extent, lon_max_uw - lon_min, crossing
+
+
+def _unwrap_lons(lons, lon_min: float):
+    """Make source longitudes CONTINUOUS across the dateline for a crossing
+    bbox. Wrapped [-180, 180] lons (the AHI inverse projection wraps; GOES-West
+    emits sub-sat-relative values) carry a ±360 jump at the dateline column —
+    cartopy's pcolormesh wrap-detection then mangles the jump-spanning cells
+    into misplaced horizontal smears (observed on the first live swpac
+    backdrop), and _guard_mesh_coords' nanmean fill lands far outside the
+    window. Everything west of the bbox's west edge is really the >180 side:
+    shift it up by 360. PlateCarree transforms are periodic, so unwrapped
+    values >180 plot exactly right."""
+    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
+    with np.errstate(invalid="ignore"):
+        return np.where(lons < lon_min - 1e-9, lons + 360.0, lons)
 
 
 def _coast_resolution(span_deg: float) -> str:
@@ -250,7 +303,7 @@ def render_png(
             cbar_label = enh.get("cbar_label", "Brightness Temperature (°C)")
 
     lon_min, lat_min, lon_max, lat_max = bbox
-    lon_span = lon_max - lon_min
+    proj, extent, lon_span, crossing = _map_geometry(bbox)
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
@@ -275,10 +328,10 @@ def render_png(
     map_w = 0.84 if show_cbar else 0.92
 
     ax = fig.add_axes(
-        [0.04, bottom_pad, map_w, map_h], projection=ccrs.PlateCarree()
+        [0.04, bottom_pad, map_w, map_h], projection=proj
     )
     ax.set_facecolor(DARK_BG)
-    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
 
     mesh = None
     # Plot with the (lats, lons) arrays we computed via inverse projection.
@@ -334,6 +387,8 @@ def render_png(
         # Masked / non-finite geolocation (off-disk limb; early-era ABI
         # sectors) would raise inside pcolormesh -- same guard as the
         # backdrop path (one guard, both call sites).
+        if crossing:
+            lons = _unwrap_lons(lons, lon_min)
         lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
         mesh = ax.pcolormesh(
             lons,
@@ -400,7 +455,7 @@ def render_png(
             linestyle="--",
             color=GRID_COLOR,
             alpha=0.7,
-            xlocs=np.arange(np.floor(lon_min / step) * step, lon_max + step, step),
+            xlocs=_gridline_xlocs(lon_min, extent[1], step),
             ylocs=np.arange(np.floor(lat_min / step) * step, lat_max + step, step),
         )
         gl.top_labels = False
@@ -651,10 +706,12 @@ def render_backdrop_webp(
 
     # Off-disk / masked geolocation guard -- shared with the main scalar
     # render (see _guard_mesh_coords; without it every basin backdrop 500s).
+    if bbox[2] < bbox[0]:   # antimeridian-crossing: continuous lons first
+        lons = _unwrap_lons(lons, bbox[0])
     lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
 
     lon_min, lat_min, lon_max, lat_max = bbox
-    lon_span = lon_max - lon_min
+    proj, extent, lon_span, _crossing = _map_geometry(bbox)
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
@@ -663,9 +720,9 @@ def render_backdrop_webp(
     fig_w = 10.0
     fig_h = max(2.0, fig_w / max(aspect, 0.2))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
-    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
+    ax = fig.add_axes([0, 0, 1, 1], projection=proj)
     ax.set_facecolor(DARK_BG)
-    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
     ax.set_aspect("auto")
     ax.axis("off")
     ax.pcolormesh(
