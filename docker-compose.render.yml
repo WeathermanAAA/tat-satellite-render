@@ -75,6 +75,13 @@ services:
     <<: *render-base
     command: python floater_poller.py
     environment:
+      # PIN the output prefix: the shared box .env carries R2_PREFIX=meso
+      # for the MESO stack, and env_file inheritance silently pointed this
+      # poller at meso/* from the 2026-07-14 bring-up — floaters/* then
+      # froze the moment the GH stopgap schedule retired (Jul 15 01:03Z,
+      # found 2026-07-17). environment: beats env_file, so this holds
+      # whatever the shared .env says.
+      R2_PREFIX: floaters
       RENDER_BASE_URL: http://render:8080   # compose network, not the public host
       # Co-located callers are auto-detected by the render service (private
       # peer + no X-Forwarded-For) and get RATE_LIMIT_INTERNAL (600/min
