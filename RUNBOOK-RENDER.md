@@ -150,6 +150,34 @@ the repo as the migration record. (Railway's push-to-deploy hooks die with
 the project — pushes to `main` / `hafs-render-worker` then only feed the box
 and CI.)
 
+## 7. Output watchdog — the product is the truth (2026-07-17)
+
+The 2026-07-15..17 floaters/ freeze looked like a poller hang but was a
+CONFIG failure: the shared box .env carries R2_PREFIX=meso (for the meso
+stack), env_file inheritance silently pointed the render floater-poller
+at meso/* from its first start, and floaters/* lost its last writer the
+moment the GH stopgap schedule retired. Nothing crashed, nothing hung —
+restart policies and the section-4a in-process stall watchdog are both
+blind to a healthy process writing the WRONG keys (or to a wedged
+sub-task while the rest of the loop progresses). The durable defense
+watches the PRODUCT:
+
+- /usr/local/bin/tat-floater-watchdog.sh (on the box): fetches
+  floaters/manifest.json from the CDN cache-busted; if generated_utc is
+  older than 30 min it restarts the floater-poller service via compose.
+  A stamp file (/var/run/tat-floater-watchdog.last) limits restarts to
+  one per 30 min so a genuine upstream outage (or a config failure a
+  restart cannot fix, like this one) never restart-loops the container —
+  the log then shows repeated stale findings, which IS the alert.
+- systemd timer tat-floater-watchdog.timer (every 10 min, enabled):
+  systemctl list-timers tat-floater-watchdog.timer to check,
+  /var/log/tat-floater-watchdog.log for actions.
+
+Pattern note: any box product with a manifest timestamp can get the same
+treatment — copy the script, swap the URL + service name. The env-pin
+that fixes this incident is in docker-compose.render.yml (floater-poller
+environment: R2_PREFIX: floaters — environment beats env_file).
+
 ## Ops crib
 
 ```bash
