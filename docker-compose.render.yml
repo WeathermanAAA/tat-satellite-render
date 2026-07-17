@@ -100,6 +100,12 @@ services:
       # Railway env parity: the PROMOTED live map key (not the shadow one) --
       # wrong key silently blanks the home-map storm layer
       GLOBAL_GEOJSON_KEY: global_storms.geojson
+      # Same parity trap, found 2026-07-17: without this the adv/cone
+      # writer falls back to its shadow/cyclolab default and the SITE key
+      # (cyclolab/adv/{sid}.json) silently freezes at the last promoted
+      # write - ELIDA sat on adv 1 for ~2 days while adv 9 landed in the
+      # shadow tree.
+      CYCLOLAB_PREFIX: cyclolab
       LOG_LEVEL: INFO
     mem_limit: 2g
 
