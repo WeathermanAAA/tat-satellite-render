@@ -54,8 +54,17 @@ def _parse_stamp(s: str) -> dt.datetime:
 def _backfill_slots(step_min: int, backfill_min: int,
                     now: dt.datetime | None = None) -> list:
     """The step-minute slot grid covering the trailing backfill window,
-    oldest first. Slots are grid times (:00/:10/:20 for step 10); the actual
-    scan each slot renders is resolved nearest-to-slot by the fetchers."""
+    NEWEST first (the enscenters/§11-H lesson: oldest-first freezes 'latest'
+    behind the backfill — a ~20-min geo slot render walking old→new left the
+    world composite 75+ min stale, and a timeout kill lost the newest slot
+    entirely). Newest-first makes freshness independent of backfill depth:
+    the current slot lands first, older holes heal with whatever budget
+    remains, and a killed run costs only old-slot work (ready-marker dedup
+    resumes it next tick). Slots are grid times (:00/:10/:20 for step 10);
+    the actual scan each slot renders is resolved nearest-to-slot by the
+    fetchers. Emit order is safe to change: manifests rebuild from R2
+    reality per emit and frames dedup by ready marker, so no consumer
+    depends on slot arrival order."""
     now = now or dt.datetime.now(UTC)
     newest = now.replace(second=0, microsecond=0)
     newest -= dt.timedelta(minutes=newest.minute % step_min)
@@ -64,7 +73,7 @@ def _backfill_slots(step_min: int, backfill_min: int,
     while t >= floor:
         slots.append(t)
         t -= dt.timedelta(minutes=step_min)
-    return list(reversed(slots))
+    return slots
 
 
 def _covered_times(entries, store, prefix: str) -> list:
