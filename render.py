@@ -390,16 +390,52 @@ def render_png(
         if crossing:
             lons = _unwrap_lons(lons, lon_min)
         lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
-        mesh = ax.pcolormesh(
-            lons,
-            lats,
-            plot_field,
-            cmap=plot_cmap,
-            norm=plot_cnorm,
-            shading="auto",
-            transform=ccrs.PlateCarree(),
-            rasterized=True,
-        )
+        # ---- REGULAR-GRID FAST PATH (Time Machine archive tiers) --------
+        # GridSat-B1 / GridSat-GOES / MergIR (and GOES fetch_regular) are
+        # uniform lat/lon grids that the fetchers meshgrid into 2-D coords;
+        # pcolormesh then transforms MILLIONS of quad vertices per frame
+        # (seconds each -- the dominant server cost of a 25-frame archive
+        # window). A separable uniform grid renders identically via imshow
+        # with a cell-EDGE extent (shading="auto" places edges at centers
+        # ± half-step; matched exactly here) in milliseconds. The native
+        # geos path (floaters / meso / live sectors -- genuinely
+        # curvilinear 2-D coords) can never satisfy the detector, so the
+        # frozen-renderer guarantee is untouched: this branch simply never
+        # fires for it. Antimeridian-crossing boxes stay on pcolormesh
+        # (axes central_longitude=180 vs a PlateCarree(0) image transform
+        # would trigger cartopy's warp -- the same reason the true-color
+        # imshow path is 422-gated for crossing).
+        axes1d = None if crossing else _regular_grid_axes(lons, lats)
+        if axes1d is not None:
+            lon1, lat1 = axes1d
+            dlon = (lon1[-1] - lon1[0]) / max(len(lon1) - 1, 1)
+            dlat = (lat1[-1] - lat1[0]) / max(len(lat1) - 1, 1)
+            ext_img = [
+                lon1[0] - dlon / 2.0, lon1[-1] + dlon / 2.0,
+                min(lat1[0], lat1[-1]) - abs(dlat) / 2.0,
+                max(lat1[0], lat1[-1]) + abs(dlat) / 2.0,
+            ]
+            mesh = ax.imshow(
+                np.ma.masked_invalid(plot_field),
+                origin="lower" if dlat > 0 else "upper",
+                extent=ext_img,
+                cmap=plot_cmap,
+                norm=plot_cnorm,
+                transform=ccrs.PlateCarree(),
+                interpolation="nearest",
+                zorder=1,
+            )
+        else:
+            mesh = ax.pcolormesh(
+                lons,
+                lats,
+                plot_field,
+                cmap=plot_cmap,
+                norm=plot_cnorm,
+                shading="auto",
+                transform=ccrs.PlateCarree(),
+                rasterized=True,
+            )
 
     # Coastlines + borders. Resolution scales with bbox; zorder explicitly
     # above pcolormesh (which defaults to ~1.5 in cartopy) so cyan coast
@@ -608,6 +644,45 @@ def _erode1(mask: np.ndarray) -> np.ndarray:
     e[:, 1:] &= mask[:, :-1]
     e[:, :-1] &= mask[:, 1:]
     return e
+
+
+def _regular_grid_axes(lons, lats):
+    """(lon1, lat1) 1-D center axes when the 2-D coord arrays are a UNIFORM,
+    SEPARABLE lat/lon meshgrid — else None.
+
+    The archive tiers (GridSat-B1 0.07°, GridSat-GOES 0.04°, MergIR ~0.036°)
+    and GOES fetch_regular all build their 2-D coords as np.meshgrid of
+    uniform 1-D axes; the render fast path (imshow) is exact only for that
+    shape. Full-array separability checks (every lons row identical, every
+    lats column identical) cost ~ms on a 5M-cell grid — cheap insurance that
+    a curvilinear geos grid (which varies per row/column by construction)
+    can NEVER slip through. Uniform-step tolerance absorbs float32 coord
+    wobble (~1e-5°) while rejecting real curvature (degrees). Masked
+    geolocation = limb handling = never regular. Ascending lons only (the
+    crop functions emit ascending, antimeridian-unwrapped axes; unwrapped
+    >180 grids are handled by the caller's `crossing` gate)."""
+    if getattr(lons, "ndim", 0) != 2 or getattr(lats, "ndim", 0) != 2:
+        return None
+    if lons.shape != lats.shape or lons.shape[0] < 2 or lons.shape[1] < 2:
+        return None
+    if isinstance(lons, np.ma.MaskedArray) or isinstance(lats, np.ma.MaskedArray):
+        return None
+    lon1 = np.asarray(lons[0], dtype=np.float64)
+    lat1 = np.asarray(lats[:, 0], dtype=np.float64)
+    if not (np.isfinite(lon1).all() and np.isfinite(lat1).all()):
+        return None
+    if not ((lons == lons[0]).all() and (lats == lats[:, :1]).all()):
+        return None
+    dlon = np.diff(lon1)
+    dlat = np.diff(lat1)
+    if not (dlon > 0).all():
+        return None
+    if not ((dlat > 0).all() or (dlat < 0).all()):
+        return None
+    tol = 1e-3
+    if (dlon.max() - dlon.min()) > tol or (np.abs(dlat).max() - np.abs(dlat).min()) > tol:
+        return None
+    return lon1, lat1
 
 
 def _guard_mesh_coords(lons, lats, plot_field):

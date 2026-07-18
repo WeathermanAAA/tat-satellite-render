@@ -100,7 +100,18 @@ def _session():
     return s
 
 
+# Each hourly nc4 granule holds BOTH half-hour slots, so a Time Machine
+# 30-min scrub window hits every file exactly twice — without a cache that
+# is a full multi-MB re-download per frame. Two entries cover the window
+# walker's worst case (center-out order straddles two adjacent hours);
+# ~2×20 MB resident is fine on the render box.
+_GRANULE_CACHE: dict = {}
+_GRANULE_CACHE_MAX = 2
+
+
 def download_granule(url: str, timeout: int = 120) -> bytes:
+    if url in _GRANULE_CACHE:
+        return _GRANULE_CACHE[url]
     if not have_credentials():
         raise RuntimeError(
             "MergIR needs Earthdata credentials (EARTHDATA_TOKEN or "
@@ -115,6 +126,9 @@ def download_granule(url: str, timeout: int = 120) -> bytes:
                 "credentials and that the 'NASA GESDISC DATA ARCHIVE' app is "
                 "authorized on the profile (urs.earthdata.nasa.gov -> Applications)")
         r.raise_for_status()
+        while len(_GRANULE_CACHE) >= _GRANULE_CACHE_MAX:
+            _GRANULE_CACHE.pop(next(iter(_GRANULE_CACHE)))
+        _GRANULE_CACHE[url] = r.content
         return r.content
 
 

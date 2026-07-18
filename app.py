@@ -94,6 +94,10 @@ ALLOWED_ORIGINS = [
 ]
 MAX_CONCURRENT_RENDERS = int(os.getenv("MAX_CONCURRENT_RENDERS", "2"))
 RATE_LIMIT = os.getenv("RATE_LIMIT", "10/minute")
+# Optional archive pacing hint surfaced as X-Archive-Pace-Ms (see _response);
+# raise RATE_LIMIT in lockstep when setting it or clients just trade pacing
+# sleep for 429 backoff.
+TM_PACE_MS_HINT = os.getenv("TM_PACE_MS_HINT", "").strip()
 LATEST_CACHE_TTL = float(os.getenv("LATEST_CACHE_TTL", "300"))  # 5 min
 # format=webp loop frames: the 1320 px render Lanczos-downscaled to this width
 # (1056 = the 525 CSS px player box at 2x Retina, and exactly 0.8 x 1320) and
@@ -403,6 +407,7 @@ app.add_middleware(
         "X-Generic-Channel",
         "X-Native-Band",
         "X-Deprecated-Channel-API",
+        "X-Archive-Pace-Ms",
     ],
     allow_credentials=False,
 )
@@ -786,6 +791,15 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
+        # Archive pacing hint: the Time Machine client paces its window fill
+        # to the PUBLIC rate limit (6.5 s default, sized to 10/min). With the
+        # regular-grid imshow fast path the per-frame cost dropped ~3x, so
+        # the box can advertise a faster pace WITHOUT a frontend redeploy:
+        # set TM_PACE_MS_HINT (e.g. 3200) together with a matching RATE_LIMIT
+        # raise (e.g. 20/minute) and clients speed up on their next frame.
+        # Absent env -> no header -> clients keep their built-in default.
+        if use_archive and TM_PACE_MS_HINT:
+            headers["X-Archive-Pace-Ms"] = TM_PACE_MS_HINT
         media_type = ("image/webp" if (out_format == "webp" or body.backdrop)
                       else "image/png")
         return Response(content=content, media_type=media_type, headers=headers)
