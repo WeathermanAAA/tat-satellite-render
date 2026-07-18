@@ -1,0 +1,11 @@
+# CONUS dedicated emit lane (2026-07-18): the single emit-cron rotation
+# takes 4+ h across all five suites, so conus freshness was riding the GH
+# stopgap workflow. This override runs a SECOND emit-cron project pinned to
+# the conus suite only (10-min slot backfill, newest-first) — per-frame
+# ready markers keep the two writers idempotent. Start:
+#   docker compose -p tat-s2-conus -f docker-compose.s2.yml #     -f docker-compose.s2.conus-lane.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CRON_SUITES: conus
+      S2_CRON_INTERVAL_S: "300"
