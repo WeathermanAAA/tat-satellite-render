@@ -59,6 +59,13 @@ services:
       # browser-facing CORS (the API already answers the preflight + exposes
       # the X-* stat headers itself; caddy only proxies)
       ALLOWED_ORIGINS: "https://triple-a-tropics.com,https://www.triple-a-tropics.com"
+      # Time Machine archive throughput (2026-07-18, with the regular-grid
+      # imshow fast path — ~3x cheaper archive frames): advertise a faster
+      # client pace via X-Archive-Pace-Ms and raise the per-IP budget in
+      # lockstep. Semaphore(2) still bounds concurrent render CPU; revert =
+      # delete these two lines (clients fall back to 6.5 s pacing).
+      TM_PACE_MS_HINT: "1500"
+      RATE_LIMIT: "90/minute"
     # loopback publish for box-local debugging; the public path is caddy
     ports:
       - "127.0.0.1:8210:8080"
