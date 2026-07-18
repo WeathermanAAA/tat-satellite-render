@@ -91,6 +91,7 @@ services:
               --suite "$$suite" \
               --store r2 --prefix "$${S2_CRON_PREFIX:-shadow}" \
               --max-zoom "$${S2_CRON_MAX_ZOOM:-5}" \
+              --allow-geometry-change \
               $$STEPARGS \
               || echo "[s2-cron] $$suite emit failed rc=$$? (next tick retries)"
           done
