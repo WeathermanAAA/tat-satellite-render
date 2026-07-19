@@ -1371,9 +1371,10 @@ HTML_TEMPLATE = r"""<!doctype html>
              preserveAspectRatio="xMidYMid meet" role="img"
              aria-label="Model forecast track guidance"></svg>
         <div class="g-legend" id="gtracks-legend"></div>
-        <p class="hafs-caption">Operational track aids, NHC ATCF aid_public.
-          Colored by each model's peak forecast wind (SSHWS category).
-          Consensus aids (TVCN, HCCA) are drawn heavier.</p>
+        <p class="hafs-caption">Operational track aids from the current
+          cycle. One color per model, labeled on the plot; consensus aids
+          and the official forecast are drawn heavier. Dots mark daily
+          forecast hours.</p>
         <div id="gtracks-empty" class="stub" style="display:none">No model
           guidance for this storm yet.</div>
       </div>
@@ -1886,9 +1887,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   // in-plot brand strip: init time left, the site mark right. Every guidance
   // plot reads as a finished graphic in-page AND in a copy.
   function gInfoBar(W, leftTxt) {
-    return '<text x="10" y="16" fill="#8ea2bd" font-size="10.5" font-weight="600">' +
+    // backing strip: a quiet header band so the brand text never collides
+    // with map furniture underneath
+    return '<rect x="0" y="0" width="' + W + '" height="22" fill="rgba(7,16,28,0.8)"/>' +
+      '<text x="10" y="15" fill="#8ea2bd" font-size="10.5" font-weight="600">' +
       gEsc(leftTxt) + '</text>' +
-      '<text x="' + (W - 10) + '" y="16" text-anchor="end" fill="#71809a" ' +
+      '<text x="' + (W - 10) + '" y="15" text-anchor="end" fill="#71809a" ' +
       'font-size="10.5" font-weight="600">@WeathermanAAA_</text>';
   }
   function gInitTxt() {
@@ -2074,7 +2078,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       body.push('<rect x="' + mL + '" y="' + y1.toFixed(1) + '" width="' + pw + '" height="' + (y0 - y1).toFixed(1) + '" fill="' + SSHS[b[2]] + '" fill-opacity="0.12"/>');
       if (b[0] > 0) body.push('<line x1="' + mL + '" y1="' + y0.toFixed(1) + '" x2="' + (mL + pw) + '" y2="' + y0.toFixed(1) + '" stroke="' + SSHS[b[2]] + '" stroke-opacity="0.3" stroke-width="1"/><text x="' + (mL + pw - 4) + '" y="' + (y0 - 3).toFixed(1) + '" text-anchor="end" fill="' + SSHS[b[2]] + '" font-size="9.5" font-weight="700" opacity="0.85">' + b[2] + '</text>');
     });
-    for (var v = 0; v <= vmax; v += 20) body.push('<text x="' + (mL - 7) + '" y="' + (Y(v) + 3).toFixed(1) + '" text-anchor="end" fill="#8ea2bd" font-size="10" font-weight="600">' + v + '</text>');
+    for (var v = 0; v <= vmax; v += 20) { if (Y(v) < mT + 8) continue; body.push('<text x="' + (mL - 7) + '" y="' + (Y(v) + 3).toFixed(1) + '" text-anchor="end" fill="#8ea2bd" font-size="10" font-weight="600">' + v + '</text>'); }
     body.push('<text x="14" y="' + (mT + 4) + '" fill="#8ea2bd" font-size="10" font-weight="700">kt</text>');
     for (var t = 0; t <= tmax; t += 24) body.push('<line x1="' + X(t).toFixed(1) + '" y1="' + mT + '" x2="' + X(t).toFixed(1) + '" y2="' + (mT + ph) + '" stroke="rgba(150,170,200,0.12)" stroke-width="1"/><text x="' + X(t).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#8ea2bd" font-size="10" font-weight="600">' + t + '</text>');
     body.push('<text x="' + (mL + pw / 2) + '" y="' + (H - 0.5) + '" text-anchor="middle" fill="#8ea2bd" font-size="9.5" font-weight="600">forecast hour</text>');
