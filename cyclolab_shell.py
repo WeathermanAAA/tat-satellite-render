@@ -1386,7 +1386,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <p class="hafs-caption">EPS + GEFS members carrying this system,
           each colored by its minimum forecast MSLP; the cross-member mean
           is drawn heavy. Members whose genesis is elsewhere are absent by
-          construction &mdash; member count is a signal, not a style choice.</p>
+          construction; the member count is itself a signal.</p>
         <div id="gens-empty" class="stub" style="display:none">No ensemble
           members track this system in the current cycles.</div>
       </div>
@@ -1872,52 +1872,106 @@ HTML_TEMPLATE = r"""<!doctype html>
       '<path class="ac-coast" d="' + pathOf(BASEMAP_COAST, false) + '"/>';
   }
   var G_TAUS = [0, 24, 48, 72, 96, 120];
+  // Stable per-model hues (shared identity with the explorer's guidance
+  // overlay — one model, one color, everywhere). Consensus family warm+bold.
+  var GD_HUES = {
+    AVNI: "#5aa9ff", AVNO: "#5aa9ff", AEMN: "#5aa9ff",
+    HFAI: "#46c56a", HFBI: "#2bd4c0", HWFI: "#ffe14d", HMNI: "#ff9a2f",
+    CMCI: "#c08bff", CEMN: "#c08bff", NVGI: "#8ea2bd", NEMN: "#8ea2bd",
+    EGRI: "#ff6b9d", EGRR: "#ff6b9d", EMXI: "#46c56a", EEMN: "#46c56a",
+    CTCI: "#7aa0ff", OFCL: "#ffffff", TVCN: "#f5333c", HCCA: "#ff7a59",
+    DSHP: "#b6c0cc", LGEM: "#8ea2bd", SHIP: "#98a8c0", IVCN: "#ffffff"
+  };
+  function gHue(t) { return GD_HUES[t] || "#5d6b80"; }
+  // in-plot brand strip: init time left, the site mark right. Every guidance
+  // plot reads as a finished graphic in-page AND in a copy.
+  function gInfoBar(W, leftTxt) {
+    return '<text x="10" y="16" fill="#8ea2bd" font-size="10.5" font-weight="600">' +
+      gEsc(leftTxt) + '</text>' +
+      '<text x="' + (W - 10) + '" y="16" text-anchor="end" fill="#71809a" ' +
+      'font-size="10.5" font-weight="600">@WeathermanAAA_</text>';
+  }
+  function gInitTxt() {
+    if (!GDATA || !GDATA.init_time) return "";
+    return "init " + String(GDATA.init_time).replace("T", " ").replace(":00:00Z", "Z");
+  }
+  // simple vertical declutter for right-edge line labels
+  function gStackLabels(items, minGap, topY, botY) {
+    items.sort(function (a, b) { return a.y - b.y; });
+    for (var i = 1; i < items.length; i++)
+      if (items[i].y - items[i - 1].y < minGap) items[i].y = items[i - 1].y + minGap;
+    for (var j = items.length - 1; j >= 0; j--) {
+      if (items[j].y > botY) items[j].y = botY;
+      if (j < items.length - 1 && items[j + 1].y - items[j].y < minGap)
+        items[j].y = items[j + 1].y - minGap;
+    }
+    items.forEach(function (it) { if (it.y < topY) it.y = topY; });
+    return items;
+  }
   function gTracks() {
     var svg = document.getElementById("gtracks"),
         empty = document.getElementById("gtracks-empty"),
         leg = document.getElementById("gtracks-legend");
     var taids = (GDATA && GDATA.track_aids) || [], aids = (GDATA && GDATA.aids) || {};
+    if (aids.OFCL && taids.indexOf("OFCL") < 0) taids = taids.concat(["OFCL"]);
     var cons = {}; ((GDATA && GDATA.consensus) || []).forEach(function (c) { cons[c] = 1; });
+    cons.OFCL = 1;
     var ext = [];
     taids.forEach(function (t) { (aids[t] || []).forEach(function (p) {
       if (p.lat != null) ext.push({ lat: p.lat, lon: p.lon }); }); });
-    if (ext.length < 2) {                       // fresh invest / no dynamical tracks
+    if (ext.length < 2) {
       svg.innerHTML = ""; if (leg) leg.innerHTML = "";
       empty.style.display = "block";
-      empty.textContent = GDATA ? "No track aids yet (statistical-only / fresh invest)."
+      empty.textContent = GDATA ? "No track aids yet (statistical-only or fresh invest)."
                                 : "No model guidance for this storm yet.";
       return;
     }
     empty.style.display = "none";
-    // PART 2: aspect-FILL the panel so the tracks fill the frame. The shared
-    // fitProjection fits-to-CONTAIN and centers, which letterboxes a tall/narrow
-    // or wide/short track envelope into a corner with big empty-ocean dead space.
-    // gFitFrame pads the track bbox then expands it to the panel aspect (cos-lat
-    // correct) so both axes fill edge-to-edge.
     var pr = gFitFrame(ext);
     svg.setAttribute("viewBox", "0 0 " + pr.W + " " + pr.H);
     var body = [gBasemap(pr), graticule(pr)];
     var ordered = taids.slice().sort(function (a, b) { return (cons[a] ? 1 : 0) - (cons[b] ? 1 : 0); });
+    var labels = [];
     ordered.forEach(function (t) {
       var pts = (aids[t] || []).filter(function (p) { return p.lat != null; });
       if (pts.length < 2) return;
-      var col = SSHS[sshsCat(gPeak(pts))] || "#8ea2bd", isC = cons[t];
+      var col = gHue(t), isC = cons[t];
       var d = "M" + pts.map(function (p) { return pr.X(p.lon).toFixed(1) + "," + pr.Y(p.lat).toFixed(1); }).join("L");
-      if (isC) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="6" stroke-linejoin="round" stroke-linecap="round" stroke-opacity="0.85"/>');
-      body.push('<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + (isC ? 3.4 : 1.7) + '" stroke-opacity="' + (isC ? 1 : 0.82) + '" stroke-linejoin="round" stroke-linecap="round"/>');
-      pts.forEach(function (p) { body.push('<circle cx="' + pr.X(p.lon).toFixed(1) + '" cy="' + pr.Y(p.lat).toFixed(1) + '" r="' + (isC ? 2.4 : 1.5) + '" fill="' + col + '"/>'); });
+      if (isC) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="6.4" stroke-linejoin="round" stroke-linecap="round" stroke-opacity="0.85"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + (isC ? 3.2 : 1.7) + '" stroke-opacity="' + (isC ? 1 : 0.88) + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      // forecast-hour ticks: a dot each point, heavier on the daily marks
+      pts.forEach(function (p) {
+        var daily = p.tau % 24 === 0;
+        body.push('<circle cx="' + pr.X(p.lon).toFixed(1) + '" cy="' + pr.Y(p.lat).toFixed(1) + '" r="' + (daily ? (isC ? 2.8 : 2.1) : 1.2) + '" fill="' + col + '"' + (daily && !isC ? ' fill-opacity="0.9"' : '') + '/>');
+      });
+      var pe = pts[pts.length - 1];
+      labels.push({ t: t, col: col, isC: isC, x: pr.X(pe.lon), y: pr.Y(pe.lat) });
     });
-    var spine = aids.TVCN || aids.HCCA || aids[taids[0]] || [];
+    // per-aid identity ON the plot: tech label at each track's end, decluttered
+    var laid = gStackLabels(labels.map(function (l) {
+      return { t: l.t, col: l.col, isC: l.isC, x: l.x, y: l.y }; }), 13, 26, pr.H - 8);
+    laid.forEach(function (l) {
+      body.push('<text x="' + (l.x + 7).toFixed(1) + '" y="' + (l.y + 3.5).toFixed(1) +
+        '" fill="' + l.col + '" font-size="' + (l.isC ? 11 : 10) + '" font-weight="700" ' +
+        'paint-order="stroke" stroke="#0a1320" stroke-width="3">' + gEsc(l.t) + '</text>');
+    });
+    // tau chips ride the consensus spine
+    var spine = aids.TVCN || aids.HCCA || aids.OFCL || aids[taids[0]] || [];
     spine.forEach(function (p) {
-      if (p.lat == null || G_TAUS.indexOf(p.tau) < 0) return;
+      if (p.lat == null || G_TAUS.indexOf(p.tau) < 0 || p.tau === 0) return;
       var x = pr.X(p.lon), y = pr.Y(p.lat);
-      body.push('<g><rect x="' + (x + 5).toFixed(1) + '" y="' + (y - 8).toFixed(1) + '" width="' + (p.tau >= 100 ? 23 : 17) + '" height="13" rx="3" fill="rgba(7,16,28,0.86)" stroke="rgba(120,140,170,0.4)" stroke-width="0.7"/><text x="' + (x + 7).toFixed(1) + '" y="' + (y + 1.5).toFixed(1) + '" fill="#e8eef5" font-size="9.5" font-weight="700">' + p.tau + '</text></g>');
+      body.push('<g><rect x="' + (x + 5).toFixed(1) + '" y="' + (y - 8).toFixed(1) + '" width="' + (p.tau >= 100 ? 27 : 22) + '" height="13" rx="3" fill="rgba(7,16,28,0.86)" stroke="rgba(120,140,170,0.4)" stroke-width="0.7"/><text x="' + (x + 7).toFixed(1) + '" y="' + (y + 2).toFixed(1) + '" fill="#e8eef5" font-size="9.5" font-weight="700">' + p.tau + 'h</text></g>');
     });
-    var c0 = (aids.TVCN || aids[taids[0]] || []).filter(function (p) { return p.tau === 0 && p.lat != null; })[0];
+    var c0 = spine.filter(function (p) { return p.tau === 0 && p.lat != null; })[0];
     if (c0) body.push('<circle cx="' + pr.X(c0.lon).toFixed(1) + '" cy="' + pr.Y(c0.lat).toFixed(1) + '" r="4.5" fill="#fff" stroke="#0a1320" stroke-width="1.5"/>');
+    body.push(gInfoBar(pr.W, gInitTxt() + " \u00b7 operational track aids"));
     svg.innerHTML = body.join("");
-    if (leg) leg.innerHTML = taids.map(function (t) {
-      var isC = cons[t]; return '<span class="lg"><span class="sw" style="background:' + (SSHS[sshsCat(gPeak(aids[t] || []))] || "#8ea2bd") + ';height:' + (isC ? 4 : 3) + 'px"></span>' + (isC ? '<b>' + gEsc(t) + '</b> (consensus)' : gEsc(t)) + '</span>'; }).join("");
+    if (leg) leg.innerHTML = ordered.slice().reverse().map(function (t) {
+      var isC = cons[t];
+      return '<span class="lg"><span class="sw" style="background:' + gHue(t) +
+        ';height:' + (isC ? 4 : 3) + 'px"></span>' +
+        (isC ? '<b>' + gEsc(t) + '</b>' + (t === "OFCL" ? " (official)" : " (consensus)") : gEsc(t)) + '</span>';
+    }).join("");
   }
   var GENS_MEAN_COL = { ecens: "#49b6c8", gefs: "#ff9a5c" };
   function gEnsColor(m) {
@@ -1955,33 +2009,48 @@ HTML_TEMPLATE = r"""<!doctype html>
           '" stroke-width="1.1" stroke-opacity="0.55" stroke-linejoin="round" stroke-linecap="round"/>');
       });
     });
+    var meanEnds = [];
     models.forEach(function (m) {
       var mean = m.mean || [];
       if (mean.length < 2) return;
+      var col = GENS_MEAN_COL[m.model] || "#dfe8f2";
       var d = "M" + mean.map(function (p) { return pr.X(p[2]).toFixed(1) + "," + pr.Y(p[1]).toFixed(1); }).join("L");
       body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="6" stroke-opacity="0.85" stroke-linejoin="round"/>');
-      body.push('<path d="' + d + '" fill="none" stroke="' + (GENS_MEAN_COL[m.model] || "#dfe8f2") +
+      body.push('<path d="' + d + '" fill="none" stroke="' + col +
         '" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>');
       mean.forEach(function (p) {
-        if (G_TAUS.indexOf(p[0]) < 0) return;
+        if (p[0] % 24 !== 0) return;
         body.push('<circle cx="' + pr.X(p[2]).toFixed(1) + '" cy="' + pr.Y(p[1]).toFixed(1) +
-          '" r="2.6" fill="' + (GENS_MEAN_COL[m.model] || "#dfe8f2") + '"/>');
+          '" r="2.6" fill="' + col + '"/>');
       });
+      var pe = mean[mean.length - 1];
+      meanEnds.push({ t: (m.label || m.model) + " mean", col: col,
+                      x: pr.X(pe[2]), y: pr.Y(pe[1]) });
+      var p0 = mean[0];
+      body.push('<circle cx="' + pr.X(p0[2]).toFixed(1) + '" cy="' + pr.Y(p0[1]).toFixed(1) +
+        '" r="4.5" fill="#fff" stroke="#0a1320" stroke-width="1.5"/>');
     });
+    gStackLabels(meanEnds, 14, 26, pr.H - 8).forEach(function (l) {
+      body.push('<text x="' + (l.x + 7).toFixed(1) + '" y="' + (l.y + 3.5).toFixed(1) +
+        '" fill="' + l.col + '" font-size="11" font-weight="700" ' +
+        'paint-order="stroke" stroke="#0a1320" stroke-width="3">' + gEsc(l.t) + '</text>');
+    });
+    var inits = models.map(function (m) {
+      return (m.label || m.model) + " " + (m.init_cycle || ""); }).join(" \u00b7 ");
+    body.push(gInfoBar(pr.W, inits ? "init " + inits : ""));
     svg.innerHTML = body.join("");
     if (leg) {
-      var bands = [["&le;945", "#b03bff"], ["&le;960", "#f5333c"], ["&le;970", "#ff9a2f"],
-                   ["&le;980", "#ffe14d"], ["&le;990", "#46c56a"], ["&le;1000", "#5aa9ff"],
-                   ["&gt;1000", "#8ea2bd"]];
+      var bands = [["945 hPa and deeper", "#b03bff"], ["960", "#f5333c"], ["970", "#ff9a2f"],
+                   ["980", "#ffe14d"], ["990", "#46c56a"], ["1000", "#5aa9ff"],
+                   ["weaker", "#8ea2bd"]];
       leg.innerHTML = models.map(function (m) {
         return '<span class="lg"><span class="sw" style="background:' +
           (GENS_MEAN_COL[m.model] || "#dfe8f2") + ';height:4px"></span><b>' +
-          gEsc(m.label || m.model) + '</b> mean &middot; ' + m.n_matched + "/" +
-          (m.n_members_total || "?") + ' members &middot; init ' +
-          gEsc(m.init_cycle || "") + '</span>';
+          gEsc(m.label || m.model) + '</b> mean \u00b7 ' + m.n_matched + "/" +
+          (m.n_members_total || "?") + ' members</span>';
       }).join("") + bands.map(function (b) {
         return '<span class="lg"><span class="sw" style="background:' + b[1] +
-          ';height:3px"></span>' + b[0] + ' hPa</span>';
+          ';height:3px"></span>' + b[0] + '</span>';
       }).join("");
     }
   }
@@ -1991,7 +2060,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         leg = document.getElementById("gintensity-legend"),
         empty = document.getElementById("gintensity-empty");
     var iaids = (GDATA && GDATA.intensity_aids) || [], aids = (GDATA && GDATA.aids) || {};
-    var W = 1000, H = 380, mL = 46, mR = 16, mT = 14, mB = 30, pw = W - mL - mR, ph = H - mT - mB;
+    var W = 1000, H = 380, mL = 46, mR = 70, mT = 24, mB = 30, pw = W - mL - mR, ph = H - mT - mB;
     var taus = [], vs = [];
     iaids.forEach(function (t) { (aids[t] || []).forEach(function (p) { if (p.vmax != null) { taus.push(p.tau); vs.push(p.vmax); } }); });
     if (!taus.length) { svg.innerHTML = ""; if (leg) leg.innerHTML = ""; empty.style.display = "block"; empty.textContent = GDATA ? "No intensity aids yet." : ""; return; }
@@ -2009,24 +2078,31 @@ HTML_TEMPLATE = r"""<!doctype html>
     body.push('<text x="14" y="' + (mT + 4) + '" fill="#8ea2bd" font-size="10" font-weight="700">kt</text>');
     for (var t = 0; t <= tmax; t += 24) body.push('<line x1="' + X(t).toFixed(1) + '" y1="' + mT + '" x2="' + X(t).toFixed(1) + '" y2="' + (mT + ph) + '" stroke="rgba(150,170,200,0.12)" stroke-width="1"/><text x="' + X(t).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#8ea2bd" font-size="10" font-weight="600">' + t + '</text>');
     body.push('<text x="' + (mL + pw / 2) + '" y="' + (H - 0.5) + '" text-anchor="middle" fill="#8ea2bd" font-size="9.5" font-weight="600">forecast hour</text>');
-    var HIRES = { HFAI: "#46c56a", HFBI: "#2bd4c0", HWFI: "#ffe14d", HMNI: "#ff9a2f" };
     function st(t) {
-      if (t === "IVCN") return { c: "#ffffff", w: 3.2, op: 1, dash: "", cons: 1, tier: "consensus" };
-      if (HIRES[t]) return { c: HIRES[t], w: 2.2, op: 0.95, dash: "", tier: "hi-res" };
-      if (t === "DSHP" || t === "LGEM" || t === "SHIP") return { c: "#8ea2bd", w: 1.4, op: 0.85, dash: "3,3", tier: "statistical" };
-      return { c: "#5d6b80", w: 1.2, op: 0.7, dash: "", tier: "global" };
+      if (t === "IVCN") return { c: gHue(t), w: 3.2, op: 1, dash: "", cons: 1, tier: "consensus" };
+      if (t === "DSHP" || t === "LGEM" || t === "SHIP") return { c: gHue(t), w: 1.4, op: 0.85, dash: "3,3", tier: "statistical" };
+      return { c: gHue(t), w: 2.0, op: 0.95, dash: "", tier: GD_HUES[t] ? "dynamical" : "global" };
     }
     var ordered = iaids.slice().sort(function (a, b) { return (a === "IVCN" ? 1 : 0) - (b === "IVCN" ? 1 : 0); });
+    var ends = [];
     ordered.forEach(function (t) {
       var pts = (aids[t] || []).filter(function (p) { return p.vmax != null; }); if (pts.length < 2) return;
-      var s = st(t), d = "M" + pts.map(function (p) { return X(p.tau).toFixed(1) + "," + Y(p.vmax).toFixed(1); }).join("L");
-      if (s.cons) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="5.4" stroke-linejoin="round" stroke-opacity="0.8"/>');
-      body.push('<path d="' + d + '" fill="none" stroke="' + s.c + '" stroke-width="' + s.w + '" stroke-opacity="' + s.op + '" stroke-dasharray="' + s.dash + '" stroke-linejoin="round" stroke-linecap="round"/>');
-      pts.forEach(function (p) { body.push('<circle cx="' + X(p.tau).toFixed(1) + '" cy="' + Y(p.vmax).toFixed(1) + '" r="' + (s.cons ? 2.2 : 1.4) + '" fill="' + s.c + '"/>'); });
+      var s2 = st(t), d = "M" + pts.map(function (p) { return X(p.tau).toFixed(1) + "," + Y(p.vmax).toFixed(1); }).join("L");
+      if (s2.cons) body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="5.4" stroke-linejoin="round" stroke-opacity="0.8"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + s2.c + '" stroke-width="' + s2.w + '" stroke-opacity="' + s2.op + '" stroke-dasharray="' + s2.dash + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function (p) { body.push('<circle cx="' + X(p.tau).toFixed(1) + '" cy="' + Y(p.vmax).toFixed(1) + '" r="' + (s2.cons ? 2.2 : 1.4) + '" fill="' + s2.c + '"/>'); });
+      var pe = pts[pts.length - 1];
+      ends.push({ t: t, col: s2.c, isC: s2.cons, x: X(pe.tau), y: Y(pe.vmax) });
+    });
+    gStackLabels(ends, 12, mT + 4, mT + ph - 2).forEach(function (l) {
+      body.push('<text x="' + (l.x + 6).toFixed(1) + '" y="' + (l.y + 3.5).toFixed(1) +
+        '" fill="' + l.col + '" font-size="' + (l.isC ? 10.5 : 9.5) + '" font-weight="700" ' +
+        'paint-order="stroke" stroke="#0a1320" stroke-width="3">' + gEsc(l.t) + '</text>');
     });
     body.push('<rect x="' + mL + '" y="' + mT + '" width="' + pw + '" height="' + ph + '" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>');
+    body.push(gInfoBar(W, gInitTxt() + " \u00b7 intensity aids"));
     svg.innerHTML = body.join("");
-    if (leg) leg.innerHTML = ordered.slice().reverse().map(function (t) { var s = st(t); return '<span class="lg"><span class="sw" style="background:' + s.c + ';height:' + Math.max(3, s.w) + 'px"></span>' + (s.cons ? '<b>' + gEsc(t) + '</b>' : gEsc(t)) + ' (' + s.tier + ')</span>'; }).join("");
+    if (leg) leg.innerHTML = ordered.slice().reverse().map(function (t) { var s3 = st(t); return '<span class="lg"><span class="sw" style="background:' + s3.c + ';height:' + Math.max(3, s3.w) + 'px"></span>' + (s3.cons ? '<b>' + gEsc(t) + '</b>' : gEsc(t)) + ' (' + s3.tier + ')</span>'; }).join("");
   }
   function gSpark(vals, taus, w, h, color) {
     var ok = []; vals.forEach(function (v, i) { if (v != null) ok.push({ v: v, t: taus[i] }); });
@@ -5803,7 +5879,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 // (?cors=1, like the GIF export) so the canvas is not tainted. Only these plots
 // opt in (cl-copyable) -- normal right-click everywhere else is untouched.
 (function initPlotCopy() {
-  var MARK = "@WeathermanAAA";
+  var MARK = "@WeathermanAAA_";
   var SITE = "cyclolab.triple-a-tropics.com";
   var SC = 2;                  // @2x -- it's a shareable
   var HEAD = 30, FOOT = 26;    // logical-px header/footer bands (x SC on canvas)
