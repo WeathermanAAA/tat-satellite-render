@@ -1,0 +1,12 @@
+# GEO-ring dedicated emit lane (2026-07-19): the explorer BOOTS on the ring,
+# but its cadence rode the all-suites rotation (once per 4+ h) + the 30-min
+# GH stopgap — median 30-min frame spacing on the default view. Same pattern
+# as the conus lane: a second compose project pinned to geo-global only.
+# Start:
+#   docker compose -p tat-s2-geo -f docker-compose.s2.yml \
+#     -f docker-compose.s2.geo-lane.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CRON_SUITES: geo-global
+      S2_CRON_INTERVAL_S: "300"
