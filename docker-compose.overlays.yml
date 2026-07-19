@@ -1,0 +1,86 @@
+# Overlay-feed BOX POLLERS (2026-07-19): UHR ASCAT / MRMS / METAR / WPC
+# surface analysis moved here from GitHub-Actions crons — GH load-sheds even
+# staggered schedules to ~hourly, so a 2-min radar product rode a 10-min cron
+# that fired 6x less often than declared. This is the TAT never-miss ingest
+# pattern: a tight per-feed loop; each generator carries its own watermark /
+# new-object gate (MRMS+SFC no-op on an unchanged stamp, UHR dedups by pass
+# id and backfills the window, METAR frames by run time at the obs cadence),
+# so ticks are cheap and writes happen only on new data. The box is the
+# single authoritative writer; the GH workflows are dispatch-only relics.
+#
+# Generators live in the SITE repo (public): each service keeps a sparse
+# blob-less clone and hard-resets to origin/main every tick — commit-to-main
+# deploys poller code too, matching the site model.
+#
+# Start:  docker compose -p tat-overlays -f docker-compose.overlays.yml up -d
+# Logs:   docker logs tat-overlays-<feed>-poller-1 --tail 20
+x-poller: &poller
+  image: tat-s2:latest
+  entrypoint: ["/bin/sh", "-c"]
+  env_file: .env
+  restart: always
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "3" }
+
+x-cmd: &cmd
+  - |
+    set -u
+    REPO=/work/tat
+    if [ -n "$${EXTRA_PIP:-}" ]; then
+      pip install --quiet $${EXTRA_PIP} || echo "[poller] pip $${EXTRA_PIP} failed"
+    fi
+    if [ ! -d "$$REPO/.git" ]; then
+      git clone -q --depth 1 --filter=blob:none --sparse \
+        https://github.com/WeathermanAAA/Triple-A-Tropics.git "$$REPO" \
+      && git -C "$$REPO" sparse-checkout set ascatobs assets
+    fi
+    echo "[poller] $${GEN} every $${INTERVAL}s args=$${GENARGS:-}"
+    while true; do
+      { git -C "$$REPO" fetch -q --depth 1 origin main \
+        && git -C "$$REPO" reset -q --hard FETCH_HEAD; } \
+        || echo "[poller] repo refresh failed (stale copy runs this tick)"
+      ( cd "$$REPO" && python $${GEN} --store r2 $${GENARGS:-} ) \
+        || echo "[poller] $${GEN} rc=$$? (next tick retries)"
+      sleep "$${INTERVAL}"
+    done
+
+services:
+  mrms-poller:
+    <<: *poller
+    command: *cmd
+    environment:
+      GEN: generate_mrms_overlay.py
+      INTERVAL: "75"          # native 2-min product: emit every new scan
+      GENARGS: "--keep 150"   # ~5 h of 2-min scans outruns the sat loop
+      EXTRA_PIP: pygrib       # the only generator dep the image lacks
+    mem_limit: 6g
+    volumes: ["/root/tat-overlays/mrms:/work"]
+
+  metar-poller:
+    <<: *poller
+    command: *cmd
+    environment:
+      GEN: generate_metar_obs.py
+      INTERVAL: "300"
+    mem_limit: 1g
+    volumes: ["/root/tat-overlays/metar:/work"]
+
+  sfc-poller:
+    <<: *poller
+    command: *cmd
+    environment:
+      GEN: generate_sfc_analysis.py
+      INTERVAL: "600"
+    mem_limit: 1g
+    volumes: ["/root/tat-overlays/sfc:/work"]
+
+  uhr-poller:
+    <<: *poller
+    command: *cmd
+    environment:
+      GEN: generate_uhr_ascat.py
+      INTERVAL: "300"
+      GENARGS: "--max-new 8"
+    mem_limit: 2g
+    volumes: ["/root/tat-overlays/uhr:/work"]
