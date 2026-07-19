@@ -1,11 +1,24 @@
-# CONUS dedicated emit lane (2026-07-18): the single emit-cron rotation
-# takes 4+ h across all five suites, so conus freshness was riding the GH
-# stopgap workflow. This override runs a SECOND emit-cron project pinned to
-# the conus suite only (10-min slot backfill, newest-first) — per-frame
-# ready markers keep the two writers idempotent. Start:
-#   docker compose -p tat-s2-conus -f docker-compose.s2.yml #     -f docker-compose.s2.conus-lane.yml --profile cron up -d --no-build emit-cron
+# CONUS full-suite lane, v2 (2026-07-19): now covers ONLY the products the
+# fast lanes do NOT own — running --suite conus alongside them created a
+# geometry WAR on the z6-upgraded bands (each lane rebuilt the manifest
+# around its own geometry; last writer won, live manifests ping-ponged
+# z5<->z6). The rare set here keeps z5 (all 2 km-class or rarely looped);
+# pass ~10-11 min so cadence lands ~15-25 min.
+# Start:
+#   docker compose -p tat-s2-conus -f docker-compose.s2.yml \
+#     -f docker-compose.s2.conus-lane.yml --profile cron up -d --no-build emit-cron
 services:
   emit-cron:
-    environment:
-      S2_CRON_SUITES: conus
-      S2_CRON_INTERVAL_S: "300"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-conus] rare set: c04 c06 c11 c12 c15 c16 + 7 RGBs (z5)"
+        while true; do
+          for prod in c04 c06 c11 c12 c15 c16 ash dust firetemp daycloudphase dayconvection daylandcloud snowfog; do
+            python s2_pyramid_emit.py --product goes19-conus-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 90 \
+              || echo "[s2-conus] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 180
+        done
