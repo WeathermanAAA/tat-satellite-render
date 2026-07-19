@@ -132,3 +132,37 @@ services:
           ( cd "$$REPO" && rm -rf /work/ascat_build             && python generate_ascat.py --out-dir /work/ascat_build             && python scripts/ascat_r2_publish.py /work/ascat_build )             || echo "[ascat-poller] tick failed rc=$$? (next tick retries)"
           sleep 600
         done
+
+  # Aircraft-recon mission feed (/recon/): the never-miss loop that owns the
+  # mission JSON tree. Every tick: incremental build into the work dir (the
+  # bulletin cache keeps a warm tick to directory listings + genuinely NEW
+  # files only), then publish through the workflow contract
+  # (scripts/recon_r2_publish.py: data-fingerprint gate vs the live copy so
+  # idle ticks are no-ops, shrink guard on the growing union, index-last
+  # upload order, targeted per-slug prunes). 90 s ticks catch each new
+  # 10-min bulletin the moment it posts — no cron shedding, no hourly lag.
+  recon-poller:
+    <<: *poller
+    mem_limit: 1g
+    volumes: ["/root/tat-overlays/recon:/work"]
+    command:
+      - |
+        set -u
+        REPO=/work/tat
+        if [ ! -d "$$REPO/.git" ]; then
+          git clone -q --depth 1 --filter=blob:none --sparse \
+            https://github.com/WeathermanAAA/Triple-A-Tropics.git "$$REPO" \
+          && git -C "$$REPO" sparse-checkout set reconobs scripts
+        fi
+        echo "[recon-poller] armed (90s ticks)"
+        while true; do
+          { git -C "$$REPO" fetch -q --depth 1 origin main \
+            && git -C "$$REPO" reset -q --hard FETCH_HEAD; } \
+            || echo "[recon-poller] repo refresh failed (stale copy runs this tick)"
+          ( cd "$$REPO" && rm -rf /work/recon_build \
+            && python generate_recon.py --out-dir /work/recon_build \
+                 --cache-dir /work/cache --window-days 7 --stagger 0.05 \
+            && python scripts/recon_r2_publish.py /work/recon_build ) \
+            || echo "[recon-poller] tick failed rc=$$? (next tick retries)"
+          sleep 90
+        done
