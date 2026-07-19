@@ -1378,6 +1378,19 @@ HTML_TEMPLATE = r"""<!doctype html>
           guidance for this storm yet.</div>
       </div>
       <div class="card">
+        <h3>Ensemble forecast tracks</h3>
+        <svg id="gens" viewBox="0 0 1000 560"
+             preserveAspectRatio="xMidYMid meet" role="img"
+             aria-label="Ensemble forecast track guidance"></svg>
+        <div class="g-legend" id="gens-legend"></div>
+        <p class="hafs-caption">EPS + GEFS members carrying this system,
+          each colored by its minimum forecast MSLP; the cross-member mean
+          is drawn heavy. Members whose genesis is elsewhere are absent by
+          construction &mdash; member count is a signal, not a style choice.</p>
+        <div id="gens-empty" class="stub" style="display:none">No ensemble
+          members track this system in the current cycles.</div>
+      </div>
+      <div class="card">
         <h3>Model forecast intensity</h3>
         <svg id="gintensity" viewBox="0 0 1000 380"
              preserveAspectRatio="xMidYMid meet" role="img"
@@ -1906,6 +1919,72 @@ HTML_TEMPLATE = r"""<!doctype html>
     if (leg) leg.innerHTML = taids.map(function (t) {
       var isC = cons[t]; return '<span class="lg"><span class="sw" style="background:' + (SSHS[sshsCat(gPeak(aids[t] || []))] || "#8ea2bd") + ';height:' + (isC ? 4 : 3) + 'px"></span>' + (isC ? '<b>' + gEsc(t) + '</b> (consensus)' : gEsc(t)) + '</span>'; }).join("");
   }
+  var GENS_MEAN_COL = { ecens: "#49b6c8", gefs: "#ff9a5c" };
+  function gEnsColor(m) {
+    if (m == null) return "#8ea2bd";
+    return m <= 945 ? "#b03bff" : m <= 960 ? "#f5333c" : m <= 970 ? "#ff9a2f"
+         : m <= 980 ? "#ffe14d" : m <= 990 ? "#46c56a"
+         : m <= 1000 ? "#5aa9ff" : "#8ea2bd";
+  }
+  function gEns() {
+    var svg = document.getElementById("gens"),
+        empty = document.getElementById("gens-empty"),
+        leg = document.getElementById("gens-legend");
+    if (!svg) return;
+    var models = ((GDATA && GDATA.ens) || {}).models || [];
+    var ext = [];
+    models.forEach(function (m) { (m.members || []).forEach(function (mm) {
+      (mm.points || []).forEach(function (p) { ext.push({ lat: p[1], lon: p[2] }); }); }); });
+    if (ext.length < 2) {
+      svg.innerHTML = ""; if (leg) leg.innerHTML = "";
+      if (empty) empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+    var pr = gFitFrame(ext);
+    svg.setAttribute("viewBox", "0 0 " + pr.W + " " + pr.H);
+    var body = [gBasemap(pr), graticule(pr)];
+    models.forEach(function (m) {
+      (m.members || []).forEach(function (mm) {
+        var pts = mm.points || [];
+        if (pts.length < 2) return;
+        var mins = null;
+        pts.forEach(function (p) { if (p[3] != null && (mins == null || p[3] < mins)) mins = p[3]; });
+        var d = "M" + pts.map(function (p) { return pr.X(p[2]).toFixed(1) + "," + pr.Y(p[1]).toFixed(1); }).join("L");
+        body.push('<path d="' + d + '" fill="none" stroke="' + gEnsColor(mins) +
+          '" stroke-width="1.1" stroke-opacity="0.55" stroke-linejoin="round" stroke-linecap="round"/>');
+      });
+    });
+    models.forEach(function (m) {
+      var mean = m.mean || [];
+      if (mean.length < 2) return;
+      var d = "M" + mean.map(function (p) { return pr.X(p[2]).toFixed(1) + "," + pr.Y(p[1]).toFixed(1); }).join("L");
+      body.push('<path d="' + d + '" fill="none" stroke="#0a1320" stroke-width="6" stroke-opacity="0.85" stroke-linejoin="round"/>');
+      body.push('<path d="' + d + '" fill="none" stroke="' + (GENS_MEAN_COL[m.model] || "#dfe8f2") +
+        '" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>');
+      mean.forEach(function (p) {
+        if (G_TAUS.indexOf(p[0]) < 0) return;
+        body.push('<circle cx="' + pr.X(p[2]).toFixed(1) + '" cy="' + pr.Y(p[1]).toFixed(1) +
+          '" r="2.6" fill="' + (GENS_MEAN_COL[m.model] || "#dfe8f2") + '"/>');
+      });
+    });
+    svg.innerHTML = body.join("");
+    if (leg) {
+      var bands = [["&le;945", "#b03bff"], ["&le;960", "#f5333c"], ["&le;970", "#ff9a2f"],
+                   ["&le;980", "#ffe14d"], ["&le;990", "#46c56a"], ["&le;1000", "#5aa9ff"],
+                   ["&gt;1000", "#8ea2bd"]];
+      leg.innerHTML = models.map(function (m) {
+        return '<span class="lg"><span class="sw" style="background:' +
+          (GENS_MEAN_COL[m.model] || "#dfe8f2") + ';height:4px"></span><b>' +
+          gEsc(m.label || m.model) + '</b> mean &middot; ' + m.n_matched + "/" +
+          (m.n_members_total || "?") + ' members &middot; init ' +
+          gEsc(m.init_cycle || "") + '</span>';
+      }).join("") + bands.map(function (b) {
+        return '<span class="lg"><span class="sw" style="background:' + b[1] +
+          ';height:3px"></span>' + b[0] + ' hPa</span>';
+      }).join("");
+    }
+  }
   var G_SSHS_BANDS = [[0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"], [83, 96, "C2"], [96, 113, "C3"], [113, 137, "C4"], [137, 999, "C5"]];
   function gIntensity() {
     var svg = document.getElementById("gintensity"),
@@ -1980,7 +2059,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     root.innerHTML = '<div class="g-ships-head">' + head.join("") + '</div><div class="g-sm-grid">' + cells + '</div>' + tbl;
   }
-  function gRenderAll() { try { gTracks(); } catch (e) {} try { gIntensity(); } catch (e2) {} try { gShips(); } catch (e3) {} }
+  function gRenderAll() { try { gTracks(); } catch (e) {} try { gEns(); } catch (e15) {} try { gIntensity(); } catch (e2) {} try { gShips(); } catch (e3) {} }
   function initGuidance() {
     if (gDrawn) return; gDrawn = true;
     var base = CDN + "/cyclolab/" + encodeURIComponent(SID) + "/";
@@ -5733,12 +5812,15 @@ HTML_TEMPLATE = r"""<!doctype html>
   // the title lockup / legends / stat box come along); "svg" = self-contained
   // SVG (all chrome is in-SVG); "hero" = the SST hero (a baked <img> + overlays).
   var PLOTS = [["advcone", "stage"], ["trackplot", "stage"], ["swathplot", "stage"],
-               ["intensity", "svg"], ["chart", "svg"], ["sst-hero-img", "hero"]];
+               ["intensity", "svg"], ["chart", "svg"], ["sst-hero-img", "hero"],
+               ["gtracks", "svg"], ["gens", "svg"], ["gintensity", "svg"]];
   // Clean section titles for the header band (track/swath have no card <h3> --
   // their head lives in the in-stage lockup, which the band must not duplicate).
   var TITLES = {advcone: "Forecast cone", intensity: "Intensity forecast",
     chart: "Wind & pressure", trackplot: "Track history",
-    swathplot: "Wind swath", "sst-hero-img": "Sea surface temperature"};
+    swathplot: "Wind swath", "sst-hero-img": "Sea surface temperature",
+    gtracks: "Model forecast tracks", gens: "Ensemble forecast tracks",
+    gintensity: "Model forecast intensity"};
   var STYLE_PROPS = ["fill", "fill-opacity", "stroke", "stroke-width",
     "stroke-dasharray", "stroke-linecap", "stroke-linejoin", "stroke-opacity",
     "opacity", "font-family", "font-size", "font-weight", "font-style",
