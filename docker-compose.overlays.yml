@@ -33,7 +33,7 @@ x-cmd: &cmd
     if [ ! -d "$$REPO/.git" ]; then
       git clone -q --depth 1 --filter=blob:none --sparse \
         https://github.com/WeathermanAAA/Triple-A-Tropics.git "$$REPO" \
-      && git -C "$$REPO" sparse-checkout set ascatobs assets
+      && git -C "$$REPO" sparse-checkout set ascatobs assets scripts
     fi
     echo "[poller] $${GEN} every $${INTERVAL}s args=$${GENARGS:-}"
     while true; do
@@ -75,6 +75,16 @@ services:
     mem_limit: 1g
     volumes: ["/root/tat-overlays/sfc:/work"]
 
+  nhc-poller:
+    <<: *poller
+    command: *cmd
+    environment:
+      GEN: generate_nhc_overlay.py
+      INTERVAL: "300"
+      EXTRA_PIP: pyshp   # the only generator dep the image lacks
+    mem_limit: 1g
+    volumes: ["/root/tat-overlays/nhc:/work"]
+
   uhr-poller:
     <<: *poller
     command: *cmd
@@ -84,3 +94,41 @@ services:
       GENARGS: "--max-new 8"
     mem_limit: 2g
     volumes: ["/root/tat-overlays/uhr:/work"]
+
+  # Standard scatterometer feed (OSI SAF 12.5 km coastal NRT): the never-miss
+  # loop for the pass union. CRED-GATED: the ingest needs EARTHDATA_TOKEN
+  # (or EARTHDATA_USERNAME+EARTHDATA_PASSWORD, or KNMI_API_KEY) in .env —
+  # until one lands the tick is a guarded no-op and the GH workflow remains
+  # the writer (retire its schedule once this publishes). Every tick: build
+  # into the work dir (pass-id watermark vs the live manifest, idempotent,
+  # window self-heals gaps), then publish via the exact workflow contract
+  # (scripts/ascat_r2_publish.py). 10-min ticks catch fresh orbits the
+  # moment the source lists them — no cron shedding, no fixed-hour lag.
+  ascat-poller:
+    image: tat-s2:latest
+    entrypoint: ["/bin/sh", "-c"]
+    env_file: .env
+    restart: always
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+    mem_limit: 2g
+    volumes: ["/root/tat-overlays/ascat:/work"]
+    command:
+      - |
+        set -u
+        REPO=/work/tat
+        if [ ! -d "$$REPO/.git" ]; then
+          git clone -q --depth 1 --filter=blob:none --sparse             https://github.com/WeathermanAAA/Triple-A-Tropics.git "$$REPO"           && git -C "$$REPO" sparse-checkout set ascatobs assets scripts
+        fi
+        echo "[ascat-poller] armed (600s ticks; cred-gated)"
+        while true; do
+          { git -C "$$REPO" fetch -q --depth 1 origin main             && git -C "$$REPO" reset -q --hard FETCH_HEAD; }             || echo "[ascat-poller] repo refresh failed (stale copy runs this tick)"
+          if [ -z "$${EARTHDATA_TOKEN:-}" ] && [ -z "$${EARTHDATA_USERNAME:-}" ] && [ -z "$${KNMI_API_KEY:-}" ]; then
+            echo "[ascat-poller] no source credential in .env (EARTHDATA_TOKEN / EARTHDATA_USERNAME+EARTHDATA_PASSWORD / KNMI_API_KEY) — guarded idle; GH workflow remains the writer"
+            sleep 1800
+            continue
+          fi
+          ( cd "$$REPO" && rm -rf /work/ascat_build             && python generate_ascat.py --out-dir /work/ascat_build             && python scripts/ascat_r2_publish.py /work/ascat_build )             || echo "[ascat-poller] tick failed rc=$$? (next tick retries)"
+          sleep 600
+        done
