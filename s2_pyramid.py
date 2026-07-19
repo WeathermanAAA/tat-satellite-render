@@ -249,12 +249,31 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
         cut = s2_webmerc.cut_webmerc_pyramid(raster, bounds, spec, maxzoom=max_zoom)
     else:
         cut = cut_pyramid(raster, spec)
-    n = 0
-    for (z, x, y), data in cut["tiles"].items():
+    # BOUNDED-PARALLEL tile PUTs: the serial loop was the deep-pyramid wall
+    # (~610 tiles at z7 ≈ 6.5 min serial). A worker pool bounded by
+    # S2_PUT_WORKERS (default 8; the store's client pool is sized to match)
+    # uploads them concurrently. The atomicity contract is unchanged: any
+    # failed PUT raises here, BEFORE the ready marker — a partial frame is
+    # never marked whole, and the next pass re-renders it.
+    items = list(cut["tiles"].items())
+    workers = max(1, int(os.environ.get("S2_PUT_WORKERS", "8")))
+
+    def _put_tile(item):
+        (z, x, y), data = item
         if not store.put_bytes(entry.tile_key(prefix, stamp, z, x, y),
                                data, TILE_CONTENT_TYPE, CACHE_FRAME):
-            raise IOError(f"tile PUT failed: {entry.tile_key(prefix, stamp, z, x, y)}")
-        n += 1
+            raise IOError(
+                f"tile PUT failed: {entry.tile_key(prefix, stamp, z, x, y)}")
+
+    if workers > 1 and len(items) > 8:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            # list() drains the iterator so the FIRST failure re-raises here
+            list(ex.map(_put_tile, items))
+    else:
+        for it in items:
+            _put_tile(it)
+    n = len(items)
     # Calibrated BT data raster beside the tiles (before the marker, so it is part
     # of the atomically-completed frame the inspector can rely on).
     if bt_png is not None:

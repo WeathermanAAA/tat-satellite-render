@@ -156,7 +156,10 @@ class R2:
             endpoint_url=R2_ENDPOINT,
             aws_access_key_id=R2_ACCESS_KEY_ID,
             aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}),
+            config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"},
+                              # sized for the emitter's parallel tile PUTs
+                              max_pool_connections=max(
+                                  10, int(os.environ.get("S2_PUT_WORKERS", "8")) + 4)),
         )
 
     def put_bytes(self, key: str, data: bytes, content_type: str, cache: str) -> bool:
