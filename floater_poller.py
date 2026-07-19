@@ -73,7 +73,7 @@ def _env(name: str, default: str | None = None) -> str | None:
 # /render base. Prefer Railway private networking, e.g.
 #   http://tat-satellite-render.railway.internal:8080
 # Falls back to the public URL (then set RATE_MIN_SPACING_S=7).
-RENDER_BASE_URL = _env("RENDER_BASE_URL", "https://web-production-b88d.up.railway.app").rstrip("/")
+RENDER_BASE_URL = _env("RENDER_BASE_URL", "http://render:8080").rstrip("/")
 RENDER_URL = RENDER_BASE_URL + "/render"
 
 # R2 / S3

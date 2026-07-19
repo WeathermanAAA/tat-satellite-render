@@ -119,7 +119,7 @@ MESO_ENABLED = _env_bool("MESO_ENABLED", True)
 # /render base. Prefer Railway private networking, e.g.
 #   http://tat-satellite-render.railway.internal:8080
 # Falls back to the public URL (then set RATE_MIN_SPACING_S=7).
-RENDER_BASE_URL = _env("RENDER_BASE_URL", "https://web-production-b88d.up.railway.app").rstrip("/")
+RENDER_BASE_URL = _env("RENDER_BASE_URL", "http://meso-render:8080").rstrip("/")
 RENDER_URL = RENDER_BASE_URL + "/render"
 # COLD-lane /render base. The compose stack points this at a SECOND render
 # container (meso-render-cold) so a slow cold render (true-color ~spans
