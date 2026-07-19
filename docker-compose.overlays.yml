@@ -184,3 +184,33 @@ services:
       GENARGS: "--max-new 4"
     mem_limit: 2g
     volumes: ["/root/tat-overlays/tpw:/work"]
+
+  # Storm-tasked SAR winds (/obs/sar/): per-storm archive, never-miss loop.
+  # Every tick: discover new passes on the source listing (the live R2
+  # manifest/indexes are the watermark), render + publish only what is new
+  # (media first, index then manifest last), budgeted per tick so backfill
+  # spreads politely. Passes exist only when a storm is tasked; off-season
+  # ticks are a listing-read no-op. 600 s ticks: SAR latency is hours, and
+  # the listing is a PHP page, so gentler polling is the right trade.
+  sar-poller:
+    <<: *poller
+    mem_limit: 2g
+    volumes: ["/root/tat-overlays/sar:/work"]
+    command:
+      - |
+        set -u
+        REPO=/work/tat
+        if [ ! -d "$$REPO/.git" ]; then
+          git clone -q --depth 1 --filter=blob:none --sparse \
+            https://github.com/WeathermanAAA/Triple-A-Tropics.git "$$REPO" \
+          && git -C "$$REPO" sparse-checkout set sarobs scripts
+        fi
+        echo "[sar-poller] armed (600s ticks)"
+        while true; do
+          { git -C "$$REPO" fetch -q --depth 1 origin main \
+            && git -C "$$REPO" reset -q --hard FETCH_HEAD; } \
+            || echo "[sar-poller] repo refresh failed (stale copy runs this tick)"
+          ( cd "$$REPO" && python generate_sar_winds.py --store r2 ) \
+            || echo "[sar-poller] tick failed rc=$$? (next tick retries)"
+          sleep 600
+        done
