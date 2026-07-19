@@ -445,3 +445,87 @@ def parse_ships(text: str) -> dict:
                     break
     out["ahi"] = {"value": ahi_val, "verdict": verdict}
     return out
+
+
+# ---------------------------------------------------------------------------
+# Ensemble track guidance: the per-storm cut of the site's ensemble-centers
+# tracks feed (models/enscenters/{slug}/{cycle}.tracks.json). PURE like the
+# rest of this module: the poller fetches, this matches.
+# ---------------------------------------------------------------------------
+ENS_MATCH_KM = 400.0     # a member track must START this close to the storm
+ENS_MATCH_TAU_H = 12     # ...at an early tau, or it's a different system
+ENS_TAU_STEP_H = 6
+ENS_TAU_MAX_H = 168
+
+
+def _hav_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    r = math.radians
+    a = (math.sin(r(lat2 - lat1) / 2) ** 2 +
+         math.cos(r(lat1)) * math.cos(r(lat2)) *
+         math.sin(r(lon2 - lon1) / 2) ** 2)
+    return 6371.0 * 2 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def match_ens_tracks(doc: dict, storm_lat: float, storm_lon: float,
+                     *, max_km: float = ENS_MATCH_KM) -> "Optional[dict]":
+    """One ensemble tracks document + the storm's current position -> the
+    per-member track serving THIS storm: for each member, the track whose
+    earliest early-tau fix lies nearest the storm, gated at max_km (a member
+    with no nearby genesis simply doesn't carry the storm - honest absence,
+    never a forced match). Points decimate to the 6-h grid (tau <= 168) as
+    [tau, lat, lon, mslp, vmax]; a cross-member MEAN rides along (position
+    mean where at least a third of matched members still track the system;
+    lon via vector mean, dateline-safe). None when nothing matches."""
+    import math
+    members_out = []
+    for m in (doc or {}).get("members", []) or []:
+        best = None
+        best_d = None
+        for tr in m.get("tracks", []) or []:
+            if not tr:
+                continue
+            early = [p for p in tr if p[0] <= ENS_MATCH_TAU_H]
+            if not early:
+                continue
+            p0 = early[0]
+            d = _hav_km(storm_lat, storm_lon, p0[1], p0[2])
+            if d <= max_km and (best_d is None or d < best_d):
+                best, best_d = tr, d
+        if best is None:
+            continue
+        pts = [[int(p[0]), round(float(p[1]), 2), round(float(p[2]), 2),
+                (round(float(p[3]), 1) if p[3] is not None else None),
+                (round(float(p[4]), 1) if p[4] is not None else None)]
+               for p in best
+               if p[0] % ENS_TAU_STEP_H == 0 and p[0] <= ENS_TAU_MAX_H]
+        if len(pts) >= 2:
+            members_out.append({"id": str(m.get("id")),
+                                "dist_km": round(best_d, 1), "points": pts})
+    if not members_out:
+        return None
+    bytau: dict = {}
+    for mm in members_out:
+        for p in mm["points"]:
+            bytau.setdefault(p[0], []).append(p)
+    need = max(2, len(members_out) // 3)
+    mean = []
+    for tau in sorted(bytau):
+        rows = bytau[tau]
+        if len(rows) < need:
+            continue
+        la = sum(r[1] for r in rows) / len(rows)
+        sx = sum(math.cos(math.radians(r[2])) for r in rows)
+        sy = sum(math.sin(math.radians(r[2])) for r in rows)
+        lo = math.degrees(math.atan2(sy, sx))
+        ms = [r[3] for r in rows if r[3] is not None]
+        vs = [r[4] for r in rows if r[4] is not None]
+        mean.append([tau, round(la, 2), round(lo, 2),
+                     round(sum(ms) / len(ms), 1) if ms else None,
+                     round(sum(vs) / len(vs), 1) if vs else None])
+    return {"model": doc.get("model"), "label": doc.get("model_label"),
+            "init_cycle": doc.get("init_cycle"),
+            "init_time": doc.get("init_time"),
+            "n_members_total": doc.get("n_members"),
+            "n_matched": len(members_out),
+            "members": members_out, "mean": mean}
