@@ -1,0 +1,23 @@
+# CONUS FAST LANE (2026-07-19): the full 28-product conus lane pass takes
+# 30-45 min, so single products landed only every ~24 min (watched on a real
+# loop capture). This lane pins the FOUR loop-critical products to the true
+# 10-min slot grid; the full-suite conus lane keeps everything else fresh
+# and skips already-emitted slots via the ready markers (idempotent).
+# Start:
+#   docker compose -p tat-s2-conus-fast -f docker-compose.s2.yml \
+#     -f docker-compose.s2.conus-fast.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-fast] conus loop products: ir c02 irbd truecolor (10-min grid)"
+        while true; do
+          for prod in ir c02 irbd truecolor; do
+            python s2_pyramid_emit.py --product goes19-conus-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-fast] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 120
+        done

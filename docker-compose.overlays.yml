@@ -52,7 +52,7 @@ services:
     environment:
       GEN: generate_mrms_overlay.py
       INTERVAL: "75"          # native 2-min product: emit every new scan
-      GENARGS: "--keep 150"   # ~5 h of 2-min scans outruns the sat loop
+      GENARGS: "--keep 220"  # ~7.3 h of 2-min scans covers the 6-h loop window
       EXTRA_PIP: pygrib       # the only generator dep the image lacks
     mem_limit: 6g
     volumes: ["/root/tat-overlays/mrms:/work"]
