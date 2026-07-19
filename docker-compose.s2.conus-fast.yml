@@ -1,8 +1,10 @@
-# CONUS FAST LANE (2026-07-19): the full 28-product conus lane pass takes
-# 30-45 min, so single products landed only every ~24 min (watched on a real
-# loop capture). This lane pins the FOUR loop-critical products to the true
-# 10-min slot grid; the full-suite conus lane keeps everything else fresh
-# and skips already-emitted slots via the ready markers (idempotent).
+# CONUS FAST LANE (2026-07-19, v2 with the native-res ladder): the four
+# loop-lead products on the true 10-min slot grid. Resolution: c02 (0.5 km
+# native) now cuts to z6 with a 6144 px base (z7/native needs ~610 tiles/
+# slot = ~6.5 min serial upload — over budget; documented ceiling). The
+# 2 km-class products (ir/irbd) are NATIVE-BOUND at z5 (source is 2500 px
+# across this box) — deeper tiles would upsample, not sharpen. truecolor
+# renders at the 2 km class by design (Rayleigh cost).
 # Start:
 #   docker compose -p tat-s2-conus-fast -f docker-compose.s2.yml \
 #     -f docker-compose.s2.conus-fast.yml --profile cron up -d --no-build emit-cron
@@ -11,11 +13,15 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "[s2-fast] conus loop products: ir c02 irbd truecolor (10-min grid)"
+        echo "[s2-fast] conus loop products: ir irbd truecolor (z5) + c02 (z6)"
         while true; do
-          for prod in ir c02 irbd truecolor; do
+          for prod in ir irbd truecolor c02; do
+            case "$$prod" in
+              c02) Z=6; PX="--pyramid-px 6144" ;;
+              *)   Z=5; PX="" ;;
+            esac
             python s2_pyramid_emit.py --product goes19-conus-$$prod \
-              --store r2 --prefix shadow --max-zoom 5 \
+              --store r2 --prefix shadow --max-zoom $$Z $$PX \
               --allow-geometry-change --step 10 --backfill 60 \
               || echo "[s2-fast] $$prod failed rc=$$? (next tick retries)"
           done

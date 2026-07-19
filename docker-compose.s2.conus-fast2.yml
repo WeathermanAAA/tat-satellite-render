@@ -1,0 +1,28 @@
+# CONUS FAST LANE 2 (2026-07-19): the commonly-looped bands join the 10-min
+# grid — measured ~48 s wall per product-slot, so 11 products fit the
+# 10-min budget (~9 min/pass). 1 km-native bands (c01/c03/c05) cut to z6
+# with a 6144 px base; the rest are 2 km-class, native-bound at z5. The
+# rarely-looped RGBs + remaining channels stay on the full lane, which
+# drops from 28 to ~13 novel products per pass (~15-25 min cadence).
+# Start:
+#   docker compose -p tat-s2-conus-fast2 -f docker-compose.s2.yml \
+#     -f docker-compose.s2.conus-fast2.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-fast2] common bands: c01 c03 c05 (z6) + c07 c08 c09 c10 c14 sandwich nightmicro airmass (z5)"
+        while true; do
+          for prod in c01 c03 c05 c07 c08 c09 c10 c14 sandwich nightmicro airmass; do
+            case "$$prod" in
+              c01|c03|c05) Z=6; PX="--pyramid-px 6144" ;;
+              *)           Z=5; PX="" ;;
+            esac
+            python s2_pyramid_emit.py --product goes19-conus-$$prod \
+              --store r2 --prefix shadow --max-zoom $$Z $$PX \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-fast2] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 120
+        done
