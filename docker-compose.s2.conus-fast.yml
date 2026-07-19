@@ -1,7 +1,8 @@
-# CONUS FAST LANE (2026-07-19, v2 with the native-res ladder): the four
+# CONUS FAST LANE (2026-07-19, v3: c02 at NATIVE z7 via parallel PUTs): the four
 # loop-lead products on the true 10-min slot grid. Resolution: c02 (0.5 km
-# native) now cuts to z6 with a 6144 px base (z7/native needs ~610 tiles/
-# slot = ~6.5 min serial upload — over budget; documented ceiling). The
+# native) now cuts to NATIVE z7 on a 10240 px base — the serial-upload
+# ceiling fell with the emitter's bounded-parallel tile PUTs
+# (S2_PUT_WORKERS). The
 # 2 km-class products (ir/irbd) are NATIVE-BOUND at z5 (source is 2500 px
 # across this box) — deeper tiles would upsample, not sharpen. truecolor
 # renders at the 2 km class by design (Rayleigh cost).
@@ -17,7 +18,7 @@ services:
         while true; do
           for prod in ir irbd truecolor c02; do
             case "$$prod" in
-              c02) Z=6; PX="--pyramid-px 6144" ;;
+              c02) Z=7; PX="--pyramid-px 10240" ;;
               *)   Z=5; PX="" ;;
             esac
             python s2_pyramid_emit.py --product goes19-conus-$$prod \
