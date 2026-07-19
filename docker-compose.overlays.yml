@@ -166,3 +166,21 @@ services:
             || echo "[recon-poller] tick failed rc=$$? (next tick retries)"
           sleep 90
         done
+
+  # MIMIC-TPW2 moisture overlay (CIMSS/SSEC mirror, anonymous): hourly global
+  # TPW frames for the explorer's env/tpw series. The generator presence-
+  # gates on the month directory listings (the mirror lags and sometimes
+  # STALLS — frozen 13 days at deploy time), backfills only within the
+  # rolling 36-frame window, and no-ops when the watermark holds — so this
+  # service idles honestly against a stalled upstream and self-activates
+  # the moment new files list. The frontend toggle independently gates on
+  # frame freshness (<3h), so stale frames never present as live.
+  tpw-poller:
+    <<: *poller
+    command: *cmd
+    environment:
+      GEN: generate_mimic_tpw.py
+      INTERVAL: "300"
+      GENARGS: "--max-new 4"
+    mem_limit: 2g
+    volumes: ["/root/tat-overlays/tpw:/work"]
