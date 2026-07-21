@@ -215,6 +215,29 @@ services:
           sleep 3600
         done
 
+  hy2-poller:
+    <<: *poller
+    mem_limit: 1g
+    volumes: ["/root/tat-overlays/hy2:/work"]
+    command:
+      - |
+        set -u
+        REPO=/work/tat
+        if [ ! -d "$$REPO/.git" ]; then
+          git clone -q --depth 1 --filter=blob:none --sparse \
+            https://github.com/WeathermanAAA/Triple-A-Tropics.git "$$REPO" \
+          && git -C "$$REPO" sparse-checkout set sarobs hy2obs
+        fi
+        echo "[hy2-poller] armed (3600s ticks; HSCAT daily, watermark-gated, outage-tolerant)"
+        while true; do
+          { git -C "$$REPO" fetch -q --depth 1 origin main \
+            && git -C "$$REPO" reset -q --hard FETCH_HEAD; } \
+            || echo "[hy2-poller] repo refresh failed (stale copy runs this tick)"
+          ( cd "$$REPO" && python generate_hy2_winds.py --store r2 ) \
+            || echo "[hy2-poller] tick failed rc=$$? (next tick retries)"
+          sleep 3600
+        done
+
   sar-poller:
     <<: *poller
     mem_limit: 2g
