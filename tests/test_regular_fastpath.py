@@ -122,10 +122,14 @@ class TestFastPathRenderParity(unittest.TestCase):
             a, b = self._decode(fast), self._decode(slow)
             self.assertEqual(a.shape, b.shape)
             mean_delta = float(np.abs(a - b).mean())
-            # sub-1/255 mean delta = the two rasterizations differ only in
-            # cell-edge antialiasing, not placement or color mapping
+            # Small mean delta = the two rasterizations differ only in
+            # cell-edge antialiasing, not placement or color mapping. The
+            # box's matplotlib build measures ~1.2 on IDENTICAL code where
+            # the original author environment measured <1.0 (verified on
+            # pure origin/main during the 2026-07 reconciliation); a real
+            # placement or colormap bug measures in the tens.
             self.assertLess(
-                mean_delta, 1.0,
+                mean_delta, 2.0,
                 f"fast/slow render diverged (mean|Δ|={mean_delta:.3f}, "
                 f"ascending_lat={ascending})")
 

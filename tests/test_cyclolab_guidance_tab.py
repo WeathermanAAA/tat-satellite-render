@@ -60,10 +60,13 @@ class TestStructure(unittest.TestCase):
         self.assertIn("initModels(); initGuidance();", self.html)
 
     def test_palette_b_locked_no_options_board(self):
-        # tracks color = SSHWS category of peak wind (palette B); the guidance BLOCK
-        # itself must not reference WIND_TIER (no fork), and the live page has no
-        # options board (that was the held review only).
-        self.assertIn("SSHS[sshsCat(gPeak", self.html)
+        # Track color contract: the Model Guidance rebuild (per-model identity
+        # everywhere) colors each aid's track by its per-tech identity hue -
+        # gHue(t) - superseding the earlier peak-SSHWS palette B. The other
+        # locks stand: the guidance BLOCK itself must not reference WIND_TIER
+        # (no fork), and the live page has no options board (that was the
+        # held review only).
+        self.assertIn("var col = gHue(t)", self.html)
         start = self.html.index("Model guidance (Stage B)")
         end = self.html.index("section nav (lazy init", start)
         block = self.html[start:end]

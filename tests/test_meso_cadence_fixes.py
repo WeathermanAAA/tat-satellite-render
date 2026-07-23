@@ -86,7 +86,12 @@ class AntimeridianBboxTests(unittest.TestCase):
         self.assertEqual(v.bbox[0], 141.5)
 
     def test_validator_still_rejects_garbage(self):
-        for bad in ([200.0, 0, 10, 10], [0, 0, 200.0, 10], [5, 0, 5, 10],
+        # [200, 0, 10, 10] left this list with the edge-preserving-wrap
+        # validator: an out-of-range west edge is a legal UNWRAPPED form now
+        # (200 == -160E) and normalizes instead of raising. Out-of-band
+        # (+-360), zero-width, inverted-lat and the [180, -180] degenerate
+        # all still reject.
+        for bad in ([400.0, 0, 10, 10], [0, 0, 200.0, 10], [5, 0, 5, 10],
                     [0, 50, 10, 40], [180.0, 0, -180.0, 10]):
             with self.assertRaises(Exception, msg=bad):
                 app.RenderRequest(bbox=bad, channel="clean_ir")
