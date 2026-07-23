@@ -1,0 +1,172 @@
+# docker-compose.render.yml -- the ex-RAILWAY workloads as a BOX stack
+# (Railway paused the project at the compute cap, 2026-07-11/12). One compose
+# project (-p tat-render) mirroring the S2/meso box pattern: shared image,
+# restart policies, the SAME .env the s1/meso/s2 stacks load (R2_ENDPOINT /
+# R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET). No host pip, no cred
+# paste. Fully isolated from those stacks: distinct image tag (tat-render) +
+# distinct compose project.
+#
+# Services (was: 6 Railway services, one railway.*.json each):
+#   caddy            -- TLS edge for render.triple-a-tropics.com (new)
+#   render           -- FastAPI /render + /export  (railway.json)
+#   floater-poller   -- storm floater frames -> R2  (railway.worker.json)
+#   intensity-poller -- live ACE/tracks feeds -> R2 (railway.intensity.json)
+#   guidance-poller  -- a-deck+SHIPS guidance -> R2 (railway.guidance.json)
+#   ens-watchdog     -- GH workflow_dispatch fallback alarms (railway.watchdog.json)
+#   hafs-worker      -- HAFS model plots (railway.hafs.json; PROFILE-GATED,
+#                       see the RAM note on the service)
+#
+# Bring-up (full runbook: RUNBOOK-RENDER.md):
+#   docker compose -p tat-render -f docker-compose.render.yml build
+#   docker compose -p tat-render -f docker-compose.render.yml up -d
+#   docker compose -p tat-render -f docker-compose.render.yml ps
+#
+# The pollers reach /render over the compose network (http://render:8080) --
+# NEVER the public URL; only the browser-facing /render + /export go through
+# caddy. Workers publish no ports; their health heartbeats ride to R2 via
+# poller_framework, and `restart: unless-stopped` handles crashes.
+
+x-render-base: &render-base
+  build:
+    context: .
+    dockerfile: Dockerfile.render
+  image: tat-render:latest
+  env_file: .env
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.render:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+  render:
+    <<: *render-base
+    command: uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
+    environment:
+      # browser-facing CORS (the API already answers the preflight + exposes
+      # the X-* stat headers itself; caddy only proxies)
+      ALLOWED_ORIGINS: "https://triple-a-tropics.com,https://www.triple-a-tropics.com"
+      # Time Machine archive throughput (2026-07-18, with the regular-grid
+      # imshow fast path — ~3x cheaper archive frames): advertise a faster
+      # client pace via X-Archive-Pace-Ms and raise the per-IP budget in
+      # lockstep. Semaphore(2) still bounds concurrent render CPU; revert =
+      # delete these two lines (clients fall back to 6.5 s pacing).
+      TM_PACE_MS_HINT: "1500"
+      RATE_LIMIT: "90/minute"
+    # loopback publish for box-local debugging; the public path is caddy
+    ports:
+      - "127.0.0.1:8210:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    # matplotlib/cartopy render peaks; OOM-kill in-container, never the box
+    mem_limit: 8g
+
+  floater-poller:
+    <<: *render-base
+    command: python floater_poller.py
+    environment:
+      # PIN the output prefix: the shared box .env carries R2_PREFIX=meso
+      # for the MESO stack, and env_file inheritance silently pointed this
+      # poller at meso/* from the 2026-07-14 bring-up — floaters/* then
+      # froze the moment the GH stopgap schedule retired (Jul 15 01:03Z,
+      # found 2026-07-17). environment: beats env_file, so this holds
+      # whatever the shared .env says.
+      R2_PREFIX: floaters
+      RENDER_BASE_URL: http://render:8080   # compose network, not the public host
+      # Co-located callers are auto-detected by the render service (private
+      # peer + no X-Forwarded-For) and get RATE_LIMIT_INTERNAL (600/min
+      # default) instead of the public 10/min — 1 s spacing is self-pacing.
+      RATE_MIN_SPACING_S: "1.0"
+      LOG_LEVEL: INFO
+    depends_on:
+      render:
+        condition: service_healthy
+    mem_limit: 4g
+
+  intensity-poller:
+    <<: *render-base
+    command: python intensity_poller.py
+    environment:
+      # Railway env parity: the PROMOTED live map key (not the shadow one) --
+      # wrong key silently blanks the home-map storm layer
+      GLOBAL_GEOJSON_KEY: global_storms.geojson
+      # Same parity trap, found 2026-07-17: without this the adv/cone
+      # writer falls back to its shadow/cyclolab default and the SITE key
+      # (cyclolab/adv/{sid}.json) silently freezes at the last promoted
+      # write - ELIDA sat on adv 1 for ~2 days while adv 9 landed in the
+      # shadow tree.
+      CYCLOLAB_PREFIX: cyclolab
+      LOG_LEVEL: INFO
+    mem_limit: 2g
+
+  guidance-poller:
+    <<: *render-base
+    command: python cyclolab_guidance_poller.py
+    mem_limit: 1g
+
+  ens-watchdog:
+    <<: *render-base
+    command: python ens_watchdog.py
+    # needs ENS_WATCHDOG_GH_TOKEN in .env to actually dispatch GH fallbacks;
+    # without it it watches + logs only (still useful, never crashes)
+    mem_limit: 512m
+
+  # HAFS render worker -- PROFILE-GATED, off by default. Peak RSS during a
+  # full HAFS-A+B cycle measured ~23 GB on Railway; on a 32 GB box that
+  # coexists with render+pollers only with this hard cap and headroom watch.
+  # The 2026-06 telemetry verdict was "HAFS gets its own box"; until that
+  # box exists the GH-Actions update-hafs.yml path (6-hourly cron +
+  # ens-watchdog dispatch) stays the HAFS renderer. Enable here ONLY
+  # deliberately:  ... --profile hafs up -d hafs-worker
+  # Builds from the PINNED hafs-render-worker branch (public repo) -- main's
+  # requirements-hafs.txt carries the v0.12 env-color repin that is still
+  # gated on a go/no-go (queued manual step Q9).
+  hafs-worker:
+    build:
+      context: https://github.com/WeathermanAAA/tat-satellite-render.git#hafs-render-worker
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+              git gcc g++ pkg-config curl ca-certificates \
+            && rm -rf /var/lib/apt/lists/*
+        WORKDIR /app
+        COPY requirements-hafs.txt .
+        RUN pip install -r requirements-hafs.txt
+        COPY . .
+        CMD ["python", "hafs_render_poller.py"]
+    image: tat-render-hafs:latest
+    env_file: .env
+    environment:
+      HERBIE_DATA: /data/herbie
+      HAFS_JOBS: "6"        # 8 vCPU box shared with render+pollers
+    volumes:
+      - herbie_data:/data/herbie
+    profiles: ["hafs"]
+    restart: unless-stopped
+    mem_limit: 24g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  caddy_data:
+  caddy_config:
+  herbie_data:

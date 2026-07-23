@@ -65,8 +65,13 @@ def state_lines_status() -> str:
 
 DARK_BG = "#0a0d12"
 GRID_COLOR = "#3a4252"
-COAST_COLOR = "#000000"   # deep bold black — landmass outlines (Andrew's pref)
-BORDER_COLOR = "#000000"  # black — political borders, to match the coastlines
+# Coast/border style (2026-07-12, Andrew's call — OVERRIDES the 2026-07-11
+# cyan/white restyle): coastlines, borders, state lines and the halo are all
+# BLACK. The halo under-stroke geometry is kept (it just reads as a slightly
+# heavier black line), so a future restyle is a constants-only change again.
+COAST_COLOR = "#000000"   # black — landmass outlines
+BORDER_COLOR = "#000000"  # black — political borders
+LINE_HALO = "#000000"     # black halo under both (thin: +~1.2 px)
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
@@ -132,6 +137,18 @@ def _effective_extent(
     return lo, hi, la, lb
 
 
+def _gridline_xlocs(lon_min: float, lon_max_uw: float, step: float) -> np.ndarray:
+    """Meridian locations for the graticule. ``lon_max_uw`` may exceed 180 (the
+    unwrapped east edge of an antimeridian-crossing bbox) — locs are generated
+    in unwrapped space so the sequence is continuous across the dateline, then
+    wrapped into [-180, 180] for cartopy's Gridliner (which speaks wrapped
+    PlateCarree longitudes). Non-crossing boxes reproduce the legacy arange."""
+    locs = np.arange(np.floor(lon_min / step) * step, lon_max_uw + step, step)
+    if lon_max_uw > 180.0:
+        locs = np.unique(((locs + 180.0) % 360.0) - 180.0)
+    return locs
+
+
 def _gridline_step(span: float) -> float:
     """Pick a sane gridline interval (degrees) for the given bbox span."""
     if span <= 2:
@@ -143,6 +160,47 @@ def _gridline_step(span: float) -> float:
     if span <= 25:
         return 5.0
     return 10.0
+
+
+def _map_geometry(bbox: list[float]):
+    """Crossing-aware map geometry for a ``[W, S, E, N]`` bbox.
+
+    Returns ``(projection, extent, lon_span, crossing)``:
+      * ``projection`` — the AXES projection. PlateCarree(central_longitude=180)
+        when the bbox crosses the antimeridian (normalized convention:
+        lon_max < lon_min), so the extent is continuous in axes space; the
+        plain PlateCarree otherwise (existing behavior, byte-identical).
+      * ``extent`` — [lon_min, lon_max_unwrapped, lat_min, lat_max] to pass to
+        ``set_extent(..., crs=ccrs.PlateCarree())``; cartopy transforms the
+        unwrapped east edge into the crossing projection correctly.
+      * ``lon_span`` — positive unwrapped span (drives aspect / coast scale /
+        gridline step).
+    Data plotting stays ``transform=ccrs.PlateCarree()`` in both cases: with a
+    180-centered axes projection the transformed mesh is continuous across the
+    dateline (the ±180 jump in wrapped source longitudes lands at the axes
+    center, not at a seam), so pcolormesh needs no special handling.
+    """
+    lon_min, lat_min, lon_max, lat_max = bbox
+    crossing = lon_max < lon_min
+    lon_max_uw = lon_max + 360.0 if crossing else lon_max
+    proj = ccrs.PlateCarree(central_longitude=180.0) if crossing else ccrs.PlateCarree()
+    extent = [lon_min, lon_max_uw, lat_min, lat_max]
+    return proj, extent, lon_max_uw - lon_min, crossing
+
+
+def _unwrap_lons(lons, lon_min: float):
+    """Make source longitudes CONTINUOUS across the dateline for a crossing
+    bbox. Wrapped [-180, 180] lons (the AHI inverse projection wraps; GOES-West
+    emits sub-sat-relative values) carry a ±360 jump at the dateline column —
+    cartopy's pcolormesh wrap-detection then mangles the jump-spanning cells
+    into misplaced horizontal smears (observed on the first live swpac
+    backdrop), and _guard_mesh_coords' nanmean fill lands far outside the
+    window. Everything west of the bbox's west edge is really the >180 side:
+    shift it up by 360. PlateCarree transforms are periodic, so unwrapped
+    values >180 plot exactly right."""
+    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
+    with np.errstate(invalid="ignore"):
+        return np.where(lons < lon_min - 1e-9, lons + 360.0, lons)
 
 
 def _coast_resolution(span_deg: float) -> str:
@@ -453,43 +511,99 @@ def render_png(
             zorder=1,
         )
     else:
-        mesh = ax.pcolormesh(
-            lons,
-            lats,
-            plot_field,
-            cmap=plot_cmap,
-            norm=plot_cnorm,
-            shading="auto",
-            transform=ccrs.PlateCarree(),
-            rasterized=True,
-        )
+        # Masked / non-finite geolocation (off-disk limb; early-era ABI
+        # sectors) would raise inside pcolormesh -- same guard as the
+        # backdrop path (one guard, both call sites).
+        if crossing:
+            lons = _unwrap_lons(lons, lon_min)
+        lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
+        # ---- REGULAR-GRID FAST PATH (Time Machine archive tiers) --------
+        # GridSat-B1 / GridSat-GOES / MergIR (and GOES fetch_regular) are
+        # uniform lat/lon grids that the fetchers meshgrid into 2-D coords;
+        # pcolormesh then transforms MILLIONS of quad vertices per frame
+        # (seconds each -- the dominant server cost of a 25-frame archive
+        # window). A separable uniform grid renders identically via imshow
+        # with a cell-EDGE extent (shading="auto" places edges at centers
+        # ± half-step; matched exactly here) in milliseconds. The native
+        # geos path (floaters / meso / live sectors -- genuinely
+        # curvilinear 2-D coords) can never satisfy the detector, so the
+        # frozen-renderer guarantee is untouched: this branch simply never
+        # fires for it. Antimeridian-crossing boxes stay on pcolormesh
+        # (axes central_longitude=180 vs a PlateCarree(0) image transform
+        # would trigger cartopy's warp -- the same reason the true-color
+        # imshow path is 422-gated for crossing).
+        axes1d = None if crossing else _regular_grid_axes(lons, lats)
+        if axes1d is not None:
+            lon1, lat1 = axes1d
+            dlon = (lon1[-1] - lon1[0]) / max(len(lon1) - 1, 1)
+            dlat = (lat1[-1] - lat1[0]) / max(len(lat1) - 1, 1)
+            ext_img = [
+                lon1[0] - dlon / 2.0, lon1[-1] + dlon / 2.0,
+                min(lat1[0], lat1[-1]) - abs(dlat) / 2.0,
+                max(lat1[0], lat1[-1]) + abs(dlat) / 2.0,
+            ]
+            mesh = ax.imshow(
+                np.ma.masked_invalid(plot_field),
+                origin="lower" if dlat > 0 else "upper",
+                extent=ext_img,
+                cmap=plot_cmap,
+                norm=plot_cnorm,
+                transform=ccrs.PlateCarree(),
+                interpolation="nearest",
+                zorder=1,
+            )
+        else:
+            mesh = ax.pcolormesh(
+                lons,
+                lats,
+                plot_field,
+                cmap=plot_cmap,
+                norm=plot_cnorm,
+                shading="auto",
+                transform=ccrs.PlateCarree(),
+                rasterized=True,
+            )
 
     # Coastlines + borders. Resolution scales with bbox; zorder explicitly
     # above pcolormesh (which defaults to ~1.5 in cartopy) so cyan coast
     # never gets painted over by hot cloud tops; full alpha for legibility.
     if coastlines:
         coast_scale = _coast_resolution(max(lon_span, lat_span))
+        # halo under-strokes first (same geometry, slightly wider, below)…
         ax.add_feature(
             cfeature.COASTLINE.with_scale(coast_scale),
-            linewidth=1.2, edgecolor=COAST_COLOR, alpha=1.0, zorder=3,
+            linewidth=2.2, edgecolor=LINE_HALO, alpha=0.9, zorder=3,
         )
         ax.add_feature(
             cfeature.BORDERS.with_scale(coast_scale),
-            linewidth=0.8, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3,
+            linewidth=1.6, edgecolor=LINE_HALO, alpha=0.9, zorder=3,
+        )
+        # …then the legible light strokes on top
+        ax.add_feature(
+            cfeature.COASTLINE.with_scale(coast_scale),
+            linewidth=1.0, edgecolor=COAST_COLOR, alpha=1.0, zorder=3.02,
+        )
+        ax.add_feature(
+            cfeature.BORDERS.with_scale(coast_scale),
+            linewidth=0.7, edgecolor=BORDER_COLOR, alpha=1.0, zorder=3.02,
         )
         # State/province (admin_1) boundary LINES — the internal-boundary-only
         # dataset (not the admin_1 *lakes* polygons), so it never re-traces the
-        # coastline. One more feature layer in the SAME black as the coast +
-        # country borders, a touch thinner so US/MX/AU state lines read as
-        # subtle landfall context. Loaded from the vendored geojson (see
-        # _state_lines_feature) so it works on the deploy host. Guarded: a
-        # missing asset degrades to "no state lines" rather than a failed frame.
+        # coastline. Same halo'd off-white as the country borders, a touch
+        # thinner so US/MX/AU state lines read as subtle landfall context.
+        # Loaded from the vendored geojson (see _state_lines_feature) so it
+        # works on the deploy host. Guarded: a missing asset degrades to "no
+        # state lines" rather than a failed frame.
         try:
             states = _state_lines_feature()
             if states is not None:
                 ax.add_feature(
-                    states, linewidth=0.5, edgecolor=BORDER_COLOR,
-                    facecolor="none", alpha=1.0, zorder=3,
+                    states, linewidth=1.1, edgecolor=LINE_HALO,
+                    facecolor="none", alpha=0.9, zorder=3,
+                )
+                ax.add_feature(
+                    states, linewidth=0.45, edgecolor=BORDER_COLOR,
+                    facecolor="none", alpha=1.0, zorder=3.02,
                 )
         except Exception as e:  # noqa: BLE001 — never let admin_1 break a frame
             log.warning("state borders skipped: %s", e)
@@ -545,7 +659,20 @@ def render_png(
     # resolution — so an old frame can never imply modern imagery.
     is_gridsat = data.bucket.startswith("noaa-cdr-gridsat")
     is_mergir = data.bucket == "gesdisc-mergir"
-    if is_mergir:
+    is_gg = data.bucket == "ncei-gridsat-goes"
+    if is_gg:
+        # per-satellite GOES-era tier: name the ACTUAL satellite + channel +
+        # cadence + resolution (native 1 km GVAR is order-staged only — never
+        # imply it; the visible channel says its 4 km is subsampled)
+        sensor_label = "GOES Imager (GridSat-GOES)"
+        gg_chan = {1: "0.65 µm visible (4 km, from 1 km)",
+                   2: "3.9 µm shortwave IR",
+                   3: "6.5 µm water vapor",
+                   4: "10.7 µm IR window"}.get(channel, f"ch{channel}")
+        center_title = (
+            f"{data.sat_name} · GridSat-GOES · {gg_chan} · hourly · ~4 km "
+            f"· {time_str} UTC")
+    elif is_mergir:
         sensor_label = "merged geostationary IR"
         center_title = (
             f"NASA MergIR · 11 µm IR window · 30-min · ~4 km · {time_str} UTC")
@@ -609,6 +736,7 @@ def render_png(
     # right-aligned product label so the two corners balance visually.
     # Translucent dark backing rect keeps it legible over hot pixels.
     source_label = ("NASA" if is_mergir
+                    else "NOAA NCEI" if is_gg
                     else "NOAA CDR" if is_gridsat
                     else "JMA" if data.bucket.startswith("noaa-himawari")
                     else "NOAA")
@@ -648,13 +776,83 @@ def _erode1(mask: np.ndarray) -> np.ndarray:
     """Erode a boolean mask by one 4-connected cell (True = keep). A kept cell
     that touches a dropped cell in any of the 4 directions is itself dropped --
     so the surviving cells never border the off-disk fill region (see
-    render_backdrop_webp). Pure numpy (no scipy)."""
+    _guard_mesh_coords). Pure numpy (no scipy)."""
     e = mask.copy()
     e[1:, :] &= mask[:-1, :]
     e[:-1, :] &= mask[1:, :]
     e[:, 1:] &= mask[:, :-1]
     e[:, :-1] &= mask[:, 1:]
     return e
+
+
+def _regular_grid_axes(lons, lats):
+    """(lon1, lat1) 1-D center axes when the 2-D coord arrays are a UNIFORM,
+    SEPARABLE lat/lon meshgrid — else None.
+
+    The archive tiers (GridSat-B1 0.07°, GridSat-GOES 0.04°, MergIR ~0.036°)
+    and GOES fetch_regular all build their 2-D coords as np.meshgrid of
+    uniform 1-D axes; the render fast path (imshow) is exact only for that
+    shape. Full-array separability checks (every lons row identical, every
+    lats column identical) cost ~ms on a 5M-cell grid — cheap insurance that
+    a curvilinear geos grid (which varies per row/column by construction)
+    can NEVER slip through. Uniform-step tolerance absorbs float32 coord
+    wobble (~1e-5°) while rejecting real curvature (degrees). Masked
+    geolocation = limb handling = never regular. Ascending lons only (the
+    crop functions emit ascending, antimeridian-unwrapped axes; unwrapped
+    >180 grids are handled by the caller's `crossing` gate)."""
+    if getattr(lons, "ndim", 0) != 2 or getattr(lats, "ndim", 0) != 2:
+        return None
+    if lons.shape != lats.shape or lons.shape[0] < 2 or lons.shape[1] < 2:
+        return None
+    if isinstance(lons, np.ma.MaskedArray) or isinstance(lats, np.ma.MaskedArray):
+        return None
+    lon1 = np.asarray(lons[0], dtype=np.float64)
+    lat1 = np.asarray(lats[:, 0], dtype=np.float64)
+    if not (np.isfinite(lon1).all() and np.isfinite(lat1).all()):
+        return None
+    if not ((lons == lons[0]).all() and (lats == lats[:, :1]).all()):
+        return None
+    dlon = np.diff(lon1)
+    dlat = np.diff(lat1)
+    if not (dlon > 0).all():
+        return None
+    if not ((dlat > 0).all() or (dlat < 0).all()):
+        return None
+    tol = 1e-3
+    if (dlon.max() - dlon.min()) > tol or (np.abs(dlat).max() - np.abs(dlat).min()) > tol:
+        return None
+    return lon1, lat1
+
+
+def _guard_mesh_coords(lons, lats, plot_field):
+    """Make (lons, lats, plot_field) safe for pcolormesh when the geolocation
+    carries masked / non-finite cells.
+
+    Geostationary lat/lon grids carry NaN at the OFF-DISK limb (and early-era
+    ABI sectors -- e.g. GOES-16 CONUS from the 89.5W checkout slot in 2017 --
+    carry off-earth pixels INSIDE the sector), and pcolormesh REJECTS
+    non-finite values in its x/y (coord) arrays ("x and y arguments ... cannot
+    have non-finite values or be of type numpy.ma.MaskedArray"). Mask the
+    field at those cells (-> transparent), replace the bad coords with a
+    finite in-extent fill so pcolormesh accepts the grid, and erode the valid
+    region by one cell so an on-disk edge cell never stretches a quad out to a
+    filled coord (shading="auto" averages neighbouring centres -> limb streaks
+    otherwise). Coords are coerced to plain NaN-filled float arrays FIRST -- a
+    fetch may hand back MASKED lat/lon, and pcolormesh rejects both masked
+    coords and non-finite values, so np.where alone (which can stay masked) is
+    not enough. Shared by the main scalar render and the backdrop render (one
+    guard, both call sites)."""
+    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
+    lats = np.asarray(np.ma.filled(lats, np.nan), dtype=float)
+    xy_ok = np.isfinite(lons) & np.isfinite(lats)
+    if not xy_ok.all():
+        valid = _erode1(xy_ok & ~np.ma.getmaskarray(plot_field))
+        plot_field = np.ma.masked_array(np.ma.getdata(plot_field), mask=~valid)
+        fill_lon = float(np.nanmean(lons)) if np.isfinite(lons).any() else 0.0
+        fill_lat = float(np.nanmean(lats)) if np.isfinite(lats).any() else 0.0
+        lons = np.where(xy_ok, lons, fill_lon)
+        lats = np.where(xy_ok, lats, fill_lat)
+    return lons, lats, plot_field
 
 
 def render_backdrop_webp(
@@ -720,31 +918,14 @@ def render_backdrop_webp(
             "— bailing so a partial fetch never publishes a near-empty backdrop"
         )
 
-    # Geostationary lat/lon grids carry NaN at the OFF-DISK limb. A storm box is
-    # well inside the disk so this never bites, but a BASIN-scale extent reaches
-    # the limb -- and pcolormesh REJECTS non-finite values in its x/y (coord)
-    # arrays (it raises "x and y arguments ... cannot have non-finite values").
-    # Mask the field at off-disk cells (-> transparent), replace the NaN coords
-    # with a finite in-extent fill so pcolormesh accepts the grid, and erode the
-    # valid region by one cell so an on-disk edge cell never stretches a quad out
-    # to a filled coord (shading="auto" averages neighbouring centres -> limb
-    # streaks otherwise). Without this, every basin backdrop 500s.
-    # Coerce coords to plain NaN-filled float arrays first -- a fetch may hand back
-    # MASKED lat/lon at the limb, and pcolormesh rejects BOTH non-finite values and
-    # masked-array coords, so np.where alone (which can stay masked) is not enough.
-    lons = np.asarray(np.ma.filled(lons, np.nan), dtype=float)
-    lats = np.asarray(np.ma.filled(lats, np.nan), dtype=float)
-    xy_ok = np.isfinite(lons) & np.isfinite(lats)
-    if not xy_ok.all():
-        valid = _erode1(xy_ok & ~np.ma.getmaskarray(plot_field))
-        plot_field = np.ma.masked_array(np.ma.getdata(plot_field), mask=~valid)
-        fill_lon = float(np.nanmean(lons)) if np.isfinite(lons).any() else 0.0
-        fill_lat = float(np.nanmean(lats)) if np.isfinite(lats).any() else 0.0
-        lons = np.where(xy_ok, lons, fill_lon)
-        lats = np.where(xy_ok, lats, fill_lat)
+    # Off-disk / masked geolocation guard -- shared with the main scalar
+    # render (see _guard_mesh_coords; without it every basin backdrop 500s).
+    if bbox[2] < bbox[0]:   # antimeridian-crossing: continuous lons first
+        lons = _unwrap_lons(lons, bbox[0])
+    lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
 
     lon_min, lat_min, lon_max, lat_max = bbox
-    lon_span = lon_max - lon_min
+    proj, extent, lon_span, _crossing = _map_geometry(bbox)
     lat_span = lat_max - lat_min
     aspect = lon_span / max(lat_span, 1e-6)
 
@@ -753,9 +934,9 @@ def render_backdrop_webp(
     fig_w = 10.0
     fig_h = max(2.0, fig_w / max(aspect, 0.2))
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
-    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
+    ax = fig.add_axes([0, 0, 1, 1], projection=proj)
     ax.set_facecolor(DARK_BG)
-    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
     ax.set_aspect("auto")
     ax.axis("off")
     ax.pcolormesh(

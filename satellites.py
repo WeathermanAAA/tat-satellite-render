@@ -120,6 +120,12 @@ async def _to_thread(fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 def _bbox_overlaps(a: list[float], b: tuple[float, float, float, float]) -> bool:
+    # ``a`` may cross the antimeridian (a[2] < a[0], the normalized crossing
+    # convention) — split it at ±180 and test both lobes. ``b`` (a disk /
+    # sector footprint) never crosses.
+    if a[2] < a[0]:
+        return (_bbox_overlaps([a[0], a[1], 180.0, a[3]], b)
+                or _bbox_overlaps([-180.0, a[1], a[2], a[3]], b))
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 def bbox_lon_span(bbox) -> float:
     """Longitudinal width in degrees; lon_max < lon_min is an antimeridian
@@ -130,7 +136,9 @@ def _bbox_inside(inner: list[float], outer: tuple[float, float, float, float], b
     """Wrap-aware containment: either box may cross the antimeridian
     (lon_max < lon_min). Longitudes compare as the inner box's wrapped
     offset east of the outer's west edge; a crossing inner box can never
-    sit inside a non-crossing outer (the offset math rejects it)."""
+    sit inside a non-crossing outer (the offset math rejects it, which is
+    what keeps a dateline storm box from selecting a CONUS/PACUS/meso
+    sector with a no-data wedge)."""
     if inner[1] < outer[1] - buffer or inner[3] > outer[3] + buffer:
         return False
     o_span = (outer[2] - outer[0]) % 360.0
@@ -876,7 +884,10 @@ class GOESBaseSatellite(Satellite):
         # Sample bbox corners + center to get xy span (use a denser grid for
         # safety). Antimeridian crossing (lon_max < lon_min): unwrap the east
         # edge so the sample sweep covers the bbox, not the far side of the
-        # planet — _latlon_to_xy is trig-based, so lons past 180 are fine.
+        # planet — _latlon_to_xy is trig-periodic in (lon - lambda_0), so
+        # unwrapped longitudes project identically to wrapped ones. Matters
+        # for GOES-West, whose disk reaches across ±180 (e.g. a storm box
+        # straddling the dateline near 175°W).
         lon_min, lat_min, lon_max, lat_max = bbox
         lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
         n_sample = 16
@@ -959,6 +970,49 @@ class GOESBaseSatellite(Satellite):
             sub_sat_lon=resolved.sub_sat_lon,
             units=units,
         )
+
+    async def fetch_regular(
+        self, resolved: ResolvedFile, bbox: list[float], generic_channel: str
+    ) -> FetchResult:
+        """One band on a REGULAR lat/lon grid over the bbox (the truecolor
+        target-grid pattern applied to a single band): forward-project the
+        regular mesh to scan angles and bilinear-sample the geos crop. This
+        is the format=btpng path for the NATIVE ABI era — the frontend's
+        objfix / Hovmöller / DAV decoder assumes a bbox-regular grid, which
+        the plain fetch (curvilinear geos mesh) is not."""
+        return await _to_thread(self._fetch_regular_sync, resolved, bbox, generic_channel)
+
+    def _fetch_regular_sync(self, resolved, bbox, generic_channel) -> FetchResult:
+        ds, tmp_dir = self.open(resolved)
+        try:
+            cmi, x_sub, y_sub, lon_origin, H, r_eq, r_pol = self._crop_to_bbox(ds, bbox)
+            units = ds["CMI"].attrs.get("units", "")
+        finally:
+            ds.close()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        H_pix, W_pix = cmi.shape
+        lon_min, lat_min, lon_max, lat_max = bbox
+        lon_max_uw = lon_max + 360.0 if lon_max < lon_min else lon_max
+        tgt_lons = ((np.linspace(lon_min, lon_max_uw, W_pix) + 180.0) % 360.0) - 180.0
+        tgt_lats = np.linspace(lat_max, lat_min, H_pix)   # row 0 = north
+        TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+        TX, TY = _latlon_to_xy(TLAT, TLON, lon_origin, H, r_eq, r_pol)
+        grid = _sample_geos(cmi, x_sub, y_sub, TX, TY)
+        return FetchResult(
+            cmi=grid,
+            lats=TLAT.astype(np.float32),
+            lons=TLON.astype(np.float32),
+            channel=self.generic_to_band[generic_channel],
+            generic_channel=generic_channel,
+            scan_start=resolved.scan_start,
+            product=resolved.product,
+            bucket=resolved.bucket,
+            sat_name=resolved.sat_name,
+            sub_sat_lon=resolved.sub_sat_lon,
+            units=units,
+        )
+
+
 class GOESEastSatellite(GOESBaseSatellite):
     """GOES-East satellite (sub-sat -75.2°W).
     Resolves to GOES-19 for time >= 2025-04-04; GOES-16 otherwise. The

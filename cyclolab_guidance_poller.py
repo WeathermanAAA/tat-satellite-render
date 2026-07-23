@@ -56,6 +56,13 @@ ADECK_BASE = "https://ftp.nhc.noaa.gov/atcf/aid_public"
 # chain serves btk only). Plain .dat (not gzipped); fetch_adeck handles both.
 ADECK_WP_BASE = "https://hurricanes.ral.ucar.edu/repository/data/adecks_open"
 SHIPS_BASE = "https://ftp.nhc.noaa.gov/atcf/stext"
+# ensemble-centers tracks feeds (the site's own public product) joined into
+# guidance.json per storm - one shared data product for every consumer
+ENS_TRACKS_BASE = _env("ENS_TRACKS_BASE",
+                       "https://cdn.triple-a-tropics.com/models/enscenters")
+ENS_MODELS = [x.strip() for x in
+              (_env("GUIDANCE_ENS_MODELS", "ecens,gefs") or "").split(",")
+              if x.strip()]
 CACHE_CONTROL = "public, max-age=120"
 UA = {"User-Agent": "triple-a-tropics-cyclolab-guidance/1.0 (+triple-a-tropics.com)"}
 _TIMEOUT = 25.0
@@ -105,9 +112,65 @@ def discover_entities(feed: dict) -> List[str]:
     return out
 
 
+def entity_positions(feed: dict) -> Dict[str, Tuple[float, float]]:
+    """sid -> (lat, lon) current position from the same active markers."""
+    out: Dict[str, Tuple[float, float]] = {}
+    for f in (feed or {}).get("features", []):
+        pr = f.get("properties", {})
+        if pr.get("kind") != "active_marker":
+            continue
+        sid = pr.get("storm_id") or pr.get("sid")
+        g = (f.get("geometry") or {}).get("coordinates")
+        if sid and g and len(g) >= 2:
+            try:
+                out[sid] = (float(g[1]), float(g[0]))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 # --------------------------------------------------------------------------
 # Fetch
 # --------------------------------------------------------------------------
+_ENS_CACHE: Dict[str, Tuple[str, str, dict]] = {}   # slug -> (cycle, version, doc)
+
+
+def fetch_ens_docs(session: requests.Session) -> List[dict]:
+    """Latest tracks document per configured ensemble system, cached by
+    (cycle, cycle_version) so steady-state polls cost one manifest GET. Any
+    failure returns what we have - ensemble absence never blocks guidance."""
+    docs: List[dict] = []
+    if not ENS_MODELS:
+        return docs
+    try:
+        man = session.get(f"{ENS_TRACKS_BASE}/manifest.json",
+                          headers=UA, timeout=_TIMEOUT).json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("guidance ens: manifest fetch failed (%s)", e)
+        return [c[2] for c in _ENS_CACHE.values()]
+    by_slug = {m.get("slug"): m for m in (man or {}).get("models", [])}
+    for slug in ENS_MODELS:
+        m = by_slug.get(slug)
+        if not m or not m.get("latest"):
+            continue
+        cycle = m["latest"]
+        ver = str((m.get("cycle_versions") or {}).get(cycle, ""))
+        hit = _ENS_CACHE.get(slug)
+        if hit and hit[0] == cycle and hit[1] == ver:
+            docs.append(hit[2])
+            continue
+        try:
+            doc = session.get(f"{ENS_TRACKS_BASE}/{slug}/{cycle}.tracks.json",
+                              headers=UA, timeout=_TIMEOUT).json()
+            _ENS_CACHE[slug] = (cycle, ver, doc)
+            docs.append(doc)
+        except Exception as e:  # noqa: BLE001
+            log.warning("guidance ens: %s %s fetch failed (%s)", slug, cycle, e)
+            if hit:
+                docs.append(hit[2])
+    return docs
+
+
 def adeck_url(basin: str, nn: str, year: str) -> str:
     # WPAC: DTC open mirror, plain .dat (awp{nn}{year}.dat). NHC: aid_public, gzipped.
     if basin.upper() in JTWC_BASINS:
@@ -216,7 +279,9 @@ def _qc_guidance(g: dict) -> List[str]:
 
 def process_entity(sid: str, session: requests.Session,
                    put_json: Callable[[str, dict], bool],
-                   formation_map: Optional[Dict[str, dict]] = None) -> dict:
+                   formation_map: Optional[Dict[str, dict]] = None,
+                   ens_docs: Optional[List[dict]] = None,
+                   pos: Optional[Tuple[float, float]] = None) -> dict:
     """Fetch + parse + write one entity's guidance.json + ships.json (+ for an
     invest, formation.json from the pre-parsed TWO map). Returns a per-entity
     status dict (for the heartbeat). Raises nothing the caller must catch beyond
@@ -258,6 +323,22 @@ def process_entity(sid: str, session: requests.Session,
                          "present_aids": [], "track_aids": [],
                          "intensity_aids": [], "consensus": [],
                          "stale_skipped": status["guidance_stale"]})
+    # ensemble member tracks (EPS/GEFS) joined per storm - same document,
+    # every consumer. Skipped for a stale/nulled cycle (no position match on
+    # a recycled invest number's old system) and on any per-model failure.
+    if ens_docs and pos and guidance.get("init_cycle"):
+        ens_models = []
+        for docm in ens_docs:
+            try:
+                hit = cg.match_ens_tracks(docm, pos[0], pos[1])
+                if hit:
+                    ens_models.append(hit)
+            except Exception as e:  # noqa: BLE001
+                status["warns"].append(f"ens {docm.get('model')}: {e}")
+        if ens_models:
+            guidance["ens"] = {"models": ens_models}
+            status["ens_models"] = [f"{h['model']}:{h['n_matched']}"
+                                    for h in ens_models]
     status["warns"] = _qc_guidance(guidance)
     status["guidance"] = put_json(f"{R2_PREFIX}/{sid}/guidance.json", guidance)
     status["init"] = guidance.get("init_cycle")
@@ -305,10 +386,14 @@ def run_once(session: requests.Session, put_json: Callable[[str, dict], bool],
               if sid_parts(s) and int(sid_parts(s)[1]) >= 90
               and sid_parts(s)[0] in NHC_BASINS}:   # WP has no NHC TWO
         formation_map.update(fetch_two(session, b, year))
+    positions = entity_positions(feed)
+    ens_docs = fetch_ens_docs(session)
     statuses: List[dict] = []
     for sid in sids:
         try:
-            statuses.append(process_entity(sid, session, put_json, formation_map))
+            statuses.append(process_entity(sid, session, put_json, formation_map,
+                                           ens_docs=ens_docs,
+                                           pos=positions.get(sid)))
         except Exception as e:  # noqa: BLE001 - PER-ENTITY isolation
             log.warning("guidance: entity %s FAILED (isolated): %s", sid, e)
             statuses.append({"sid": sid, "ok": False, "reason": f"exception: {e}"})

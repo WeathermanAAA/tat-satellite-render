@@ -1,0 +1,35 @@
+# Dockerfile.render -- ONE image for the ex-Railway main-branch services:
+# the FastAPI /render+/export web service and the floater / intensity /
+# guidance / ens-watchdog workers (docker-compose.render.yml picks the
+# command per service). Mirrors Dockerfile.meso (the proven box base) plus
+# ffmpeg, which Railway's nixpacks installed for /export but the meso image
+# never needed -- without it POST /export 503s.
+#
+# NOTE (palette pin): requirements.txt installs tat-palettes in a CACHED pip
+# layer -- the same Docker-layer trap as the meso stack: a palette change
+# needs the requirements pin bumped (or a --no-cache build) to reach this
+# image.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# git: the git+https tat-palettes/ace-core pins; gcc/g++/pkg-config: native
+# wheels fallback; curl: compose healthchecks; ffmpeg: /export mp4+gif.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git gcc g++ pkg-config curl ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt \
+    && pip install "boto3>=1.34" "requests>=2.31"
+
+# pre-warm pyspectral's Rayleigh LUTs so first truecolor render doesn't
+# stall on a download (non-fatal offline)
+RUN python -c "from pyspectral.rayleigh import check_and_download; check_and_download()" || true
+
+COPY . .
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

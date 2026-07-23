@@ -44,6 +44,7 @@ from poller_framework import process_mem_mb
 from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
 import gridsat
+import gridsat_goes
 import mergir
 from satellites import (
     ALL_SATELLITES,
@@ -102,6 +103,10 @@ RATE_LIMIT = os.getenv("RATE_LIMIT", "10/minute")
 RATE_LIMIT_EXEMPT_INTERNAL = os.getenv(
     "RATE_LIMIT_EXEMPT_INTERNAL", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
+# Optional archive pacing hint surfaced as X-Archive-Pace-Ms (see _response);
+# raise RATE_LIMIT in lockstep when setting it or clients just trade pacing
+# sleep for 429 backoff.
+TM_PACE_MS_HINT = os.getenv("TM_PACE_MS_HINT", "").strip()
 LATEST_CACHE_TTL = float(os.getenv("LATEST_CACHE_TTL", "300"))  # 5 min
 # format=webp loop frames: the 1320 px render Lanczos-downscaled to this width
 # (1056 = the 525 CSS px player box at 2x Retina, and exactly 0.8 x 1320) and
@@ -215,9 +220,11 @@ def compute_downsample_factor(bbox: list[float], channel, budget: int = PIXEL_BU
     tiers pass a smaller budget (QUALITY_BUDGETS) to cap the output dimension.
     """
     # Wrapped span: lon_max < lon_min is a valid antimeridian crossing
-    # (e.g. a GOES-18 meso sector steered over the Bering Sea). A zero
-    # remainder is the legal full-width [-180, 180] box (the validator
-    # rejects the zero-span [180, -180] form).
+    # (e.g. a GOES-18 meso sector steered over the Bering Sea); a normal
+    # bbox's positive span passes through % 360 unchanged. `or 360.0`: the
+    # legal full-width [-180, 180] box lands exactly on 0 here and would
+    # otherwise dodge the pixel budget entirely (unstrided full disk); the
+    # validator rejects the zero-span [180, -180] form.
     lon_w_deg = (bbox[2] - bbox[0]) % 360.0 or 360.0
     lat_h_deg = bbox[3] - bbox[1]
     km_per_px = _native_km_per_pixel(channel)
@@ -306,11 +313,64 @@ def normalize_channel(raw) -> tuple[str, bool]:
 # (the meso poller was being 429'd by its OWN loopback render service,
 # which throttled every band to a crawl).
 # ---------------------------------------------------------------------------
+# Trusted-internal callers (the co-located poller fleet on the compose network,
+# or the GH stopgap's localhost uvicorn) get RATE_LIMIT_INTERNAL instead of the
+# public RATE_LIMIT. Without this the pollers share the public 10/min budget
+# and the 16-region basin-backdrop sweep starves its own tail (observed on the
+# box: "basin backdrop wpac failed: 429 rate limited" — wpac is region #11 in
+# the sweep, right past the 10-req window).
+# Trust rule: NO X-Forwarded-For header AND a loopback/private peer address.
+# The public path always traverses caddy, which appends XFF — an external
+# client cannot reach this branch by spoofing (a forged XFF still carries the
+# header, so the request takes the public limit on its claimed first hop).
+RATE_LIMIT_INTERNAL = os.getenv("RATE_LIMIT_INTERNAL", "600/minute")
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private  # loopback counts as private
+    except ValueError:
+        return False
+
+
+def _is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _peer_ip(request: Request) -> str:
+    """Socket peer address (slowapi's get_remote_address equivalent — this
+    branch dropped the slowapi dependency)."""
+    return request.client.host if request.client else "127.0.0.1"
+
+
 def real_ip(request: Request) -> str:
+    """Rate-limit key. The ``internal|`` prefix is minted ONLY here, on the
+    no-XFF + private-peer branch — any request carrying X-Forwarded-For takes
+    a PUBLIC key. XFF content is attacker text, so the first hop is used only
+    when it parses as an IP address; a non-IP first hop (including a forged
+    "internal|..." — the injection an adversarial review demonstrated against
+    the naive split) falls back to the last hop caddy appended (which the
+    client cannot control) and then to the socket peer. Neither fallback can
+    reach the internal branch."""
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+        hops = [h.strip() for h in xff.split(",")]
+        for hop in (hops[0], hops[-1]):
+            if _is_ip(hop):
+                return hop
+        return _peer_ip(request)
+    ip = _peer_ip(request)
+    if _is_private_ip(ip):
+        return f"internal|{ip}"
+    return ip
+# (main's slowapi rate_limit_for tier is subsumed here: this branch replaced
+# slowapi with SlidingWindowLimiter, and direct internal pollers bypass the
+# window entirely via is_internal_request; internal|-keyed private peers get
+# their own window bucket at the standard limit.)
 
 
 def _parse_rate(limit: str) -> tuple[int, float]:
@@ -426,6 +486,7 @@ app.add_middleware(
         "X-Generic-Channel",
         "X-Native-Band",
         "X-Deprecated-Channel-API",
+        "X-Archive-Pace-Ms",
     ],
     allow_credentials=False,
 )
@@ -505,21 +566,44 @@ class RenderRequest(BaseModel):
         # handles oversized bboxes by auto-downsampling rather than rejecting.
         # Disk-overlap check moved to pick_satellite() — out-of-coverage bboxes
         # surface as a 422 CoverageError that names the missing region/satellite.
+        #
+        # ANTIMERIDIAN: two dateline-crossing input forms are accepted and both
+        # normalize to the ONE internal convention (lon_max < lon_min, both in
+        # [-180, 180] — the convention satellites.py already speaks):
+        #   * unwrapped   [140, -35, 200, 5]   (E > 180; the basin-backdrop /
+        #     widen_bbox_to_view form — "E=200 = 160°W")      -> [140, -35, -160, 5]
+        #   * pre-wrapped [172, -6, -176, 6]   (the poller's norm_lon storm box)
+        # Every downstream consumer (pick_satellite, geos crops, render extents,
+        # downsample budget) is crossing-aware; true color is gated at the
+        # endpoint (regular-grid composite doesn't cross yet).
         lon_min, lat_min, lon_max, lat_max = v
-        # lon_max < lon_min is a VALID antimeridian crossing (e < w
-        # convention — same one the meso poller, floater frontend, and the
-        # satellite picker already speak). Each edge must still be a real
-        # longitude, and a zero-width box is degenerate — including the
-        # [180, -180] form, whose edges are the same meridian even though
-        # the floats differ ([-180, 180] is the legal full-width box).
-        if not (-180 <= lon_min <= 180 and -180 <= lon_max <= 180
-                and lon_min != lon_max):
+        if not (-360 <= lon_min <= 360 and -360 <= lon_max <= 360):
             raise ValueError("invalid longitude range")
-        if lon_min > lon_max and (lon_max - lon_min) % 360.0 == 0.0:
+        # Edge-preserving wrap into [-180, 180], applied ONLY to out-of-range
+        # edges: in-range longitudes pass through byte-identical (float mod
+        # perturbs fractional values, which would churn every existing cache
+        # key), and today's legal exact-dateline boxes ([100, 0, 180, 45])
+        # stay NON-crossing instead of flipping convention.
+        if not -180.0 <= lon_min <= 180.0:
+            lon_min = ((lon_min + 180.0) % 360.0) - 180.0
+        if not -180.0 <= lon_max <= 180.0:
+            lon_max = ((lon_max + 180.0) % 360.0) - 180.0
+        if lon_max == -180.0:
+            # An east edge of exactly -180 always means the dateline itself:
+            # prefer the +180 (non-crossing) form, wrapped or not.
+            lon_max = 180.0
+        if lon_min == lon_max:
             raise ValueError("invalid longitude range")
+        if lon_max < lon_min and (lon_max - lon_min) % 360.0 > 180.0:
+            # No real storm box or basin backdrop crosses the dateline with
+            # more than half the globe; a >180-deg "crossing" box is almost
+            # certainly reversed west/east edges, which used to 422 loudly.
+            raise ValueError(
+                "antimeridian-crossing bbox spans more than 180 degrees of "
+                "longitude (reversed west/east edges?)")
         if not (-90 <= lat_min < lat_max <= 90):
             raise ValueError("invalid latitude range")
-        return v
+        return [lon_min, lat_min, lon_max, lat_max]
 
     @field_validator("channel")
     @classmethod
@@ -657,6 +741,16 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # deprecation header on the response when numeric was used.
     generic_channel, channel_was_numeric = normalize_channel(body.channel)
     is_true_color = generic_channel == "true_color"
+    # True color composes onto a REGULAR lat/lon grid built with plain
+    # linspace(lon_min, lon_max) in every family and renders via imshow —
+    # neither leg is antimeridian-aware yet. Refuse crossing bboxes honestly
+    # (422 -> the poller's RenderSkip path) instead of composing a wrong grid.
+    if is_true_color and body.bbox[2] < body.bbox[0]:
+        raise HTTPException(
+            status_code=422,
+            detail="true color across the antimeridian is not supported yet; "
+                   "use a scalar channel or split the bbox at 180",
+        )
 
     # Pixel-budget downsample is deterministic from bbox+channel so the
     # cache key (already keyed on bbox+channel) implicitly covers it. We
@@ -687,38 +781,45 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # ADDITIVE: pre-2017 dates previously 502'd; every "latest" / 2017+
     # request takes the unchanged native path below.
     use_archive = (not is_latest) and parsed_time < gridsat.ABI_CUTOVER
-    use_mergir = (use_archive and parsed_time >= mergir.MERGIR_START
-                  and generic_channel in mergir.MergIRSatellite.generic_to_band
-                  and mergir.have_credentials())
-    use_gridsat = use_archive and not use_mergir
-    if use_mergir:
-        satellite: Satellite = mergir.MERGIR
-        downsample = 1                 # ~4 km native — never stride the archive
-    elif use_gridsat:
-        if generic_channel not in gridsat.GridSatB1Satellite.generic_to_band:
+    archive_tiers: list = []
+    if use_archive:
+        # ordered best-first; each tier claims the render only if it can
+        # actually resolve a covering file — resolve failures fall THROUGH so
+        # the burned-in header always names the record that truly drew it.
+        if (gridsat_goes.GG_START <= parsed_time < gridsat_goes.GG_END
+                and generic_channel in gridsat_goes.GridSatGoesSatellite.generic_to_band):
+            archive_tiers.append(gridsat_goes.GRIDSAT_GOES)
+        if (parsed_time >= mergir.MERGIR_START
+                and generic_channel in mergir.MergIRSatellite.generic_to_band
+                and mergir.have_credentials()):
+            archive_tiers.append(mergir.MERGIR)
+        if generic_channel in gridsat.GridSatB1Satellite.generic_to_band:
+            archive_tiers.append(gridsat.GRIDSAT)
+        if not archive_tiers:
             raise HTTPException(
                 status_code=422,
-                detail="multi-band fields are not available before 2017 — the "
-                       "deep archive (GridSat-B1) is a single-channel record: "
-                       "use the 11 µm IR window (clean_ir) or 6.7 µm water "
-                       "vapor (wv_upper)")
-        satellite = gridsat.GRIDSAT
-        # ~8 km native — the archive is already far below the pixel budget;
-        # never stride it further
-        downsample = 1
-    else:
+                detail="that field is not available for this archive date — "
+                       "the deep tiers carry visible / 3.9 µm / 6.5-6.7 µm WV "
+                       "/ 11 µm IR (GridSat-GOES 1994-2017) and 11 µm IR + WV "
+                       "(GridSat-B1, 1980+)")
+        downsample = 1                 # archives are already ≤ native budget
+    if not use_archive:
         try:
             satellite = pick_satellite(
                 body.bbox, parsed_time, family_hint=body.satellite
             )
         except (CoverageError, UnsupportedTimeError) as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-    if body.format == "btpng" and not (use_gridsat or use_mergir):
-        raise HTTPException(
-            status_code=422,
-            detail="format=btpng (calibrated-BT raster) is currently served "
-                   "for the archive tiers (GridSat-B1 / MergIR) only — the "
-                   "live suites publish per-frame bt.png beside their tiles")
+    if body.format == "btpng" and not use_archive:
+        # NATIVE era: served where the family regrids to a bbox-regular grid
+        # (GOES fetch_regular; the frontend btpng decoder assumes regularity)
+        if is_true_color or not hasattr(satellite, "fetch_regular"):
+            raise HTTPException(
+                status_code=422,
+                detail="format=btpng (calibrated-BT raster) is served for the "
+                       "archive tiers and single-band GOES native fetches — "
+                       "not RGB composites"
+                )
 
     # Resolve which file we'll use; this gives us the snapped scan time which
     # is part of the cache key. For "latest" we don't snap to file precision
@@ -728,14 +829,34 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # RGB bands); the composite fetch reuses that resolved file.
     nearest_to_target = not is_latest
     resolve_channel = "visible_red" if is_true_color else generic_channel
-    try:
-        resolved = await satellite.find_file(
-            parsed_time, resolve_channel, body.bbox, nearest_to_target,
-            product_hint=body.product,
-        )
-    except Exception as e:
-        log.exception("resolve failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"could not resolve satellite file: {e}") from e
+    if use_archive:
+        resolved = None
+        tier_errs = []
+        for tier in archive_tiers:
+            try:
+                resolved = await tier.find_file(
+                    parsed_time, resolve_channel, body.bbox, nearest_to_target)
+                satellite = tier
+                break
+            except Exception as e:  # noqa: BLE001 — fall through, keep reason
+                tier_errs.append(f"{tier.family}: {e}")
+                log.info("archive tier %s passed: %s", tier.family, e)
+        if resolved is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no archive record covers this box/time — "
+                       + " | ".join(tier_errs)[:400])
+    else:
+        try:
+            # product_hint: the native GOES path can pin a specific L2 product
+            # (box-side addition); the archive tiers have no such notion.
+            resolved = await satellite.find_file(
+                parsed_time, resolve_channel, body.bbox, nearest_to_target,
+                product_hint=body.product,
+            )
+        except Exception as e:
+            log.exception("resolve failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"could not resolve satellite file: {e}") from e
 
     if is_latest:
         bucket_id = int(time.time() // LATEST_CACHE_TTL)
@@ -772,6 +893,15 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
+        # Archive pacing hint: the Time Machine client paces its window fill
+        # to the PUBLIC rate limit (6.5 s default, sized to 10/min). With the
+        # regular-grid imshow fast path the per-frame cost dropped ~3x, so
+        # the box can advertise a faster pace WITHOUT a frontend redeploy:
+        # set TM_PACE_MS_HINT (e.g. 3200) together with a matching RATE_LIMIT
+        # raise (e.g. 20/minute) and clients speed up on their next frame.
+        # Absent env -> no header -> clients keep their built-in default.
+        if use_archive and TM_PACE_MS_HINT:
+            headers["X-Archive-Pace-Ms"] = TM_PACE_MS_HINT
         media_type = ("image/webp" if (out_format == "webp" or body.backdrop)
                       else "image/png")
         return Response(content=content, media_type=media_type, headers=headers)
@@ -799,6 +929,12 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 # the fetch -- byte-identical to striding after, but far cheaper
                 # (what makes low fast). render_png must then NOT stride again.
                 data = await satellite.fetch_true_color(body.bbox, resolved, downsample)
+                render_downsample = 1
+            elif body.format == "btpng" and hasattr(satellite, "fetch_regular"):
+                # native-era btpng: regular-grid single band (the archive
+                # tiers have no fetch_regular — their grids are already
+                # regular and take the plain fetch below)
+                data = await satellite.fetch_regular(resolved, body.bbox, generic_channel)
                 render_downsample = 1
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)

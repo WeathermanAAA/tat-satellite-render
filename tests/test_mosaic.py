@@ -106,5 +106,78 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(mosaic.LAT_LIM, 65.0)
 
 
+# --- bounded disk fetch (2026-07-12 box poller stall regression) -------------
+# The old ProcessPoolExecutor shape LOOKED bounded (future.result(timeout=...))
+# but the with-block exit ran shutdown(wait=True) and blocked the poller loop
+# forever behind a hung child. These tests prove the replacement actually
+# returns on a wedged child (kill, not wait) and still round-trips results.
+# The child functions live at module scope so the SPAWNED process can import
+# them by reference.
+
+def _hang_child(sat_idx, when, out_q):  # pragma: no cover - runs in a child
+    import time as _t
+    _t.sleep(120)
+
+
+def _ok_child(sat_idx, when, out_q):  # pragma: no cover - runs in a child
+    out_q.put(("grids-for", sat_idx))
+
+
+def _crash_child(sat_idx, when, out_q):  # pragma: no cover - runs in a child
+    raise SystemExit(3)   # dies without ever feeding the queue
+
+
+def _grids_child(sat_idx, when, out_q):  # pragma: no cover - runs in a child
+    import numpy as _np
+    import mosaic as _m
+    shape = (_m.TARGET_H, _m.TARGET_W)
+    out_q.put(tuple(_np.full(shape, float(i)) for i in range(4)))
+
+
+class TestBoundedDiskFetch(unittest.TestCase):
+    def test_hung_child_is_killed_not_waited(self):
+        import time
+        from unittest import mock
+        with mock.patch.object(mosaic, "_disk_grids_child", _hang_child), \
+             mock.patch.object(mosaic, "PER_DISK_TIMEOUT_S", 3.0):
+            t0 = time.monotonic()
+            out = mosaic._disk_grids_bounded(0, dt.datetime(2026, 1, 1))
+            took = time.monotonic() - t0
+        self.assertIsNone(out)
+        # timeout (3 s) + spawn/import overhead + join(10) at most - anywhere
+        # near the child's 120 s sleep means we waited on the hang again
+        self.assertLess(took, 45.0)
+
+    def test_child_result_round_trips(self):
+        from unittest import mock
+        with mock.patch.object(mosaic, "_disk_grids_child", _ok_child), \
+             mock.patch.object(mosaic, "PER_DISK_TIMEOUT_S", 60.0):
+            out = mosaic._disk_grids_bounded(2, dt.datetime(2026, 1, 1))
+        self.assertEqual(out, ("grids-for", 2))
+
+    def test_production_size_payload_round_trips(self):
+        # the real result is 4 float64 grids (~37 MB total) - prove the queue
+        # path ships that, not just a token tuple
+        from unittest import mock
+        with mock.patch.object(mosaic, "_disk_grids_child", _grids_child), \
+             mock.patch.object(mosaic, "PER_DISK_TIMEOUT_S", 60.0):
+            out = mosaic._disk_grids_bounded(0, dt.datetime(2026, 1, 1))
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[0].shape, (mosaic.TARGET_H, mosaic.TARGET_W))
+        self.assertTrue((out[3] == 3.0).all())
+
+    def test_crashed_child_returns_fast_not_full_budget(self):
+        import time
+        from unittest import mock
+        with mock.patch.object(mosaic, "_disk_grids_child", _crash_child), \
+             mock.patch.object(mosaic, "PER_DISK_TIMEOUT_S", 120.0):
+            t0 = time.monotonic()
+            out = mosaic._disk_grids_bounded(1, dt.datetime(2026, 1, 1))
+            took = time.monotonic() - t0
+        self.assertIsNone(out)
+        self.assertLess(took, 30.0)   # noticed via is_alive, not the 120 s cap
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -154,38 +154,43 @@ def fetch_live_bdecks(session: requests.Session, basin_cfg: dict, year: int,
     """Fetch + parse the current-season named b-decks via the proxy chain. Same
     chain + same parser (ace_core.parse_bdeck) as the main-repo generators, so a
     named storm yields the IDENTICAL canonical track. Returns a (possibly empty)
-    live frame; stops after 3 consecutive missing storm numbers."""
-    patterns = basin_cfg["atcf_patterns"]
+    live frame; stops after 3 consecutive missing storm numbers (per deck-
+    prefix chain — EP's base also carries the CPHC bcp chain in
+    atcf_patterns_extra, so designated Central Pacific systems are swept
+    too; ace_core >=0.8.3's parse_bdeck keys their SIDs off the deck rows'
+    own basin field, NHC_CP##<year>)."""
     yy = year % 100
     frames = []
-    misses = 0
-    for nn in range(1, max_storm_num + 1):
-        text = None
-        for pat in patterns:
-            url = pat.format(nn=f"{nn:02d}", yy=f"{yy:02d}", year=year)
-            try:
-                t = _get_text(session, url, policy)
-            except (pf.TransientFetchError, pf.PermanentFetchError,
-                    requests.exceptions.RequestException) as e:
-                # A single bad mirror (SSL/connection/timeout/HTTP error) must
-                # NEVER crash the whole basin fetch and discard storms already
-                # collected this pass - that is what lost EP01 tonight when the
-                # WP-only natyphoon mirror SSL-failed (TLSV1_UNRECOGNIZED_NAME)
-                # in the AL/EP chain. resilient_fetch already retried this mirror
-                # per policy; fall through to the NEXT mirror in the chain.
-                log.debug("b-deck mirror failed (%s): %s -- trying next mirror",
-                          url, type(e).__name__)
-                continue            # try the next mirror in the chain
-            if t and "BEST" in t:
-                text = t
-                break
-        if text is not None:
-            frames.append(ac.parse_bdeck(text, year, basin_cfg))
-            misses = 0
-        else:
-            misses += 1
-            if misses >= 3:
-                break
+    for patterns in ([basin_cfg["atcf_patterns"]]
+                     + list(basin_cfg.get("atcf_patterns_extra") or [])):
+        misses = 0
+        for nn in range(1, max_storm_num + 1):
+            text = None
+            for pat in patterns:
+                url = pat.format(nn=f"{nn:02d}", yy=f"{yy:02d}", year=year)
+                try:
+                    t = _get_text(session, url, policy)
+                except (pf.TransientFetchError, pf.PermanentFetchError,
+                        requests.exceptions.RequestException) as e:
+                    # A single bad mirror (SSL/connection/timeout/HTTP error) must
+                    # NEVER crash the whole basin fetch and discard storms already
+                    # collected this pass - that is what lost EP01 tonight when the
+                    # WP-only natyphoon mirror SSL-failed (TLSV1_UNRECOGNIZED_NAME)
+                    # in the AL/EP chain. resilient_fetch already retried this mirror
+                    # per policy; fall through to the NEXT mirror in the chain.
+                    log.debug("b-deck mirror failed (%s): %s -- trying next mirror",
+                              url, type(e).__name__)
+                    continue            # try the next mirror in the chain
+                if t and "BEST" in t:
+                    text = t
+                    break
+            if text is not None:
+                frames.append(ac.parse_bdeck(text, year, basin_cfg))
+                misses = 0
+            else:
+                misses += 1
+                if misses >= 3:
+                    break
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -201,8 +206,13 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
     drop the named-storm cards (per-source-guarded)."""
     if not INVESTS_ENABLED:
         return pd.DataFrame()
-    letter = (basin_cfg.get("invest_letter") or "").upper()
-    if not letter:
+    # Accepted ATCF trailing letters: primary invest_letter + any extras (EP
+    # also accepts "C" -- Central Pacific systems share the EP page but ATCF
+    # designates them 90C). Mirror of generate_tracks_plot.fetch_live_invests.
+    letters = {x.strip().upper() for x in
+               (basin_cfg.get("invest_letters")
+                or [basin_cfg.get("invest_letter") or ""]) if x.strip()}
+    if not letters:
         return pd.DataFrame()
     try:
         text = _get_text(session, KNACKWX_ATCF_URL, policy)
@@ -228,7 +238,7 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
         # usable trailing letter. Mirrors generate_tracks_plot.fetch_live_invests.
         id_letter = atcf_id[-1] if atcf_id[-1:].isalpha() else ""
         basin_letter = id_letter or (it.get("origin_basin") or "").strip().upper()
-        if basin_letter != letter:
+        if basin_letter not in letters:
             continue
         try:
             storm_num = int(atcf_id[:-1])
@@ -272,31 +282,40 @@ def fetch_live_invests(session: requests.Session, basin_cfg: dict, year: int,
             nature = "TS" if (pd.notna(vmax) and vmax > 0) else "DS"
         name_raw = (it.get("storm_name") or "").strip()
         name = (name_raw if name_raw and name_raw not in {"INVEST", "NAMELESS", "UNNAMED"}
-                else f"{storm_num}{letter}")
+                else f"{storm_num}{basin_letter}")
         # 92W->07W carry (mirror of the cron). knackwx gives the prior invest as
-        # transitioned_from ("92W"); feed its NUMBER as spawn_invest so ace_core's
-        # number-keyed superseding-invest dedup retires it the cycle the
-        # designation appears. FRAME-COINCIDENT (recycle-safe, stateless): carry
+        # transitioned_from ("92W"); feed its NUMBER + letter as
+        # spawn_invest(_letter) so ace_core's letter-aware superseding-invest
+        # dedup (ace-core-v0.8.3) retires it the cycle the designation appears
+        # without ever touching a same-numbered invest in the other basin
+        # sharing the page. FRAME-COINCIDENT (recycle-safe, stateless): carry
         # only while the SAME payload still lists that 9x invest.
         spawn_invest = None
+        spawn_invest_letter = None
         if is_designated:
             tf = (it.get("transitioned_from") or "").strip().upper()
             mtf = re.fullmatch(r"(\d{1,2})[A-Z]", tf)
             if mtf:
                 tf_num = int(mtf.group(1))
                 tf_letter = tf[-1] if tf[-1:].isalpha() else ""
-                if 90 <= tf_num <= 99 and tf_letter == letter and any(
+                if 90 <= tf_num <= 99 and tf_letter in letters and any(
                     (str((d.get("atcf_id") or "")).strip().upper())
-                        == f"{tf_num:02d}{letter}"
+                        == f"{tf_num:02d}{tf_letter}"
                     for d in data):
                     spawn_invest = tf_num
+                    spawn_invest_letter = tf_letter
+        # SID basin token follows the row's OWN ATCF letter ("C" -> CP) so a
+        # 90C never shares a SID with a simultaneous 90E. Mirror of the cron.
+        sid_basin = {"L": "AL", "E": "EP", "C": "CP", "W": "WP"}.get(
+            basin_letter, basin_cfg["short"].upper())
         rows.append({
-            "SID": f"{basin_cfg['agency_name']}_{basin_cfg['short'].upper()}"
+            "SID": f"{basin_cfg['agency_name']}_{sid_basin}"
                    f"{storm_num:02d}{year}",
             "NAME": name, "season": year, "time": t, "lat": lat, "lon": lon,
             "wind_kt": vmax, "pressure_mb": pres, "nature": nature,
             "source": "live-knackwx-designated" if is_designated else "live-knackwx",
             "storm_num": storm_num, "spawn_invest": spawn_invest,
+            "spawn_invest_letter": spawn_invest_letter,
         })
     return pd.DataFrame(rows)
 
