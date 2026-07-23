@@ -11,6 +11,10 @@
 #     -f docker-compose.s2.conus-fast.yml --profile cron up -d --no-build emit-cron
 services:
   emit-cron:
+    # the c02 native-z7 render (10240 px base) peaks past the stack default
+    # 8g; the spike is transient (~1 min/slot) and the box carries ~10Gi
+    # available. OOM-kill (rc=137) was the z7 blocker after parallel PUTs.
+    mem_limit: 12g
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
