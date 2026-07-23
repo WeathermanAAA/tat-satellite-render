@@ -188,3 +188,13 @@ $P restart floater-poller     # bounce one worker
 $P pull && $P build && $P up -d   # redeploy after a git pull
 $P down                       # stop everything (caddy cert state survives in the volume)
 ```
+
+## Deploy topology discipline (2026-07-23, post-reconciliation)
+
+ONE canonical history: origin/main. The box clone PULLS from main before
+any change and PUSHES its commits BACK to main (rebase-and-push loop, same
+as the TAT repo). No long-lived box-only branches: the 2026-07 three-way
+divergence (box 59 ahead / main 21 ahead / a Codespace orphan) cost a full
+reconciliation session. box-ops, codespace-backfill-backup and the
+prod-pre-reconcile tag stay parked as rollback refs until main has been
+stable a while; do not build new work on them.

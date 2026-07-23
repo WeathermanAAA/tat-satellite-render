@@ -125,3 +125,9 @@ degrade honestly and the wedge stays the labeled transparent gap.
 
 Per-member valid times ride `latest_times.json` as `members[]` — the ~1 h
 Meteosat skew is surfaced, never hidden.
+
+## Deploy topology discipline (2026-07-23)
+
+Same rule as RUNBOOK-RENDER: box clone pulls from AND pushes to
+origin/main only; no long-lived box-only branches. Rebuild images from
+/root/tsr-s2 at main; the compose lane files are canonical on main.
