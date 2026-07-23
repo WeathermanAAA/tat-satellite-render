@@ -514,7 +514,7 @@ def render_png(
         # Masked / non-finite geolocation (off-disk limb; early-era ABI
         # sectors) would raise inside pcolormesh -- same guard as the
         # backdrop path (one guard, both call sites).
-        if crossing:
+        if crosses:
             lons = _unwrap_lons(lons, lon_min)
         lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
         # ---- REGULAR-GRID FAST PATH (Time Machine archive tiers) --------
@@ -532,7 +532,7 @@ def render_png(
         # (axes central_longitude=180 vs a PlateCarree(0) image transform
         # would trigger cartopy's warp -- the same reason the true-color
         # imshow path is 422-gated for crossing).
-        axes1d = None if crossing else _regular_grid_axes(lons, lats)
+        axes1d = None if crosses else _regular_grid_axes(lons, lats)
         if axes1d is not None:
             lon1, lat1 = axes1d
             dlon = (lon1[-1] - lon1[0]) / max(len(lon1) - 1, 1)

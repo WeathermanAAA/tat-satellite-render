@@ -367,10 +367,14 @@ def real_ip(request: Request) -> str:
     if _is_private_ip(ip):
         return f"internal|{ip}"
     return ip
-# (main's slowapi rate_limit_for tier is subsumed here: this branch replaced
-# slowapi with SlidingWindowLimiter, and direct internal pollers bypass the
-# window entirely via is_internal_request; internal|-keyed private peers get
-# their own window bucket at the standard limit.)
+def rate_limit_for(key: str) -> str:
+    """Tier mapping for a rate-limit key: internal|-prefixed keys (direct
+    private/loopback peers, see real_ip) get RATE_LIMIT_INTERNAL. Under the
+    SlidingWindowLimiter architecture direct internal pollers normally bypass
+    the window entirely via is_internal_request; this mapping is the
+    documented contract (and the safety tier if the bypass is disabled via
+    RATE_LIMIT_EXEMPT_INTERNAL=0)."""
+    return RATE_LIMIT_INTERNAL if key.startswith("internal|") else RATE_LIMIT
 
 
 def _parse_rate(limit: str) -> tuple[int, float]:
