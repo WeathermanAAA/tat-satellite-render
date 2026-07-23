@@ -599,7 +599,7 @@ _CONUS_BBOX = (-125.0, 15.0, -66.0, 49.0)   # same bbox as goes19-conus-ir
 # Pyramid long-edge by the recipe's finest native band resolution over the
 # ~59-degree CONUS lon span: 0.5 km ~ 10600 native px, 1 km ~ 5300, 2 km ~ 2650.
 # (0.5 km class capped at the 4800 fetch stride -- see fetch_max_px.)
-_PX_BY_KM = {0.5: 4800, 1.0: 4096, 2.0: 3072}
+_PX_BY_KM = {0.5: 6144, 1.0: 6144, 2.0: 3072}
 
 
 def _recipe_row(r) -> ProductEntry:
@@ -615,7 +615,7 @@ def _recipe_row(r) -> ProductEntry:
         render_product_hint="conus", render_sat_hint="GOES-East",
         cadence_s=300,
         tiled=True, tile_size=512,
-        pyramid_px=_PX_BY_KM[r.finest_km], fetch_max_px=4800,
+        pyramid_px=_PX_BY_KM[r.finest_km], fetch_max_px=6144,
         pyramid_scheme="webmercator-xyz",
         sector_bbox=_CONUS_BBOX,
         recipe_id=r.key,

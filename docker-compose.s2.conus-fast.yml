@@ -5,7 +5,9 @@
 # (S2_PUT_WORKERS). The
 # 2 km-class products (ir/irbd) are NATIVE-BOUND at z5 (source is 2500 px
 # across this box) — deeper tiles would upsample, not sharpen. truecolor
-# renders at the 2 km class by design (Rayleigh cost).
+# (v4, 2026-07-23) cuts NATIVE z7 off the registry 6144 px base + 6144 fetch
+# cap: the C02 red channel is 0.5 km, so zoomed tiles sharpen instead of
+# upsampling; the Rayleigh transient fits the 12g cap.
 # Start:
 #   docker compose -p tat-s2-conus-fast -f docker-compose.s2.yml \
 #     -f docker-compose.s2.conus-fast.yml --profile cron up -d --no-build emit-cron
@@ -18,12 +20,13 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "[s2-fast] conus loop products: ir irbd truecolor (z5) + c02 (z6)"
+        echo "[s2-fast] conus loop products: ir irbd (z5) + truecolor c02 (z7)"
         while true; do
           for prod in ir irbd truecolor c02; do
             case "$$prod" in
-              c02) Z=7; PX="--pyramid-px 10240" ;;
-              *)   Z=5; PX="" ;;
+              c02)       Z=7; PX="--pyramid-px 10240" ;;
+              truecolor) Z=7; PX="" ;;
+              *)         Z=5; PX="" ;;
             esac
             python s2_pyramid_emit.py --product goes19-conus-$$prod \
               --store r2 --prefix shadow --max-zoom $$Z $$PX \
