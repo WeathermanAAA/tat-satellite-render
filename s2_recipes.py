@@ -54,7 +54,15 @@ AHI_BAND_NATIVE_KM = {1: 1.0, 2: 1.0, 3: 0.5, 4: 1.0, 5: 2.0, 6: 2.0,
                       7: 2.0, 8: 2.0, 9: 2.0, 10: 2.0, 11: 2.0, 12: 2.0,
                       13: 2.0, 14: 2.0, 15: 2.0, 16: 2.0}
 AHI_EMISSIVE_BANDS = frozenset(range(7, 17))
-_NATIVE_KM = {"abi": BAND_NATIVE_KM, "ahi": AHI_BAND_NATIVE_KM}
+# GK-2A AMI band numbering mirrors AHI's solar layout (VI004=1 blue, VI005=2
+# NATIVE green, VI006=3 red 0.5 km, VI008=4 veggie NIR) with IR105=13 the
+# clean-IR window -- per the KMA AMI channel table / the noaa-gk2a-pds file
+# naming (vi004/vi005/vi006 fd005ge/vi008/.../ir105 fd020ge).
+AMI_BAND_NATIVE_KM = {1: 1.0, 2: 1.0, 3: 0.5, 4: 1.0, 5: 2.0, 6: 2.0,
+                      7: 2.0, 8: 2.0, 9: 2.0, 10: 2.0, 11: 2.0, 12: 2.0,
+                      13: 2.0, 14: 2.0, 15: 2.0, 16: 2.0}
+_NATIVE_KM = {"abi": BAND_NATIVE_KM, "ahi": AHI_BAND_NATIVE_KM,
+              "ami": AMI_BAND_NATIVE_KM}
 
 # Sandwich blend knobs: out = ir_rgb * (FLOOR + (1-FLOOR) * clip(vis)**GAMMA).
 # The luminance floor keeps the IR enhancement readable where VIS is dark
@@ -108,8 +116,10 @@ class Recipe:
             need.update((self.vis_band, 13))
         elif self.kind == "truecolor":
             # abi: red C02 / blue C01 / veggie C03 (synth green) + clean-IR;
-            # ahi: red B03 / NATIVE green B02 / blue B01 / veggie B04 + clean-IR
-            need.update((1, 2, 3, 4, 13) if self.sensor == "ahi" else (1, 2, 3, 13))
+            # ahi/ami: red 3 / NATIVE green 2 / blue 1 / veggie 4 + clean-IR
+            # (AMI numbering mirrors AHI: VI004/VI005/VI006/VI008 + IR105)
+            need.update((1, 2, 3, 4, 13) if self.sensor in ("ahi", "ami")
+                        else (1, 2, 3, 13))
         if self.bt_band:
             need.add(self.bt_band)
         return tuple(sorted(need))
@@ -117,7 +127,7 @@ class Recipe:
     @property
     def vis_band(self) -> int:
         """The 'red visible' band for VIS-luminance blends (sandwich)."""
-        return 3 if self.sensor == "ahi" else 2
+        return 3 if self.sensor in ("ahi", "ami") else 2
 
     @property
     def finest_km(self) -> float:
@@ -436,8 +446,40 @@ AHI_RECIPES: tuple[Recipe, ...] = (
 )
 
 AHI_RECIPES_BY_KEY = {r.key: r for r in AHI_RECIPES}
-_TABLES = {"abi": RECIPES_BY_KEY, "ahi": AHI_RECIPES_BY_KEY}
-_FAMILY_SENSOR = {"goes": "abi", "himawari": "ahi"}
+
+# ---------------------------------------------------------------------------
+# GK-2A AMI recipes -- the ring's fourth true-color sensor. DELIBERATELY a
+# minimal set (truecolor + the clean-IR pair): the point of onboarding GK-2A
+# is the harmonized true-color ring, not a fourth full channel suite. AMI
+# rows use AMI native numbering (mirrors AHI: 1=VI004 blue, 2=VI005 native
+# green, 3=VI006 red 0.5 km, 4=VI008 veggie, 13=IR105 clean IR). The
+# truecolor row rides the SAME shared truecolor.assemble_truecolor pipeline
+# (sensor="ami": HybridGreen 0.85*VI005 + 0.15*VI008, GK-2A SRF Rayleigh,
+# cira_stretch) -- identical look to GOES/Himawari/FCI by construction.
+# ---------------------------------------------------------------------------
+AMI_RECIPES: tuple[Recipe, ...] = (
+    Recipe(sensor="ami", key="truecolor", title="True Color (GeoColor-lite)",
+           group="composite", kind="truecolor",
+           source="shared tsr truecolor.py ring pipeline (AMI hybrid green "
+                  "VI005+VI008, pyspectral GK-2A SRF Rayleigh, cira_stretch, "
+                  "night IR fade)"),
+    Recipe(sensor="ami", key="ir", title="IR105 · 10.5 µm (Clean IR)",
+           group="channel", kind="single_palette", band=13,
+           enhancement="rainbow_ir", bt_band=13,
+           source="frozen rainbow_ir on the AMI clean window (KMA AMI channel "
+                  "table; keyed 'ir' so the explorer's domain switch maps "
+                  "across satellites)"),
+    Recipe(sensor="ami", key="irbd", title="IR105 · 10.5 µm (IR, Dvorak BD)",
+           group="channel", kind="single_palette", band=13,
+           enhancement="dvorak", bt_band=13,
+           source="frozen corrected Dvorak BD (same palette as the goes19/"
+                  "himawari9 irbd rows)"),
+)
+
+AMI_RECIPES_BY_KEY = {r.key: r for r in AMI_RECIPES}
+_TABLES = {"abi": RECIPES_BY_KEY, "ahi": AHI_RECIPES_BY_KEY,
+           "ami": AMI_RECIPES_BY_KEY}
+_FAMILY_SENSOR = {"goes": "abi", "himawari": "ahi", "gk2a": "ami"}
 
 
 def recipe_for(sensor: str, key: str) -> Recipe:

@@ -68,7 +68,7 @@ services:
   # the box keeps up -- watch a full pass stay under the interval first).
   # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list;
   # DEFAULTS to the FULL set -- conus fd himawari9-wpac himawari9-fd
-  # geo-global -- so a bare `up` runs everything; the legacy single
+  # gk2a-fd geo-global -- so a bare `up` runs everything; the legacy single
   # S2_CRON_SUITE still overrides), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
   # S2_CRON_PREFIX, S2_CRON_STEP_MIN, S2_CRON_BACKFILL_MIN. A failed suite
   # never blocks the rest of the tick.
@@ -80,7 +80,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        SUITES="$${S2_CRON_SUITES:-$${S2_CRON_SUITE:-conus fd himawari9-wpac himawari9-fd geo-global}}"
+        SUITES="$${S2_CRON_SUITES:-$${S2_CRON_SUITE:-conus fd himawari9-wpac himawari9-fd gk2a-fd geo-global}}"
         STEP="$${S2_CRON_STEP_MIN:-10}"
         STEPARGS=""
         [ "$$STEP" != "0" ] && STEPARGS="--step $$STEP --backfill $${S2_CRON_BACKFILL_MIN:-90}"

@@ -232,6 +232,16 @@ def _pin_suite_scan(entries, when):
                      f"near {t.isoformat()}")
         return slot
 
+    if e0.family == "gk2a":
+        import s2_gk2a
+        need = sorted({b for e in entries for b in e.bands})
+        names = [s2_gk2a.BAND_TOKENS[b] for b in need]
+        slot = s2_gk2a.newest_complete_slot(names, time=when, nearest=True)
+        if slot is None:
+            sys.exit(f"ERROR: no complete GK-2A AMI FD slot for bands {need} "
+                     f"near {t.isoformat()}")
+        return slot
+
     from satellites import GOESEastSatellite
     sat = GOESEastSatellite()
     if (e0.render_product_hint or "").lower() == "fd":

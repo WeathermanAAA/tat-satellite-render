@@ -704,6 +704,45 @@ HW_FD_ROWS: tuple[ProductEntry, ...] = tuple(
     for r in _rx.AHI_RECIPES if r.key != "truecolor")
 
 # ---------------------------------------------------------------------------
+# GK-2A AMI suite (the ring's fourth true-color sensor, 128.2E): minimal row
+# set from s2_recipes.AMI_RECIPES (truecolor + ir + irbd). Source is the
+# PUBLIC NOAA Open Data bucket noaa-gk2a-pds (anon, netCDF L1B, 10-min FD
+# slots); ingest module s2_gk2a.py. Truecolor renders at the 2 km-class
+# raster exactly like himawari9 (the 0.5 km VI006 red file is ~470 MB --
+# fetched once per slot, sampled at the capped raster). The fd bbox mirrors
+# the Himawari convention: sub-lon +-80 deg with the unwrapped east edge.
+# ---------------------------------------------------------------------------
+_GK2A_FD_BBOX = (48.0, -60.0, 208.0, 60.0)   # 128.2E ± ~80°, unwrapped E edge
+_GK2A_FD_PX_BY_KM = {0.5: 6144, 1.0: 6144, 2.0: 5120}
+
+
+def _gk2a_recipe_row(r) -> ProductEntry:
+    px = _GK2A_FD_PX_BY_KM[2.0] if r.key == "truecolor" \
+        else _GK2A_FD_PX_BY_KM[r.finest_km]
+    return ProductEntry(
+        product_id=f"gk2a-fd-{r.key}",
+        family="gk2a", substrate="ami_l1b", bucket="noaa-gk2a-pds",
+        sat_num="2a",
+        s3_prefix="AMI/L1B/FD/", sns_filter_prefixes=(),
+        accept_sectors=frozenset({"FD"}),
+        channels=(), bands=tuple(r.bands),
+        sat_key="gk2a", sector_key="fd", band_key=r.key,
+        prod_meso_slug=None,
+        render_channel="recipe", render_enhancement=r.enhancement,
+        render_product_hint="fd", render_sat_hint="GK-2A",
+        cadence_s=600,
+        tiled=True, tile_size=512,
+        pyramid_px=px,
+        pyramid_scheme="webmercator-xyz",
+        sector_bbox=_GK2A_FD_BBOX,
+        recipe_id=r.key,
+    )
+
+
+GK2A_FD_ROWS: tuple[ProductEntry, ...] = tuple(
+    _gk2a_recipe_row(r) for r in _rx.AMI_RECIPES)
+
+# ---------------------------------------------------------------------------
 # GLOBAL GEO-RING COMPOSITE (the explorer's global default): GOES-19 East +
 # GOES-18 West + Himawari-9 full disks stitched nadir-nearest onto one global
 # webmerc pyramid (s2_imagery.produce_global_composite). BT fields ONLY --
@@ -740,7 +779,7 @@ GEO_GLOBAL_ROWS: tuple[ProductEntry, ...] = tuple(
     _geo_row(k) for k in ("ir", "irbd", "wv"))
 
 REGISTRY = (REGISTRY + SUITE_ROWS + FD_SUITE_ROWS + HW_WPAC_ROWS + HW_FD_ROWS
-            + GEO_GLOBAL_ROWS)
+            + GK2A_FD_ROWS + GEO_GLOBAL_ROWS)
 
 REGISTRY_BY_ID = {e.product_id: e for e in REGISTRY}
 

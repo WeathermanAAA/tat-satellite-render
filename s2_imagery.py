@@ -413,6 +413,9 @@ def produce_recipe_imagery(entry, time=None, nearest=True,
     if entry.family == "himawari":
         return produce_ahi_recipe_imagery(entry, time=time, nearest=nearest,
                                           band_cache=band_cache)
+    if entry.family == "gk2a":
+        return produce_gk2a_recipe_imagery(entry, time=time, nearest=nearest,
+                                           band_cache=band_cache)
     recipe = s2_recipes.RECIPES_BY_KEY[entry.recipe_id]
     if recipe.kind == "truecolor":
         return produce_truecolor(entry, time=time, nearest=nearest)
@@ -759,6 +762,121 @@ def produce_ahi_truecolor(entry, time=None, nearest=True, band_cache=None):
     rgba = s2_recipes.rgba_from_rgb(np.asarray(rgb, dtype=np.float32),
                                     valid=geom_valid)
     return _ahi_result(entry, rgba, bounds, slot, bucket, "truecolor", "tat_neon")
+
+
+# ============================================================================
+# GK-2A AMI (s2_gk2a): the ring's fourth true-color sensor. Same shape as the
+# AHI trio above, but AmiDisk carries its own GEOS nav + sampler, so the
+# target mesh is plain lat/lon (no shared scan-angle precompute). Sources are
+# the PUBLIC noaa-gk2a-pds netCDFs -- no creds, no satpy.
+# ============================================================================
+def _gk2a_target_mesh(bbox, out_w):
+    """Regular lat/lon target grid over `bbox` (row 0 = north; unwrapped
+    east edge like _ahi_target_mesh -- GK-2A's disk crosses the antimeridian
+    on its east limb)."""
+    W, S, E, N = bbox
+    E_uw = E if E >= W else E + 360.0
+    span_x = max(E_uw - W, 1e-6)
+    span_y = max(N - S, 1e-6)
+    out_h = max(1, round(out_w * span_y / span_x))
+    tgt_lons = (((np.linspace(W, E_uw, out_w) + 180.0) % 360.0) - 180.0).astype(np.float32)
+    tgt_lats = np.linspace(N, S, out_h).astype(np.float32)
+    TLON, TLAT = np.meshgrid(tgt_lons, tgt_lats)
+    return TLON, TLAT, (W, S, E_uw, N), (out_w, out_h)
+
+
+def fetch_gk2a_band_disks(entry, bands, time=None, nearest=True, cache=None):
+    """Fetch calibrated AmiDisks for native band numbers, slot-pinned so the
+    whole suite renders one scan. Cache key mirrors the AHI pattern."""
+    import s2_gk2a
+    names = [s2_gk2a.BAND_TOKENS[b] for b in sorted(set(bands))]
+    slot = s2_gk2a.newest_complete_slot(names, time=time, nearest=nearest)
+    stamp = slot.strftime("%Y%m%dT%H%M%SZ")
+    disks, missing = {}, []
+    for b in sorted(set(bands)):
+        got = cache.get(("gk2a", entry.sector_key, b, stamp)) if cache is not None else None
+        if got is not None:
+            disks[b] = got
+        else:
+            missing.append(b)
+    for b in missing:   # sequential: the 0.5 km VI006 alone is ~470 MB
+        token = s2_gk2a.BAND_TOKENS[b]
+        disks[b] = s2_gk2a.fetch_ami_disk(
+            token, time=slot, nearest=False,
+            stride=s2_gk2a.SUITE_STRIDE.get(token, 1))
+        if cache is not None:
+            cache[("gk2a", entry.sector_key, b, stamp)] = disks[b]
+    return slot, disks
+
+
+def _gk2a_result(entry, rgba, bounds, slot, channel, enhancement):
+    return ImageryResult(
+        rgba=rgba, bounds=bounds, scan_start=slot, product="FD",
+        bucket="noaa-gk2a-pds",
+        s3_key=f"noaa-gk2a-pds/AMI/L1B/FD/{slot:%Y%m/%d/%H}/",
+        generic_channel=channel, enhancement=enhancement)
+
+
+def produce_gk2a_truecolor(entry, time=None, nearest=True, band_cache=None):
+    """GK-2A true color through the SHARED ring pipeline (sensor='ami'):
+    hybrid green 0.85*VI005 + 0.15*VI008, pyspectral GK-2A SRF Rayleigh,
+    cira_stretch, IR105 night fade -- identical treatment to the other ring
+    sensors by construction. 2 km-class raster like the himawari9 rows."""
+    import truecolor
+    import s2_gk2a
+
+    roles = dict(s2_gk2a.TRUECOLOR_ROLE_BANDS)   # role -> native band number
+    slot, disks = fetch_gk2a_band_disks(
+        entry, roles.values(), time=time, nearest=nearest, cache=band_cache)
+    TLON, TLAT, bounds, _dims = _gk2a_target_mesh(entry.sector_bbox,
+                                                  entry.pyramid_px)
+    d_red = disks[roles["red"]]
+    grid = {}
+    for role, b in roles.items():
+        grid[role] = disks[b].sample(TLAT, TLON)
+        if band_cache is None:
+            disks.pop(b, None)   # uncached single-product run: free as we go
+    geom_valid = np.isfinite(grid["red"])
+    lats = TLAT.astype(np.float32)
+    lons = TLON.astype(np.float32)
+    rgb, _cos_sza = truecolor.assemble_truecolor(
+        grid["red"], grid["green"], grid["blue"], grid.get("veggie"),
+        lats, lons, when=slot, sub_sat_lon=d_red.sub_lon,
+        platform_name=s2_gk2a.PLATFORM_NAME, sensor="ami",
+        ir_bt=grid.get("ir"))
+    rgba = s2_recipes.rgba_from_rgb(np.asarray(rgb, dtype=np.float32),
+                                    valid=geom_valid)
+    return _gk2a_result(entry, rgba, bounds, slot, "truecolor", "tat_neon")
+
+
+def produce_gk2a_recipe_imagery(entry, time=None, nearest=True, band_cache=None):
+    """End-to-end GK-2A recipe product (truecolor delegates above; the
+    single_palette clean-IR pair samples IR105 and colorizes with the frozen
+    enhancement, exactly like the AHI rows)."""
+    import s2_recipes as _rx_mod
+    recipe = _rx_mod.AMI_RECIPES_BY_KEY[entry.recipe_id]
+    if recipe.kind == "truecolor":
+        return produce_gk2a_truecolor(entry, time=time, nearest=nearest,
+                                      band_cache=band_cache)
+    if recipe.kind != "single_palette":
+        raise ValueError(f"gk2a recipe kind {recipe.kind!r} not onboarded")
+    slot, disks = fetch_gk2a_band_disks(entry, (recipe.band,), time=time,
+                                        nearest=nearest, cache=band_cache)
+    TLON, TLAT, bounds, _dims = _gk2a_target_mesh(entry.sector_bbox,
+                                                  entry.pyramid_px)
+    bt = disks[recipe.band].sample(TLAT, TLON)
+    rgb = _colorize_bt(bt, recipe.enhancement)
+    rgba = s2_recipes.rgba_from_rgb(rgb)
+    res = _gk2a_result(entry, rgba, bounds, slot, recipe.key,
+                       recipe.enhancement)
+    if recipe.bt_band:
+        try:
+            res.bt_grid, res.bt_dims = _decimate_bt(
+                bt - 273.15, bounds,
+                out_w=(getattr(entry, "bt_px", 0) or BT_PX))
+        except Exception:   # noqa: BLE001  (inspector is best-effort)
+            res.bt_grid, res.bt_dims = None, None
+    return res
 
 
 # ============================================================================
