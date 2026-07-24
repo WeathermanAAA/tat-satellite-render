@@ -38,6 +38,13 @@ RUN pip install -r requirements.txt \
 # (non-fatal: the recipe guards a missing LUT and renders hazier).
 RUN python -c "from pyspectral.rayleigh import check_and_download; check_and_download()" || true
 
+# Pre-warm pyspectral's sensor spectral responses too: the shared true-color
+# pipeline passes BAND NAMES so Rayleigh uses each sensor's SRF-weighted
+# effective wavelength (ABI/AHI/AMI/FCI); without the RSR files every fresh
+# container re-downloads them at first render (non-fatal: the pipeline falls
+# back to central wavelengths and renders slightly off-tint).
+RUN python -c "from pyspectral.utils import download_rsr; download_rsr()" || true
+
 # App source (poller + render + the satellite/render canon they share).
 COPY . .
 
