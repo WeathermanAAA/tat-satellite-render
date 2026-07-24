@@ -20,19 +20,22 @@ def _stamp(t):
 
 
 class TestSlotGrid(unittest.TestCase):
-    def test_slots_snap_to_step_grid_oldest_first(self):
+    def test_slots_snap_to_step_grid_newest_first(self):
+        # NEWEST first (the enscenters/§11-H lesson in _backfill_slots'
+        # docstring): the current slot renders before old holes heal, so
+        # freshness never waits on backfill depth
         slots = E._backfill_slots(10, 60, now=NOW)
-        self.assertEqual(slots[-1], dt.datetime(2026, 7, 12, 3, 0, tzinfo=UTC))
-        self.assertEqual(slots[0], dt.datetime(2026, 7, 12, 2, 10, tzinfo=UTC))
+        self.assertEqual(slots[0], dt.datetime(2026, 7, 12, 3, 0, tzinfo=UTC))
+        self.assertEqual(slots[-1], dt.datetime(2026, 7, 12, 2, 10, tzinfo=UTC))
         self.assertTrue(all(s.minute % 10 == 0 and s.second == 0 for s in slots))
-        self.assertEqual(slots, sorted(slots))
+        self.assertEqual(slots, sorted(slots, reverse=True))
         self.assertEqual(len(slots), 6)
 
     def test_step_five_grid(self):
-        # now 03:07:42, window 20m -> floor 02:47:42: 02:50..03:05 = 4 slots
+        # now 03:07:42, window 20m -> floor 02:47:42: 03:05..02:50 = 4 slots
         slots = E._backfill_slots(5, 20, now=NOW)
-        self.assertEqual(slots[-1], dt.datetime(2026, 7, 12, 3, 5, tzinfo=UTC))
-        self.assertEqual(slots[0], dt.datetime(2026, 7, 12, 2, 50, tzinfo=UTC))
+        self.assertEqual(slots[0], dt.datetime(2026, 7, 12, 3, 5, tzinfo=UTC))
+        self.assertEqual(slots[-1], dt.datetime(2026, 7, 12, 2, 50, tzinfo=UTC))
         self.assertEqual(len(slots), 4)
 
 
@@ -65,9 +68,10 @@ class TestCoverage(unittest.TestCase):
 
 
 class TestBackfillLoop(unittest.TestCase):
-    """Single-product --step path: emits ONLY missing slots, oldest first,
-    re-checks coverage as frames land (adjacent slots resolving to the same
-    scan dedup to one render), isolates per-slot failures."""
+    """Single-product --step path: emits ONLY missing slots, NEWEST first
+    (freshness before hole-healing), re-checks coverage as frames land
+    (adjacent slots resolving to the same scan dedup to one render),
+    isolates per-slot failures."""
 
     def _run(self, covered_times, emit_effect=None, argv_extra=()):
         emitted = []
@@ -98,14 +102,14 @@ class TestBackfillLoop(unittest.TestCase):
                         + list(argv_extra))
         return rc, emitted, cov
 
-    def test_emits_only_missing_slots_oldest_first(self):
-        # window (30m from 03:07:42): slots 02:40, 02:50, 03:00; only the
-        # newest is covered -> the two older emit, oldest first
+    def test_emits_only_missing_slots_newest_first(self):
+        # window (30m from 03:07:42): slots 03:00, 02:50, 02:40; only the
+        # newest is covered -> the two older emit, newest of the holes first
         newest = dt.datetime(2026, 7, 12, 3, 0, tzinfo=UTC)
         rc, emitted, _ = self._run([newest])
         self.assertEqual(rc, 0)
-        self.assertEqual(emitted, [dt.datetime(2026, 7, 12, 2, 40, tzinfo=UTC),
-                                   dt.datetime(2026, 7, 12, 2, 50, tzinfo=UTC)])
+        self.assertEqual(emitted, [dt.datetime(2026, 7, 12, 2, 50, tzinfo=UTC),
+                                   dt.datetime(2026, 7, 12, 2, 40, tzinfo=UTC)])
 
     def test_fully_covered_window_emits_nothing(self):
         newest = dt.datetime(2026, 7, 12, 3, 0, tzinfo=UTC)
@@ -141,9 +145,10 @@ class TestBackfillLoop(unittest.TestCase):
             rc = E.main(["--product", entry.product_id,
                          "--store", "local:/tmp/nope",
                          "--step", "10", "--backfill", "30"])
-        # 2:45 covers BOTH 2:40 and 2:50 (tol 5m): exactly one render
+        # 2:45 covers BOTH 2:50 and 2:40 (tol 5m): exactly one render --
+        # newest-first means the 02:50 hole renders and 02:40 self-heals
         self.assertEqual(rc, 0)
-        self.assertEqual(emitted, [dt.datetime(2026, 7, 12, 2, 40, tzinfo=UTC)])
+        self.assertEqual(emitted, [dt.datetime(2026, 7, 12, 2, 50, tzinfo=UTC)])
 
     def test_step_and_time_mutually_exclusive(self):
         entry = next(e for e in E.R.REGISTRY if e.tiled)
