@@ -198,6 +198,66 @@ class TestSuitePinDedup(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(emitted, [])
 
+    def test_pin_failure_isolated_per_slot(self):
+        """One slot's pin blowing up (OpenSearch flake) must not drop the
+        remaining slots or the pass's successful emits."""
+        emitted = []
+        calls = {"n": 0}
+
+        def flaky_pin(entries, slot):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("opensearch 502")
+            return self.PIN
+
+        def fake_emit(entry, when, store, args, band_cache=None):
+            emitted.append((entry.product_id, when))
+            return {"count": 1}
+
+        with mock.patch.object(E, "emit_one", side_effect=fake_emit), \
+             mock.patch.object(E, "_pin_suite_scan", side_effect=flaky_pin), \
+             mock.patch.object(E.P, "complete_stamps", return_value=[]), \
+             mock.patch.object(E, "_write_products_index"), \
+             mock.patch.object(E.dt, "datetime", wraps=dt.datetime) as md:
+            md.now.return_value = NOW
+            rc = E.main(["--suite", "mtgi1-fd", "--store", "local:/tmp/nope",
+                         "--step", "10", "--backfill", "30"])
+        self.assertEqual(rc, 0)                  # later slots still emitted
+        self.assertEqual(len(emitted), 3)        # one pinned scan, 3 products
+        self.assertGreaterEqual(calls["n"], 2)   # pin retried on later slots
+
+
+class TestProductsIndexStoreTruth(unittest.TestCase):
+    """products.json must only advertise products with >= 1 complete frame
+    in the store -- a persistently-failing recipe next to healthy siblings
+    (or a fully gated suite) stays out until it actually emits."""
+
+    def _write(self, frames_by_id):
+        puts = {}
+
+        class _Store:
+            def put_json(self, key, obj, cache):
+                puts[key] = obj
+
+        def fake_complete(entry, store, prefix):
+            return frames_by_id.get(entry.product_id, [])
+
+        with mock.patch.object(E.P, "complete_stamps", side_effect=fake_complete):
+            E._write_products_index(_Store(), "shadow", "mtgi1", "fd")
+        return puts
+
+    def test_partial_failure_drops_frameless_products(self):
+        puts = self._write({"mtgi1-fd-ir": [("20260712T020935Z", 5)],
+                            "mtgi1-fd-irbd": [("20260712T020935Z", 5)]})
+        idx = puts["shadow/sat/mtgi1/fd/products.json"]
+        self.assertEqual(idx["count"], 2)
+        self.assertEqual({p["id"] for p in idx["products"]},
+                         {"mtgi1-fd-ir", "mtgi1-fd-irbd"})
+
+    def test_no_frames_at_all_writes_nothing(self):
+        puts = self._write({})
+        self.assertEqual(puts, {})
+
 
 if __name__ == "__main__":
     unittest.main()

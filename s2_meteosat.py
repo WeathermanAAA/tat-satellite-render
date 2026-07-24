@@ -323,6 +323,21 @@ def _float_indices(area, lons, lats):
         raise RuntimeError(f"pyresample lonlat->index API unavailable: {e}")
 
 
+def _sweep_stale_tmp(prefix: str, max_age_s: float = 7200.0) -> None:
+    """An OOM-kill mid-fetch (mem_limit SIGKILL bypasses ``finally``)
+    strands a multi-GB temp dir in the long-lived emit container, and
+    nothing else ever sweeps it. Reap same-prefix siblings older than
+    max_age_s before starting a new fetch -- an active fetch is always
+    younger than that."""
+    now = _time.time()
+    for p in glob.glob(os.path.join(tempfile.gettempdir(), prefix + "*")):
+        try:
+            if now - os.path.getmtime(p) > max_age_s:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def fetch_seviri_disk(collection: str, time=None, delay_min=None) -> SeviriDisk:
     """Fetch + decode the newest licence-compliant SEVIRI slot for a service.
 
@@ -338,15 +353,17 @@ def fetch_seviri_disk(collection: str, time=None, delay_min=None) -> SeviriDisk:
         t = time if time.tzinfo else time.replace(tzinfo=UTC)
         not_after = min(not_after, t)
 
+    from satpy import Scene   # fail BEFORE the ~270 MB transfer, not after
+
     feat = _search_latest(collection, not_after)
     pid = feat["properties"]["identifier"]
     date = feat["properties"]["date"]
     scan_end = dt.datetime.fromisoformat(date.split("/")[1].replace("Z", "+00:00"))
 
+    _sweep_stale_tmp("seviri_")
     tmp = tempfile.mkdtemp(prefix="seviri_")
     try:
         nats = _download_product(collection, pid, tmp)
-        from satpy import Scene
         scn = Scene(filenames=nats, reader="seviri_l1b_native")
         scn.load(list(_EAGER_DATASETS), calibration="brightness_temperature")
         values = {}
@@ -413,7 +430,9 @@ def newest_fci_slot(time=None, delay_min=None):
         not_after = min(not_after, t + dt.timedelta(minutes=FCI_CADENCE_MIN / 2.0))
     try:
         feat = _search_latest(COLLECTION_FCI, not_after)
-    except RuntimeError:
+    except (RuntimeError, requests.RequestException):
+        # empty window OR a transient OpenSearch failure (5xx, timeout,
+        # reset) -- both mean "no pin this tick", never an uncaught abort
         return None
     date = feat["properties"]["date"]
     return dt.datetime.fromisoformat(date.split("/")[1].replace("Z", "+00:00"))
@@ -474,6 +493,8 @@ def fetch_fci_disk(time=None, delay_min=None,
         t = time if time.tzinfo else time.replace(tzinfo=UTC)
         not_after = min(not_after, t)
 
+    from satpy import Scene   # fail BEFORE the ~800 MB transfer, not after
+
     feat = _search_latest(COLLECTION_FCI, not_after)
     pid = feat["properties"]["identifier"]
     date = feat["properties"]["date"]
@@ -485,11 +506,11 @@ def fetch_fci_disk(time=None, delay_min=None,
                 f"FCI: no repeat cycle within {slot_tolerance_min} min of "
                 f"{t.isoformat()} (nearest ends {scan_end.isoformat()})")
 
+    _sweep_stale_tmp("fci_")
     tmp = tempfile.mkdtemp(prefix="fci_")
     try:
         chunks = _download_product(COLLECTION_FCI, pid, tmp, pattern="*.nc")
         _verify_fci_chunks(chunks, pid)
-        from satpy import Scene
         scn = Scene(filenames=chunks, reader="fci_l1c_nc")
         vis = [d for d in datasets if d != FCI_IR_DATASET]
         if vis:

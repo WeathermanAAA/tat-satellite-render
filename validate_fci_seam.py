@@ -18,18 +18,22 @@ Geometry masks: both satellite zenith angles < 65 deg (the ring's own
 GEO_MAX_ZENITH_DEG) and SZA < 70 deg so the classes are lit and inside both
 feather windows.
 
-Run on the box (needs EUMETSAT creds + the accepted licence + satpy):
+Run on the box (needs EUMETSAT creds + the accepted licence + satpy). Mount
+a host dir and point SEAM_OUT at it, or the --rm container destroys the
+eyeball PNG with the container filesystem:
 
   docker compose -p tat-s2 -f docker-compose.s2.yml run --rm \
+      -v /root:/host -e SEAM_OUT=/host \
       --entrypoint python emit validate_fci_seam.py
 
 Exit 0 = seam holds within the ring tolerances; exit 1 = numbers printed for
-diagnosis, do NOT ship the sector into the ring until resolved. A PNG pair
-(fci_seam_check.png) lands beside the script for the eyeball step.
+diagnosis, do NOT ship the sector into the ring until resolved. The eyeball
+panel lands at $SEAM_OUT/fci_seam_check.png (default: cwd).
 """
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 
 import numpy as np
@@ -172,9 +176,11 @@ def main() -> int:
         half = np.where(LON[..., None] < (BOX_W + BOX_E) / 2.0, a, b)
         panel = np.concatenate(
             [np.nan_to_num(a), np.nan_to_num(half), np.nan_to_num(b)], axis=1)
+        out_png = os.path.join(os.environ.get("SEAM_OUT", "."),
+                               "fci_seam_check.png")
         Image.fromarray((np.clip(panel, 0, 1) * 255).astype(np.uint8)).save(
-            "fci_seam_check.png")
-        print("[seam] wrote fci_seam_check.png (FCI | split | GOES-E)")
+            out_png)
+        print(f"[seam] wrote {out_png} (FCI | split | GOES-E)")
     except Exception as e:  # noqa: BLE001 -- the PNG is the eyeball aid only
         print(f"[seam] panel save skipped: {e}")
 

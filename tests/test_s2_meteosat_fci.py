@@ -312,6 +312,35 @@ def test_mtgi1_registry_rows_and_recipes():
     assert idx["products"][0]["path"] == "sat/mtgi1/fd/truecolor"
 
 
+def test_fci_disk_cache_is_negative_too(monkeypatch):
+    """Within one suite pass, a failed slot download must not be retried by
+    the sibling products -- the failure is cached alongside successes."""
+    import s2_imagery as I
+    slot = dt.datetime(2026, 7, 24, 16, 39, 35, tzinfo=UTC)
+    calls = {"n": 0}
+
+    def failing_fetch(time=None, slot_tolerance_min=None):
+        calls["n"] += 1
+        raise RuntimeError("HTTP 403: GeneralLicense required")
+
+    monkeypatch.setattr(MET, "newest_fci_slot", lambda time=None: slot)
+    monkeypatch.setattr(MET, "fetch_fci_disk", failing_fetch)
+    cache = {}
+    with pytest.raises(RuntimeError, match="GeneralLicense"):
+        I.fetch_fci_disk_cached(time=slot, cache=cache)
+    with pytest.raises(RuntimeError, match="already failed this pass"):
+        I.fetch_fci_disk_cached(time=slot, cache=cache)
+    assert calls["n"] == 1
+
+
+def test_newest_fci_slot_swallows_transport_errors(monkeypatch):
+    def fake_search(collection, not_after, lookback_h=6.0):
+        raise MET.requests.ConnectionError("reset by peer")
+
+    monkeypatch.setattr(MET, "_search_latest", fake_search)
+    assert MET.newest_fci_slot() is None
+
+
 def test_pin_suite_scan_mtgi1_uses_fci_slot(monkeypatch):
     import s2_pyramid_emit as E
     import s2_registry as R

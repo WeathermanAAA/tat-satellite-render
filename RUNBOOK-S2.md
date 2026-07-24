@@ -150,6 +150,12 @@ cadence + 1 h licence delay):
     docker compose -p tat-s2-mtg -f docker-compose.s2.yml \
       -f docker-compose.s2.mtg-lane.yml --profile cron up -d --no-build emit-cron
 
+Seam validation at first post-licence data (mount a host dir for the PNG):
+
+    docker compose -p tat-s2 -f docker-compose.s2.yml run --rm \
+      -v /root:/host -e SEAM_OUT=/host \
+      --entrypoint python emit validate_fci_seam.py
+
 Attribution rides the viewer source line: "Contains EUMETSAT Meteosat data".
 SEVIRI stays OUT of the true-color ring (no blue/green band) — BT members
 only, per policy.

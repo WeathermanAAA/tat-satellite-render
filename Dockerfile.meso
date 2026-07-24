@@ -40,7 +40,12 @@ RUN pip install -r requirements.txt \
 # header of requirements-s2-geo.txt). s2_meteosat lazy-imports it and stays
 # creds-gated, so every non-Meteosat suite is unaffected by this layer.
 COPY requirements-s2-geo.txt ./
-RUN pip install -r requirements-s2-geo.txt
+# Constrain to the versions the base layer already resolved (pip freeze;
+# direct-URL rows like tat-palettes are not valid constraints and satpy
+# must not silently upgrade xarray/pyresample/dask under the render stack).
+RUN pip freeze | grep -v "@" > /tmp/base-constraints.txt \
+    && pip install -r requirements-s2-geo.txt -c /tmp/base-constraints.txt \
+    && rm /tmp/base-constraints.txt
 
 # Pre-warm pyspectral's Rayleigh LUTs so the first true-color render isn't slow
 # (non-fatal: the recipe guards a missing LUT and renders hazier).

@@ -195,6 +195,23 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
 
 def _write_products_index(store, prefix: str, sat_key: str, sector_key: str):
     idx = R.build_products_index(sat_key, sector_key, dt.datetime.now(UTC))
+    # STORE-TRUTH filter: the registry-derived index advertises every row,
+    # but the explorer un-greys purely off this file -- a product that has
+    # never emitted a complete frame must stay OUT (one persistently
+    # failing recipe next to healthy siblings would otherwise 404 its
+    # manifest forever; review finding 2026-07-24). Costs one store LIST
+    # per row, paid only when an index is (re)written.
+    kept = []
+    for p in idx["products"]:
+        e = R.REGISTRY_BY_ID.get(p["id"])
+        if e is not None and P.complete_stamps(e, store, prefix):
+            kept.append(p)
+    if not kept:
+        print(f"[index] SKIPPED ({sat_key}/{sector_key}: no product has a "
+              f"complete frame in the store yet)")
+        return None
+    idx["products"] = kept
+    idx["count"] = len(kept)
     key = R.products_index_key(prefix, sat_key, sector_key)
     store.put_json(key, idx, P.CACHE_MANIFEST)
     print(f"[index] {key}: {idx['count']} products")
@@ -345,8 +362,26 @@ def main(argv=None) -> int:
                 if not _slot_missing(slot, covered, tol):
                     print(f"[backfill] {slot.isoformat()} now covered -- skip")
                     continue
+                when_arg = slot
+                if entry.family == "mtgi1":
+                    # licence-embargoed slots all pin to the newest compliant
+                    # cycle -- resolve the pin FIRST and skip if that cycle's
+                    # frame already exists, else each young slot re-downloads
+                    # the same ~800 MB product (suite mode has the same
+                    # guard; review finding 2026-07-24)
+                    try:
+                        when_arg = _pin_suite_scan([entry], slot)
+                    except (SystemExit, Exception) as e:  # noqa: BLE001
+                        n_fail += 1
+                        print(f"[FAIL] pin for {slot.isoformat()}: {e}")
+                        continue
+                    if not _slot_missing(when_arg, covered,
+                                         dt.timedelta(seconds=90)):
+                        print(f"[backfill] {slot.isoformat()} pins to covered "
+                              f"scan {when_arg.isoformat()} -- skip")
+                        continue
                 try:
-                    emit_one(entry, slot, store, args)
+                    emit_one(entry, when_arg, store, args)
                     n_ok += 1
                 except Exception as e:   # noqa: BLE001 -- one bad slot must not
                     n_fail += 1          # kill the rest of the window
@@ -400,8 +435,24 @@ def main(argv=None) -> int:
 
     ok_all, failed_all = [], []
     rendered_pins: set = set()
+    pin_failures = 0
     for slot in todo:
-        pinned = _pin_suite_scan(entries, slot)
+        if args.step:
+            # per-slot pin isolation: one transient resolve failure (an
+            # OpenSearch flake, an empty bucket listing) must not drop the
+            # remaining backfill slots NOR strand this pass's successful
+            # emits unindexed (review finding 2026-07-24). Non-step mode
+            # keeps the loud abort -- a single-tick pin failure IS the
+            # whole tick.
+            try:
+                pinned = _pin_suite_scan(entries, slot)
+            except (SystemExit, Exception) as e:  # noqa: BLE001
+                pin_failures += 1
+                print(f"[suite] pin failed for slot {slot.isoformat()}: {e} "
+                      f"-- next slot")
+                continue
+        else:
+            pinned = _pin_suite_scan(entries, slot)
         if args.step:
             # Slots whose pin resolves to an ALREADY-RENDERED scan must skip
             # BEFORE the fetch: emit_one dedups only after downloading, and
@@ -449,7 +500,9 @@ def main(argv=None) -> int:
     print(f" failed : {len(failed_all)}  {sorted(set(failed_all))}")
     if is_r2 and ok_all:
         print(f" index  : {CDN}/{R.products_index_key(args.prefix, suite_sat, suite_sector)}")
-    if failed_all and not ok_all:
+    if pin_failures:
+        print(f" pins  : {pin_failures} slot(s) failed to resolve")
+    if (failed_all or pin_failures) and not ok_all:
         return 1          # total failure aborts (mirror the HAFS total-failure rule)
     return 0
 

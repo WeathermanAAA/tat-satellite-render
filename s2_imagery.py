@@ -903,12 +903,23 @@ def fetch_fci_disk_cached(time=None, nearest=True, cache=None):
     stamp = slot.strftime("%Y%m%dT%H%M%SZ")
     key = ("fci", "fd", stamp)
     disk = cache.get(key) if cache is not None else None
+    if isinstance(disk, Exception):
+        # NEGATIVE cache: the first product of this suite slot already paid
+        # for (and lost) the download attempt -- its siblings must not
+        # retry the same ~800 MB inside the same pass (review finding
+        # 2026-07-24); the next cron tick retries fresh.
+        raise RuntimeError(f"FCI {stamp} already failed this pass: {disk}")
     if disk is None:
-        # tolerance = HALF the cadence: the adjacent repeat cycle sits
-        # exactly one cadence away, so a full-cadence tolerance would
-        # admit it in a pin/fetch race (review finding 2026-07-24)
-        disk = MET.fetch_fci_disk(time=slot,
-                                  slot_tolerance_min=MET.FCI_CADENCE_MIN / 2.0)
+        try:
+            # tolerance = HALF the cadence: the adjacent repeat cycle sits
+            # exactly one cadence away, so a full-cadence tolerance would
+            # admit it in a pin/fetch race (review finding 2026-07-24)
+            disk = MET.fetch_fci_disk(
+                time=slot, slot_tolerance_min=MET.FCI_CADENCE_MIN / 2.0)
+        except Exception as e:
+            if cache is not None:
+                cache[key] = e
+            raise
         if cache is not None:
             cache[key] = disk
     return slot, disk
