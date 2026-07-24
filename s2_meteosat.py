@@ -145,7 +145,10 @@ def _token() -> str:
         return _token_cache["token"]
     creds = credentials()
     if creds is None:
-        raise RuntimeError("EUMETSAT_CONSUMER_KEY/SECRET not set")
+        # _FatalDownloadError so the download retry loop fails fast instead
+        # of burning attempts on a condition retrying can never fix (still a
+        # RuntimeError to every existing caller's contract)
+        raise _FatalDownloadError("EUMETSAT_CONSUMER_KEY/SECRET not set")
     basic = base64.b64encode(f"{creds[0]}:{creds[1]}".encode()).decode()
     r = requests.post(f"{API}/token",
                       headers={"Authorization": f"Basic {basic}"},
