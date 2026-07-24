@@ -242,6 +242,17 @@ def _pin_suite_scan(entries, when):
                      f"near {t.isoformat()}")
         return slot
 
+    if e0.family == "mtgi1":
+        # OpenSearch needs no creds, so pinning works even while the
+        # download is still licence-gated; the pin is the product's
+        # sensing END (one FDHSI product carries every band).
+        import s2_meteosat as MET
+        slot = MET.newest_fci_slot(time=when)
+        if slot is None:
+            sys.exit(f"ERROR: no licence-compliant MTG FCI repeat cycle "
+                     f"near {t.isoformat()}")
+        return slot
+
     from satellites import GOESEastSatellite
     sat = GOESEastSatellite()
     if (e0.render_product_hint or "").lower() == "fd":
@@ -341,7 +352,12 @@ def main(argv=None) -> int:
                     n_fail += 1          # kill the rest of the window
                     print(f"[FAIL] {entry.product_id} @ {slot.isoformat()}: {e}")
                     traceback.print_exc()
-            _write_products_index(store, args.prefix, entry.sat_key, entry.sector_key)
+            if n_ok or not n_fail:
+                _write_products_index(store, args.prefix, entry.sat_key,
+                                      entry.sector_key)
+            else:
+                print("[index] SKIPPED (total failure): products.json left "
+                      "untouched")
             print(f"\n=== BACKFILL SUMMARY === ok={n_ok} failed={n_fail} "
                   f"skipped={len(slots) - len(todo)}")
             return 1 if (n_fail and not n_ok) else 0
@@ -396,7 +412,15 @@ def main(argv=None) -> int:
                 failed_all.append(entry.product_id)
                 print(f"[FAIL] {entry.product_id}: {e}")
                 traceback.print_exc()
-    _write_products_index(store, args.prefix, suite_sat, suite_sector)
+    if ok_all or not failed_all:
+        _write_products_index(store, args.prefix, suite_sat, suite_sector)
+    else:
+        # total failure: never advertise a product list with zero frames
+        # behind it (a still-gated suite -- e.g. FCI pre-licence -- would
+        # un-grey the explorer domain and 404 every manifest). The viewer's
+        # availability probe stays honestly dark until an emit succeeds.
+        print(f"[index] SKIPPED (total failure -- {len(failed_all)} products, "
+              f"0 ok): products.json left untouched")
 
     print("\n=== SUITE EMIT SUMMARY ===")
     print(f" slots  : {len(todo)}")

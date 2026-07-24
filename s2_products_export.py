@@ -154,6 +154,11 @@ def main(argv=None) -> int:
     # TVProducts.products stays the goes19 list -- compare.html and any
     # existing reader see an unchanged shape (additive key only).
     hw_rows = _sector_rows("himawari9", "wpac")
+    # GK-2A emits full-disk only, so fd IS the export sector (the cockpit's
+    # sector substitution is a no-op) -- same additive-nested-key pattern.
+    gk2a_rows = _sector_rows("gk2a", "fd")
+    # MTG-I1 FCI (Meteosat-12): full-disk only, like GK-2A.
+    mtgi1_rows = _sector_rows("mtgi1", "fd")
     geo_rows = _sector_rows("geo", "global")
 
     cdir = os.path.join(args.out, "cbars")
@@ -174,13 +179,16 @@ def main(argv=None) -> int:
               "sector": args.sector,
               "products": rows,
               "himawari9": {"sector": "wpac", "products": hw_rows},
+              "gk2a": {"sector": "fd", "products": gk2a_rows},
+              "mtgi1": {"sector": "fd", "products": mtgi1_rows},
               "geo": {"sector": "global", "products": geo_rows},
           }, indent=2, ensure_ascii=False) + ";\n")
     with open(os.path.join(args.out, "products.js"), "w") as f:
         f.write(js)
     print(f"wrote products.js ({len(rows)} goes19 + {len(hw_rows)} himawari9 "
-          f"+ {len(geo_rows)} geo-global products) + {len(CBARS)+1} colorbars "
-          f"-> {args.out}")
+          f"+ {len(gk2a_rows)} gk2a + {len(mtgi1_rows)} mtgi1 + "
+          f"{len(geo_rows)} geo-global products) + "
+          f"{len(CBARS)+1} colorbars -> {args.out}")
     return 0
 
 

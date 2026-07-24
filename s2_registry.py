@@ -743,6 +743,48 @@ GK2A_FD_ROWS: tuple[ProductEntry, ...] = tuple(
     _gk2a_recipe_row(r) for r in _rx.AMI_RECIPES)
 
 # ---------------------------------------------------------------------------
+# MTG-I1 FCI suite (Meteosat-12 at 0 deg -- the ring's FIFTH true-color
+# sensor, filling the Africa/Europe/Atlantic wedge). Minimal row set from
+# s2_recipes.FCI_RECIPES (truecolor + ir + irbd), the GK-2A model exactly.
+# Source is the EUMETSAT Data Store FDHSI L1C collection EO:EUM:DAT:0662
+# (creds-gated, licence >= 1 h latency, ~800 MB zip of 41 chunked netCDFs
+# per 10-min cycle); ingest module s2_meteosat.py (fetch_fci_disk + the
+# chunk-completeness gate). Truecolor renders at the 2 km-class raster like
+# gk2a/himawari9 -- one ~2.1 GB FciDisk per slot serves all three rows via
+# the suite band_cache. The fd bbox mirrors the Himawari/GK-2A convention:
+# sub-lon (0 deg) +-80.
+# ---------------------------------------------------------------------------
+_MTGI1_FD_BBOX = (-80.0, -60.0, 80.0, 60.0)
+_MTGI1_FD_PX_BY_KM = {1.0: 6144, 2.0: 5120}
+
+
+def _mtgi1_recipe_row(r) -> ProductEntry:
+    px = _MTGI1_FD_PX_BY_KM[2.0] if r.key == "truecolor" \
+        else _MTGI1_FD_PX_BY_KM[r.finest_km]
+    return ProductEntry(
+        product_id=f"mtgi1-fd-{r.key}",
+        family="mtgi1", substrate="fci_l1c", bucket="eumetsat-datastore",
+        sat_num="i1",
+        s3_prefix="", sns_filter_prefixes=(),
+        accept_sectors=frozenset({"FD"}),
+        channels=(), bands=tuple(r.bands),
+        sat_key="mtgi1", sector_key="fd", band_key=r.key,
+        prod_meso_slug=None,
+        render_channel="recipe", render_enhancement=r.enhancement,
+        render_product_hint="fd", render_sat_hint="MTG-I1",
+        cadence_s=600,
+        tiled=True, tile_size=512,
+        pyramid_px=px,
+        pyramid_scheme="webmercator-xyz",
+        sector_bbox=_MTGI1_FD_BBOX,
+        recipe_id=r.key,
+    )
+
+
+MTGI1_FD_ROWS: tuple[ProductEntry, ...] = tuple(
+    _mtgi1_recipe_row(r) for r in _rx.FCI_RECIPES)
+
+# ---------------------------------------------------------------------------
 # GLOBAL GEO-RING COMPOSITE (the explorer's global default): GOES-19 East +
 # GOES-18 West + Himawari-9 full disks stitched nadir-nearest onto one global
 # webmerc pyramid (s2_imagery.produce_global_composite). BT fields ONLY --
@@ -779,7 +821,7 @@ GEO_GLOBAL_ROWS: tuple[ProductEntry, ...] = tuple(
     _geo_row(k) for k in ("ir", "irbd", "wv"))
 
 REGISTRY = (REGISTRY + SUITE_ROWS + FD_SUITE_ROWS + HW_WPAC_ROWS + HW_FD_ROWS
-            + GK2A_FD_ROWS + GEO_GLOBAL_ROWS)
+            + GK2A_FD_ROWS + MTGI1_FD_ROWS + GEO_GLOBAL_ROWS)
 
 REGISTRY_BY_ID = {e.product_id: e for e in REGISTRY}
 

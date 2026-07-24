@@ -44,12 +44,16 @@ def test_available_false_without_creds(monkeypatch):
 
 
 class _Resp:
-    def __init__(self, content):
+    def __init__(self, content, status=200, headers=None, text=""):
         self._c = content
-        self.status_code = 200
+        self.status_code = status
+        self.headers = {"Content-Length": str(len(content))} if headers is None \
+            else headers
+        self.text = text
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise MET.requests.HTTPError(f"HTTP {self.status_code}")
 
     def iter_content(self, n):
         for i in range(0, len(self._c), n):
@@ -136,6 +140,186 @@ def test_fci_disk_sample_uses_own_area_per_dataset():
     assert v[0, 0] == pytest.approx(0.0)
     b = disk.sample("ir_105", np.array([[10.0]]), np.array([[0.0]]))
     assert b[0, 0] == pytest.approx(250.0)
+
+
+def _fci_zip(n_body=40, trailer=True, skip=()):
+    """A fake FDHSI product zip: n_body CHK-BODY strips + one TRAIL, all
+    numbered _NNNN.nc like the real Data Store product."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        k = 0
+        for i in range(1, n_body + 1):
+            if i in skip:
+                continue
+            k += 1
+            zf.writestr(f"prod/W_XX-CHK-BODY_{i:04d}.nc", b"b")
+        if trailer:
+            zf.writestr(f"prod/W_XX-CHK-TRAIL_{n_body + 1:04d}.nc", b"t")
+    return buf.getvalue()
+
+
+def test_fci_chunk_gate_accepts_complete_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(MET, "_token", lambda: "tok")
+    monkeypatch.setattr(MET.requests, "get",
+                        lambda *a, **k: _Resp(_fci_zip()))
+    paths = MET._download_product(MET.COLLECTION_FCI, "PID", str(tmp_path),
+                                  pattern="*.nc")
+    assert len(paths) == MET.FCI_EXPECTED_CHUNKS == 41
+    MET._verify_fci_chunks(paths, "PID")   # must not raise
+
+
+def test_fci_chunk_gate_rejects_short_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(MET, "_token", lambda: "tok")
+    monkeypatch.setattr(MET.requests, "get",
+                        lambda *a, **k: _Resp(_fci_zip(n_body=39)))
+    paths = MET._download_product(MET.COLLECTION_FCI, "PID", str(tmp_path),
+                                  pattern="*.nc")
+    with pytest.raises(RuntimeError, match="incomplete FCI chunk set"):
+        MET._verify_fci_chunks(paths, "PID")
+
+
+def test_fci_chunk_gate_rejects_gapped_numbering(tmp_path, monkeypatch):
+    # 41 files but body strip 0007 missing (an extra strip pushes the count
+    # back up) -- the contiguity check must still refuse
+    monkeypatch.setattr(MET, "_token", lambda: "tok")
+    monkeypatch.setattr(MET.requests, "get",
+                        lambda *a, **k: _Resp(_fci_zip(n_body=41, skip=(7,))))
+    paths = MET._download_product(MET.COLLECTION_FCI, "PID", str(tmp_path),
+                                  pattern="*.nc")
+    assert len(paths) == 41
+    with pytest.raises(RuntimeError, match="missing"):
+        MET._verify_fci_chunks(paths, "PID")
+
+
+def test_download_product_resumes_with_range(tmp_path, monkeypatch):
+    """A dropped stream mid-transfer must resume from the byte on disk via
+    a Range request, not restart (an ~800 MB product makes restarts a
+    reliability cliff)."""
+    payload = _fci_zip()
+    cut = len(payload) // 2
+    calls = []
+
+    class _DropResp(_Resp):
+        def iter_content(self, n):
+            yield payload[:cut]
+            raise IOError("connection reset")
+
+    def fake_get(url, headers=None, stream=True, timeout=0):
+        calls.append(dict(headers or {}))
+        if len(calls) == 1:
+            return _DropResp(payload)
+        rng = (headers or {}).get("Range", "")
+        assert rng == f"bytes={cut}-", f"expected resume, got {rng!r}"
+        rest = payload[cut:]
+        return _Resp(rest, status=206,
+                     headers={"Content-Length": str(len(rest))})
+
+    monkeypatch.setattr(MET, "_token", lambda: "tok")
+    monkeypatch.setattr(MET.requests, "get", fake_get)
+    paths = MET._download_product(MET.COLLECTION_FCI, "PID", str(tmp_path),
+                                  pattern="*.nc")
+    assert len(calls) == 2
+    assert len(paths) == 41
+
+
+def test_download_product_4xx_is_fatal_with_server_message(tmp_path, monkeypatch):
+    """The licence gate's 403 must surface EUMETSAT's own message verbatim
+    and must NOT burn retries (a 4xx never heals)."""
+    calls = []
+
+    def fake_get(url, headers=None, stream=True, timeout=0):
+        calls.append(1)
+        return _Resp(b"", status=403,
+                     text='{"exceptionText":"GeneralLicense required to '
+                          'access this collection"}')
+
+    monkeypatch.setattr(MET, "_token", lambda: "tok")
+    monkeypatch.setattr(MET.requests, "get", fake_get)
+    with pytest.raises(RuntimeError, match="GeneralLicense required"):
+        MET._download_product(MET.COLLECTION_FCI, "PID", str(tmp_path),
+                              pattern="*.nc")
+    assert len(calls) == 1
+
+
+def test_newest_fci_slot_clamps_to_slot_plus_half_cadence(monkeypatch):
+    """The suite pin for a backfill slot must search end <= slot + cadence/2
+    (the emit grid's covered-tolerance), never the raw wall clock."""
+    seen = {}
+
+    def fake_search(collection, not_after, lookback_h=6.0):
+        seen["not_after"] = not_after
+        return {"properties": {"identifier": "PID",
+                               "date": "2026-07-24T16:30:07Z/2026-07-24T16:39:35Z"}}
+
+    monkeypatch.setattr(MET, "_search_latest", fake_search)
+    slot = dt.datetime(2026, 7, 24, 16, 40, tzinfo=UTC)
+    got = MET.newest_fci_slot(time=slot)
+    assert got == dt.datetime(2026, 7, 24, 16, 39, 35, tzinfo=UTC)
+    assert seen["not_after"] == slot + dt.timedelta(minutes=MET.FCI_CADENCE_MIN / 2)
+
+
+def test_newest_fci_slot_none_when_window_empty(monkeypatch):
+    def fake_search(collection, not_after, lookback_h=6.0):
+        raise RuntimeError("no product")
+
+    monkeypatch.setattr(MET, "_search_latest", fake_search)
+    assert MET.newest_fci_slot(time=dt.datetime(2026, 7, 24, tzinfo=UTC)) is None
+
+
+def test_fetch_fci_disk_slot_tolerance_rejects_wrong_cycle(monkeypatch):
+    """With a pinned time + tolerance, a product from a different repeat
+    cycle must be refused BEFORE any download (never render the wrong
+    cycle under a backfill slot's stamp)."""
+    def fake_search(collection, not_after, lookback_h=6.0):
+        return {"properties": {"identifier": "OLD",
+                               "date": "2026-07-24T15:30:07Z/2026-07-24T15:39:35Z"}}
+
+    def no_download(*a, **k):
+        raise AssertionError("download must not be attempted")
+
+    monkeypatch.setenv("EUMETSAT_CONSUMER_KEY", "k")
+    monkeypatch.setenv("EUMETSAT_CONSUMER_SECRET", "s")
+    monkeypatch.setattr(MET, "_search_latest", fake_search)
+    monkeypatch.setattr(MET, "_download_product", no_download)
+    with pytest.raises(RuntimeError, match="no repeat cycle within"):
+        MET.fetch_fci_disk(time=dt.datetime(2026, 7, 24, 17, 0, tzinfo=UTC),
+                           slot_tolerance_min=MET.FCI_CADENCE_MIN)
+
+
+def test_fci_band_tokens_align_with_recipes():
+    """The numeric convention (1/2/3/4/13) must resolve to the exact satpy
+    dataset names the shared pipeline expects -- registry rows, recipes and
+    the fetcher all speak through this one table."""
+    assert MET.FCI_BAND_TOKENS == {1: "vis_04", 2: "vis_05", 3: "vis_06",
+                                   4: "vis_08", 13: "ir_105"}
+
+
+def test_mtgi1_registry_rows_and_recipes():
+    import s2_recipes as rx
+    import s2_registry as R
+    tc_recipe = rx.FCI_RECIPES_BY_KEY["truecolor"]
+    assert tc_recipe.bands == (1, 2, 3, 4, 13)
+    assert tc_recipe.finest_km == 1.0            # FDHSI: no 0.5 km band
+    assert rx.recipe_for("mtgi1", "irbd").enhancement == "dvorak"
+    ids = [e.product_id for e in R.REGISTRY if e.sat_key == "mtgi1"]
+    assert ids == ["mtgi1-fd-truecolor", "mtgi1-fd-ir", "mtgi1-fd-irbd"]
+    e = R.REGISTRY_BY_ID["mtgi1-fd-truecolor"]
+    assert e.family == "mtgi1" and e.sector_key == "fd" and e.tiled
+    assert e.sector_bbox == (-80.0, -60.0, 80.0, 60.0)
+    idx = R.build_products_index("mtgi1", "fd",
+                                 dt.datetime(2026, 7, 24, tzinfo=UTC))
+    assert idx["count"] == 3
+    assert idx["products"][0]["path"] == "sat/mtgi1/fd/truecolor"
+
+
+def test_pin_suite_scan_mtgi1_uses_fci_slot(monkeypatch):
+    import s2_pyramid_emit as E
+    import s2_registry as R
+    want = dt.datetime(2026, 7, 24, 16, 39, 35, tzinfo=UTC)
+    monkeypatch.setattr(MET, "newest_fci_slot", lambda time=None: want)
+    entries = [e for e in R.REGISTRY if e.sat_key == "mtgi1"]
+    got = E._pin_suite_scan(entries, dt.datetime(2026, 7, 24, 16, 40, tzinfo=UTC))
+    assert got == want
 
 
 def test_search_latest_rechecks_end_time(monkeypatch):

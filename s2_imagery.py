@@ -416,6 +416,9 @@ def produce_recipe_imagery(entry, time=None, nearest=True,
     if entry.family == "gk2a":
         return produce_gk2a_recipe_imagery(entry, time=time, nearest=nearest,
                                            band_cache=band_cache)
+    if entry.family == "mtgi1":
+        return produce_mtgi1_recipe_imagery(entry, time=time, nearest=nearest,
+                                            band_cache=band_cache)
     recipe = s2_recipes.RECIPES_BY_KEY[entry.recipe_id]
     if recipe.kind == "truecolor":
         return produce_truecolor(entry, time=time, nearest=nearest)
@@ -869,6 +872,105 @@ def produce_gk2a_recipe_imagery(entry, time=None, nearest=True, band_cache=None)
     rgba = s2_recipes.rgba_from_rgb(rgb)
     res = _gk2a_result(entry, rgba, bounds, slot, recipe.key,
                        recipe.enhancement)
+    if recipe.bt_band:
+        try:
+            res.bt_grid, res.bt_dims = _decimate_bt(
+                bt - 273.15, bounds,
+                out_w=(getattr(entry, "bt_px", 0) or BT_PX))
+        except Exception:   # noqa: BLE001  (inspector is best-effort)
+            res.bt_grid, res.bt_dims = None, None
+    return res
+
+
+# ============================================================================
+# MTG-I1 FCI (s2_meteosat): the ring's FIFTH true-color sensor (Meteosat-12,
+# 0 deg). Same shape as the GK-2A trio above, but ONE FciDisk carries every
+# dataset (the Data Store product is a single ~800 MB zip of 41 chunks that
+# serves all bands), so the suite cache holds the whole disk once per slot
+# and all three rows (truecolor/ir/irbd) render from it. Downloads are
+# creds-gated + licence-gated (s2_meteosat honest-degrade: any failure
+# raises, the emit loop logs it, nothing is faked).
+# ============================================================================
+def fetch_fci_disk_cached(time=None, nearest=True, cache=None):
+    """Slot-pinned FciDisk, cached so the whole suite downloads ONCE.
+    Mirrors fetch_gk2a_band_disks: pin the repeat cycle first (OpenSearch,
+    no creds needed), then reuse the cached disk for that stamp."""
+    import s2_meteosat as MET
+    slot = MET.newest_fci_slot(time=time)
+    if slot is None:
+        raise RuntimeError("FCI: no licence-compliant repeat cycle in the "
+                           "search window")
+    stamp = slot.strftime("%Y%m%dT%H%M%SZ")
+    key = ("fci", "fd", stamp)
+    disk = cache.get(key) if cache is not None else None
+    if disk is None:
+        disk = MET.fetch_fci_disk(time=slot,
+                                  slot_tolerance_min=MET.FCI_CADENCE_MIN)
+        if cache is not None:
+            cache[key] = disk
+    return slot, disk
+
+
+def _mtgi1_result(entry, rgba, bounds, slot, channel, enhancement):
+    return ImageryResult(
+        rgba=rgba, bounds=bounds, scan_start=slot, product="FD",
+        bucket="eumetsat-datastore",
+        s3_key=f"EO:EUM:DAT:0662/{slot:%Y%m%d/%H%M}/",
+        generic_channel=channel, enhancement=enhancement)
+
+
+def produce_fci_truecolor(entry, time=None, nearest=True, band_cache=None):
+    """MTG FCI true color through the SHARED ring pipeline (sensor='fci'):
+    NDVI-hybrid green (limits [0.15, 0.05], strength 3) from vis_05+vis_08,
+    pyspectral Meteosat-12 SRF Rayleigh, cira_stretch, ir_105 night fade --
+    identical treatment to the other ring sensors by construction, NO
+    FCI-specific compensation. 2 km-class raster like the gk2a/himawari9
+    rows (FDHSI has no 0.5 km band; self-sharpen is a documented no-op)."""
+    import truecolor
+    import s2_meteosat as MET
+
+    slot, disk = fetch_fci_disk_cached(time=time, nearest=nearest,
+                                       cache=band_cache)
+    TLON, TLAT, bounds, _dims = _gk2a_target_mesh(entry.sector_bbox,
+                                                  entry.pyramid_px)
+    grid = {}
+    for role, ds in MET.FCI_TRUECOLOR_ROLES.items():
+        grid[role] = disk.sample(ds, TLAT, TLON)
+    geom_valid = np.isfinite(grid["red"])
+    lats = TLAT.astype(np.float32)
+    lons = TLON.astype(np.float32)
+    rgb, _cos_sza = truecolor.assemble_truecolor(
+        grid["red"], grid["green"], grid["blue"], grid.get("veggie"),
+        lats, lons, when=slot, sub_sat_lon=0.0,
+        platform_name=MET.FCI_PLATFORM, sensor="fci",
+        ir_bt=grid.get("ir"))
+    rgba = s2_recipes.rgba_from_rgb(np.asarray(rgb, dtype=np.float32),
+                                    valid=geom_valid)
+    return _mtgi1_result(entry, rgba, bounds, slot, "truecolor", "tat_neon")
+
+
+def produce_mtgi1_recipe_imagery(entry, time=None, nearest=True,
+                                 band_cache=None):
+    """End-to-end MTG FCI recipe product (truecolor delegates above; the
+    single_palette clean-IR pair samples ir_105 and colorizes with the
+    frozen enhancement, exactly like the gk2a rows)."""
+    import s2_meteosat as MET
+    import s2_recipes as _rx_mod
+    recipe = _rx_mod.FCI_RECIPES_BY_KEY[entry.recipe_id]
+    if recipe.kind == "truecolor":
+        return produce_fci_truecolor(entry, time=time, nearest=nearest,
+                                     band_cache=band_cache)
+    if recipe.kind != "single_palette":
+        raise ValueError(f"mtgi1 recipe kind {recipe.kind!r} not onboarded")
+    slot, disk = fetch_fci_disk_cached(time=time, nearest=nearest,
+                                       cache=band_cache)
+    TLON, TLAT, bounds, _dims = _gk2a_target_mesh(entry.sector_bbox,
+                                                  entry.pyramid_px)
+    bt = disk.sample(MET.FCI_BAND_TOKENS[recipe.band], TLAT, TLON)
+    rgb = _colorize_bt(bt, recipe.enhancement)
+    rgba = s2_recipes.rgba_from_rgb(rgb)
+    res = _mtgi1_result(entry, rgba, bounds, slot, recipe.key,
+                        recipe.enhancement)
     if recipe.bt_band:
         try:
             res.bt_grid, res.bt_dims = _decimate_bt(

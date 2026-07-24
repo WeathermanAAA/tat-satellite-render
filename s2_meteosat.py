@@ -16,10 +16,29 @@ on the box AND satpy (requirements-s2-geo.txt) is installed in the emit
 image -- both are queued manual/activation steps; until then every fetch
 raises and the sector stays an honest transparent gap.
 
-ACCESS (verified against the EUMETSAT Data Store, 2026-07-11):
+ACCESS (verified against the EUMETSAT Data Store, 2026-07-11; auth path
+re-verified 2026-07-24):
   - Free EUMETSAT account -> consumer key/secret at api.eumetsat.int/api-key/;
     token via POST /token (OAuth2 client credentials). Env:
     EUMETSAT_CONSUMER_KEY + EUMETSAT_CONSUMER_SECRET.
+  - AUTH MIGRATION NOTE (2026-07-24): the api-key page banners a "new
+    authentication method" -- that is the v2 Data Access Services flow
+    (OAuth2 Authorization Code + PKCE against user.eumetsat.int/cas, live
+    since 2026-06-30). It requires an INTERACTIVE browser login to bootstrap
+    a 30-day refresh-token chain, so it is unsuitable for this headless box
+    today. Our client-credentials flow at POST /token is the documented v1
+    method, still fully supported ("will be depreciated in due time" -- no
+    date anywhere), and is exactly what the official eumdac client (3.1.1,
+    2025-12) still ships. Stay on v1 until eumdac gains v2 support or
+    EUMETSAT announces a deadline; the v2 delta is small (endpoints 1.0.0 ->
+    2.0.0 + the refresh-token mint) and is documented in the Data Store
+    detailed guide on user.eumetsat.int.
+  - LICENCE GATE: collection downloads 403 with "GeneralLicense required to
+    access this collection" until the account holder accepts the EUMETSAT
+    General Licence on user.eumetsat.int (self-service; activation can lag
+    up to 1 h). One acceptance covers FCI + both SEVIRI services. Search
+    works without it, so slot pinning succeeds and every download honestly
+    degrades until the click.
   - The account must have accepted the "Meteosat Level 1 data with latency
     >= 1 hour" licence (free, self-service on user.eumetsat.int). That
     licence allows use FOR ANY PURPOSE with attribution but not
@@ -76,7 +95,31 @@ FCI_TRUECOLOR_ROLES = {"blue": "vis_04", "green": "vis_05", "red": "vis_06",
                        "veggie": "vis_08", "ir": FCI_IR_DATASET}
 FCI_PLATFORM = "Meteosat-12"   # pyspectral RSR platform name (MTG-I1)
 
+# Registry/recipe numeric convention (mirrors AMI/AHI: 1=blue, 2=green,
+# 3=red, 4=veggie NIR, 13=clean IR) so the mtgi1-fd rows read like every
+# other suite and the explorer's cross-satellite key mapping holds.
+FCI_BAND_TOKENS = {1: "vis_04", 2: "vis_05", 3: "vis_06", 4: "vis_08",
+                   13: FCI_IR_DATASET}
+
+# FCI FDHSI repeat cycle is 10 min; the emit backfill grid + slot-covered
+# tolerance both key off this.
+FCI_CADENCE_MIN = 10
+
+# COMPLETENESS GATE (never-miss): one FDHSI FD product is a zip of 41
+# chunked netCDFs (40 CHK-BODY strips + 1 CHK-TRAIL) and satpy's fci_l1c_nc
+# needs ALL of them -- a partial set decodes into a disk with silent missing
+# strips. fetch_fci_disk refuses to decode unless the extracted chunk set is
+# contiguous and complete, so a truncated download or a mid-upload product
+# can never render. Env override for schema drift, never for convenience.
+FCI_EXPECTED_CHUNKS = int(os.getenv("EUMETSAT_FCI_EXPECTED_CHUNKS", "41"))
+
 _token_cache = {"token": None, "expires": 0.0}
+
+
+class _FatalDownloadError(RuntimeError):
+    """A download failure that retrying cannot fix (4xx: licence gate,
+    vanished product). Propagates out of the retry loop with the server's
+    own message intact."""
 
 
 def credentials():
@@ -144,21 +187,78 @@ def _search_latest(collection: str, not_after: dt.datetime,
 
 
 def _download_product(collection: str, product_id: str, dest_dir: str,
-                      pattern: str = "*.nat") -> list[str]:
+                      pattern: str = "*.nat", attempts: int = 3) -> list[str]:
     """Download one product zip and return the extracted paths matching
-    ``pattern`` (SEVIRI Native = one .nat; FCI L1C = ~40 chunked *.nc)."""
+    ``pattern`` (SEVIRI Native = one .nat; FCI L1C = 41 chunked *.nc).
+
+    An FCI product is ~800 MB over one HTTP stream, so a dropped connection
+    mid-transfer is a matter of time, not chance. The stream lands in a
+    .part file; a short read RESUMES with a Range request from the byte
+    already on disk (the Data Store supports Range -- verified 2026-07-24),
+    and a zip that still fails to open after completion is discarded for a
+    clean full retry. The zip only becomes product.zip once its size checks
+    out, so extraction never sees a half-written file."""
     from urllib.parse import quote
     url = (f"{API}/data/download/1.0.0/collections/"
            f"{quote(collection, safe='')}/products/{quote(product_id, safe='')}")
+    part = os.path.join(dest_dir, "product.zip.part")
     zpath = os.path.join(dest_dir, "product.zip")
-    with requests.get(url, headers={"Authorization": f"Bearer {_token()}"},
-                      stream=True, timeout=900) as r:
-        r.raise_for_status()
-        with open(zpath, "wb") as fh:
-            for chunk in r.iter_content(1 << 20):
-                fh.write(chunk)
-    with zipfile.ZipFile(zpath) as zf:
-        zf.extractall(dest_dir)
+    total = None            # Content-Length of the full object, once known
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            got = os.path.getsize(part) if os.path.exists(part) else 0
+            if total is not None and got >= total:
+                pass        # transfer already complete; go verify the zip
+            else:
+                headers = {"Authorization": f"Bearer {_token()}"}
+                if got:
+                    headers["Range"] = f"bytes={got}-"
+                with requests.get(url, headers=headers, stream=True,
+                                  timeout=900) as r:
+                    if got and r.status_code == 200:
+                        got = 0     # server ignored Range: restart the file
+                    if 400 <= r.status_code < 500:
+                        # a 4xx never heals on retry, and its body carries
+                        # the actionable message (e.g. the licence gate's
+                        # "GeneralLicense required to access this
+                        # collection") -- surface it verbatim
+                        raise _FatalDownloadError(
+                            f"{product_id}: HTTP {r.status_code}: "
+                            f"{r.text[:300]}")
+                    r.raise_for_status()
+                    if total is None:
+                        cl = r.headers.get("Content-Length")
+                        if cl and r.status_code == 200:
+                            total = int(cl)
+                        elif cl and r.status_code == 206:
+                            total = got + int(cl)
+                    with open(part, "ab" if got else "wb") as fh:
+                        for chunk in r.iter_content(1 << 20):
+                            fh.write(chunk)
+            size = os.path.getsize(part) if os.path.exists(part) else 0
+            if total is not None and size < total:
+                raise IOError(f"short read: {size}/{total} bytes")
+            os.replace(part, zpath)
+            with zipfile.ZipFile(zpath) as zf:
+                zf.extractall(dest_dir)
+            break
+        except zipfile.BadZipFile as e:
+            # complete-length but corrupt: resume can't fix it -- start over
+            last_err = e
+            for p in (part, zpath):
+                if os.path.exists(p):
+                    os.remove(p)
+            total = None
+        except _FatalDownloadError:
+            raise               # 4xx: retrying cannot help, message matters
+        except Exception as e:  # noqa: BLE001 -- timeouts, resets, short reads
+            last_err = e        # .part stays for the Range resume
+            if os.path.exists(zpath) and not os.path.exists(part):
+                os.replace(zpath, part)   # extraction failed post-rename
+    else:
+        raise RuntimeError(
+            f"{product_id}: download failed after {attempts} attempts: {last_err}")
     os.remove(zpath)
     paths = sorted(glob.glob(os.path.join(dest_dir, "**", pattern), recursive=True))
     if not paths:
@@ -264,6 +364,58 @@ def fetch_seviri_disk(collection: str, time=None, delay_min=None) -> SeviriDisk:
 # ---------------------------------------------------------------------------
 # MTG FCI (Meteosat-12): the TRUE-COLOR Meteosat ring member
 # ---------------------------------------------------------------------------
+def _verify_fci_chunks(paths: list[str], product_id: str) -> None:
+    """The never-miss completeness gate: refuse to decode a partial FDHSI
+    chunk set. Chunk files end in _NNNN.nc (body strips numbered from 1,
+    plus the trailer); the set must be CONTIGUOUS from 1 and total
+    FCI_EXPECTED_CHUNKS files, else this slot does not render (the emit
+    backfill retries it next tick -- a gap is honest, a half disk is not)."""
+    import re
+    idx = []
+    for p in paths:
+        m = re.search(r"_(\d{4})\.nc$", os.path.basename(p))
+        if m:
+            idx.append(int(m.group(1)))
+    n = len(paths)
+    if n != FCI_EXPECTED_CHUNKS:
+        raise RuntimeError(
+            f"{product_id}: incomplete FCI chunk set -- {n} *.nc files, "
+            f"expected {FCI_EXPECTED_CHUNKS} (env EUMETSAT_FCI_EXPECTED_CHUNKS "
+            f"overrides if the product schema ever changes)")
+    if idx:
+        want = set(range(1, max(idx) + 1))
+        missing = sorted(want - set(idx))
+        if missing:
+            raise RuntimeError(
+                f"{product_id}: FCI chunk numbering has gaps -- missing "
+                f"indices {missing[:8]}{'...' if len(missing) > 8 else ''}")
+
+
+def newest_fci_slot(time=None, delay_min=None):
+    """Sensing-END datetime of the newest licence-compliant FCI repeat cycle
+    (the suite pin -- mirrors s2_gk2a.newest_complete_slot). With ``time``,
+    resolves the cycle covering that backfill slot: newest product ending
+    <= time + FCI_CADENCE_MIN/2 (the emit grid's own covered-tolerance), so
+    a slot the licence delay still embargoes resolves to an older, already-
+    emitted cycle and dedups instead of erroring. Returns None if the
+    search window is empty (caller decides how loud to be). Needs NO
+    credentials -- OpenSearch is open, so pinning works even while the
+    licence gate still 403s the download (honest-degrade per product)."""
+    delay = (float(os.getenv("EUMETSAT_FCI_DELAY_MIN",
+                             os.getenv("EUMETSAT_DELAY_MIN", "60")))
+             if delay_min is None else float(delay_min))
+    not_after = dt.datetime.now(UTC) - dt.timedelta(minutes=delay)
+    if time is not None:
+        t = time if time.tzinfo else time.replace(tzinfo=UTC)
+        not_after = min(not_after, t + dt.timedelta(minutes=FCI_CADENCE_MIN / 2.0))
+    try:
+        feat = _search_latest(COLLECTION_FCI, not_after)
+    except RuntimeError:
+        return None
+    date = feat["properties"]["date"]
+    return dt.datetime.fromisoformat(date.split("/")[1].replace("Z", "+00:00"))
+
+
 class FciDisk:
     """Calibrated FCI L1C fields + per-resolution pyresample areas.
 
@@ -289,7 +441,8 @@ class FciDisk:
 
 
 def fetch_fci_disk(time=None, delay_min=None,
-                   datasets=FCI_VIS_DATASETS + (FCI_IR_DATASET,)) -> FciDisk:
+                   datasets=FCI_VIS_DATASETS + (FCI_IR_DATASET,),
+                   slot_tolerance_min=None) -> FciDisk:
     """Fetch + decode the newest licence-compliant MTG FCI L1C repeat cycle.
 
     Mirrors fetch_seviri_disk: same creds/token/OpenSearch/download client,
@@ -304,6 +457,10 @@ def fetch_fci_disk(time=None, delay_min=None,
     time: pin near this UTC time (archive use); None = newest allowed.
     delay_min: minimum data age in minutes (default env EUMETSAT_FCI_DELAY_MIN
     or EUMETSAT_DELAY_MIN or 60). Set 0 only with an NRT-tier licence.
+    slot_tolerance_min: with ``time``, refuse a product whose sensing end is
+    further than this from the requested slot (the cron producer passes the
+    FCI cadence so a pin/fetch race can never render the wrong cycle);
+    None = legacy nearest-before behavior for archive use.
     """
     delay = (float(os.getenv("EUMETSAT_FCI_DELAY_MIN",
                              os.getenv("EUMETSAT_DELAY_MIN", "60")))
@@ -318,10 +475,17 @@ def fetch_fci_disk(time=None, delay_min=None,
     pid = feat["properties"]["identifier"]
     date = feat["properties"]["date"]
     scan_end = dt.datetime.fromisoformat(date.split("/")[1].replace("Z", "+00:00"))
+    if slot_tolerance_min is not None and time is not None:
+        t = time if time.tzinfo else time.replace(tzinfo=UTC)
+        if abs((scan_end - t).total_seconds()) > slot_tolerance_min * 60.0:
+            raise RuntimeError(
+                f"FCI: no repeat cycle within {slot_tolerance_min} min of "
+                f"{t.isoformat()} (nearest ends {scan_end.isoformat()})")
 
     tmp = tempfile.mkdtemp(prefix="fci_")
     try:
         chunks = _download_product(COLLECTION_FCI, pid, tmp, pattern="*.nc")
+        _verify_fci_chunks(chunks, pid)
         from satpy import Scene
         scn = Scene(filenames=chunks, reader="fci_l1c_nc")
         vis = [d for d in datasets if d != FCI_IR_DATASET]
