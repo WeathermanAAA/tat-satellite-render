@@ -904,8 +904,11 @@ def fetch_fci_disk_cached(time=None, nearest=True, cache=None):
     key = ("fci", "fd", stamp)
     disk = cache.get(key) if cache is not None else None
     if disk is None:
+        # tolerance = HALF the cadence: the adjacent repeat cycle sits
+        # exactly one cadence away, so a full-cadence tolerance would
+        # admit it in a pin/fetch race (review finding 2026-07-24)
         disk = MET.fetch_fci_disk(time=slot,
-                                  slot_tolerance_min=MET.FCI_CADENCE_MIN)
+                                  slot_tolerance_min=MET.FCI_CADENCE_MIN / 2.0)
         if cache is not None:
             cache[key] = disk
     return slot, disk

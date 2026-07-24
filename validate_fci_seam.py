@@ -99,7 +99,17 @@ def main() -> int:
     print(f"[seam] common slot (FCI sensing end): {slot.isoformat()}")
 
     e_fci = R.REGISTRY_BY_ID["mtgi1-fd-truecolor"]
-    e_goes = R.REGISTRY_BY_ID["goes19-fd-truecolor"]
+    # goes19 has no fd-truecolor registry row (true color is conus-scoped,
+    # like himawari) -- build an ad-hoc FULL-DISK entry over the Atlantic
+    # comparison region; fetch_band_crops honors render_product_hint="fd"
+    # (CMIPF files) + the entry bbox, and the render still routes through
+    # the production dispatcher.
+    import dataclasses
+    e_goes = dataclasses.replace(
+        R.REGISTRY_BY_ID["goes19-conus-truecolor"],
+        product_id="seamcheck-goes19-fd-truecolor",
+        sector_key="fd", render_product_hint="fd",
+        sector_bbox=(-70.0, -45.0, -5.0, 45.0), pyramid_px=3072)
     img_fci = I.produce_recipe_imagery(e_fci, time=slot, nearest=True)
     img_goes = I.produce_recipe_imagery(e_goes, time=slot, nearest=True)
     print(f"[seam] FCI stamp {img_fci.stamp}  GOES-E stamp {img_goes.stamp}")

@@ -157,5 +157,47 @@ class TestBackfillLoop(unittest.TestCase):
                     "--step", "10", "--time", "2026-07-12T02:00:00"])
 
 
+class TestSuitePinDedup(unittest.TestCase):
+    """Suite --step path: multiple backfill slots that PIN to the same scan
+    (a licence-embargoed product resolves every young slot to the newest
+    compliant cycle) must fetch+render that scan ONCE -- emit_one's
+    post-download dedup would otherwise re-download ~800 MB per slot per
+    tick. Also: a pin already covered in the store skips before fetching."""
+
+    PIN = dt.datetime(2026, 7, 12, 2, 9, 35, tzinfo=UTC)
+
+    def _run_suite(self, covered_times):
+        emitted = []
+
+        def fake_emit(entry, when, store, args, band_cache=None):
+            emitted.append((entry.product_id, when))
+            return {"count": 1}
+
+        def fake_complete(entry, store, prefix):
+            return [(_stamp(t), 5) for t in covered_times]
+
+        with mock.patch.object(E, "emit_one", side_effect=fake_emit), \
+             mock.patch.object(E, "_pin_suite_scan", return_value=self.PIN), \
+             mock.patch.object(E.P, "complete_stamps", side_effect=fake_complete), \
+             mock.patch.object(E, "_write_products_index"), \
+             mock.patch.object(E.dt, "datetime", wraps=dt.datetime) as md:
+            md.now.return_value = NOW
+            rc = E.main(["--suite", "mtgi1-fd", "--store", "local:/tmp/nope",
+                         "--step", "10", "--backfill", "30"])
+        return rc, emitted
+
+    def test_same_pin_renders_once_per_pass(self):
+        rc, emitted = self._run_suite([])       # nothing covered yet
+        self.assertEqual(rc, 0)
+        # 3 suite entries, exactly ONE slot rendered despite 3 open slots
+        self.assertEqual(len(emitted), 3)
+        self.assertEqual({t for _, t in emitted}, {self.PIN})
+
+    def test_covered_pin_skips_before_fetch(self):
+        rc, emitted = self._run_suite([self.PIN])   # cycle already in store
+        self.assertEqual(rc, 0)
+        self.assertEqual(emitted, [])
+
+
 if __name__ == "__main__":
     unittest.main()

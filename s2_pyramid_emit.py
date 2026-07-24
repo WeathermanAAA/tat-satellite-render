@@ -399,8 +399,29 @@ def main(argv=None) -> int:
         todo = [when]                     # legacy: one tick, newest (or --time)
 
     ok_all, failed_all = [], []
+    rendered_pins: set = set()
     for slot in todo:
         pinned = _pin_suite_scan(entries, slot)
+        if args.step:
+            # Slots whose pin resolves to an ALREADY-RENDERED scan must skip
+            # BEFORE the fetch: emit_one dedups only after downloading, and
+            # for a licence-embargoed product (FCI: slots younger than the
+            # 1 h delay all pin to the newest compliant cycle) that means
+            # re-downloading ~800 MB per slot per tick just to discover the
+            # duplicate. Intra-pass via rendered_pins; cross-tick via the
+            # store re-check (same self-heal pattern as the single-product
+            # loop above).
+            if pinned in rendered_pins:
+                print(f"[suite] {slot.isoformat()} pins to already-rendered "
+                      f"{pinned.isoformat()} -- skip")
+                continue
+            if ok_all:
+                covered = _covered_times(entries, store, args.prefix)
+            if not _slot_missing(pinned, covered, dt.timedelta(seconds=90)):
+                print(f"[suite] {slot.isoformat()} pins to already-covered "
+                      f"scan {pinned.isoformat()} -- skip")
+                continue
+        rendered_pins.add(pinned)
         print(f"[suite] {args.suite}: {len(entries)} products @ scan {pinned.isoformat()}")
         band_cache: dict = {}             # per-scan: bands download once per slot
         for entry in entries:
