@@ -34,6 +34,14 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt \
     && pip install "boto3>=1.34" "requests>=2.31"
 
+# GEO-ring Meteosat layer (satpy: seviri_l1b_native + fci_l1c_nc readers).
+# Deliberately its OWN cached layer after requirements.txt, and deliberately
+# NOT in requirements.txt (Railway services must never pull satpy -- see the
+# header of requirements-s2-geo.txt). s2_meteosat lazy-imports it and stays
+# creds-gated, so every non-Meteosat suite is unaffected by this layer.
+COPY requirements-s2-geo.txt ./
+RUN pip install -r requirements-s2-geo.txt
+
 # Pre-warm pyspectral's Rayleigh LUTs so the first true-color render isn't slow
 # (non-fatal: the recipe guards a missing LUT and renders hazier).
 RUN python -c "from pyspectral.rayleigh import check_and_download; check_and_download()" || true

@@ -126,6 +126,34 @@ degrade honestly and the wedge stays the labeled transparent gap.
 Per-member valid times ride `latest_times.json` as `members[]` — the ~1 h
 Meteosat skew is surfaced, never hidden.
 
+## MTG FCI true color (mtgi1-fd) — activation runbook (2026-07-24)
+
+Meteosat-12 (MTG-I1) FCI is the ring's FIFTH true-color sensor: registry
+suite `mtgi1-fd` (truecolor/ir/irbd, the GK-2A model), collection
+`EO:EUM:DAT:0662` (FDHSI L1C, ~800 MB zip of 41 chunked netCDFs per 10-min
+cycle), ingest `s2_meteosat.fetch_fci_disk` behind a chunk-completeness gate
+(a partial slot NEVER renders; the lane's backfill retries it).
+
+State as of 2026-07-24: creds are on the box `.env` and the v1 token flow is
+verified working (see the auth-migration note in `s2_meteosat.py` — we stay
+on v1 client-credentials; the banner's "new method" is an interactive PKCE
+flow unsuited to a headless box). Search/pinning works WITHOUT the licence;
+downloads 403 with "GeneralLicense required to access this collection" until
+the account accepts the EUMETSAT General Licence on user.eumetsat.int (one
+click covers FCI + both SEVIRI services; activation lags up to 1 h). The
+lane can run pre-licence: every tick fails honestly, publishes nothing, and
+self-heals on the first post-licence tick.
+
+Lane (dedicated — the base rotation's 4+ h cycle can't cover a 10-min
+cadence + 1 h licence delay):
+
+    docker compose -p tat-s2-mtg -f docker-compose.s2.yml \
+      -f docker-compose.s2.mtg-lane.yml --profile cron up -d --no-build emit-cron
+
+Attribution rides the viewer source line: "Contains EUMETSAT Meteosat data".
+SEVIRI stays OUT of the true-color ring (no blue/green band) — BT members
+only, per policy.
+
 ## Deploy topology discipline (2026-07-23)
 
 Same rule as RUNBOOK-RENDER: box clone pulls from AND pushes to

@@ -1,0 +1,23 @@
+# MTG FCI dedicated emit lane (2026-07-24): Meteosat-12 true color + IR for
+# the ring's fifth sensor. Its own lane (same pattern as the geo/conus
+# lanes) because (a) the base suite rotation is 4+ h -- longer than the
+# 90-min default backfill window, which would leave permanent slot gaps for
+# a 10-min-cadence product, and (b) the licence's >= 1 h data delay means
+# slots only become fetchable an hour after scan, so the lane needs a
+# 150-min lookback for full coverage: each slot gets ~8 retry ticks between
+# becoming licence-eligible (~60-70 min old) and aging out of the window.
+# Memory: one FDHSI FciDisk is ~2.1 GB eager float32 + satpy decode + the
+# 5120 px truecolor assembly -- 12g headroom instead of the base 8g.
+# Start:
+#   docker compose -p tat-s2-mtg -f docker-compose.s2.yml \
+#     -f docker-compose.s2.mtg-lane.yml --profile cron up -d --no-build emit-cron
+# Pre-licence this lane fails every download with the Data Store's
+# "GeneralLicense required" 403 (logged, nothing published, explorer stays
+# greyed) and heals itself on the first tick after the licence is accepted.
+services:
+  emit-cron:
+    environment:
+      S2_CRON_SUITES: mtgi1-fd
+      S2_CRON_INTERVAL_S: "600"
+      S2_CRON_BACKFILL_MIN: "150"
+    mem_limit: 12g

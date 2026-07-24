@@ -68,7 +68,10 @@ services:
   # the box keeps up -- watch a full pass stay under the interval first).
   # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list;
   # DEFAULTS to the FULL set -- conus fd himawari9-wpac himawari9-fd
-  # gk2a-fd geo-global -- so a bare `up` runs everything; the legacy single
+  # gk2a-fd geo-global -- so a bare `up` runs everything; mtgi1-fd runs on
+  # its OWN lane, docker-compose.s2.mtg-lane.yml, because the licence's 1 h
+  # delay + 10-min cadence need a longer backfill window than the base
+  # rotation provides; the legacy single
   # S2_CRON_SUITE still overrides), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
   # S2_CRON_PREFIX, S2_CRON_STEP_MIN, S2_CRON_BACKFILL_MIN. A failed suite
   # never blocks the rest of the tick.
