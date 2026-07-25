@@ -3,8 +3,15 @@
 # Same shape as the GOES-19 FD lane (see its header for the ordering rationale
 # and the RAM measurement that argues for one container per satellite):
 #
-#   every pass   ir irbd sandwich airmass b08
-#   then         one quarter of the 22 browse bands
+#   every pass   ir irbd sandwich airmass b08   on the NATIVE 10-min grid
+#   then         one quarter of the 22 browse bands on a 30-min grid
+#
+# The browse grid is explicit, and it is what the box can actually sustain:
+# a 305-tile FD product-slot costs ~39 s, so all 27 products on the 10-min grid
+# would need 1.75x real time on a serial lane. Leads @10 min + browse @30 min
+# is 0.80x. Leaving browse on --step 10 with a revisit longer than its backfill
+# window silently drops the slots that age out -- a loop full of holes rather
+# than a slower, uniform one.
 #
 # AHI FLDK scans every 10 min; this suite previously rode the shared rotation
 # and refreshed ~5 h.
@@ -28,15 +35,21 @@ services:
         B1="b07 b09 b10 b11 b12"
         B2="b14 b15 b16 ash dust"
         B3="nightmicro firetemp daycloudphase dayconvection daylandcloud snowfog"
-        echo "[s2-hwfd] Himawari-9 FD: leads=[$$LEAD] + 1/4 of the browse catalog per pass (z5 native)"
+        echo "[s2-hwfd] himawari9-fd: leads=[$$LEAD] @10min + 1/4 of the browse catalog @30min (z5 native)"
         n=0
         while true; do
-          eval "BROWSE=\$$B$$((n % 4))"
-          for prod in $$LEAD $$BROWSE; do
+          for prod in $$LEAD; do
             python s2_pyramid_emit.py --product himawari9-fd-$$prod \
               --store r2 --prefix shadow --max-zoom 5 \
               --allow-geometry-change --step 10 --backfill 60 \
-              || echo "[s2-hwfd] $$prod failed rc=$$? (next tick retries)"
+              || echo "[s2-hwfd] lead $$prod failed rc=$$? (next tick retries)"
+          done
+          eval "BROWSE=\$$B$$((n % 4))"
+          for prod in $$BROWSE; do
+            python s2_pyramid_emit.py --product himawari9-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 30 --backfill 120 \
+              || echo "[s2-hwfd] browse $$prod failed rc=$$? (next tick retries)"
           done
           n=$$((n + 1))
           sleep 30

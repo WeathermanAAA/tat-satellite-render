@@ -6,14 +6,21 @@
 #
 # WITHIN the lane, the pass is ordered by what a viewer actually animates:
 #
-#   every pass   ir irbd sandwich airmass c08   (~5 x 39 s = 200 s)
-#   then         one quarter of the 22 browse bands (~6 x 39 s = 235 s)
+#   every pass   ir irbd sandwich airmass c08   on the NATIVE 10-min grid
+#   then         one quarter of the 22 browse bands on a 30-min grid
 #
-# so a pass is ~7 min inside the 10-min slot grid: the loop leads keep native
-# LATENCY (newest frame ~7 min old) and native SPACING (the --step 10 grid),
-# while the browse catalog completes a full cycle every 4 passes (~30 min).
-# Frame spacing is 10 min for every product either way -- the backfill window
-# fills each product's missing slots when the lane reaches it.
+# The two grids are the honest consequence of one measured fact: a 305-tile FD
+# product-slot costs ~39 s, so holding ALL 27 products on the 10-min grid needs
+#   27 products x 6 slots/h x 39 s = 6318 s per 3600 s hour = 1.75x real time
+# on a serial lane. It cannot be done here at any pass ordering. What fits:
+#   leads @10 min + browse @30 min = 2886 s/h = 0.80x real time.
+#
+# The browse grid is EXPLICIT (--step 30), not emergent. An earlier version
+# left browse on --step 10 with a 60-min backfill and a ~2 h revisit, so every
+# cycle silently dropped the slots that had aged out of the window -- loops
+# with permanent holes. A 30-min grid the lane can actually fill gives a
+# uniform, gapless browse loop instead, and --backfill 120 covers the revisit
+# interval so nothing is lost between visits.
 #
 # Why one container and not a fast/bulk pair: RAM, measured. A full-disk cut
 # peaks ~4.5 GB, the box has 31 GB, and the non-s2 stacks (meso-render, radar,
@@ -38,15 +45,21 @@ services:
         B1="c07 c09 c10 c11 c12"
         B2="c14 c15 c16 ash dust"
         B3="nightmicro firetemp daycloudphase dayconvection daylandcloud snowfog"
-        echo "[s2-g19fd] GOES-19 FD: leads=[$$LEAD] + 1/4 of the browse catalog per pass (z5 native)"
+        echo "[s2-g19fd] goes19-fd: leads=[$$LEAD] @10min + 1/4 of the browse catalog @30min (z5 native)"
         n=0
         while true; do
-          eval "BROWSE=\$$B$$((n % 4))"
-          for prod in $$LEAD $$BROWSE; do
+          for prod in $$LEAD; do
             python s2_pyramid_emit.py --product goes19-fd-$$prod \
               --store r2 --prefix shadow --max-zoom 5 \
               --allow-geometry-change --step 10 --backfill 60 \
-              || echo "[s2-g19fd] $$prod failed rc=$$? (next tick retries)"
+              || echo "[s2-g19fd] lead $$prod failed rc=$$? (next tick retries)"
+          done
+          eval "BROWSE=\$$B$$((n % 4))"
+          for prod in $$BROWSE; do
+            python s2_pyramid_emit.py --product goes19-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 30 --backfill 120 \
+              || echo "[s2-g19fd] browse $$prod failed rc=$$? (next tick retries)"
           done
           n=$$((n + 1))
           sleep 30
