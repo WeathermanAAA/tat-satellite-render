@@ -41,14 +41,15 @@ boxes:
     host: root@2.25.183.231
     tier: 8 vCPU / 31 GB / Hostinger KVM8 (Europe)
     role: >-
-      The original all-purpose box. Owns the GOES side of the satellite ring,
-      the global composite, and every non-satellite render stack. CPU-bound;
-      Hostinger has flagged it as pegged, which is why the Himawari lanes
-      moved to box2 on 2026-07-25 (load ~9-10 -> ~3.9, free RAM ~1 -> ~13 GB).
+      Carries every non-satellite render stack -- cyclolab, meso, radar, s1,
+      overlays -- which cost ~3.7 cores that CANNOT move, because they serve
+      live requests or poll region-specific sources. That baseline leaves only
+      ~3.3 cores for emit here, which is the number that decides what stays.
+      Keeps the GOES-19 full disk (leads + browse) and the two cheap CONUS
+      lanes; the expensive z7 CONUS lane went to box2 on 2026-07-25.
     lanes:
       - tat-s2-g19fd-leads
       - tat-s2-g19fd
-      - tat-s2-conus-fast
       - tat-s2-conus-fast2
       - tat-s2-conus
     services:
@@ -66,8 +67,10 @@ boxes:
       throughput; the template for future emit boxes. Took the Himawari lanes
       off box1 on 2026-07-25 to unpeg it, then the three location-independent
       lanes (GK-2A, MTG, the GEO ring composite) once the first heartbeats
-      showed box1 at 0.97 load/core against box2 at 0.22. Nothing here fetches
-      from a region-locked source, so these lanes are placement-free.
+      showed box1 at 0.97 load/core against box2 at 0.22, then the z7 CONUS
+      fast lane once CONUS moved to its native 5-min grid and box1 measured
+      ~3.7 cores of immovable render load. Nothing here fetches from a
+      region-locked source, so these lanes are placement-free.
     lanes:
       - tat-s2-hwfd-leads
       - tat-s2-hwfd
@@ -75,6 +78,7 @@ boxes:
       - tat-s2-gk2a
       - tat-s2-mtg
       - tat-s2-geo
+      - tat-s2-conus-fast
     services: []
 
 lanes:
@@ -112,7 +116,7 @@ lanes:
     cost: ~0.8 cores steady / ~2.2 GB peak
   - project: tat-s2-conus-fast
     compose: docker-compose.s2.conus-fast.yml
-    box: box1
+    box: box2
     cost: ~2.0 cores steady / ~4.1 GB peak (native 5-min grid; z7 c02 is the RAM peak)
   - project: tat-s2-conus-fast2
     compose: docker-compose.s2.conus-fast2.yml
