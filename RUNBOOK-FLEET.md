@@ -134,10 +134,12 @@ want to watch it.)
 
 The page's roster is published too — every box writes `fleet/index.json` from
 `fleet.yml` next to its own heartbeat — so **box3 appears on the health page as
-soon as it is in the inventory**, with nothing to edit in the site repo. It carries: git sha + branch +
-dirty count (so drift shows up on the health page too), load per core, memory,
-disk, **OOM kills since boot** (the failure mode that actually bites an emit
-box), and which lanes are up vs exited.
+soon as it is in the inventory**, with nothing to edit in the site repo.
+
+The heartbeat carries: git sha + branch + dirty count (so drift shows up on the
+health page too), load per core, memory, disk, **OOM kills since boot** (the
+failure mode that actually bites an emit box), and which lanes are up vs
+exited.
 
 Consumers must judge freshness on the heartbeat's own `ts`. A stale object
 means a dead box no matter how healthy its contents look — the page treats
