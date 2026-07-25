@@ -19,8 +19,11 @@
 # left browse on --step 10 with a 60-min backfill and a ~2 h revisit, so every
 # cycle silently dropped the slots that had aged out of the window -- loops
 # with permanent holes. A 30-min grid the lane can actually fill gives a
-# uniform, gapless browse loop instead, and --backfill 120 covers the revisit
-# interval so nothing is lost between visits.
+# uniform, gapless browse loop instead. --backfill 240 is sized off the
+# MEASURED revisit: a pass runs ~36 min (09:06:23 -> 09:42:01), so a quarter
+# comes round every ~142 min. The window must exceed that or the slots that
+# age out between visits are lost forever -- the exact hole the 60-min
+# window punched. 240 leaves margin for a slow pass.
 #
 # Why one container and not a fast/bulk pair: RAM, measured. A full-disk cut
 # peaks ~4.5 GB, the box has 31 GB, and the non-s2 stacks (meso-render, radar,
@@ -58,7 +61,7 @@ services:
           for prod in $$BROWSE; do
             python s2_pyramid_emit.py --product goes19-fd-$$prod \
               --store r2 --prefix shadow --max-zoom 5 \
-              --allow-geometry-change --step 30 --backfill 120 \
+              --allow-geometry-change --step 30 --backfill 240 \
               || echo "[s2-g19fd] browse $$prod failed rc=$$? (next tick retries)"
           done
           n=$$((n + 1))
