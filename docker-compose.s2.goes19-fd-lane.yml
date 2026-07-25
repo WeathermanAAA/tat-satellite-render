@@ -1,16 +1,26 @@
-# GOES-19 FULL DISK — full-band lane (2026-07-25).
+# GOES-19 FULL DISK — dedicated lane (2026-07-25).
 #
-# Every FD product the loop-lead lane does NOT own: the browse catalog (the
-# remaining 16 ABI bands + the day RGBs). Disjoint from
-# docker-compose.s2.goes19-fd-fast.yml by construction — two lanes touching one
-# product rebuild its manifest around their own geometry and the live manifest
-# ping-pongs (the conus-lane scar).
+# Before this lane, goes19-fd shared one rotation container with both Himawari
+# suites and GK-2A, so its cadence was the SUM of all of them (~5 h against a
+# 10-min scan). Now nothing but GOES-19 decides when GOES-19 publishes.
 #
-# Honest cadence: 22 products x ~39 s = ~15 min per pass, against a 10-min
-# scan. Reaching native on the full catalog for EVERY ring member needs
-# ~12.6 cores of cut CPU; this box has 8 (about 6 after the render stack). The
-# loop leads are the ones that hold native cadence; these bands are one click
-# away and refresh ~15 min instead of the ~5 h the shared rotation gave them.
+# WITHIN the lane, the pass is ordered by what a viewer actually animates:
+#
+#   every pass   ir irbd sandwich airmass c08   (~5 x 39 s = 200 s)
+#   then         one quarter of the 22 browse bands (~6 x 39 s = 235 s)
+#
+# so a pass is ~7 min inside the 10-min slot grid: the loop leads keep native
+# LATENCY (newest frame ~7 min old) and native SPACING (the --step 10 grid),
+# while the browse catalog completes a full cycle every 4 passes (~30 min).
+# Frame spacing is 10 min for every product either way -- the backfill window
+# fills each product's missing slots when the lane reaches it.
+#
+# Why one container and not a fast/bulk pair: RAM, measured. A full-disk cut
+# peaks ~4.5 GB, the box has 31 GB, and the non-s2 stacks (meso-render, radar,
+# s1, overlays) hold ~12 GB resident. Eight concurrent emit lanes tripped the
+# HOST OOM killer (global_oom, not the container cap) and killed a wpac pass.
+# ~5 heavy lanes is the ceiling; a second container per satellite would double
+# the heavy count to buy ~15 min instead of ~30 min on browse bands.
 #
 # Start:
 #   docker compose -p tat-s2-g19fd -f docker-compose.s2.yml \
@@ -18,20 +28,26 @@
 services:
   emit-cron:
     environment:
-      S2_CUT_WORKERS: "2"      # bulk lane yields cores to the loop-lead lanes
+      S2_CUT_WORKERS: "3"
     mem_limit: 10g
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "[s2-g19fd] GOES-19 FD browse catalog: 22 bands/RGBs (z5 native)"
+        LEAD="ir irbd sandwich airmass c08"
+        B0="c01 c02 c03 c04 c05 c06"
+        B1="c07 c09 c10 c11 c12"
+        B2="c14 c15 c16 ash dust"
+        B3="nightmicro firetemp daycloudphase dayconvection daylandcloud snowfog"
+        echo "[s2-g19fd] GOES-19 FD: leads=[$$LEAD] + 1/4 of the browse catalog per pass (z5 native)"
+        n=0
         while true; do
-          for prod in c01 c02 c03 c04 c05 c06 c07 c09 c10 c11 c12 c14 c15 c16 \
-                      ash dust nightmicro firetemp daycloudphase dayconvection \
-                      daylandcloud snowfog; do
+          eval "BROWSE=\$$B$$((n % 4))"
+          for prod in $$LEAD $$BROWSE; do
             python s2_pyramid_emit.py --product goes19-fd-$$prod \
               --store r2 --prefix shadow --max-zoom 5 \
               --allow-geometry-change --step 10 --backfill 60 \
               || echo "[s2-g19fd] $$prod failed rc=$$? (next tick retries)"
           done
-          sleep 60
+          n=$$((n + 1))
+          sleep 30
         done
