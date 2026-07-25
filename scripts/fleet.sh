@@ -61,7 +61,11 @@ cmd_lanes() {
 }
 
 cmd_status() {
-  _boxes | while IFS=$'\t' read -r name host; do
+  # `|| echo UNREACHABLE` is load-bearing: ssh exits 255 for a down box OR a
+  # bad key, and under `set -e` that aborted the whole run -- so one dead box
+  # blinded you to every box after it, which is the opposite of what a fleet
+  # status is for.
+  while IFS=$'\t' read -r name host; do
     echo "=== $name  $host"
     on "$host" '
       cd /root/tsr-s2 2>/dev/null && \
@@ -69,36 +73,51 @@ cmd_status() {
       echo "  load  $(uptime | sed "s/.*load average: //")   mem $(free -g | awk "/Mem:/{print \$3\"/\"\$2\"GB used, \"\$7\"GB avail\"}")"
       n=$(docker ps --format "{{.Names}}" | grep -c "^tat-s2-" || true)
       echo "  lanes  $n running: $(docker ps --format "{{.Label \"com.docker.compose.project\"}}" | grep "^tat-s2-" | sort -u | tr "\n" " ")"
-    ' 2>&1 | sed 's/^/ /'
-  done
+    ' 2>&1 | sed 's/^/ /' || echo "  UNREACHABLE (ssh failed)"
+  done < <(_boxes)
 }
 
 # DRIFT: the fleet git rule, enforced. Any box not exactly on origin/main and
 # clean is an incident -- a box-only commit is invisible to every other box and
 # to the next agent.
 cmd_drift() {
+  # Two things this has to get right to be worth running:
+  #   * a box that is DOWN is drift too, not a silent skip. ssh exits 255 for
+  #     both unreachable and bad-key, and a bare assignment under `set -e`
+  #     aborted the whole loop -- so a dead box hid every box behind it.
+  #   * it must EXIT non-zero when it finds drift, or it cannot gate anything.
+  #     The old loop ran in a pipeline subshell, so a flag set inside died with
+  #     the subshell; the input is redirected instead so `bad` survives.
   local bad=0
-  _boxes | while IFS=$'\t' read -r name host; do
+  while IFS=$'\t' read -r name host; do
     out=$(on "$host" '
-      cd /root/tsr-s2 || { echo "NOREPO"; exit 0; }
+      cd /root/tsr-s2 2>/dev/null || { echo "NOREPO"; exit 0; }
       git fetch -q origin main 2>/dev/null || true
       b=$(git branch --show-current)
       d=$(git status --porcelain | wc -l)
       a=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
       be=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
       echo "$b|$d|$a|$be|$(git rev-parse --short HEAD)"
-    ' 2>/dev/null)
-    IFS='|' read -r branch dirty ahead behind sha <<<"$out"
-    if [ "$out" = "NOREPO" ]; then
-      echo "DRIFT $name: no /root/tsr-s2"; continue
+    ' 2>/dev/null) || out="UNREACHABLE"
+    if [ "$out" = "UNREACHABLE" ] || [ -z "$out" ]; then
+      echo "DRIFT $name: UNREACHABLE (ssh failed)"; bad=1; continue
     fi
+    if [ "$out" = "NOREPO" ]; then
+      echo "DRIFT $name: no /root/tsr-s2"; bad=1; continue
+    fi
+    IFS='|' read -r branch dirty ahead behind sha <<<"$out"
     msg=""
     [ "$branch" != "main" ] && msg="$msg on '$branch' not main;"
     [ "${dirty:-0}" -gt 0 ] && msg="$msg $dirty uncommitted file(s);"
     [ "${ahead:-0}" -gt 0 ] && msg="$msg $ahead commit(s) NOT pushed to main;"
     [ "${behind:-0}" -gt 0 ] && msg="$msg $behind commit(s) behind main;"
-    if [ -n "$msg" ]; then echo "DRIFT $name ($sha):$msg"; else echo "ok    $name ($sha) clean on main"; fi
-  done
+    if [ -n "$msg" ]; then
+      echo "DRIFT $name ($sha):$msg"; bad=1
+    else
+      echo "ok    $name ($sha) clean on main"
+    fi
+  done < <(_boxes)
+  return "$bad"
 }
 
 cmd_provision() {
@@ -111,7 +130,7 @@ cmd_provision() {
 
 cmd_deploy() {
   local target="${1:?box|all}"
-  _boxes | while IFS=$'\t' read -r name host; do
+  while IFS=$'\t' read -r name host; do
     [ "$target" != "all" ] && [ "$target" != "$name" ] && continue
     echo "=== deploy $name"
     local lanes; lanes="$(_lanes_of "$name")"
@@ -122,7 +141,16 @@ cmd_deploy() {
       echo "  -> $proj"
       on "$host" "cd /root/tsr-s2 && docker compose -p $proj -f docker-compose.s2.yml -f $comp --profile cron up -d --no-build emit-cron 2>&1 | tail -1"
     done <<<"$lanes"
-  done
+    # RECONCILE. Deploy used to only bring lanes UP, so a lane reassigned to
+    # another box kept running on BOTH -- two emitters racing one product's
+    # manifest geometry, which is the failure the lane headers warn about.
+    # "Moving a lane is an edit plus a deploy" is only true if the box the lane
+    # LEFT also converges to the map.
+    local want; want="$(echo "$lanes" | cut -f1 | tr '\n' ' ')"
+    on "$host" "cd /root/tsr-s2 && for p in \$(docker ps --format '{{.Label \"com.docker.compose.project\"}}' | grep '^tat-s2-' | sort -u); do
+        case ' $want ' in *\" \$p \"*) ;; *) echo \"  <- stopping \$p (not assigned to $name)\"; docker compose -p \$p down >/dev/null 2>&1 || true ;; esac
+      done"
+  done < <(_boxes)
 }
 
 # Secret propagation: write/replace a key in every target box's .env, then
@@ -130,11 +158,25 @@ cmd_deploy() {
 cmd_setenv() {
   local target="${1:?box|all}" kv="${2:?KEY=VALUE}"
   local key="${kv%%=*}"
-  _boxes | while IFS=$'\t' read -r name host; do
+  # A PARTIALLY applied credential is the worst outcome here -- some boxes on
+  # the new secret, some on the old, and no signal. So each box reports, a
+  # failure does not abort the rest, and the command exits non-zero if any box
+  # was missed.
+  local bad=0 n=0
+  while IFS=$'\t' read -r name host; do
     [ "$target" != "all" ] && [ "$target" != "$name" ] && continue
-    on "$host" "touch /root/tsr-s2/.env && chmod 600 /root/tsr-s2/.env && sed -i '/^${key}=/d' /root/tsr-s2/.env && printf '%s\n' '$kv' >> /root/tsr-s2/.env && echo '  $name: $key set'"
-  done
-  echo "[setenv] restart lanes to pick it up:  fleet.sh deploy $target"
+    n=$((n + 1))
+    if on "$host" "touch /root/tsr-s2/.env && chmod 600 /root/tsr-s2/.env && sed -i '/^${key}=/d' /root/tsr-s2/.env && printf '%s\n' '$kv' >> /root/tsr-s2/.env && echo '  $name: $key set'"; then :; else
+      echo "  $name: FAILED to set $key (ssh/write error)"; bad=1
+    fi
+  done < <(_boxes)
+  [ "$n" -eq 0 ] && { echo "[setenv] no box matched '$target'"; return 1; }
+  if [ "$bad" -ne 0 ]; then
+    echo "[setenv] INCOMPLETE -- $key is not uniform across the fleet. Re-run for the failed box before deploying."
+  else
+    echo "[setenv] restart lanes to pick it up:  fleet.sh deploy $target"
+  fi
+  return "$bad"
 }
 
 case "${1:-}" in

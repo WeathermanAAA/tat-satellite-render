@@ -107,7 +107,13 @@ say "image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' tat-s2
 # A box that dies quietly is worse than one that dies loudly: its lanes just
 # stop publishing and the site looks merely stale. The heartbeat makes silence
 # visible -- see scripts/heartbeat.sh.
-if [ ${#MISSING[@]} -eq 0 ]; then
+# Installed UNCONDITIONALLY. It used to be gated on all secrets being present,
+# but the documented flow delivers secrets AFTER provision (provision -> setenv
+# -> deploy), so a brand-new box got no heartbeat and was invisible on /fleet/
+# exactly when you most want to watch it. The unit is Type=oneshot and re-reads
+# EnvironmentFile every run, so it simply fails until the secrets land and then
+# starts succeeding on its own -- no second provision needed.
+if true; then
   say "installing heartbeat timer"
   install -m 0755 "$DIR/scripts/heartbeat.sh" /usr/local/bin/tat-heartbeat.sh
   # The heartbeat keys on the FLEET name (box1/box2/...), not the provider
@@ -137,8 +143,10 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now tat-heartbeat.timer
   say "heartbeat timer active"
-else
-  say "heartbeat NOT installed (needs R2 secrets)"
+  if [ ${#MISSING[@]} -gt 0 ]; then
+    say "  (it will fail until the secrets land -- that is expected, and the"
+    say "   box will start reporting on its own once fleet.sh setenv runs)"
+  fi
 fi
 
 say "done. next:  fleet.sh deploy <box>"

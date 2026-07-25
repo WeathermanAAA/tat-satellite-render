@@ -60,6 +60,37 @@ if ! printf '%s' "$json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>
   exit 1
 fi
 
+# Publish the ROSTER too, from fleet.yml. Without this the health page has to
+# hardcode the box list, so box3 would heartbeat into the void until somebody
+# remembered to edit a file in the OTHER repo -- a new box invisible on the
+# health page is precisely the failure this whole mechanism exists to prevent.
+# Every box is on the same main sha, so whoever writes it writes the same bytes.
+ROSTER=$(python3 - <<'PYR'
+import json
+try:
+    import yaml
+    f = yaml.safe_load(open("/root/tsr-s2/fleet.yml"))
+    print(json.dumps({"boxes": [{"name": b["name"],
+                                 "role": " ".join(str(b.get("role", "")).split()),
+                                 "tier": b.get("tier", "")}
+                                for b in f["boxes"]]}, separators=(",", ":")))
+except Exception:
+    print("")
+PYR
+)
+if [ -n "$ROSTER" ]; then
+  HB_ROSTER="$ROSTER" python3 - <<'PYR2'
+import os, sys
+sys.path.insert(0, "/root/tsr-s2")
+try:
+    import s1_ingest
+    s1_ingest.R2().put_bytes("fleet/index.json", os.environ["HB_ROSTER"].encode(),
+                             "application/json", "max-age=60")
+except Exception as e:
+    print("roster put failed:", e, file=sys.stderr)
+PYR2
+fi
+
 HB_JSON="$json" python3 - "$KEY" <<'PY'
 import os, sys
 sys.path.insert(0, "/root/tsr-s2")
