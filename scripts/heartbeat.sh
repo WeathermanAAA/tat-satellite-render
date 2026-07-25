@@ -70,8 +70,13 @@ import json
 try:
     import yaml
     f = yaml.safe_load(open("/root/tsr-s2/fleet.yml"))
-    print(json.dumps({"boxes": [{"name": b["name"],
-                                 "role": " ".join(str(b.get("role", "")).split()),
+    def blurb(b):
+        # fleet.yml roles carry the full placement rationale; the card wants a
+        # line, not an essay. First sentence, and never a truncated word.
+        r = " ".join(str(b.get("role", "")).split())
+        head = r.split(". ")[0].rstrip(".")
+        return (head + ".") if head else ""
+    print(json.dumps({"boxes": [{"name": b["name"], "role": blurb(b),
                                  "tier": b.get("tier", "")}
                                 for b in f["boxes"]]}, separators=(",", ":")))
 except Exception:
