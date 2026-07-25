@@ -157,9 +157,19 @@ class R2:
             aws_access_key_id=R2_ACCESS_KEY_ID,
             aws_secret_access_key=R2_SECRET_ACCESS_KEY,
             config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"},
-                              # sized for the emitter's parallel tile PUTs
+                              # Sized for the WIDEST concurrent user of this
+                              # client: parallel tile PUTs (S2_PUT_WORKERS) or
+                              # the manifest's parallel stamp probes
+                              # (S2_LIST_WORKERS). Sizing it off PUTs alone made
+                              # the probe pool spill -- "Connection pool is
+                              # full, discarding connection" on every rebuild,
+                              # which silently serialized the listing it was
+                              # supposed to parallelize.
                               max_pool_connections=max(
-                                  10, int(os.environ.get("S2_PUT_WORKERS", "8")) + 4)),
+                                  10,
+                                  int(os.environ.get("S2_PUT_WORKERS", "8")),
+                                  int(os.environ.get("S2_LIST_WORKERS", "16")))
+                              + 4),
         )
 
     def put_bytes(self, key: str, data: bytes, content_type: str, cache: str) -> bool:

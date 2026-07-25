@@ -390,7 +390,10 @@ def complete_stamps(entry, store, prefix: str, *, limit: int = 0) -> list:
               if z[len(root) + len(s) + 1:].strip("/").isdigit()]
         return (s, max(zs) if zs else 0)
 
-    workers = max(1, int(os.environ.get("S2_LIST_WORKERS", "32")))
+    # keep this in step with s1_ingest.R2's max_pool_connections, which is
+    # sized from the same env var -- more threads than connections just
+    # thrashes the pool
+    workers = max(1, int(os.environ.get("S2_LIST_WORKERS", "16")))
     if len(stamps) > 4 and workers > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=workers) as ex:
