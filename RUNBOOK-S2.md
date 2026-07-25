@@ -7,10 +7,16 @@ untouched. Runs on the **Hostinger box** (NOT Railway), on the same image base
 and `.env` as the meso/S1 stacks — **no host pip, no cred paste, no
 tat_palettes install**.
 
-All commands from the repo dir on the box, on branch `s2-sat-ingest`:
+>> **MULTI-BOX:** this runbook covers ONE box's emitter. For which box runs
+>> which lane, adding a box, secret propagation, the fleet git rule and the
+>> health page, see **[RUNBOOK-FLEET.md](RUNBOOK-FLEET.md)** — `fleet.yml` is
+>> the assignment map and `scripts/fleet.sh` the entry point. Lanes are
+>> deployed from that map, not started by hand.
+
+All commands from the repo dir on the box, on branch `main`:
 
 ```bash
-git fetch origin && git checkout s2-sat-ingest && git pull
+git fetch origin main && git checkout main && git pull
 ```
 
 ## 0) Build the image (once per code pull)
