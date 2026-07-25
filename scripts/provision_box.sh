@@ -39,7 +39,12 @@ else
   say "docker present: $(docker --version)"
 fi
 command -v git >/dev/null || apt-get install -y -qq git
-python3 -c 'import yaml' 2>/dev/null || apt-get install -y -qq python3-yaml >/dev/null
+# host-side python deps: yaml for fleet.yml, boto3 for the heartbeat's R2 PUT.
+# The heartbeat runs on the HOST (not in a lane container) on purpose -- it has
+# to keep reporting when every container is dead, which is exactly the case it
+# exists to make visible.
+python3 -c 'import yaml'  2>/dev/null || apt-get install -y -qq python3-yaml  >/dev/null
+python3 -c 'import boto3' 2>/dev/null || apt-get install -y -qq python3-boto3 >/dev/null
 
 # --- 2. the repo, on main, nothing else ------------------------------------
 # FLEET GIT RULE: a box tracks origin/main and only origin/main. No box-only
@@ -94,11 +99,17 @@ say "image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' tat-s2
 if [ ${#MISSING[@]} -eq 0 ]; then
   say "installing heartbeat timer"
   install -m 0755 "$DIR/scripts/heartbeat.sh" /usr/local/bin/tat-heartbeat.sh
-  cat >/etc/systemd/system/tat-heartbeat.service <<'UNIT'
+  # The heartbeat keys on the FLEET name (box1/box2/...), not the provider
+  # hostname -- fleet.yml is the vocabulary everything else uses, and a
+  # heartbeat filed under "srv1856364" is one more thing to translate.
+  BOXNAME="$(python3 "$DIR/scripts/box_name.py")"
+  say "heartbeat identity: $BOXNAME"
+  cat >/etc/systemd/system/tat-heartbeat.service <<UNIT
 [Unit]
 Description=TAT fleet heartbeat (publishes box health to R2)
 [Service]
 Type=oneshot
+Environment=TAT_BOX_NAME=${BOXNAME}
 EnvironmentFile=/root/tsr-s2/.env
 ExecStart=/usr/local/bin/tat-heartbeat.sh
 UNIT
