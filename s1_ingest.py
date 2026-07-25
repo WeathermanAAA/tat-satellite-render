@@ -199,6 +199,31 @@ class R2:
             keys.extend(o["Key"] for o in page.get("Contents", []))
         return keys
 
+    # --- delimiter listing: read a level WITHOUT walking its subtree ---------
+    # A pyramid product holds retained_frames x tiles_per_frame keys (geo/global
+    # is ~460k today), and list_keys costs one round-trip per 1000 of them.
+    # These answer "which frames exist, and how deep is each" from the key
+    # LAYOUT instead, at a cost independent of pyramid depth.
+    def list_prefixes(self, prefix: str, start_after: str = "") -> list[str]:
+        """Immediate child "directories" of prefix (S3 CommonPrefixes)."""
+        out: list[str] = []
+        kw = {"Bucket": R2_BUCKET, "Prefix": prefix, "Delimiter": "/"}
+        if start_after:
+            kw["StartAfter"] = start_after
+        for page in self.s3.get_paginator("list_objects_v2").paginate(**kw):
+            out.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
+        return out
+
+    def list_level(self, prefix: str) -> tuple:
+        """(child prefixes, own keys) at prefix -- one round-trip per level."""
+        pres: list[str] = []
+        keys: list[str] = []
+        for page in self.s3.get_paginator("list_objects_v2").paginate(
+                Bucket=R2_BUCKET, Prefix=prefix, Delimiter="/"):
+            pres.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
+            keys.extend(o["Key"] for o in page.get("Contents", []))
+        return pres, keys
+
 
 # ---------------------------------------------------------------------------
 # SQS wrapper

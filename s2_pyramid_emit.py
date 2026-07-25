@@ -81,7 +81,9 @@ def _covered_times(entries, store, prefix: str) -> list:
     out = []
     for e in entries:
         ts = []
-        for s, _mz in P.complete_stamps(e, store, prefix):
+        # only the recent tail can cover a backfill slot (deepest production
+        # window is 150 min), so bound this at O(window), not O(retention)
+        for s, _mz in P.complete_stamps(e, store, prefix, limit=300):
             try:
                 ts.append(_parse_stamp(s))
             except ValueError:
@@ -160,7 +162,11 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
     # COMPLETE frames at that same maxzoom, so the viewer's grid derivation
     # never 404s. A frame at a different geometry is dropped + logged.
     image_px = [img.rgba.shape[1], img.rgba.shape[0]]
-    frames = P.complete_stamps(entry, store, args.prefix)   # [(stamp, maxzoom)]
+    # bounded to the advertised window (+margin): frames older than `keep` can
+    # never appear in times[], so probing them is pure cost. The geometry guard
+    # below still covers everything the manifest can advertise.
+    frames = P.complete_stamps(entry, store, args.prefix,
+                               limit=max(int(args.keep or 0) * 2, 200))
     maxzoom = dict(frames).get(img.stamp, meta.get("maxzoom") or 0)
     times = [s for s, mz in frames if mz == maxzoom]
     dropped = [s for s, mz in frames if mz != maxzoom]
@@ -199,12 +205,13 @@ def _write_products_index(store, prefix: str, sat_key: str, sector_key: str):
     # but the explorer un-greys purely off this file -- a product that has
     # never emitted a complete frame must stay OUT (one persistently
     # failing recipe next to healthy siblings would otherwise 404 its
-    # manifest forever; review finding 2026-07-24). Costs one store LIST
-    # per row, paid only when an index is (re)written.
+    # manifest forever; review finding 2026-07-24). has_complete_frame answers
+    # that boolean off the newest stamps instead of enumerating each product's
+    # whole pyramid -- the enumeration form cost 18 min per lane pass.
     kept = []
     for p in idx["products"]:
         e = R.REGISTRY_BY_ID.get(p["id"])
-        if e is not None and P.complete_stamps(e, store, prefix):
+        if e is not None and P.has_complete_frame(e, store, prefix):
             kept.append(p)
     if not kept:
         print(f"[index] SKIPPED ({sat_key}/{sector_key}: no product has a "

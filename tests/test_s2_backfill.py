@@ -84,7 +84,7 @@ class TestBackfillLoop(unittest.TestCase):
 
         cov = {"times": list(covered_times)}
 
-        def fake_complete(entry, store, prefix):
+        def fake_complete(entry, store, prefix, limit=0):
             return [(_stamp(t), 5) for t in cov["times"]]
 
         entry = next(e for e in E.R.REGISTRY
@@ -132,7 +132,7 @@ class TestBackfillLoop(unittest.TestCase):
             cov_state["times"].append(dt.datetime(2026, 7, 12, 2, 45, tzinfo=UTC))
             return {"count": 1}
 
-        def fake_complete(entry, store, prefix):
+        def fake_complete(entry, store, prefix, limit=0):
             return [(_stamp(t), 5) for t in cov_state["times"]]
 
         entry = next(e for e in E.R.REGISTRY
@@ -173,7 +173,7 @@ class TestSuitePinDedup(unittest.TestCase):
             emitted.append((entry.product_id, when))
             return {"count": 1}
 
-        def fake_complete(entry, store, prefix):
+        def fake_complete(entry, store, prefix, limit=0):
             return [(_stamp(t), 5) for t in covered_times]
 
         with mock.patch.object(E, "emit_one", side_effect=fake_emit), \
@@ -239,10 +239,16 @@ class TestProductsIndexStoreTruth(unittest.TestCase):
             def put_json(self, key, obj, cache):
                 puts[key] = obj
 
-        def fake_complete(entry, store, prefix):
+        def fake_complete(entry, store, prefix, limit=0):
             return frames_by_id.get(entry.product_id, [])
 
-        with mock.patch.object(E.P, "complete_stamps", side_effect=fake_complete):
+        # the store-truth contract is unchanged; only HOW the boolean is
+        # answered moved (full enumeration -> newest-stamp probe, 2026-07-25)
+        def fake_has(entry, store, prefix):
+            return bool(frames_by_id.get(entry.product_id, []))
+
+        with mock.patch.object(E.P, "complete_stamps", side_effect=fake_complete), \
+             mock.patch.object(E.P, "has_complete_frame", side_effect=fake_has):
             E._write_products_index(_Store(), "shadow", "mtgi1", "fd")
         return puts
 

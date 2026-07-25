@@ -70,7 +70,15 @@ class PyramidSpec:
     tile_size: int = 512          # §4.2 "WebP, 512 px, served @2x"
     quality: int = 90             # §4.2: q80-85 photographic; q90/near-lossless for
                                   # hard colortable edges (rainbow_ir/Dvorak-BD banding)
-    method: int = 6               # WebP effort; matches transcode_frame
+    method: int = 4               # WebP encoder SEARCH EFFORT (libwebp default).
+                                  # `quality` alone sets the visual ceiling;
+                                  # method only trades CPU for compression
+                                  # search. Measured on real TAT tiles
+                                  # (rainbow_ir FD z4, truecolor CONUS z5):
+                                  # m6 -> m4 is 3.0-3.2x faster at IDENTICAL
+                                  # PSNR (35.9 / 47.7 dB) and size within 0.5%.
+                                  # Encoding is ~70% of the tile cut, so this is
+                                  # what lets a ring member hold native cadence.
     lossless: bool = False        # §4.2 near-lossless option for hard palette edges
     skip_empty: bool = True       # drop fully-transparent tiles (§4.2 PUT bound)
     min_zoom: int = 0
@@ -215,6 +223,25 @@ class FilesystemStore:
                     out.append(key)
         return out
 
+    # delimiter listing (R2 CommonPrefixes analogue) -- see s1_ingest.R2
+    def list_prefixes(self, prefix: str, start_after: str = "") -> list[str]:
+        base = self._path(prefix)
+        if not os.path.isdir(base):
+            return []
+        out = [prefix + d + "/" for d in sorted(os.listdir(base))
+               if os.path.isdir(os.path.join(base, d))]
+        return [p for p in out if not start_after or p > start_after]
+
+    def list_level(self, prefix: str) -> tuple:
+        base = self._path(prefix)
+        if not os.path.isdir(base):
+            return [], []
+        pres, keys = [], []
+        for n in sorted(os.listdir(base)):
+            (pres if os.path.isdir(os.path.join(base, n)) else keys).append(
+                prefix + n + ("/" if os.path.isdir(os.path.join(base, n)) else ""))
+        return pres, keys
+
 
 # ---------------------------------------------------------------------------
 # Emit -- write a frame's pyramid + (optionally) the manifest, idempotently
@@ -325,13 +352,74 @@ def prune_tiles(entry, store, prefix: str, dead_stamps: Iterable[str]) -> int:
     return n
 
 
-def complete_stamps(entry, store, prefix: str) -> list:
+def complete_stamps(entry, store, prefix: str, *, limit: int = 0) -> list:
     """Recover COMPLETE frames from R2 reality (cold start / manifest rebuild):
     every stamp that has a ``_ready.json`` marker, paired with its pyramid
     maxzoom (the max tile z present). Partial emits (tiles but no marker) are
     excluded so the manifest never advertises an incomplete frame; the maxzoom
     lets the manifest builder keep one geometry per product (drop stamps cut at a
-    different pyramid_px). Pure ``list_keys`` + key parsing -- no GET."""
+    different pyramid_px). No GET -- key layout only.
+
+    COST CONTRACT (2026-07-25): this runs twice per product-slot (manifest
+    rebuild + the backfill coverage check), so it must NOT scale with pyramid
+    depth. The old flat ``list_keys`` walked every tile of every retained frame
+    -- 460k keys / 461 page round-trips / 239 s on geo-global, and GROWING with
+    retention, which made native cadence arithmetically impossible (one ABI FD
+    product-slot needed 636 s of listing against a 600 s budget). The layout
+    ``{product}/{stamp}/{z}/{x}/{y}`` already separates the levels, so one
+    delimiter listing gives the stamps and one probe per stamp gives BOTH facts
+    we need: the ``_ready.json`` marker sits in that level's own keys, and the
+    child prefixes ARE the zoom dirs. Same answer, constant cost (~1.4 s).
+    ``limit`` keeps only the newest N stamps (the manifest window) -- the older
+    ones cannot change what the manifest says. Stores without the delimiter
+    methods fall back to the flat walk, so a FakeR2 in a test still works."""
+    root = entry.tile_stamp_prefix(prefix, "")
+    if not (hasattr(store, "list_prefixes") and hasattr(store, "list_level")):
+        return _complete_stamps_flat(entry, store, prefix)
+
+    stamps = [p[len(root):].strip("/") for p in store.list_prefixes(root)]
+    stamps = sorted(s for s in stamps if s)
+    if limit and len(stamps) > limit:
+        stamps = stamps[-limit:]
+
+    def probe(s):
+        zdirs, keys = store.list_level(root + s + "/")
+        if not any(k.endswith("/_ready.json") for k in keys):
+            return None                      # partial emit: never advertised
+        zs = [int(z[len(root) + len(s) + 1:].strip("/")) for z in zdirs
+              if z[len(root) + len(s) + 1:].strip("/").isdigit()]
+        return (s, max(zs) if zs else 0)
+
+    workers = max(1, int(os.environ.get("S2_LIST_WORKERS", "32")))
+    if len(stamps) > 4 and workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            out = list(ex.map(probe, stamps))
+    else:
+        out = [probe(s) for s in stamps]
+    return [r for r in out if r is not None]
+
+
+def has_complete_frame(entry, store, prefix: str) -> bool:
+    """Has this product EVER published a whole frame? The products-index
+    filter asks only this, and used to answer it with a full enumeration per
+    row (28 rows x ~40 s = 18 min per lane pass, measured 2026-07-25). Newest
+    stamps first: a healthy product answers on the first probe."""
+    root = entry.tile_stamp_prefix(prefix, "")
+    if not (hasattr(store, "list_prefixes") and hasattr(store, "list_level")):
+        return bool(_complete_stamps_flat(entry, store, prefix))
+    stamps = sorted(p[len(root):].strip("/")
+                    for p in store.list_prefixes(root))
+    for s in reversed(stamps[-8:]):          # newest few: cheap + decisive
+        _z, keys = store.list_level(root + s + "/")
+        if any(k.endswith("/_ready.json") for k in keys):
+            return True
+    return bool(stamps) and bool(complete_stamps(entry, store, prefix, limit=64))
+
+
+def _complete_stamps_flat(entry, store, prefix: str) -> list:
+    """The pre-2026-07-25 whole-subtree walk. Retained as the fallback for
+    stores that expose only ``list_keys`` (test fakes, older adapters)."""
     ready: set = set()
     maxz: dict = {}
     for key in store.list_keys(entry.tile_stamp_prefix(prefix, "")):
