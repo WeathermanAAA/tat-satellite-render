@@ -50,7 +50,10 @@ python3 -c 'import boto3' 2>/dev/null || apt-get install -y -qq python3-boto3 >/
 # FLEET GIT RULE: a box tracks origin/main and only origin/main. No box-only
 # branches -- work that exists only on a box is invisible to every other box
 # and to the next agent, and that is how a fleet silently forks.
-if [ ! -d "$DIR/.git" ]; then
+# `-d .git` is wrong: a git WORKTREE (and a submodule) has .git as a FILE
+# pointing at the real gitdir. box1 is exactly that, so the naive test tried to
+# re-clone over a live checkout. Ask git, don't guess at the layout.
+if ! git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1; then
   say "cloning $DIR"
   if git ls-remote "$REPO_SSH" >/dev/null 2>&1; then
     git clone -q "$REPO_SSH" "$DIR"
@@ -66,8 +69,16 @@ else
 fi
 cd "$DIR"
 git fetch -q origin main
-git checkout -q main 2>/dev/null || git checkout -q -B main origin/main
-git reset -q --hard origin/main
+# Never clobber work that only exists here. The fleet rule says a box holds no
+# unique state, but "reset --hard over whatever is there" is how you find out
+# the rule was violated by losing the evidence. Refuse and let drift report it.
+if [ -n "$(git status --porcelain)" ]; then
+  say "REFUSING to reset: working tree is dirty. Land it on main first:"
+  git status --short | sed 's/^/    /'
+else
+  git checkout -q main 2>/dev/null || git checkout -q -B main origin/main
+  git reset -q --hard origin/main
+fi
 say "repo at $(git rev-parse --short HEAD) on $(git branch --show-current)"
 
 # --- 3. secrets file exists (values come from fleet.sh setenv) --------------

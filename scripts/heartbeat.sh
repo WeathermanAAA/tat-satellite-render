@@ -34,7 +34,12 @@ dirty=$(git status --porcelain 2>/dev/null | wc -l)
 lanes_up=$(docker ps --filter "name=^/tat-s2-" --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null | sort -u | paste -sd, -)
 lanes_dead=$(docker ps -a --filter "name=^/tat-s2-" --filter "status=exited" --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null | sort -u | paste -sd, -)
 # OOM kills since boot are the failure mode that matters most on an emit box
-ooms=$(dmesg -T 2>/dev/null | grep -c "Out of memory: Killed process" || echo 0)
+# `grep -c` prints its count AND exits 1 when the count is zero, so
+# `|| echo 0` appends a SECOND zero and the JSON becomes "0\n0" -- which
+# published malformed heartbeats that every consumer then failed to parse.
+# `|| true` keeps grep's own output and nothing else.
+ooms=$(dmesg -T 2>/dev/null | grep -c "Out of memory: Killed process" || true)
+ooms=${ooms:-0}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 json=$(cat <<JSON
@@ -46,6 +51,14 @@ json=$(cat <<JSON
  "lanes_up":"${lanes_up}","lanes_exited":"${lanes_dead}"}
 JSON
 )
+
+# A malformed heartbeat is worse than a missing one: consumers show the box as
+# broken-in-an-unknown-way instead of plainly stale. Validate before we ship it.
+if ! printf '%s' "$json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+  echo "heartbeat: refusing to publish malformed JSON" >&2
+  printf '%s\n' "$json" >&2
+  exit 1
+fi
 
 HB_JSON="$json" python3 - "$KEY" <<'PY'
 import os, sys
