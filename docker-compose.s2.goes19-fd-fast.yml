@@ -1,0 +1,35 @@
+# GOES-19 FULL DISK — loop-lead lane (2026-07-25).
+#
+# The products a viewer actually ANIMATES, on the ABI full-disk native 10-min
+# slot grid, at native resolution. Before this lane GOES-19 FD rode a shared
+# rotation with the two Himawari suites and GK-2A, so it refreshed about every
+# 5 h against a satellite that scans every 10 min.
+#
+# Sizing (measured on the box 2026-07-25, after the listing + cut fixes):
+# a 305-tile FD product-slot is ~39 s wall / ~72 core-s, so 5 products is
+# ~200 s of a 600 s slot — comfortably native with headroom for a slow fetch.
+# The remaining 22 bands live on docker-compose.s2.goes19-fd-lane.yml. The two
+# product lists MUST stay disjoint: two lanes touching one product fight over
+# its manifest geometry (see the conus-lane header for that scar).
+#
+# Start:
+#   docker compose -p tat-s2-g19fd-fast -f docker-compose.s2.yml \
+#     -f docker-compose.s2.goes19-fd-fast.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CUT_WORKERS: "3"      # loop-lead: buy wall-clock with cores
+    mem_limit: 10g
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-g19fd-fast] GOES-19 FD loop leads: ir irbd sandwich airmass c08 (z5 native)"
+        while true; do
+          for prod in ir irbd sandwich airmass c08; do
+            python s2_pyramid_emit.py --product goes19-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-g19fd-fast] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 60
+        done

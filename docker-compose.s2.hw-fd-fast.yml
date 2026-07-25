@@ -1,0 +1,32 @@
+# HIMAWARI-9 FULL DISK — loop-lead lane (2026-07-25).
+#
+# AHI FLDK scans every 10 min; before this lane the hw-fd suite sat behind
+# goes19-fd and himawari9-wpac in one shared rotation and refreshed ~5 h.
+# Same split as GOES-19 FD: the animated products here, the browse catalog on
+# docker-compose.s2.hw-fd-lane.yml, product lists strictly disjoint.
+#
+# Memory: the 28-product AHI suite OOM-killed (rc=137) on the base lane's 8g
+# cap — 10 HSD segments per band decompress before the mosaic. 12g, like the
+# MTG lane.
+#
+# Start:
+#   docker compose -p tat-s2-hwfd-fast -f docker-compose.s2.yml \
+#     -f docker-compose.s2.hw-fd-fast.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CUT_WORKERS: "3"
+    mem_limit: 12g
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-hwfd-fast] Himawari-9 FD loop leads: ir irbd sandwich airmass b08 (z5 native)"
+        while true; do
+          for prod in ir irbd sandwich airmass b08; do
+            python s2_pyramid_emit.py --product himawari9-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-hwfd-fast] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 60
+        done

@@ -1,0 +1,25 @@
+# HIMAWARI-9 W PACIFIC — dedicated lane, WHOLE suite at native cadence
+# (2026-07-25).
+#
+# The regional crop is only ~75 tiles per frame against the full disk's 305,
+# so a wpac product-slot is ~15 s / ~28 core-s: all 28 products fit in ~420 s
+# of the AHI 10-min slot grid. This is the one ring member whose ENTIRE
+# catalog holds native cadence on this box — no fast/bulk split needed.
+#
+# It also carries the objfix WP intensity path (himawari9-wpac-ir is the only
+# registry row with bt_px=2560), so its freshness gates TC diagnostics, not
+# just the viewer.
+#
+# 12g: the AHI HSD segment decode OOM-killed this suite at 8g on the base lane.
+#
+# Start:
+#   docker compose -p tat-s2-hwwpac -f docker-compose.s2.yml \
+#     -f docker-compose.s2.hw-wpac-lane.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CRON_SUITES: himawari9-wpac
+      S2_CRON_INTERVAL_S: "60"
+      S2_CRON_BACKFILL_MIN: "60"
+      S2_CUT_WORKERS: "2"
+    mem_limit: 12g

@@ -1,0 +1,32 @@
+# HIMAWARI-9 FULL DISK — full-band lane (2026-07-25).
+#
+# The 22 AHI bands/RGBs the loop-lead lane does not own. Disjoint from
+# docker-compose.s2.hw-fd-fast.yml (shared products = duelling manifest
+# geometries; see the conus-lane header).
+#
+# Honest cadence ~15 min against a 10-min scan — see the GOES-19 FD lane
+# header for the core arithmetic. 12g for the AHI segment decode.
+#
+# Start:
+#   docker compose -p tat-s2-hwfd -f docker-compose.s2.yml \
+#     -f docker-compose.s2.hw-fd-lane.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CUT_WORKERS: "2"
+    mem_limit: 12g
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-hwfd] Himawari-9 FD browse catalog: 22 bands/RGBs (z5 native)"
+        while true; do
+          for prod in b01 b02 b03 b04 b05 b06 b07 b09 b10 b11 b12 b14 b15 b16 \
+                      ash dust nightmicro firetemp daycloudphase dayconvection \
+                      daylandcloud snowfog; do
+            python s2_pyramid_emit.py --product himawari9-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-hwfd] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 60
+        done

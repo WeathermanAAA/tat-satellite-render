@@ -1,0 +1,37 @@
+# GOES-19 FULL DISK — full-band lane (2026-07-25).
+#
+# Every FD product the loop-lead lane does NOT own: the browse catalog (the
+# remaining 16 ABI bands + the day RGBs). Disjoint from
+# docker-compose.s2.goes19-fd-fast.yml by construction — two lanes touching one
+# product rebuild its manifest around their own geometry and the live manifest
+# ping-pongs (the conus-lane scar).
+#
+# Honest cadence: 22 products x ~39 s = ~15 min per pass, against a 10-min
+# scan. Reaching native on the full catalog for EVERY ring member needs
+# ~12.6 cores of cut CPU; this box has 8 (about 6 after the render stack). The
+# loop leads are the ones that hold native cadence; these bands are one click
+# away and refresh ~15 min instead of the ~5 h the shared rotation gave them.
+#
+# Start:
+#   docker compose -p tat-s2-g19fd -f docker-compose.s2.yml \
+#     -f docker-compose.s2.goes19-fd-lane.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CUT_WORKERS: "2"      # bulk lane yields cores to the loop-lead lanes
+    mem_limit: 10g
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-g19fd] GOES-19 FD browse catalog: 22 bands/RGBs (z5 native)"
+        while true; do
+          for prod in c01 c02 c03 c04 c05 c06 c07 c09 c10 c11 c12 c14 c15 c16 \
+                      ash dust nightmicro firetemp daycloudphase dayconvection \
+                      daylandcloud snowfog; do
+            python s2_pyramid_emit.py --product goes19-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-g19fd] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 60
+        done

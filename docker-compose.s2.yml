@@ -68,13 +68,31 @@ services:
   # the box keeps up -- watch a full pass stay under the interval first).
   # Knobs (set in .env to override): S2_CRON_SUITES (space-separated list;
   # DEFAULTS to the FULL set -- conus fd himawari9-wpac himawari9-fd
-  # gk2a-fd geo-global -- so a bare `up` runs everything; mtgi1-fd runs on
-  # its OWN lane, docker-compose.s2.mtg-lane.yml, because the licence's 1 h
-  # delay + 10-min cadence need a longer backfill window than the base
-  # rotation provides; the legacy single
-  # S2_CRON_SUITE still overrides), S2_CRON_MAX_ZOOM, S2_CRON_INTERVAL_S,
-  # S2_CRON_PREFIX, S2_CRON_STEP_MIN, S2_CRON_BACKFILL_MIN. A failed suite
-  # never blocks the rest of the tick.
+  # gk2a-fd geo-global -- so a bare `up` runs everything), S2_CRON_MAX_ZOOM,
+  # S2_CRON_INTERVAL_S, S2_CRON_PREFIX, S2_CRON_STEP_MIN,
+  # S2_CRON_BACKFILL_MIN, S2_CUT_WORKERS. A failed suite never blocks the rest
+  # of the tick.
+  #
+  # PRODUCTION DOES NOT USE THE MULTI-SUITE ROTATION (retired 2026-07-25).
+  # Cycling suites in one container makes every satellite wait for all the
+  # others: with four suites the tail of the rotation published about every
+  # 5 h against sensors that scan every 10 min. Each ring member now owns a
+  # lane, so its cadence depends on nothing but itself:
+  #
+  #   tat-s2-g19fd-fast  goes19-fd loop leads      goes19-fd-fast.yml
+  #   tat-s2-g19fd       goes19-fd browse catalog  goes19-fd-lane.yml
+  #   tat-s2-hwfd-fast   himawari9-fd loop leads   hw-fd-fast.yml
+  #   tat-s2-hwfd        himawari9-fd browse       hw-fd-lane.yml
+  #   tat-s2-hwwpac      himawari9-wpac (all 28)   hw-wpac-lane.yml
+  #   tat-s2-gk2a        gk2a-fd (all 3)           gk2a-lane.yml
+  #   tat-s2-mtg         mtgi1-fd (all 3)          mtg-lane.yml
+  #   tat-s2-geo         geo-global (all 3)        geo-lane.yml
+  #   tat-s2-conus{,-fast,-fast2}  goes19-conus    conus-*.yml
+  #
+  # This service stays as the manual/bootstrap path (a bare `up` still runs
+  # everything) and as the template the lane files override. Keep the lane
+  # product lists DISJOINT -- two lanes emitting one product rebuild its
+  # manifest around their own geometry and the live manifest ping-pongs.
   emit-cron:
     build:
       context: .

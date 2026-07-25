@@ -1,0 +1,22 @@
+# GK-2A FULL DISK — dedicated lane (2026-07-25).
+#
+# AMI scans the full disk every 10 min. GK-2A was the LAST suite in the shared
+# rotation, so it published roughly every 5 h — the defect that prompted the
+# per-satellite lane split. Its whole suite is 3 products (truecolor, ir,
+# irbd) = ~120 s of a 600 s slot, so native cadence is not close to tight.
+#
+# Bounds cross the antimeridian (48E..208E unwrapped); nothing lane-specific
+# follows from that, but keep the unwrapped east edge if the registry is ever
+# touched — the viewer's BT probe and 3D DEM only understand E>180.
+#
+# Start:
+#   docker compose -p tat-s2-gk2a -f docker-compose.s2.yml \
+#     -f docker-compose.s2.gk2a-lane.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CRON_SUITES: gk2a-fd
+      S2_CRON_INTERVAL_S: "60"
+      S2_CRON_BACKFILL_MIN: "90"
+      S2_CUT_WORKERS: "3"
+    mem_limit: 10g
