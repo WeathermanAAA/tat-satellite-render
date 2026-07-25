@@ -20,6 +20,7 @@ the cut function differs.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 from PIL import Image
@@ -140,22 +141,45 @@ def cut_webmerc_pyramid(raster: np.ndarray, bounds, spec: PyramidSpec = PyramidS
         # y grows southward; north edge = smaller y (correct forward Mercator).
         y0 = max(0, int(lat_to_merc_y(min(n, WEBMERC_LAT_LIMIT)) * nz))
         y1 = min(nz - 1, int(lat_to_merc_y(max(s, -WEBMERC_LAT_LIMIT)) * nz))
-        c = 0
+        # Materialize the coordinate list FIRST (the dedup set is not
+        # thread-safe), then cut. Each tile is an independent, deterministic
+        # function of the source raster, so the work parallelizes exactly --
+        # and BOTH halves release the GIL (scipy map_coordinates inside
+        # reproject_tile; Pillow's WebP encoder), which is why threads and not
+        # processes: no per-worker copy of a multi-hundred-MB raster.
+        # S2_CUT_WORKERS=1 restores the serial loop byte-for-byte.
         seen = set()
+        coords = []
         for x0, x1 in x_ranges:
             for ty in range(y0, y1 + 1):
                 for tx in range(x0, x1 + 1):
                     if (tx, ty) in seen:
                         continue
                     seen.add((tx, ty))
-                    tile = reproject_tile(rgba, cb, z, tx, ty, T)
-                    if tile is None:
-                        continue
-                    data = _encode_webp(tile, spec)
-                    if data is None:
-                        continue
-                    tiles[(z, tx, ty)] = data
-                    c += 1
+                    coords.append((tx, ty))
+
+        def _cut_one(txy, _z=z):
+            tx, ty = txy
+            tile = reproject_tile(rgba, cb, _z, tx, ty, T)
+            if tile is None:
+                return None
+            data = _encode_webp(tile, spec)
+            if data is None:
+                return None
+            return (_z, tx, ty), data
+
+        workers = max(1, int(os.environ.get("S2_CUT_WORKERS", "3")))
+        if workers > 1 and len(coords) > 4:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                cuts = list(ex.map(_cut_one, coords))
+        else:
+            cuts = [_cut_one(t) for t in coords]
+        c = 0
+        for item in cuts:
+            if item is not None:
+                tiles[item[0]] = item[1]
+                c += 1
         counts[z] = c
     return {"maxzoom": maxzoom, "image_px": [W, H], "tiles": tiles,
             "tile_counts": counts, "scheme": "webmercator-xyz"}
