@@ -48,9 +48,6 @@ boxes:
     lanes:
       - tat-s2-g19fd-leads
       - tat-s2-g19fd
-      - tat-s2-gk2a
-      - tat-s2-mtg
-      - tat-s2-geo
       - tat-s2-conus-fast
       - tat-s2-conus-fast2
       - tat-s2-conus
@@ -65,13 +62,19 @@ boxes:
     host: root@72.62.97.220
     tier: 8 vCPU / 31 GB / Hostinger KVM8 (Boston)
     role: >-
-      Satellite emit only. Took the two Himawari lanes off box1 on 2026-07-25
-      to unpeg it. Deliberately kept free of render stacks so its whole
-      budget is emit throughput -- the template for future emit boxes.
+      Satellite emit only -- no render stacks -- so its whole budget is emit
+      throughput; the template for future emit boxes. Took the Himawari lanes
+      off box1 on 2026-07-25 to unpeg it, then the three location-independent
+      lanes (GK-2A, MTG, the GEO ring composite) once the first heartbeats
+      showed box1 at 0.97 load/core against box2 at 0.22. Nothing here fetches
+      from a region-locked source, so these lanes are placement-free.
     lanes:
       - tat-s2-hwfd-leads
       - tat-s2-hwfd
       - tat-s2-hwwpac
+      - tat-s2-gk2a
+      - tat-s2-mtg
+      - tat-s2-geo
     services: []
 
 lanes:
@@ -97,15 +100,15 @@ lanes:
     cost: ~1.3 cores steady / ~4.1 GB peak
   - project: tat-s2-gk2a
     compose: docker-compose.s2.gk2a-lane.yml
-    box: box1
+    box: box2
     cost: ~0.4 cores steady / ~5.5 GB peak
   - project: tat-s2-mtg
     compose: docker-compose.s2.mtg-lane.yml
-    box: box1
+    box: box2
     cost: idle until the EUMETSAT licence clears / ~12 GB cap
   - project: tat-s2-geo
     compose: docker-compose.s2.geo-lane.yml
-    box: box1
+    box: box2
     cost: ~0.8 cores steady / ~2.2 GB peak
   - project: tat-s2-conus-fast
     compose: docker-compose.s2.conus-fast.yml
