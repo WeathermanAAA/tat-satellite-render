@@ -4,6 +4,13 @@
 # with a 6144 px base; the rest are 2 km-class, native-bound at z5. The
 # rarely-looped RGBs + remaining channels stay on the full lane, which
 # drops from 28 to ~13 novel products per pass (~15-25 min cadence).
+# NATIVE 5-MIN GRID (2026-07-25): ABI scans CONUS every 5 min and this lane
+# was publishing a 10-min grid -- half the frames the instrument produced were
+# simply never cut. Affordable now that the Himawari lanes moved to box2
+# (box1: load ~9-10 -> ~3.9, free RAM ~1 GB -> ~13 GB). Measured cost of the
+# whole 28-product CONUS suite at 5 min is 1.81x real time spread across the
+# three CONUS lanes, i.e. ~0.6x each -- comfortably inside one lane's budget.
+#
 # Start:
 #   docker compose -p tat-s2-conus-fast2 -f docker-compose.s2.yml \
 #     -f docker-compose.s2.conus-fast2.yml --profile cron up -d --no-build emit-cron
@@ -21,7 +28,7 @@ services:
             esac
             python s2_pyramid_emit.py --product goes19-conus-$$prod \
               --store r2 --prefix shadow --max-zoom $$Z $$PX \
-              --allow-geometry-change --step 10 --backfill 60 \
+              --allow-geometry-change --step 5 --backfill 30 \
               || echo "[s2-fast2] $$prod failed rc=$$? (next tick retries)"
           done
           sleep 120

@@ -1,29 +1,23 @@
-# GOES-19 FULL DISK — dedicated lane (2026-07-25).
+# GOES-19 FULL DISK — BROWSE-BAND lane (2026-07-25, after the box2 split).
 #
 # Before this lane, goes19-fd shared one rotation container with both Himawari
 # suites and GK-2A, so its cadence was the SUM of all of them (~5 h against a
 # 10-min scan). Now nothing but GOES-19 decides when GOES-19 publishes.
 #
-# WITHIN the lane, the pass is ordered by what a viewer actually animates:
+# The 22 bands nobody animates. The five loop leads moved to their own
+# container (goes19-fd-leads) once box2 took the Himawari lanes and freed the
+# RAM for it, so this lane no longer has to interleave them -- which is what
+# let the browse grid tighten from 30 min to 20.
 #
-#   every pass   ir irbd sandwich airmass c08   on the NATIVE 10-min grid
-#   then         one quarter of the 22 browse bands on a 30-min grid
-#
-# The two grids are the honest consequence of one measured fact: a 305-tile FD
-# product-slot costs ~39 s, so holding ALL 27 products on the 10-min grid needs
-#   27 products x 6 slots/h x 39 s = 6318 s per 3600 s hour = 1.75x real time
-# on a serial lane. It cannot be done here at any pass ordering. What fits:
-#   leads @10 min + browse @30 min = 2886 s/h = 0.80x real time.
-#
-# The browse grid is EXPLICIT (--step 30), not emergent. An earlier version
-# left browse on --step 10 with a 60-min backfill and a ~2 h revisit, so every
-# cycle silently dropped the slots that had aged out of the window -- loops
-# with permanent holes. A 30-min grid the lane can actually fill gives a
-# uniform, gapless browse loop instead. --backfill 240 is sized off the
-# MEASURED revisit: a pass runs ~36 min (09:06:23 -> 09:42:01), so a quarter
-# comes round every ~142 min. The window must exceed that or the slots that
-# age out between visits are lost forever -- the exact hole the 60-min
-# window punched. 240 leaves margin for a slow pass.
+# Sustained-rate arithmetic at the measured ~39 s per 305-tile FD product-slot,
+# for this lane alone (22 products, no leads):
+#   @10 min grid  22 x 6 x 39 = 5148 s/h = 1.43x real time   impossible
+#   @15 min       22 x 4 x 39 = 3432 s/h = 0.95x             no margin
+#   @20 min       22 x 3 x 39 = 2574 s/h = 0.71x             fits
+# so 20 min is the honest floor here, not 10. --backfill 120 comfortably
+# exceeds the ~15 min revisit; a window narrower than the revisit silently
+# drops the slots that age out between visits, which is how this lane grew
+# holes twice before.
 #
 # Why one container and not a fast/bulk pair: RAM, measured. A full-disk cut
 # peaks ~4.5 GB, the box has 31 GB, and the non-s2 stacks (meso-render, radar,
@@ -43,27 +37,16 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        LEAD="ir irbd sandwich airmass c08"
-        B0="c01 c02 c03 c04 c05 c06"
-        B1="c07 c09 c10 c11 c12"
-        B2="c14 c15 c16 ash dust"
-        B3="nightmicro firetemp daycloudphase dayconvection daylandcloud snowfog"
-        echo "[s2-g19fd] goes19-fd: leads=[$$LEAD] @10min + 1/4 of the browse catalog @30min (z5 native)"
-        n=0
+        BROWSE="c01 c02 c03 c04 c05 c06 c07 c09 c10 c11 c12 c14 c15 c16 \
+                ash dust nightmicro firetemp daycloudphase dayconvection \
+                daylandcloud snowfog"
+        echo "[s2-g19fd] goes19-fd browse catalog: 22 bands @20min (z5 native)"
         while true; do
-          for prod in $$LEAD; do
-            python s2_pyramid_emit.py --product goes19-fd-$$prod \
-              --store r2 --prefix shadow --max-zoom 5 \
-              --allow-geometry-change --step 10 --backfill 60 \
-              || echo "[s2-g19fd] lead $$prod failed rc=$$? (next tick retries)"
-          done
-          eval "BROWSE=\$$B$$((n % 4))"
           for prod in $$BROWSE; do
             python s2_pyramid_emit.py --product goes19-fd-$$prod \
               --store r2 --prefix shadow --max-zoom 5 \
-              --allow-geometry-change --step 30 --backfill 240 \
-              || echo "[s2-g19fd] browse $$prod failed rc=$$? (next tick retries)"
+              --allow-geometry-change --step 20 --backfill 120 \
+              || echo "[s2-g19fd] $$prod failed rc=$$? (next tick retries)"
           done
-          n=$$((n + 1))
           sleep 30
         done

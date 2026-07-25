@@ -8,6 +8,13 @@
 # (v4, 2026-07-23) cuts NATIVE z7 off the registry 6144 px base + 6144 fetch
 # cap: the C02 red channel is 0.5 km, so zoomed tiles sharpen instead of
 # upsampling; the Rayleigh transient fits the 12g cap.
+# NATIVE 5-MIN GRID (2026-07-25): ABI scans CONUS every 5 min and this lane
+# was publishing a 10-min grid -- half the frames the instrument produced were
+# simply never cut. Affordable now that the Himawari lanes moved to box2
+# (box1: load ~9-10 -> ~3.9, free RAM ~1 GB -> ~13 GB). Measured cost of the
+# whole 28-product CONUS suite at 5 min is 1.81x real time spread across the
+# three CONUS lanes, i.e. ~0.6x each -- comfortably inside one lane's budget.
+#
 # Start:
 #   docker compose -p tat-s2-conus-fast -f docker-compose.s2.yml \
 #     -f docker-compose.s2.conus-fast.yml --profile cron up -d --no-build emit-cron
@@ -31,7 +38,7 @@ services:
             esac
             python s2_pyramid_emit.py --product goes19-conus-$$prod \
               --store r2 --prefix shadow --max-zoom $$Z $$PX \
-              --allow-geometry-change --step 10 --backfill 60 \
+              --allow-geometry-change --step 5 --backfill 30 \
               || echo "[s2-fast] $$prod failed rc=$$? (next tick retries)"
           done
           sleep 120

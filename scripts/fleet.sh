@@ -51,7 +51,9 @@ _env_keys() {
   py 'import sys,yaml;print("\n".join(yaml.safe_load(open(sys.argv[1]))["env_keys"]))' "$FLEET"
 }
 
-on() { local host="$1"; shift; ssh "${SSH_OPTS[@]}" "$host" "$@"; }
+# -n is load-bearing: without it ssh swallows the caller's stdin, and a
+# `while read` loop over lanes silently deploys only its first entry.
+on() { local host="$1"; shift; ssh -n "${SSH_OPTS[@]}" "$host" "$@"; }
 
 cmd_lanes() {
   local box="${1:?box}"

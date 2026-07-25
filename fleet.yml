@@ -44,8 +44,9 @@ boxes:
       The original all-purpose box. Owns the GOES side of the satellite ring,
       the global composite, and every non-satellite render stack. CPU-bound;
       Hostinger has flagged it as pegged, which is why the Himawari lanes
-      moved to box2.
+      moved to box2 on 2026-07-25 (load ~9-10 -> ~3.9, free RAM ~1 -> ~13 GB).
     lanes:
+      - tat-s2-g19fd-leads
       - tat-s2-g19fd
       - tat-s2-gk2a
       - tat-s2-mtg
@@ -68,19 +69,28 @@ boxes:
       to unpeg it. Deliberately kept free of render stacks so its whole
       budget is emit throughput -- the template for future emit boxes.
     lanes:
+      - tat-s2-hwfd-leads
       - tat-s2-hwfd
       - tat-s2-hwwpac
     services: []
 
 lanes:
+  - project: tat-s2-g19fd-leads
+    compose: docker-compose.s2.goes19-fd-leads.yml
+    box: box1
+    cost: ~0.4 cores steady / ~4.5 GB peak (5 products @10min, ~3 min pass)
   - project: tat-s2-g19fd
     compose: docker-compose.s2.goes19-fd-lane.yml
     box: box1
-    cost: ~1.4 cores steady / ~4.5 GB peak
+    cost: ~0.9 cores steady / ~4.5 GB peak (22 browse bands @20min)
+  - project: tat-s2-hwfd-leads
+    compose: docker-compose.s2.hw-fd-leads.yml
+    box: box2
+    cost: ~0.4 cores steady / ~4.5 GB peak (5 products @10min, ~3 min pass)
   - project: tat-s2-hwfd
     compose: docker-compose.s2.hw-fd-lane.yml
     box: box2
-    cost: ~1.4 cores steady / ~4.5 GB peak
+    cost: ~0.9 cores steady / ~4.5 GB peak (22 browse bands @20min)
   - project: tat-s2-hwwpac
     compose: docker-compose.s2.hw-wpac-lane.yml
     box: box2
@@ -100,11 +110,11 @@ lanes:
   - project: tat-s2-conus-fast
     compose: docker-compose.s2.conus-fast.yml
     box: box1
-    cost: ~1.0 cores steady / ~4.1 GB peak (z7 c02 is the RAM peak)
+    cost: ~2.0 cores steady / ~4.1 GB peak (native 5-min grid; z7 c02 is the RAM peak)
   - project: tat-s2-conus-fast2
     compose: docker-compose.s2.conus-fast2.yml
     box: box1
-    cost: ~0.3 cores steady / ~1.1 GB peak
+    cost: ~0.6 cores steady / ~1.1 GB peak (native 5-min grid)
   - project: tat-s2-conus
     compose: docker-compose.s2.conus-lane.yml
     box: box1

@@ -1,0 +1,37 @@
+# HIMAWARI-9 FULL DISK — LOOP-LEAD lane (2026-07-25, after the box2 split).
+#
+# The five products a viewer actually animates, alone in a container so their
+# LATENCY is a short pass instead of a long one. While himawari9-fd was a single
+# lane its pass ran ~36 min, so even though frame SPACING was a clean 10 min
+# (backfill filled every slot), the newest frame was up to 36 min old. Here the
+# pass is 5 x ~39 s = ~3 min, so latency tracks the scan.
+#
+# box2 is satellite-emit only -- no render stacks -- so it has the most
+# headroom in the fleet and the split costs it nothing. 12g for the AHI HSD
+# segment decode. See fleet.yml for the assignment map.
+#
+# DISJOINT from docker-compose.s2.himawari9-fd-lane.yml (which now carries only
+# the 22 browse bands). Two lanes emitting one product rebuild its manifest
+# around their own geometry and the live manifest ping-pongs.
+#
+# Start (or just: fleet.sh deploy box2):
+#   docker compose -p tat-s2-hwfd-leads -f docker-compose.s2.yml \
+#     -f docker-compose.s2.himawari9-fd-leads.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    environment:
+      S2_CUT_WORKERS: "3"
+    mem_limit: 12g
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-hwfd-leads] himawari9-fd loop leads @10min native (z5)"
+        while true; do
+          for prod in ir irbd sandwich airmass b08; do
+            python s2_pyramid_emit.py --product himawari9-fd-$$prod \
+              --store r2 --prefix shadow --max-zoom 5 \
+              --allow-geometry-change --step 10 --backfill 60 \
+              || echo "[s2-hwfd-leads] $$prod failed rc=$$? (next tick retries)"
+          done
+          sleep 30
+        done

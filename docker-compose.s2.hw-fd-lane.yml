@@ -1,18 +1,14 @@
-# HIMAWARI-9 FULL DISK — dedicated lane (2026-07-25).
+# HIMAWARI-9 FULL DISK — BROWSE-BAND lane (2026-07-25, box2).
 #
 # Same shape as the GOES-19 FD lane (see its header for the ordering rationale
 # and the RAM measurement that argues for one container per satellite):
 #
-#   every pass   ir irbd sandwich airmass b08   on the NATIVE 10-min grid
-#   then         one quarter of the 22 browse bands on a 30-min grid
-#
-# The browse grid is explicit, and it is what the box can actually sustain:
-# a 305-tile FD product-slot costs ~39 s, so all 27 products on the 10-min grid
-# would need 1.75x real time on a serial lane. Leads @10 min + browse @30 min
-# is 0.80x. Leaving browse on --step 10 with a revisit longer than its backfill
-# window silently drops the slots that age out -- a loop full of holes rather
-# than a slower, uniform one. --backfill 240 exceeds the MEASURED ~142 min
-# revisit (4 passes x ~36 min) so nothing ages out unseen between visits.
+# The 22 AHI bands nobody animates; the five loop leads live in
+# docker-compose.s2.hw-fd-leads.yml so their latency is a ~3 min pass rather
+# than this lane's full sweep. Grid arithmetic is the same as the GOES-19
+# browse lane: 22 products x 3 slots/h x ~39 s = 2574 s/h = 0.71x real time at
+# a 20-min grid, which fits; 10 min would need 1.43x and cannot be done
+# serially. --backfill 120 exceeds the revisit so nothing ages out unseen.
 #
 # AHI FLDK scans every 10 min; this suite previously rode the shared rotation
 # and refreshed ~5 h.
@@ -31,27 +27,16 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        LEAD="ir irbd sandwich airmass b08"
-        B0="b01 b02 b03 b04 b05 b06"
-        B1="b07 b09 b10 b11 b12"
-        B2="b14 b15 b16 ash dust"
-        B3="nightmicro firetemp daycloudphase dayconvection daylandcloud snowfog"
-        echo "[s2-hwfd] himawari9-fd: leads=[$$LEAD] @10min + 1/4 of the browse catalog @30min (z5 native)"
-        n=0
+        BROWSE="b01 b02 b03 b04 b05 b06 b07 b09 b10 b11 b12 b14 b15 b16 \
+                ash dust nightmicro firetemp daycloudphase dayconvection \
+                daylandcloud snowfog"
+        echo "[s2-hwfd] himawari9-fd browse catalog: 22 bands @20min (z5 native)"
         while true; do
-          for prod in $$LEAD; do
-            python s2_pyramid_emit.py --product himawari9-fd-$$prod \
-              --store r2 --prefix shadow --max-zoom 5 \
-              --allow-geometry-change --step 10 --backfill 60 \
-              || echo "[s2-hwfd] lead $$prod failed rc=$$? (next tick retries)"
-          done
-          eval "BROWSE=\$$B$$((n % 4))"
           for prod in $$BROWSE; do
             python s2_pyramid_emit.py --product himawari9-fd-$$prod \
               --store r2 --prefix shadow --max-zoom 5 \
-              --allow-geometry-change --step 30 --backfill 240 \
-              || echo "[s2-hwfd] browse $$prod failed rc=$$? (next tick retries)"
+              --allow-geometry-change --step 20 --backfill 120 \
+              || echo "[s2-hwfd] $$prod failed rc=$$? (next tick retries)"
           done
-          n=$$((n + 1))
           sleep 30
         done
