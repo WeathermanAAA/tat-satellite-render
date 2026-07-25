@@ -29,7 +29,12 @@ scripts/fleet.sh lanes box2        # what box2 is SUPPOSED to run
 scripts/fleet.sh status            # what every box IS running, + load/RAM/sha
 ```
 
-If those two disagree, the box is wrong and `deploy` fixes it.
+If those two disagree, the box is wrong and `deploy` fixes it — deploy
+**reconciles**, so it both starts what the map assigns and stops any lane the
+map no longer assigns to that box. That is what makes "moving a lane is an
+edit plus a deploy" true: without the stop half, a reassigned lane keeps
+running on the old box too, and two emitters race the same product's manifest
+geometry.
 
 ### 2. Every box pulls from `main` and pushes to `main`. Drift is an incident.
 
@@ -43,7 +48,13 @@ behind**.
 scripts/fleet.sh drift             # the rule, enforced
 # ok    box1 (c396aca) clean on main
 # DRIFT box2 (a1b2c3d): 2 commit(s) NOT pushed to main;
+# DRIFT box3: UNREACHABLE (ssh failed)
 ```
+
+**Exit code is the gate**: `0` = every box clean, `1` = at least one drifted,
+missing its repo, or unreachable. So `fleet.sh drift || alert` is meaningful.
+A box that is DOWN counts as drift — it is a box whose state you cannot
+vouch for — and one dead box never stops the others from being checked.
 
 Treat any `DRIFT` line as an incident: land the work on `main` (relay it
 through a box that has push rights if the box itself lacks them), then
@@ -94,6 +105,11 @@ scripts/fleet.sh setenv box2 R2_BUCKET=...                 # one box
 scripts/fleet.sh deploy all                                # restart to pick it up
 ```
 
+`setenv` reports per box and **exits non-zero if any box was missed**, because
+a half-applied credential — some boxes on the new secret, some on the old, no
+signal — is the worst outcome available. If it says `INCOMPLETE`, fix the
+failed box before deploying.
+
 Rolling a credential fleet-wide is `setenv all` + `deploy all`. To seed a new
 box from an existing one without the values ever printing:
 
@@ -110,7 +126,15 @@ independently of whether its lanes produced a frame — otherwise a dead box is
 indistinguishable from a quiet basin, since both just mean "no new imagery".
 
 The heartbeat runs on the **host**, not in a lane container, precisely so it
-keeps reporting when every container is dead. It carries: git sha + branch +
+keeps reporting when every container is dead. It is installed
+**unconditionally** at provision time, before secrets exist: it simply fails
+until `setenv` lands them and then starts reporting on its own. (Gating it on
+secrets meant a brand-new box was invisible on `/fleet/` exactly when you most
+want to watch it.)
+
+The page's roster is published too — every box writes `fleet/index.json` from
+`fleet.yml` next to its own heartbeat — so **box3 appears on the health page as
+soon as it is in the inventory**, with nothing to edit in the site repo. It carries: git sha + branch +
 dirty count (so drift shows up on the health page too), load per core, memory,
 disk, **OOM kills since boot** (the failure mode that actually bites an emit
 box), and which lanes are up vs exited.
