@@ -1,0 +1,122 @@
+# FLEET INVENTORY — the single source of truth for which box runs what.
+#
+# Read by scripts/fleet.sh (provision / deploy / status / drift) and by any
+# agent that needs to answer "where does lane X run" without asking a human.
+# If you move a lane between boxes, change it HERE and run
+# `scripts/fleet.sh deploy <box>` on both — never by hand on the box, or the
+# next agent inherits tribal knowledge instead of data.
+#
+# CONVENTIONS THAT SCALE PAST TWO BOXES
+#   * Every box PULLS from origin/main and PUSHES its commits to origin/main.
+#     No box-only branches, ever. A box that is ahead, behind, dirty, or off
+#     main is DRIFT and is treated as an incident -- `fleet.sh drift` reports
+#     it and the fix is to land the work on main, not to keep it local.
+#   * Every box runs the SAME image built from the SAME commit. `fleet.sh
+#     deploy` pulls, rebuilds, and recreates only that box's assigned lanes.
+#   * Secrets live ONLY in /root/tsr-s2/.env on each box, never in git. The
+#     key list is in env_keys below so a missing one fails loudly at
+#     provision time rather than at 03:00 in a cron log. To roll a credential
+#     fleet-wide use `fleet.sh setenv KEY=VALUE` (writes every box, restarts
+#     the lanes that declare it).
+#   * A new box is `fleet.sh provision <name>` + an entry here. If box N+1
+#     needs a bespoke step, that step belongs in scripts/provision_box.sh so
+#     box N+2 inherits it.
+#
+# schema
+#   boxes[].name        short stable id, used in commands and heartbeats
+#   boxes[].host        root@ip (SSH as root with the tat-box-agent key)
+#   boxes[].tier        vcpu/ram/disk, for capacity arithmetic
+#   boxes[].role        one line: what this box is FOR
+#   boxes[].lanes       compose lane projects this box owns (see lanes below)
+#   boxes[].services    non-lane stacks that live here (informational)
+#   lanes[].project     docker compose -p name
+#   lanes[].compose     the override file, relative to the repo root
+#   lanes[].box         which box.name owns it  <-- the assignment map
+#   lanes[].cost        measured steady-state cores / peak RAM, for planning
+
+updated: 2026-07-25
+
+boxes:
+  - name: box1
+    host: root@2.25.183.231
+    tier: 8 vCPU / 31 GB / Hostinger KVM8 (Europe)
+    role: >-
+      The original all-purpose box. Owns the GOES side of the satellite ring,
+      the global composite, and every non-satellite render stack. CPU-bound;
+      Hostinger has flagged it as pegged, which is why the Himawari lanes
+      moved to box2.
+    lanes:
+      - tat-s2-g19fd
+      - tat-s2-gk2a
+      - tat-s2-mtg
+      - tat-s2-geo
+      - tat-s2-conus-fast
+      - tat-s2-conus-fast2
+      - tat-s2-conus
+    services:
+      - tat-render (cyclolab + floater/guidance/intensity pollers)
+      - tat-satellite-render (meso render, hot + cold)
+      - tat-radar-render
+      - tat-s1 (legacy single-frame ingest)
+      - tat-overlays (mrms/recon pollers)
+
+  - name: box2
+    host: root@72.62.97.220
+    tier: 8 vCPU / 31 GB / Hostinger KVM8 (Boston)
+    role: >-
+      Satellite emit only. Took the two Himawari lanes off box1 on 2026-07-25
+      to unpeg it. Deliberately kept free of render stacks so its whole
+      budget is emit throughput -- the template for future emit boxes.
+    lanes:
+      - tat-s2-hwfd
+      - tat-s2-hwwpac
+    services: []
+
+lanes:
+  - project: tat-s2-g19fd
+    compose: docker-compose.s2.goes19-fd-lane.yml
+    box: box1
+    cost: ~1.4 cores steady / ~4.5 GB peak
+  - project: tat-s2-hwfd
+    compose: docker-compose.s2.hw-fd-lane.yml
+    box: box2
+    cost: ~1.4 cores steady / ~4.5 GB peak
+  - project: tat-s2-hwwpac
+    compose: docker-compose.s2.hw-wpac-lane.yml
+    box: box2
+    cost: ~1.3 cores steady / ~4.1 GB peak
+  - project: tat-s2-gk2a
+    compose: docker-compose.s2.gk2a-lane.yml
+    box: box1
+    cost: ~0.4 cores steady / ~5.5 GB peak
+  - project: tat-s2-mtg
+    compose: docker-compose.s2.mtg-lane.yml
+    box: box1
+    cost: idle until the EUMETSAT licence clears / ~12 GB cap
+  - project: tat-s2-geo
+    compose: docker-compose.s2.geo-lane.yml
+    box: box1
+    cost: ~0.8 cores steady / ~2.2 GB peak
+  - project: tat-s2-conus-fast
+    compose: docker-compose.s2.conus-fast.yml
+    box: box1
+    cost: ~1.0 cores steady / ~4.1 GB peak (z7 c02 is the RAM peak)
+  - project: tat-s2-conus-fast2
+    compose: docker-compose.s2.conus-fast2.yml
+    box: box1
+    cost: ~0.3 cores steady / ~1.1 GB peak
+  - project: tat-s2-conus
+    compose: docker-compose.s2.conus-lane.yml
+    box: box1
+    cost: ~0.1 cores steady / ~0.6 GB peak
+
+# Every key that must exist in /root/tsr-s2/.env on a box running lanes.
+# provision_box.sh refuses to start lanes if any is missing.
+env_keys:
+  - R2_ENDPOINT
+  - R2_ACCESS_KEY_ID
+  - R2_SECRET_ACCESS_KEY
+  - R2_BUCKET
+  - R2_PREFIX
+  - EUMETSAT_CONSUMER_KEY
+  - EUMETSAT_CONSUMER_SECRET
