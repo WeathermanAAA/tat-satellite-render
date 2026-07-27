@@ -91,7 +91,17 @@ HAFS_WORKFLOW = "update-hafs.yml"
 HAFS_LAG_H = float(_env("HAFS_WATCHDOG_LAG_H", "8"))
 # A cycle legitimately renders for ~20-40 min; in_progress longer than this = a
 # wedged build (a dead worker) -> recover regardless of the cycle id.
-HAFS_STUCK_BUILD_S = float(_env("HAFS_WATCHDOG_STUCK_BUILD_S", "3600"))
+# 6 h, deliberately LONGER than update-hafs.yml's own timeout-minutes: 350.
+# A full HAFS-A+B cycle with three storms is ~8.5k render tasks and runs for
+# HOURS; at the old 3600 s default the watchdog called every healthy long
+# render "wedged" and queued a duplicate every cooldown, which under the
+# workflow's concurrency group showed up as a train of cancelled runs
+# (observed 2026-07-27, minutes after the watchdog was given a real token).
+# Past this threshold a run has already exceeded the limit GitHub itself
+# enforces, so it is dead rather than slow -- and a killed run leaves nothing
+# in progress, which the separate lag>8h rule catches. The two rules cover
+# "wedged" and "dead" without overlapping.
+HAFS_STUCK_BUILD_S = float(_env("HAFS_WATCHDOG_STUCK_BUILD_S", "21600"))
 HAFS_COOLDOWN_S = float(_env("HAFS_WATCHDOG_COOLDOWN_S", "2400"))
 HAFS_KEY = "hafs"   # last_dispatch key (never collides with an enscenters slug)
 
