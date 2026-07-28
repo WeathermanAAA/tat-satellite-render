@@ -65,21 +65,45 @@ const log = (...a) => console.error("[wpace]", ...a);
           const s = document.getElementById("chart");
           return !!s && s.children.length > 8;
         }, { timeout: CHART_TIMEOUT });
-        await page.evaluate((bg) => {
-          const s = document.getElementById("chart");
-          s.style.background = bg;
-          s.style.display = "block";
-        }, BG);
-        // Let webfonts settle so labels are not captured mid-swap.
+        // Let webfonts settle so labels are not serialized mid-swap.
         await page.waitForTimeout(600);
-        const el = await page.$("#chart");
-        const box = await el.boundingBox();
+        // SERIALIZE, then rasterise standalone — do NOT element-screenshot.
+        // elementHandle.screenshot() clips the PAGE raster to the element's
+        // box, which on this page came back as a flat slab of card background:
+        // the chart sits well below the fold inside the storm layout, and the
+        // clip and the paint did not agree. Taking the SVG's own markup has no
+        // scroll, no layout and no viewport dependency, renders at exactly the
+        // viewBox size we ask for, and is still a photograph of the renderer
+        // that exists rather than a second implementation of it.
+        const grab = await page.evaluate(() => {
+          const s = document.getElementById("chart");
+          const vb = (s.getAttribute("viewBox") || "0 0 1000 480")
+            .trim().split(/\s+/).map(Number);
+          const cs = getComputedStyle(s);
+          return {
+            svg: s.outerHTML,
+            w: vb[2] || 1000,
+            h: vb[3] || 480,
+            // The chart's text carries inline font-SIZE but inherits its
+            // family from the page, so carry the family across or every label
+            // rasterises in the default serif.
+            font: cs.fontFamily || "system-ui, sans-serif",
+          };
+        });
+        const shot = await browser.newPage({
+          viewport: { width: grab.w, height: grab.h }, deviceScaleFactor: 2 });
+        await shot.setContent(
+          `<!doctype html><meta charset="utf-8">` +
+          `<style>html,body{margin:0;padding:0;background:${BG};` +
+          `font-family:${grab.font.replace(/[<>]/g, "")};}` +
+          `svg{display:block;width:${grab.w}px;height:${grab.h}px;}</style>` +
+          grab.svg, { waitUntil: "load" });
+        await shot.waitForTimeout(250);
         const file = path.join(OUT, sid + ".png");
-        await el.screenshot({ path: file });
-        out.push({ id: sid, file: file,
-                   w: Math.round(box ? box.width : 0),
-                   h: Math.round(box ? box.height : 0) });
-        log("captured", sid, box ? `${Math.round(box.width)}x${Math.round(box.height)}` : "");
+        await shot.screenshot({ path: file });
+        await shot.close();
+        out.push({ id: sid, file: file, w: grab.w, h: grab.h });
+        log("captured", sid, `${grab.w}x${grab.h} @2x`);
       } catch (e) {
         // PER-STORM ISOLATION: one storm without a chart must not cost the
         // others their capture.
