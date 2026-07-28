@@ -615,6 +615,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     border-color: var(--cat-accent); font-weight: 700; }
   .hafs-caption { color: var(--muted); font-size: 12px; line-height: 1.5;
     margin: 8px 0 0; }
+  /* Diagnostic subhead: forecast hour + valid time, carried in the header of
+     every diagnostic panel so a screenshot is self-dating. */
+  .wp-subhead { color: var(--muted); font-size: 11.5px; letter-spacing: .04em;
+    text-transform: uppercase; margin: -2px 0 8px; min-height: 14px; }
+  .wp-subhead .wp-sep { opacity: .45; padding: 0 6px; }
   /* --- Model guidance (Stage B; merged into the Models tab in Phase 3b, so
          the guidance SVGs are now scoped by id rather than by #sec-guidance) --- */
   #gtracks, #gintensity { width: 100%; height: auto; display: block;
@@ -1171,9 +1176,17 @@ HTML_TEMPLATE = r"""<!doctype html>
             <div class="sst-hero-glyph" id="sst-hero-glyph"></div>
           </div>
           <div class="note" id="sst-hero-note"></div></div>
-        <div class="card" id="card-wp"><h3>Wind &amp; pressure</h3>
-          <svg id="chart" viewBox="0 0 1000 320"
-               preserveAspectRatio="xMidYMid meet"></svg></div>
+        <div class="card" id="card-wp">
+          <h3>Wind, pressure &amp; ACE</h3>
+          <div class="wp-subhead" id="chart-subhead"></div>
+          <svg id="chart" viewBox="0 0 1000 480"
+               preserveAspectRatio="xMidYMid meet" role="img"
+               aria-label="Observed and forecast intensity with cumulative and projected ACE"></svg>
+          <p class="hafs-caption" id="chart-note"></p>
+          <details class="adv-method" id="chart-method" hidden>
+            <summary>How is the projected ACE computed?</summary>
+            <div id="chart-method-body"></div>
+          </details></div>
         </div>
         <div class="ov-col ov-right">
         <div class="card" id="card-track">
@@ -2570,47 +2583,243 @@ HTML_TEMPLATE = r"""<!doctype html>
     });
   }
 
+  // ======================================================================
+  // ACE — a faithful client mirror of ace_core's rules. The published
+  // storm.ace is the authority; this only has to REPRODUCE it so the
+  // chart's labelled observed total can never contradict the header.
+  //   ace_core.fix_ace_eligible : 6-hourly synoptic AND >= 34 kt AND the
+  //                               basin's NATURE set (provisional accepts
+  //                               "NR"/blank, which IBTrACS backfills only
+  //                               after post-season QC)
+  //   ace_core.fix_increment    : v^2 / 10000  (kt^2, NEVER unit-converted -
+  //                               ACE is defined in kt, so the mph/km/h
+  //                               toggle must not touch it)
+  //   ace_core.storm_ace        : an ATCF invest never accrues ACE at all
+  // Any change to ace_core's gate must be mirrored here; the harness test
+  // pins this by asserting the chart's observed total == storm.ace.
+  var ACE_NATURES = { wp: ["TS", "SS", "SD"], al: ["TS", "SS"],
+                      ep: ["TS", "SS"] };
+  function aceBasinKey() {
+    // CP systems ride the EP page and EP's nature set (storm_ids: the EP
+    // basin carries CP); anything unmapped falls back to the NHC set.
+    var b = String(BASIN || "").toLowerCase();
+    if (b === "cp") return "ep";
+    return ACE_NATURES[b] ? b : "al";
+  }
+  function aceNatureOk(nature) {
+    var n = String(nature == null ? "" : nature).toUpperCase().trim();
+    var set = ACE_NATURES[aceBasinKey()];
+    return set.indexOf(n) >= 0 || n === "NR" || n === "";
+  }
+  // The feed stamps fixes as naive ISO ("2026-07-25T00:00:00"). JS parses a
+  // date-time with NO offset as LOCAL time, which would shift the synoptic
+  // hour by the viewer's timezone and silently drop (or invent) ACE fixes
+  // for anyone not on UTC. Everything here goes through this.
+  function utcDate(s) {
+    if (s == null) return null;
+    var str = String(s);
+    if (!/[Zz]$|[+-]\d{2}:?\d{2}$/.test(str)) str += "Z";
+    var d = new Date(str);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  function aceSixHourly(d) {
+    return !!d && [0, 6, 12, 18].indexOf(d.getUTCHours()) >= 0 &&
+      d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0;
+  }
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  var _MON_U = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  // Compact, unambiguous, ALWAYS timezone-explicit: "28 JUL 12:00Z". Every
+  // diagnostic header carries one so a screenshot dates itself.
+  function isoStamp(d) {
+    if (!d || isNaN(d.getTime())) return "—";
+    return pad2(d.getUTCDate()) + " " + _MON_U[d.getUTCMonth()] + " " +
+      pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) + "Z";
+  }
+  function aceIncrement(kt) { return (kt * kt) / 10000.0; }
+  function aceCounts(d, kt, nature) {
+    return aceSixHourly(d) && kt != null && isFinite(kt) && kt >= 34 &&
+      aceNatureOk(nature);
+  }
+  // Cumulative OBSERVED ACE, one entry per counting fix.
+  function observedAceSeries(storm) {
+    if (!storm || storm.is_invest) return [];   // invest guard (storm_ace)
+    var run = 0, out = [];
+    (storm.points || []).forEach(function (p) {
+      var d = utcDate(p.t);
+      if (!d) return;
+      if (!aceCounts(d, p.wind_kt, p.nature)) return;
+      run += aceIncrement(+p.wind_kt);
+      out.push({ t: d.getTime(), ace: run });
+    });
+    return out;
+  }
+  // The official forecast, resampled onto the ACE grid. ACE is DEFINED on
+  // 6-hourly synoptic points but official forecasts are issued at
+  // 12/24/36/48/72/96/120 h, so summing the native taus would both miss the
+  // 6 h points between them and weight the 24 h gaps (72->96->120) exactly
+  // like the 12 h ones. We linearly interpolate intensity onto the synoptic
+  // grid first. This is OUR construction, not an agency product, and it is
+  // disclosed on the panel.
+  function forecastAceGrid() {
+    if (!advFull || !advFull.points) return null;
+    var fp = [];
+    advFull.points.forEach(function (p) {
+      var d = utcDate(p.valid_utc);
+      if (!d || p.intensity_kt == null) return;
+      var kt = +p.intensity_kt;
+      if (!isFinite(kt)) return;
+      fp.push({ t: d.getTime(), kt: kt });
+    });
+    fp.sort(function (a, b) { return a.t - b.t; });
+    if (fp.length < 2) return null;
+    var STEP = 6 * 3600 * 1000;
+    // Anchor the grid on the first SYNOPTIC instant at or after the first
+    // forecast point, so every sample is a legal ACE time even if an
+    // advisory is ever anchored off-synoptic.
+    var d0 = new Date(fp[0].t);
+    d0.setUTCMilliseconds(0); d0.setUTCSeconds(0); d0.setUTCMinutes(0);
+    while (d0.getTime() < fp[0].t || !aceSixHourly(d0)) {
+      d0.setUTCHours(d0.getUTCHours() + 1);
+    }
+    var start = d0.getTime();
+    var grid = [];
+    for (var t = start; t <= fp[fp.length - 1].t; t += STEP) {
+      // linear interpolation in time between bracketing forecast points
+      var kt = null;
+      for (var i = 1; i < fp.length; i++) {
+        if (t <= fp[i].t) {
+          var a = fp[i - 1], b = fp[i];
+          var f = (b.t === a.t) ? 0 : (t - a.t) / (b.t - a.t);
+          kt = a.kt + (b.kt - a.kt) * f;
+          break;
+        }
+      }
+      if (kt == null) kt = fp[fp.length - 1].kt;
+      grid.push({ t: t, kt: kt });
+    }
+    return grid.length ? grid : null;
+  }
+  // Projected cumulative ACE: RESUMES from the observed total at the latest
+  // observed fix and adds only forecast steps strictly AFTER it. The b-deck
+  // routinely runs ahead of the advisory's own t0, so summing from t0 would
+  // double-count the overlap. Never blended into the season total.
+  function projectedAceSeries(storm, obsSeries) {
+    var grid = forecastAceGrid();
+    if (!grid || !storm || storm.is_invest) return null;
+    var pts = (storm.points || []).map(function (p) { return utcDate(p.t); })
+      .filter(Boolean).map(function (d) { return d.getTime(); });
+    if (!pts.length) return null;
+    var lastObs = Math.max.apply(null, pts);
+    var run = obsSeries.length ? obsSeries[obsSeries.length - 1].ace : 0;
+    var out = [{ t: lastObs, ace: run }];    // joins the observed curve
+    var added = 0;
+    grid.forEach(function (g) {
+      if (g.t <= lastObs) return;
+      if (g.kt >= 34) { run += aceIncrement(g.kt); added++; }
+      out.push({ t: g.t, ace: run });
+    });
+    return (out.length > 1) ? { series: out, steps: added,
+                                grid: grid, lastObs: lastObs } : null;
+  }
+
   function renderChart(storm) {
-    // ONE CANON (final-gate #1): this chart mirrors the site's
-    // existing wind-history graphic (renderWindChart in the basin
-    // pages) - SSHS bands at 0.38, white series line, dark dots with
-    // white stroke, threshold y-ticks - scaled to this panel, with
-    // the dashed pressure series + its mb axis on the right (the
-    // pressure-axis backlog item, closed here since it rode along).
+    // TWO-PANEL STORM DIAGNOSTIC.
+    //   TOP    observed max wind (solid white) + OFFICIAL FORECAST wind
+    //          (dotted) on the left axis; min pressure (dashed, right axis).
+    //   BOTTOM cumulative OBSERVED ACE (solid gold) + PROJECTED ACE from the
+    //          official forecast track (dotted).
+    // ONE CANON (final-gate #1): the wind panel keeps the site's existing
+    // wind-history language - SSHS bands at 0.38, white series line, dark
+    // dots with white stroke, threshold y-ticks. ACE gets its OWN panel
+    // rather than a third axis: wind and ACE share no scale, and stacking
+    // them on one frame is the dual-axis trap the house style refuses.
+    // Observed vs forecast is carried by LINE STYLE (solid vs dotted) in the
+    // same hue, so hue keeps meaning "which quantity" throughout.
     var svg = document.getElementById("chart");
+    var note = document.getElementById("chart-note");
+    var subhead = document.getElementById("chart-subhead");
+    var method = document.getElementById("chart-method");
+    var mbody = document.getElementById("chart-method-body");
+    if (!svg) return;
     var pts = (storm.points || []).filter(function (p) {
-      return p.wind_kt != null; });
-    if (pts.length < 2) { svg.innerHTML = ""; return; }
-    var W = 1000, H = 320, padL = 56, padR = 56, padT = 16, padB = 30;
-    var plotW = W - padL - padR, plotH = H - padT - padB;
-    var wMax = Math.max(160, Math.max.apply(null, pts.map(function (p) {
-      return p.wind_kt; })) + 10);
-    var times = pts.map(function (p) { return new Date(p.t).getTime(); });
-    var tMin = Math.min.apply(null, times);
-    var tMax = Math.max.apply(null, times);
+      return p.wind_kt != null && utcDate(p.t); });
+    if (pts.length < 2) {
+      svg.innerHTML = "";
+      if (note) note.textContent = "";
+      if (subhead) subhead.textContent = "";
+      if (method) method.hidden = true;
+      return;
+    }
+
+    // ---- series -------------------------------------------------------
+    var obsAce = observedAceSeries(storm);
+    var proj = projectedAceSeries(storm, obsAce);
+    var fGrid = proj ? proj.grid : null;
+    // forecast WIND series: the native advisory points (not the ACE grid) -
+    // the wind panel shows what the agency actually issued.
+    var fWind = [];
+    if (advFull && advFull.points) {
+      advFull.points.forEach(function (p) {
+        var d = utcDate(p.valid_utc);
+        if (d && p.intensity_kt != null && isFinite(+p.intensity_kt)) {
+          fWind.push({ t: d.getTime(), kt: +p.intensity_kt,
+                       tau: +(p.tau_h || 0) });
+        }
+      });
+      fWind.sort(function (a, b) { return a.t - b.t; });
+    }
+
+    // ---- geometry: two stacked panels on ONE shared time axis ----------
+    var W = 1000, H = 480, padL = 56, padR = 56;
+    var wT = 26, wB = 292;                    // wind panel band
+    var aT = 336, aB = 442;                   // ACE panel band
+    var plotW = W - padL - padR;
+    var wH = wB - wT, aH = aB - aT;
+
+    var obsTimes = pts.map(function (p) { return utcDate(p.t).getTime(); });
+    var tMin = Math.min.apply(null, obsTimes);
+    var tMax = Math.max.apply(null, obsTimes);
+    if (fWind.length) tMax = Math.max(tMax, fWind[fWind.length - 1].t);
+    if (proj) tMax = Math.max(tMax, proj.series[proj.series.length - 1].t);
     function Xt(t) {
       if (tMax === tMin) return padL + plotW / 2;
       return padL + (t - tMin) / (tMax - tMin) * plotW;
     }
-    function Yw(w) { return padT + plotH - (w / wMax) * plotH; }
+    var obsPeak = Math.max.apply(null, pts.map(function (p) {
+      return p.wind_kt; }));
+    var fcstPeak = fWind.length
+      ? Math.max.apply(null, fWind.map(function (f) { return f.kt; })) : null;
+    var wMax = Math.max(160, obsPeak + 10,
+                        (fcstPeak == null ? 0 : fcstPeak + 10));
+    function Yw(w) { return wT + wH - (w / wMax) * wH; }
     var prs = pts.map(function (p) { return p.pressure_mb; })
       .filter(function (v) { return v != null; });
     var p0 = Math.min.apply(null, prs.concat([1000])) - 6;
     var p1 = Math.max.apply(null, prs.concat([1014])) + 6;
-    function Yp(p) { return padT + plotH - ((p - p0) / (p1 - p0)) * plotH; }
+    function Yp(p) { return wT + wH - ((p - p0) / (p1 - p0)) * wH; }
+    var aceMax = 0;
+    obsAce.forEach(function (a) { if (a.ace > aceMax) aceMax = a.ace; });
+    if (proj) proj.series.forEach(function (a) {
+      if (a.ace > aceMax) aceMax = a.ace; });
+    var aceTop = Math.max(1, aceMax * 1.18);
+    function Ya(v) { return aT + aH - (v / aceTop) * aH; }
+
+    var ACE_HUE = "#ffbe34";                  // house wind-tier gold
     var parts = ['<rect width="' + W + '" height="' + H +
                  '" fill="#0a1019"/>'];
-    // canon SSHS bands
+
+    // ---- wind panel: SSHS bands ---------------------------------------
     [[0, 34, "TD"], [34, 64, "TS"], [64, 83, "C1"], [83, 96, "C2"],
      [96, 113, "C3"], [113, 137, "C4"], [137, wMax, "C5"]]
       .forEach(function (b) {
+        if (b[0] >= wMax) return;
         var y1 = Yw(Math.min(b[1], wMax)), y2 = Yw(b[0]);
         parts.push('<rect x="' + padL + '" y="' + y1.toFixed(1) +
           '" width="' + plotW + '" height="' + (y2 - y1).toFixed(1) +
           '" fill="' + SSHS[b[2]] + '" fill-opacity="0.38"/>');
       });
-    // canon threshold y-axis (tick GEOMETRY stays in kt; the LABELS
-    // display in the chosen wind unit - final-gate-3 #3)
+    // threshold y-axis (tick GEOMETRY stays in kt; LABELS follow the unit)
     [0, 35, 65, 85, 100, 115, 140, 160].forEach(function (v) {
       if (v > wMax) return;
       var y = Yw(v);
@@ -2622,21 +2831,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         '" text-anchor="end" font-size="12" fill="#8ea2bd">' +
         windDisp(v) + "</text>");
     });
-    // x labels (canon: 3 calendar ticks)
-    var MN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
-              "Sep", "Oct", "Nov", "Dec"];
-    for (var xi = 0; xi < 3; xi++) {
-      var tt = tMin + xi * (tMax - tMin) / 2;
-      var d2 = new Date(tt);
-      parts.push('<text x="' + Xt(tt).toFixed(1) + '" y="' + (H - 8) +
-        '" text-anchor="middle" font-size="12" fill="#8ea2bd">' +
-        MN[d2.getUTCMonth()] + " " + d2.getUTCDate() + "</text>");
-    }
     // pressure series + right mb axis
     var pp = pts.filter(function (p) { return p.pressure_mb != null; });
     if (pp.length >= 2) {
       var dPres = pp.map(function (p, i) {
-        return (i ? "L" : "M") + Xt(new Date(p.t).getTime()).toFixed(1) +
+        return (i ? "L" : "M") + Xt(utcDate(p.t).getTime()).toFixed(1) +
           "," + Yp(p.pressure_mb).toFixed(1);
       }).join(" ");
       parts.push('<path d="' + dPres + '" fill="none" stroke="#8ea2bd" ' +
@@ -2651,9 +2850,35 @@ HTML_TEMPLATE = r"""<!doctype html>
           Math.round(v) + "</text>");
       });
     }
-    // canon wind series: white line + dark dots, white stroke
+    // ANALYSIS divider: everything right of it is forecast, not observation.
+    var lastObsT = Math.max.apply(null, obsTimes);
+    if ((fWind.length || proj) && lastObsT < tMax) {
+      var xa = Xt(lastObsT).toFixed(1);
+      parts.push('<line x1="' + xa + '" y1="' + wT + '" x2="' + xa +
+        '" y2="' + aB + '" stroke="#8ea2bd" stroke-width="1" ' +
+        'stroke-dasharray="2 4" stroke-opacity="0.55"/>');
+      parts.push('<text class="wp-anno" x="' + (Xt(lastObsT) + 5).toFixed(1) +
+        '" y="' + (wT + 11) + '" font-size="10" fill="#8ea2bd" ' +
+        'letter-spacing="0.06em">FORECAST →</text>');
+    }
+    // forecast WIND (dotted, same white hue as the observed series)
+    if (fWind.length >= 2) {
+      var dF = fWind.map(function (f, i) {
+        return (i ? "L" : "M") + Xt(f.t).toFixed(1) + "," +
+          Yw(f.kt).toFixed(1);
+      }).join(" ");
+      parts.push('<path d="' + dF + '" fill="none" stroke="#ffffff" ' +
+        'stroke-width="2.2" stroke-dasharray="2 5" stroke-linecap="round" ' +
+        'stroke-opacity="0.92"/>');
+      fWind.forEach(function (f) {
+        parts.push('<circle cx="' + Xt(f.t).toFixed(1) + '" cy="' +
+          Yw(f.kt).toFixed(1) + '" r="3.4" fill="#0a1324" ' +
+          'stroke="#ffffff" stroke-width="1.4" stroke-opacity="0.92"/>');
+      });
+    }
+    // observed wind: white line + dark dots (canon)
     var dWind = pts.map(function (p, i) {
-      return (i ? "L" : "M") + Xt(new Date(p.t).getTime()).toFixed(1) +
+      return (i ? "L" : "M") + Xt(utcDate(p.t).getTime()).toFixed(1) +
         "," + Yw(p.wind_kt).toFixed(1);
     }).join(" ");
     parts.push('<path class="series" d="' + dWind +
@@ -2661,23 +2886,190 @@ HTML_TEMPLATE = r"""<!doctype html>
       'stroke-linejoin="round" stroke-linecap="round"/>');
     pts.forEach(function (p) {
       parts.push('<circle cx="' +
-        Xt(new Date(p.t).getTime()).toFixed(1) + '" cy="' +
+        Xt(utcDate(p.t).getTime()).toFixed(1) + '" cy="' +
         Yw(p.wind_kt).toFixed(1) +
         '" r="4" fill="#0a1324" stroke="#ffffff" stroke-width="1.6"/>');
     });
-    parts.push('<text x="' + padL + '" y="13" fill="#8ea2bd" ' +
+    // ---- explicit peak labels (the ask) --------------------------------
+    function anno(x, y, text, hex, anchor) {
+      // dark casing under light text so a label reads over BOTH the bright
+      // SSHS bands and the dark ocean panel (same paint-order trick the
+      // map graticule uses).
+      var a = anchor || "middle";
+      return '<text class="wp-anno" x="' + x.toFixed(1) + '" y="' +
+        y.toFixed(1) + '" text-anchor="' + a + '" font-size="11.5" ' +
+        'font-weight="700" fill="' + hex + '" stroke="#0a1019" ' +
+        'stroke-width="3.2" paint-order="stroke" letter-spacing="0.03em">' +
+        text + "</text>";
+    }
+    // Place a peak label CLEAR of its own series: above the line when there
+    // is room, otherwise below it. Clamping into the panel without this puts
+    // the text ON the line it is annotating (the 150 kt forecast peak sits
+    // ~17 px from the top, so "above, clamped" landed straight on the curve).
+    function annoY(yLine, band) {
+      var above = yLine - 10, below = yLine + 19;
+      return (above >= wT + band) ? above : below;
+    }
+    var obsPeakPt = pts.filter(function (p) {
+      return p.wind_kt === obsPeak; })[0];
+    if (obsPeakPt) {
+      var ox = Xt(utcDate(obsPeakPt.t).getTime());
+      parts.push(anno(Math.min(Math.max(ox, padL + 46), W - padR - 46),
+        annoY(Yw(obsPeak), 12),
+        "OBS MAX " + windDisp(obsPeak) + " " + windUnitLabel(), "#ffffff"));
+    }
+    if (fcstPeak != null && fWind.length >= 2) {
+      var fp2 = fWind.filter(function (f) { return f.kt === fcstPeak; })[0];
+      var fx = Xt(fp2.t);
+      // The forecast label also dodges the OBSERVED label's band when the two
+      // peaks are close in both x and y.
+      var fy = annoY(Yw(fcstPeak), 26);
+      parts.push(anno(Math.min(Math.max(fx, padL + 62), W - padR - 62), fy,
+        "FCST PEAK " + windDisp(fcstPeak) + " " + windUnitLabel() +
+        " · T+" + fp2.tau + "h", "#ffffff"));
+    }
+    parts.push('<text x="' + padL + '" y="14" fill="#8ea2bd" ' +
       'font-size="11">wind ' + windUnitLabel() +
-      ' (solid) \u00b7 pressure mb (dashed, right axis)</text>');
+      ' — observed (solid) · official forecast (dotted) · ' +
+      'pressure mb (dashed, right axis)</text>');
+
+    // ---- ACE panel -----------------------------------------------------
+    parts.push('<rect x="' + padL + '" y="' + aT + '" width="' + plotW +
+      '" height="' + aH + '" fill="#0c1422" stroke="#22304a" ' +
+      'stroke-width="1"/>');
+    [0, 0.5, 1].forEach(function (f) {
+      var v = aceTop * f, y = Ya(v);
+      parts.push('<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' +
+        (W - padR) + '" y2="' + y.toFixed(1) +
+        '" stroke="#22304a" stroke-width="1" stroke-opacity="0.8"/>');
+      parts.push('<text x="' + (padL - 9) + '" y="' + (y + 4).toFixed(1) +
+        '" text-anchor="end" font-size="11" fill="#8ea2bd">' +
+        v.toFixed(v >= 10 ? 0 : 1) + "</text>");
+    });
+    parts.push('<text x="' + padL + '" y="' + (aT - 8) +
+      '" fill="#8ea2bd" font-size="11">cumulative ACE (10⁴ kt²) ' +
+      '— observed (solid) · projected from the official forecast ' +
+      '(dotted)</text>');
+    if (obsAce.length) {
+      // step-and-hold: ACE accrues in discrete 6-hourly increments, so a
+      // stepped line is the honest shape - a smooth ramp would imply the
+      // storm banked ACE continuously between synoptic fixes.
+      var dA = "", py = null;
+      obsAce.forEach(function (a, i) {
+        var x = Xt(a.t).toFixed(1), y = Ya(a.ace).toFixed(1);
+        if (i === 0) { dA += "M" + x + "," + y; }
+        else { dA += "L" + x + "," + py + "L" + x + "," + y; }
+        py = y;
+      });
+      parts.push('<path d="' + dA + '" fill="none" stroke="' + ACE_HUE +
+        '" stroke-width="2.6" stroke-linejoin="round" ' +
+        'stroke-linecap="round"/>');
+      var lastA = obsAce[obsAce.length - 1];
+      parts.push('<circle cx="' + Xt(lastA.t).toFixed(1) + '" cy="' +
+        Ya(lastA.ace).toFixed(1) + '" r="3.6" fill="#0a1324" stroke="' +
+        ACE_HUE + '" stroke-width="1.8"/>');
+      parts.push(anno(Math.min(Xt(lastA.t), W - padR - 52),
+        Math.max(aT + 12, Ya(lastA.ace) - 8),
+        "ACE " + lastA.ace.toFixed(2), ACE_HUE,
+        Xt(lastA.t) > W - padR - 60 ? "end" : "middle"));
+    }
+    if (proj) {
+      var dP = "", ppy = null;
+      proj.series.forEach(function (a, i) {
+        var x = Xt(a.t).toFixed(1), y = Ya(a.ace).toFixed(1);
+        if (i === 0) { dP += "M" + x + "," + y; }
+        else { dP += "L" + x + "," + ppy + "L" + x + "," + y; }
+        ppy = y;
+      });
+      parts.push('<path d="' + dP + '" fill="none" stroke="' + ACE_HUE +
+        '" stroke-width="2.2" stroke-dasharray="2 5" ' +
+        'stroke-linecap="round" stroke-opacity="0.95"/>');
+      var lastP = proj.series[proj.series.length - 1];
+      parts.push(anno(Math.min(Xt(lastP.t), W - padR - 4),
+        Math.max(aT + 12, Ya(lastP.ace) - 8),
+        "PROJ " + lastP.ace.toFixed(2), ACE_HUE, "end"));
+    }
+
+    // ---- shared x axis --------------------------------------------------
+    var MN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+              "Sep", "Oct", "Nov", "Dec"];
+    for (var xi = 0; xi < 3; xi++) {
+      var tt = tMin + xi * (tMax - tMin) / 2;
+      var d2 = new Date(tt);
+      parts.push('<text x="' + Xt(tt).toFixed(1) + '" y="' + (H - 10) +
+        '" text-anchor="middle" font-size="12" fill="#8ea2bd">' +
+        MN[d2.getUTCMonth()] + " " + d2.getUTCDate() + " " +
+        pad2(d2.getUTCHours()) + "Z</text>");
+    }
     svg.innerHTML = parts.join("");
+
+    // ---- header: forecast hour + valid time -----------------------------
+    if (subhead) {
+      var bits = [];
+      var lastFix = new Date(lastObsT);
+      bits.push("LATEST FIX " + isoStamp(lastFix));
+      if (fWind.length) {
+        bits.push("FCST T+0 … T+" + fWind[fWind.length - 1].tau + "H");
+        bits.push("VALID TO " + isoStamp(new Date(fWind[fWind.length - 1].t)));
+        if (advFull && advFull.advisory != null) {
+          bits.push("ADVISORY " + advFull.advisory);
+        }
+      }
+      subhead.innerHTML = bits.join('<span class="wp-sep">·</span>');
+    }
+
+    // ---- honesty: caption + method --------------------------------------
+    if (note) {
+      if (proj) {
+        note.textContent =
+          "Projected ACE is a FORECAST, not an observation — it is shown " +
+          "for this storm only and is never added to the season total. " +
+          "Official forecasts are issued at 12/24/36/48/72/96/120 h; ACE is " +
+          "defined on 6-hourly synoptic points, so the forecast intensity is " +
+          "linearly interpolated onto the 6-hourly grid before summing (" +
+          proj.steps + " forecast point" + (proj.steps === 1 ? "" : "s") +
+          " at or above 34 kt). The interpolation is ours, not the agency's.";
+      } else if (obsAce.length) {
+        note.textContent =
+          "Observed ACE only — no official forecast track is available " +
+          "for this storm yet, so no projection is drawn rather than one " +
+          "being invented.";
+      } else {
+        note.textContent =
+          "No ACE yet — ACE accrues only from 6-hourly synoptic fixes at " +
+          "or above 34 kt with an ACE-eligible classification.";
+      }
+    }
+    if (method && mbody) {
+      method.hidden = !proj;
+      if (proj) {
+        mbody.textContent =
+          "ACE = Σ v² / 10⁴ over 6-hourly synoptic fixes (00/06/" +
+          "12/18 UTC) at or above 34 kt whose classification is ACE-eligible " +
+          "for this basin. Observed ACE is the same computation the site's " +
+          "season totals use. PROJECTED ACE resumes from the latest observed " +
+          "fix and adds the official forecast track's own intensities, " +
+          "linearly interpolated from the issued taus (12/24/36/48/72/96/" +
+          "120 h) onto the 6-hourly grid — summing the issued taus " +
+          "directly would both skip the synoptic points between them and " +
+          "weight a 24 h gap the same as a 12 h one. Forecast steps at or " +
+          "before the latest observed fix are NOT counted, so the b-deck " +
+          "running ahead of the advisory cannot double-count. ACE is defined " +
+          "in knots and is never unit-converted. Sources: agency best-track " +
+          "and official forecast products.";
+      }
+    }
+
     if (!chartDrawn && !reduced) {
       var series = svg.querySelector("path.series");
-      var len = series.getTotalLength ? series.getTotalLength() : 2000;
-      series.style.setProperty("--len", len);
-      svg.classList.add("draw");
+      if (series) {
+        var len = series.getTotalLength ? series.getTotalLength() : 2000;
+        series.style.setProperty("--len", len);
+        svg.classList.add("draw");
+      }
     }
     chartDrawn = true;
   }
-
   // ======================================================================
   // FG-R3 #7/#8: the two Overview art-directed plots - track history +
   // wind-history swath. Both REUSE the cone's auto-fit projection math
@@ -3833,6 +4225,17 @@ HTML_TEMPLATE = r"""<!doctype html>
           (adv.method || "derived") + ".";
     }
     if (changed && inited.advisories) renderAdvTab();
+    // The W&P panel's forecast wind + projected ACE come from THIS payload,
+    // which lands after the first paint (and again on every new advisory),
+    // so the chart must re-render here or the baked page would show the
+    // observed half forever. Isolated: an advisory-shaped chart bug must
+    // never starve the cone / advisory-tab wiring.
+    if (lastStorm) {
+      try { renderChart(lastStorm); } catch (e) {
+        try { console.warn("[cyclolab] chart re-render failed:", e); }
+        catch (e2) {}
+      }
+    }
   }
 
   function fetchJson(url) {

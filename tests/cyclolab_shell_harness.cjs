@@ -639,6 +639,34 @@ const scheduledDelays = [];
       })(),
       chartChildCount: (document.getElementById("chart") || { children: [] })
         .children.length,
+      // ---- W&P/ACE two-panel diagnostic ----
+      // The labelled annotations ARE the panel's readable output (observed
+      // max wind, forecast peak, observed ACE, projected ACE), so they are
+      // what the tests assert on - a chart that draws but labels the wrong
+      // ACE is worse than one that fails to draw.
+      chart: (() => {
+        const c = document.getElementById("chart");
+        if (!c) return null;
+        const dash = (sel) => [...c.querySelectorAll("path")]
+          .filter((p) => (p.getAttribute("stroke-dasharray") || "") === sel)
+          .length;
+        return {
+          rendered: c.innerHTML.length > 200,
+          viewBox: c.getAttribute("viewBox"),
+          anno: [...c.querySelectorAll("text.wp-anno")]
+            .map((t) => t.textContent.trim()),
+          dottedSeries: dash("2 5"),          // forecast wind + projected ACE
+          dashedPressure: dash("5 4"),
+          subhead: (document.getElementById("chart-subhead") || {})
+            .textContent || "",
+          note: (document.getElementById("chart-note") || {})
+            .textContent || "",
+          methodShown: !((document.getElementById("chart-method") || {})
+            .hidden !== false),
+          methodBody: (document.getElementById("chart-method-body") || {})
+            .textContent || "",
+        };
+      })(),
       endedStripVisible: endedStripVisible(),
       scheduledDelays: scheduledDelays.slice(),
       clipWrites: window.__clipWrites,

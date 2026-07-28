@@ -102,17 +102,25 @@ def _node_env() -> dict:
     return env
 
 
-def run_harness(html: str, plan) -> list[dict]:
+def run_harness(html: str, plan, env: dict | None = None) -> list[dict]:
     """Render `html` + a plan through the node harness; return the list of
-    per-op snapshot records ({"op": ..., "state": {...}})."""
+    per-op snapshot records ({"op": ..., "state": {...}}).
+
+    ``env`` overlays extra environment on the node subprocess. Its reason for
+    existing is TZ: the shell parses naive ISO fix stamps, and anything that
+    reads a UTC field off them (the ACE synoptic-hour gate) must be pinned
+    against a non-UTC viewer clock, not just the runner's."""
     with tempfile.TemporaryDirectory() as td:
         page = Path(td) / "page.html"
         pj = Path(td) / "plan.json"
         page.write_text(html, encoding="utf-8")
         pj.write_text(json.dumps(plan), encoding="utf-8")
+        senv = _node_env()
+        if env:
+            senv.update(env)
         proc = subprocess.run(
             [NODE, str(HARNESS), str(page), str(pj)],
-            capture_output=True, text=True, timeout=120, env=_node_env(),
+            capture_output=True, text=True, timeout=120, env=senv,
         )
     if proc.returncode != 0:
         raise RuntimeError(f"node harness failed (rc={proc.returncode}):\n"
@@ -2126,6 +2134,197 @@ class TestMobileCopyGesture(unittest.TestCase):
         self.assertEqual(
             writes, [1, 1, 1, 2],
             f"long-press must copy; tap/scroll must not (clipWrites={writes})")
+
+
+def _adv(points, advisory=6, sid="NHC_EP082026"):
+    """A minimal official-forecast payload in the shell's advisory shape."""
+    return {"sid": sid, "advisory": advisory, "source": "nhc",
+            "method": "official-cone", "cone": [], "points": points,
+            "text": {}, "name": "SYNTH"}
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestWindPressureAceDiagnostic(unittest.TestCase):
+    """The two-panel W&P/ACE storm diagnostic.
+
+    Top panel: observed wind (solid) + official forecast wind (dotted) on the
+    kt axis, pressure dashed on the right. Bottom panel: cumulative OBSERVED
+    ACE (solid) + PROJECTED ACE from the official forecast track (dotted).
+
+    The load-bearing correctness property is that the panel's OBSERVED ACE
+    equals the storm's published ACE. The chart recomputes it client-side
+    from ace_core's rules (6-hourly synoptic, >= 34 kt, basin nature set,
+    invest guard); if that mirror drifts, the panel silently contradicts the
+    header it sits under. These tests pin the mirror to the published number
+    rather than to a hand-copied constant."""
+
+    def setUp(self):
+        self.storm = load_radii_storm()          # EP, real published ACE
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL,
+                                               loader="")
+
+    def _chart(self, storm=None, adv=None, env=None):
+        st = storm or self.storm
+        # Render the page FROM this storm. apply() only re-renders the chart
+        # on a new fix key, so handing a mutated storm to a page baked from a
+        # different one would silently probe the baked render instead.
+        html = (self.html if st is self.storm
+                else cyclolab_shell.render_page(st, feed_url=FEED_URL,
+                                                loader=""))
+        plan = {"feed": {"storms": [st]},
+                "ops": [{"op": "apply", "storm": st}]}
+        if adv is not None:
+            plan["adv"] = adv
+        recs = run_harness(html, plan, env=env)
+        return recs[-1]["state"]["chart"]
+
+    @staticmethod
+    def _ace_core_total(storm, basin="ep"):
+        """The AUTHORITY: ace_core's own ACE for this storm's points."""
+        import datetime as _dt
+        import ace_core
+        pts = [{"time": _dt.datetime.fromisoformat(p["t"]),
+                "wind_kt": p.get("wind_kt"), "nature": p.get("nature")}
+               for p in (storm.get("points") or [])]
+        return ace_core.storm_ace(pts, basin)
+
+    @staticmethod
+    def _labelled(anno, prefix):
+        for a in anno:
+            if a.startswith(prefix):
+                return a
+        return None
+
+    # ---- observed half --------------------------------------------------
+    def test_observed_ace_matches_ace_core_exactly(self):
+        # Parity against the AUTHORITY, not against a hand-copied number.
+        # (The synth fixture's own `ace` field is decorative - 12.34 - while
+        # ace_core's ACE of its points is 11.72, because its ET-nature fixes
+        # are not ACE-eligible in EP. Asserting on the field would have
+        # pinned the test to a fiction; asserting on ace_core pins the JS
+        # mirror to the same gate the season totals use.)
+        ch = self._chart()
+        lab = self._labelled(ch["anno"], "ACE ")
+        self.assertIsNotNone(lab, f"no observed-ACE label in {ch['anno']}")
+        shown = float(lab.split()[1])
+        expect = self._ace_core_total(self.storm)
+        self.assertAlmostEqual(
+            shown, round(expect, 2), places=2,
+            msg=f"panel shows ACE {shown} but ace_core computes {expect} "
+                f"- the client mirror of ace_core drifted")
+
+    def test_observed_max_wind_is_labelled(self):
+        ch = self._chart()
+        peak = max(p["wind_kt"] for p in self.storm["points"])
+        lab = self._labelled(ch["anno"], "OBS MAX")
+        self.assertIsNotNone(lab, f"no observed-max label in {ch['anno']}")
+        self.assertIn(str(int(peak)), lab)
+
+    def test_ace_is_timezone_independent(self):
+        # ACE counts only 00/06/12/18 UTC fixes. JS parses a naive ISO stamp
+        # as LOCAL time, so without an explicit UTC coercion the synoptic
+        # hour shifts with the viewer's clock and fixes are silently dropped
+        # or invented. Same storm, three very different offsets.
+        totals = {}
+        for tz in ("UTC", "Pacific/Kiritimati", "Pacific/Midway"):
+            ch = self._chart(env={"TZ": tz})
+            totals[tz] = self._labelled(ch["anno"], "ACE ")
+        self.assertEqual(len(set(totals.values())), 1,
+                         f"ACE changed with the viewer's timezone: {totals}")
+
+    def test_invest_accrues_no_ace(self):
+        # ace_core.storm_ace: an ATCF invest NEVER accrues ACE, whatever its
+        # winds. The panel must not draw a curve the season total denies.
+        storm = copy.deepcopy(self.storm)
+        storm["is_invest"] = True
+        ch = self._chart(storm=storm)
+        self.assertIsNone(self._labelled(ch["anno"], "ACE "),
+                          "an invest was given an ACE curve")
+
+    # ---- forecast half --------------------------------------------------
+    def test_projection_renders_and_is_disclosed(self):
+        pts = [{"tau_h": 0,  "valid_utc": "2026-08-23T00:00:00Z",
+                "lat": 31.9, "lon": -125.0, "intensity_kt": 60},
+               {"tau_h": 12, "valid_utc": "2026-08-23T12:00:00Z",
+                "lat": 32.8, "lon": -126.0, "intensity_kt": 75},
+               {"tau_h": 24, "valid_utc": "2026-08-24T00:00:00Z",
+                "lat": 33.9, "lon": -127.0, "intensity_kt": 90},
+               {"tau_h": 48, "valid_utc": "2026-08-25T00:00:00Z",
+                "lat": 35.5, "lon": -129.0, "intensity_kt": 80}]
+        ch = self._chart(adv=_adv(pts))
+        self.assertTrue(ch["rendered"])
+        obs = self._labelled(ch["anno"], "ACE ")
+        proj = self._labelled(ch["anno"], "PROJ ")
+        self.assertIsNotNone(proj, f"no projected-ACE label in {ch['anno']}")
+        self.assertIsNotNone(self._labelled(ch["anno"], "FCST PEAK"),
+                             f"no forecast-peak label in {ch['anno']}")
+        # a strengthening forecast must ADD to the observed total
+        self.assertGreater(float(proj.split()[1]), float(obs.split()[1]))
+        # two dotted series: forecast wind + projected ACE
+        self.assertEqual(ch["dottedSeries"], 2)
+        # the interpolation is DISCLOSED on the panel, not silent
+        note = ch["note"].lower()
+        self.assertIn("interpolat", note)
+        self.assertIn("6-hourly", note)
+        self.assertIn("12/24/36/48/72/96/120", ch["note"])
+        self.assertTrue(ch["methodShown"], "method disclosure hidden")
+
+    def test_projected_ace_is_never_presented_as_season_total(self):
+        pts = [{"tau_h": 0,  "valid_utc": "2026-08-23T00:00:00Z",
+                "lat": 31.9, "lon": -125.0, "intensity_kt": 60},
+               {"tau_h": 24, "valid_utc": "2026-08-24T00:00:00Z",
+                "lat": 33.9, "lon": -127.0, "intensity_kt": 90}]
+        ch = self._chart(adv=_adv(pts))
+        note = ch["note"].lower()
+        self.assertIn("never", note)
+        self.assertIn("season total", note)
+        self.assertIn("forecast", note)
+
+    def test_forecast_steps_at_or_before_the_last_fix_are_not_counted(self):
+        # The b-deck routinely runs ahead of the advisory's own t0. Summing
+        # from t0 would double-count the overlap window against the observed
+        # curve the projection is supposed to CONTINUE.
+        last = self.storm["points"][-1]["t"]
+        if not last.endswith("Z"):
+            last += "Z"
+        pts = [{"tau_h": 0, "valid_utc": last, "lat": 31.9, "lon": -125.0,
+                "intensity_kt": 150},
+               {"tau_h": 6, "valid_utc": last.replace("T00", "T06"),
+                "lat": 32.2, "lon": -125.5, "intensity_kt": 150}]
+        ch = self._chart(adv=_adv(pts))
+        obs = self._labelled(ch["anno"], "ACE ")
+        proj = self._labelled(ch["anno"], "PROJ ")
+        if proj is None:
+            return          # no step strictly after the fix -> no projection
+        delta = float(proj.split()[1]) - float(obs.split()[1])
+        # at most ONE 150 kt step may be added (150^2/1e4 = 2.25), never two
+        self.assertLessEqual(delta, 2.26,
+                             "the t0 overlap was double-counted")
+
+    def test_no_forecast_is_honest_not_blank(self):
+        ch = self._chart(adv=None)
+        self.assertTrue(ch["rendered"], "chart blanked without a forecast")
+        self.assertIsNone(self._labelled(ch["anno"], "PROJ "))
+        self.assertIn("no official forecast track", ch["note"].lower())
+        self.assertFalse(ch["methodShown"],
+                         "projection method disclosed with no projection")
+
+    def test_header_carries_valid_time_and_forecast_hour(self):
+        pts = [{"tau_h": 0,  "valid_utc": "2026-08-23T00:00:00Z",
+                "lat": 31.9, "lon": -125.0, "intensity_kt": 60},
+               {"tau_h": 48, "valid_utc": "2026-08-25T00:00:00Z",
+                "lat": 35.5, "lon": -129.0, "intensity_kt": 80}]
+        sub = self._chart(adv=_adv(pts))["subhead"]
+        self.assertIn("LATEST FIX", sub)
+        self.assertIn("T+48H", sub)
+        self.assertIn("VALID TO", sub)
+        self.assertRegex(sub, r"\d{2}:\d{2}Z",
+                         f"header carries no explicit UTC stamp: {sub}")
+
+    def test_two_panels_on_one_time_axis(self):
+        ch = self._chart()
+        self.assertEqual(ch["viewBox"], "0 0 1000 480")
+        self.assertEqual(ch["dashedPressure"], 1, "pressure series missing")
 
 
 @unittest.skipIf(NODE is None, "node not on PATH")
