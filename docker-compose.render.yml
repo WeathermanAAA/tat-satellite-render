@@ -190,6 +190,11 @@ services:
       OBJFIX_SITE: https://triple-a-tropics.com
       OBJFIX_RUN_TIMEOUT_S: "2400"     # a full WP loop workup is slow
       NODE_PATH: /usr/lib/node_modules
+      # The image ships the BROWSERS at /ms-playwright but not the playwright
+      # npm package — projects are expected to supply that themselves. We
+      # install it globally at start, and this tells it not to re-download
+      # ~1 GB of browsers that are already baked in.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
       LOG_LEVEL: INFO
     # boto3 via APT, not pip: this image ships python3 but NO pip module at
     # all ("No module named pip"), so a pip install here fails instantly and,
@@ -202,8 +207,10 @@ services:
     # the container silently restarting forever.
     # 30 min: the fixes only move as fast as new satellite frames land, and
     # each pass is minutes of work.
+    # /app is mounted READ-ONLY, so both installs must be global.
     command: >-
       bash -lc "apt-get update -qq && apt-get install -y -qq python3-boto3 || true;
+      npm install -g playwright@1.49.0 --silent || true;
       while true; do python3 objfix_headless.py || true; sleep 1800; done"
     restart: unless-stopped
     mem_limit: 3g
