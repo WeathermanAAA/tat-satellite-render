@@ -191,10 +191,19 @@ services:
       OBJFIX_RUN_TIMEOUT_S: "2400"     # a full WP loop workup is slow
       NODE_PATH: /usr/lib/node_modules
       LOG_LEVEL: INFO
-    # apt/pip once at start, then a poll loop. 30 min: the fixes only move as
-    # fast as new satellite frames land, and each pass is minutes of work.
+    # boto3 via APT, not pip: this image ships python3 but NO pip module at
+    # all ("No module named pip"), so a pip install here fails instantly and,
+    # because it gated the loop with &&, took the container into a restart
+    # loop that never ran a single analysis. python3-boto3 is ~10 MB and
+    # installs once per container start (rare).
+    #
+    # The install must NOT gate the loop: if apt is briefly unreachable we
+    # still want the pass to run and fail loudly on its own terms rather than
+    # the container silently restarting forever.
+    # 30 min: the fixes only move as fast as new satellite frames land, and
+    # each pass is minutes of work.
     command: >-
-      bash -lc "pip install --quiet --break-system-packages boto3 &&
+      bash -lc "apt-get update -qq && apt-get install -y -qq python3-boto3 || true;
       while true; do python3 objfix_headless.py || true; sleep 1800; done"
     restart: unless-stopped
     mem_limit: 3g
