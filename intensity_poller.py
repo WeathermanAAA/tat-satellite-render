@@ -37,6 +37,7 @@ climo or /historical.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import logging
@@ -149,6 +150,38 @@ def read_base(session: requests.Session, basin: str, kind: str,
     return json.loads(text)
 
 
+def _walk_deck_chain(session: requests.Session, patterns: list, nn: int,
+                     yy: int, year: int,
+                     policy: pf.FetchPolicy) -> tuple[Optional[str], bool]:
+    """Walk one mirror chain for storm number ``nn`` ONCE. First success wins.
+
+    Returns ``(text, answered)``. ``answered`` is True iff at least one mirror
+    gave a DEFINITIVE answer — a clean 404 (``_get_text`` -> None) or a 200 with
+    no BEST row. That distinguishes "this storm number does not exist" from
+    "every mirror errored", which is the whole point: only the second case is
+    worth spending a retry budget on.
+    """
+    answered = False
+    for pat in patterns:
+        url = pat.format(nn=f"{nn:02d}", yy=f"{yy:02d}", year=year)
+        try:
+            t = _get_text(session, url, policy)
+        except (pf.TransientFetchError, pf.PermanentFetchError,
+                requests.exceptions.RequestException) as e:
+            # A single bad mirror (SSL/connection/timeout/HTTP error) must
+            # NEVER crash the whole basin fetch and discard storms already
+            # collected this pass - that is what lost EP01 tonight when the
+            # WP-only natyphoon mirror SSL-failed (TLSV1_UNRECOGNIZED_NAME)
+            # in the AL/EP chain. Fall through to the NEXT mirror in the chain.
+            log.debug("b-deck mirror failed (%s): %s -- trying next mirror",
+                      url, type(e).__name__)
+            continue            # try the next mirror in the chain
+        if t and "BEST" in t:
+            return t, answered
+        answered = True         # the mirror ANSWERED: this number is absent
+    return None, answered
+
+
 def fetch_live_bdecks(session: requests.Session, basin_cfg: dict, year: int,
                       policy: pf.FetchPolicy = FETCH_POLICY,
                       max_storm_num: int = MAX_STORM_NUM) -> pd.DataFrame:
@@ -159,32 +192,40 @@ def fetch_live_bdecks(session: requests.Session, basin_cfg: dict, year: int,
     prefix chain — EP's base also carries the CPHC bcp chain in
     atcf_patterns_extra, so designated Central Pacific systems are swept
     too; ace_core >=0.8.3's parse_bdeck keys their SIDs off the deck rows'
-    own basin field, NHC_CP##<year>)."""
+    own basin field, NHC_CP##<year>).
+
+    THE CHAIN IS THE REDUNDANCY, so it is walked with retries OFF and escalated
+    only when it comes back with nothing but errors. Retrying mirror 1 four
+    times on a 2/4/8 s backoff before ever trying mirror 2 defeats the point of
+    having mirror 2, and it is what made a storm number that simply DOES NOT
+    EXIST cost ~30 s: our own ATCF proxy Worker answers an upstream 404 with a
+    **502** (it collapses "upstream says absent" into "upstream failed"), and
+    5xx is — correctly — classified transient by ``_get_text``. So every sweep
+    past the last real storm number burned the full retry budget on three
+    consecutive absences, in every basin, every cycle. Measured on the box
+    2026-07-28: 97 s (WP) / 46 s (AL) / 91 s (EP) per cycle = ~234 s, which is
+    why the poller's real period was ~7.2 min against a POLL_INTERVAL_S of 120,
+    and why Dolphin's 18Z fix (in the b-deck at 19:13:54Z) only published at
+    19:19Z. The proxy returning a real 404 is the root fix and is queued as a
+    Worker change; this makes the poller immune to it either way.
+
+    Retries are NOT abandoned. If the fast pass finds no deck AND no mirror gave
+    a definitive answer, every mirror errored — the genuine transient case — and
+    the chain is walked again under the full ``policy``.
+    """
     yy = year % 100
+    fast = dataclasses.replace(policy, max_retries=0)
     frames = []
     for patterns in ([basin_cfg["atcf_patterns"]]
                      + list(basin_cfg.get("atcf_patterns_extra") or [])):
         misses = 0
         for nn in range(1, max_storm_num + 1):
-            text = None
-            for pat in patterns:
-                url = pat.format(nn=f"{nn:02d}", yy=f"{yy:02d}", year=year)
-                try:
-                    t = _get_text(session, url, policy)
-                except (pf.TransientFetchError, pf.PermanentFetchError,
-                        requests.exceptions.RequestException) as e:
-                    # A single bad mirror (SSL/connection/timeout/HTTP error) must
-                    # NEVER crash the whole basin fetch and discard storms already
-                    # collected this pass - that is what lost EP01 tonight when the
-                    # WP-only natyphoon mirror SSL-failed (TLSV1_UNRECOGNIZED_NAME)
-                    # in the AL/EP chain. resilient_fetch already retried this mirror
-                    # per policy; fall through to the NEXT mirror in the chain.
-                    log.debug("b-deck mirror failed (%s): %s -- trying next mirror",
-                              url, type(e).__name__)
-                    continue            # try the next mirror in the chain
-                if t and "BEST" in t:
-                    text = t
-                    break
+            text, answered = _walk_deck_chain(session, patterns, nn, yy,
+                                              year, fast)
+            if text is None and not answered:
+                # Nothing but errors across the whole chain -> spend the budget.
+                text, _ = _walk_deck_chain(session, patterns, nn, yy,
+                                           year, policy)
             if text is not None:
                 frames.append(ac.parse_bdeck(text, year, basin_cfg))
                 misses = 0

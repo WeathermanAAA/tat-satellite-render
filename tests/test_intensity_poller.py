@@ -695,6 +695,95 @@ class TestMirrorFallthrough(unittest.TestCase):
         self.assertTrue(any("good.example" in u for u in calls))
 
 
+class TestDeckChainRetryBudget(unittest.TestCase):
+    """A storm number that DOES NOT EXIST must not cost the retry budget.
+
+    Our own ATCF proxy Worker answers an upstream 404 with a **502** (it
+    collapses "upstream says absent" into "upstream failed"), and _get_text
+    correctly classifies 5xx as transient -> resilient_fetch burned 4 attempts
+    and 2/4/8 s of backoff on EVERY absent storm number, on every mirror, in
+    every basin, every cycle. Measured on the box 2026-07-28: 97 s (WP) / 46 s
+    (AL) / 91 s (EP) = ~234 s per cycle, which stretched a POLL_INTERVAL_S of
+    120 into a real ~7.2 min period and put Dolphin's 18Z fix on the site
+    ~5 min after it reached the b-deck.
+
+    The chain is the redundancy: walk it with retries OFF, and escalate to the
+    full policy only when NOTHING in it answered.
+    """
+
+    @staticmethod
+    def _cfg():
+        return {"atcf_patterns": ["https://proxy.example/b{nn}{year}.dat",
+                                  "https://mirror.example/b{nn}{year}.dat"]}
+
+    def _run(self, fake_get_text, max_storm_num=6):
+        import intensity_poller as ip
+        sentinel = pd.DataFrame([{"storm": "x"}])
+        orig_get_text, orig_parse = ip._get_text, ip.ac.parse_bdeck
+        ip._get_text = fake_get_text
+        ip.ac.parse_bdeck = lambda text, year, basin_cfg: sentinel
+        try:
+            return ip.fetch_live_bdecks(session=None, basin_cfg=self._cfg(),
+                                        year=2026, max_storm_num=max_storm_num)
+        finally:
+            ip._get_text, ip.ac.parse_bdeck = orig_get_text, orig_parse
+
+    def test_proxy_502_on_an_absent_deck_is_not_retried(self):
+        import poller_framework as pf
+        seen = []
+
+        def fake(session, url, policy):
+            seen.append((url, policy.max_retries))
+            if "proxy.example" in url:      # the proxy's 404 -> 502 collapse
+                raise pf.TransientFetchError("502")
+            tail = url.rsplit("/", 1)[-1]
+            return "BEST track 01" if tail.startswith("b01") else None
+
+        out = self._run(fake)
+        # The real storm is still found through the second mirror - identical
+        # data to the retrying sweep, which is the whole point.
+        self.assertEqual(len(out), 1)
+        # ...and every request on the sweep ran with retries OFF.
+        self.assertEqual({retries for _u, retries in seen}, {0})
+        # 01 hit, then 02/03/04 absent ends the sweep: 4 numbers x 2 mirrors.
+        self.assertEqual(len(seen), 8)
+
+    def test_a_clean_404_from_any_mirror_stops_the_escalation(self):
+        """Absence is a definitive answer. One mirror saying 404 is enough to
+        conclude the number does not exist - no second, retrying pass."""
+        import poller_framework as pf
+        seen = []
+
+        def fake(session, url, policy):
+            seen.append(policy.max_retries)
+            if "proxy.example" in url:
+                raise pf.TransientFetchError("502")
+            return None                     # clean 404 from the mirror
+
+        self._run(fake, max_storm_num=3)
+        self.assertEqual(seen, [0] * 6)     # 3 numbers x 2 mirrors, no retries
+
+    def test_retries_are_kept_when_every_mirror_errors(self):
+        """The escalation half: nothing answered, so this is a genuine outage
+        rather than an absent storm number, and the chain IS walked again under
+        the full policy. Dropping retries outright would trade a latency bug
+        for a resilience bug."""
+        import intensity_poller as ip
+        import poller_framework as pf
+        seen = []
+
+        def fake(session, url, policy):
+            seen.append(policy.max_retries)
+            raise pf.TransientFetchError("every mirror is down")
+
+        out = self._run(fake, max_storm_num=3)
+        self.assertEqual(len(out), 0)
+        full = ip.FETCH_POLICY.max_retries
+        self.assertGreater(full, 0)
+        # Storm 01: fast pass over both mirrors, THEN the retrying pass.
+        self.assertEqual(seen[:4], [0, 0, full, full])
+
+
 class TestInvestBasinDerivation(unittest.TestCase):
     """knackwx invest discovery keys the basin off the atcf_id's trailing
     letter, NOT the separate origin_basin field.
