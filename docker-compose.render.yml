@@ -166,6 +166,55 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
+  # ---- objective centre fixes -------------------------------------------
+  # TWO lanes on purpose, decoupled through R2 rather than a shared volume.
+  #
+  # The collector drives a real browser (the explorer's own objfix.js run
+  # headlessly — see objfix_headless.py for why we do NOT reimplement ARCHER),
+  # so it needs node + chromium and nothing else. It runs on the Playwright
+  # image with a bare `pip install boto3`; pulling the render stack (pandas,
+  # ace_core, cartopy, matplotlib) onto that image just to PUT a few KB of
+  # JSON would be pure weight.
+  #
+  # The plot renderer needs the OPPOSITE set — satellites.py, cartopy,
+  # matplotlib, the palettes — and no browser at all. It reads the collector's
+  # published JSON back off the CDN, so neither lane blocks or shares state
+  # with the other, and either can fail without stalling the other.
+  objfix-collector:
+    image: mcr.microsoft.com/playwright:v1.49.0-noble
+    working_dir: /app
+    volumes:
+      - .:/app:ro
+    env_file: .env
+    environment:
+      OBJFIX_SITE: https://triple-a-tropics.com
+      OBJFIX_RUN_TIMEOUT_S: "2400"     # a full WP loop workup is slow
+      NODE_PATH: /usr/lib/node_modules
+      LOG_LEVEL: INFO
+    # apt/pip once at start, then a poll loop. 30 min: the fixes only move as
+    # fast as new satellite frames land, and each pass is minutes of work.
+    command: >-
+      bash -lc "pip install --quiet --break-system-packages boto3 &&
+      while true; do python3 objfix_headless.py || true; sleep 1800; done"
+    restart: unless-stopped
+    mem_limit: 3g
+    profiles: ["centerfix"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  centerfix-plot:
+    <<: *render-base
+    # Offset from the collector so it renders fixes that already landed
+    # rather than racing the PUT.
+    command: >-
+      bash -lc "sleep 300; while true; do python centerfix_plot.py || true;
+      sleep 1800; done"
+    environment:
+      LOG_LEVEL: INFO
+    mem_limit: 3g
+    profiles: ["centerfix"]
+
 volumes:
   caddy_data:
   caddy_config:

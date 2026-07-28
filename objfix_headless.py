@@ -99,10 +99,37 @@ def _collect(storm_filter: Optional[str] = None,
 # ---------------------------------------------------------------------------
 # Publishing
 # ---------------------------------------------------------------------------
+class _R2Json:
+    """Minimal R2 JSON writer.
+
+    Deliberately NOT intensity_poller.R2Sink: importing that drags pandas +
+    ace_core + the whole feed stack into a lane whose only job is to drive a
+    browser and PUT a few KB of JSON. This lane runs on a Playwright image
+    where that stack does not belong. Same headers as the poller's writer so
+    the CDN behaviour is identical.
+    """
+
+    def __init__(self) -> None:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        self.bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
+        self.s3 = boto3.client(
+            "s3", endpoint_url=os.environ.get("R2_ENDPOINT"),
+            aws_access_key_id=(os.environ.get("R2_ACCESS_KEY_ID")
+                               or os.environ.get("AWS_ACCESS_KEY_ID")),
+            aws_secret_access_key=(os.environ.get("R2_SECRET_ACCESS_KEY")
+                                   or os.environ.get("AWS_SECRET_ACCESS_KEY")),
+            config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
+
+    def write(self, key: str, payload: dict) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=body,
+                           ContentType="application/json",
+                           CacheControl="public, max-age=60")
+
+
 def _sink():
-    """The same R2 sink the pollers use (headers, retries and all)."""
-    from intensity_poller import R2Sink
-    return R2Sink()
+    return _R2Json()
 
 
 def publish(tracks: list[dict[str, Any]], sink=None) -> list[str]:
