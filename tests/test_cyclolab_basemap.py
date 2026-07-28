@@ -210,9 +210,11 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
         self.assertIn(".ac-frame { fill: none; stroke: none; }", self.html)
 
     def test_coast_is_drawn_in_all_furniture_sites(self):
-        # all THREE basemap sites (guidance gBasemap, mapFurniture track+swath,
-        # and the cone inline) emit the white coast polylines.
-        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 3)
+        # BOTH remaining basemap sites (mapFurniture track+swath, and the cone
+        # inline) emit the white coast polylines. There were three until the
+        # guidance renderers moved into the shared component - gBasemap was the
+        # third site, and it left with them.
+        self.assertEqual(self.html.count('<path class="ac-coast" d="'), 2)
 
     def test_cone_is_blue_glass_with_solid_white_centerline(self):
         self.assertIn('<linearGradient id="cone-glass"', self.html)
@@ -233,19 +235,20 @@ class TestMapsPassRenderMarkers(unittest.TestCase):
 
     def test_country_borders_drawn_in_all_furniture_sites(self):
         # thin SLATE internal country borders (ne_10m boundary_lines), drawn in
-        # all THREE basemap sites: the guidance gBasemap, mapFurniture
-        # (track+swath), and the cone inline. Phase-4 C: slate, not white -
-        # furniture recedes behind the subject layer.
-        self.assertEqual(self.html.count('<path class="ac-border" d="'), 3)
+        # both remaining basemap sites: mapFurniture (track+swath) and the cone
+        # inline. Phase-4 C: slate, not white - furniture recedes behind the
+        # subject layer. (The guidance gBasemap was the third site; it left with
+        # the inline renderers.)
+        self.assertEqual(self.html.count('<path class="ac-border" d="'), 2)
         self.assertIn(".ac-border { fill: none; stroke: rgba(71,85,105,0.92)",
                       self.html)
 
     def test_state_borders_drawn_in_all_furniture_sites(self):
         # ne_10m admin_1 state/province lines, dimmer than the country border,
-        # drawn UNDER it in all three basemap sites (guidance + track/swath +
-        # cone). A dim SLATE .ac-state stroke; the maps degrade gracefully if an
-        # old baked basemap lacks the 'states' key.
-        self.assertEqual(self.html.count('<path class="ac-state" d="'), 3)
+        # drawn UNDER it in both remaining basemap sites (track/swath + cone).
+        # A dim SLATE .ac-state stroke; the maps degrade gracefully if an old
+        # baked basemap lacks the 'states' key.
+        self.assertEqual(self.html.count('<path class="ac-state" d="'), 2)
         # v3: state borders are BOLDER (the v2 thinning left them too faint).
         self.assertIn(".ac-state { fill: none; stroke: rgba(71,85,105,0.9)",
                       self.html)

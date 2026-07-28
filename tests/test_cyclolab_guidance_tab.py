@@ -43,34 +43,48 @@ class TestStructure(unittest.TestCase):
         self.html = S.render_page(STORM, feed_url=FEED)
 
     def test_guidance_merged_into_models_tab(self):
-        # Phase 3b: model guidance lives INSIDE the Models tab now; the
-        # standalone Guidance tab + section are gone.
-        for m in ('id="gtracks"', 'id="gintensity"', 'id="gships-root"',
+        # Phase 3b: model guidance lives INSIDE the Models tab; the standalone
+        # Guidance tab + section are gone.
+        for m in ('id="guidance-viewer"', 'id="gships-root"',
                   "function initGuidance"):
             self.assertIn(m, self.html, m)
         self.assertNotIn('data-sec="guidance"', self.html)
         self.assertNotIn('id="sec-guidance"', self.html)
-        # the guidance cards are physically inside the Models section
+        # the guidance mount is physically inside the Models section
         i_models = self.html.index('id="sec-models"')
         i_adv = self.html.index('id="sec-advisories"')
-        i_gtracks = self.html.index('id="gtracks"')
-        self.assertTrue(i_models < i_gtracks < i_adv,
-                        "guidance cards must live inside the Models section")
+        i_mount = self.html.index('id="guidance-viewer"')
+        self.assertTrue(i_models < i_mount < i_adv,
+                        "the guidance mount must live inside the Models section")
         # opening the Models tab hydrates BOTH HAFS and guidance
         self.assertIn("initModels(); initGuidance();", self.html)
 
-    def test_palette_b_locked_no_options_board(self):
-        # Track color contract: the Model Guidance rebuild (per-model identity
-        # everywhere) colors each aid's track by its per-tech identity hue -
-        # gHue(t) - superseding the earlier peak-SSHWS palette B. The other
-        # locks stand: the guidance BLOCK itself must not reference WIND_TIER
-        # (no fork), and the live page has no options board (that was the
-        # held review only).
-        self.assertIn("var col = gHue(t)", self.html)
-        start = self.html.index("Model guidance (Stage B)")
+    def test_guidance_viewer_is_the_shared_component_not_a_fork(self):
+        """ONE IMPL, TWO MOUNTS. The viewer is lazy-loaded from the main repo's
+        origin and constructed locked to this storm - the same pattern as the
+        Recon and HAFS mounts. A reintroduced inline renderer here is the
+        regression this guards against: it is how the two copies drifted."""
+        self.assertIn('SITE_BASE + "/guidance/guidance.js"', self.html)
+        self.assertIn("new window.GuidanceViewer(root, {", self.html)
+        self.assertIn("stormLock: SID", self.html)
+        for gone in ("function gTracks(", "function gEns(", "function gIntensity(",
+                     "function gBasemap(", "GD_HUES"):
+            self.assertNotIn(gone, self.html,
+                             f"{gone} is a retired inline renderer - the "
+                             f"component owns guidance now")
+
+    def test_shell_carries_no_guidance_track_palette(self):
+        """The track-colour contract moved WITH the renderers: the component
+        owns it now (shared SSHWS hues, so an intensity reads the same colour
+        here as on the track pages). The shell must not carry a competing
+        palette - two palettes is how the two copies drifted. The remaining
+        locks stand: no WIND_TIER fork in the guidance block, no options board.
+        """
+        start = self.html.index("Model guidance ====")
         end = self.html.index("section nav (lazy init", start)
         block = self.html[start:end]
         self.assertNotIn("WIND_TIER", block)
+        self.assertNotIn("gHue", block)
         self.assertNotIn("options board", self.html)
 
     @unittest.skipUnless(shutil.which("node"), "node not on PATH")
@@ -123,25 +137,28 @@ class TestRender(unittest.TestCase):
             pg.click('button[data-sec="models"]')
             pg.wait_for_timeout(1300)
             out["errs"] = errs
-            out["tracks_len"] = pg.eval_on_selector("#gtracks", "e=>e.innerHTML.length")
-            out["inten_len"] = pg.eval_on_selector("#gintensity", "e=>e.innerHTML.length")
             out["ships"] = pg.eval_on_selector("#gships-root", "e=>e.textContent")
-            out["empty"] = pg.eval_on_selector("#gtracks-empty", "e=>e.style.display")
+            # The guidance viewer itself is served from the main repo's origin,
+            # which does not resolve under file://, so the mount degrades to its
+            # failure message rather than rendering. That IS the contract under
+            # test here: SHIPS is independent of the component, so it must still
+            # render, and a failed component load must not error the page.
+            out["mount"] = pg.eval_on_selector("#guidance-viewer", "e=>e.textContent")
             b.close()
         return out
 
     def test_developed_renders(self):
         o = self._open_tab(200)
         self.assertEqual(o["errs"], [])
-        self.assertGreater(o["tracks_len"], 1000)   # spaghetti drawn
-        self.assertGreater(o["inten_len"], 1000)    # intensity drawn
         self.assertIn("RI probability", o["ships"])
+        # component unreachable under file:// -> honest failure text, no crash
+        self.assertIn("guidance", o["mount"].lower())
 
     def test_no_guidance_graceful(self):
         o = self._open_tab(403)                     # R2 absent = storm not active
         self.assertEqual(o["errs"], [])
-        self.assertEqual(o["empty"], "block")       # "No model guidance" stub shown
         self.assertIn("unavailable", o["ships"].lower())
+        self.assertIn("guidance", o["mount"].lower())
 
 
 if __name__ == "__main__":
