@@ -565,15 +565,16 @@ def _draw_field(ax, sc: Scene, field, cmap, norm, contours: bool):
             pass
         # Inline step labels: an isotherm is only diagnostic if you can tell
         # WHICH one it is without counting inwards from the panel edge.
-        # Label only the COLD steps. The two warmest catch every patch of
-        # shallow cloud in the box, so labelling them buries the deep-convection
-        # isotherms — the ones that actually describe the eyewall — under a
-        # confetti of repeated numbers.
+        # SPARSE labels. Every BD step closes a contour around every scrap of
+        # shallow cloud in the box, so labelling many of them produced dozens
+        # of haloed numbers that read as dark smudges at this size and buried
+        # the isotherms they were annotating. Two cold steps carry the reading;
+        # the colour ladder carries the rest.
         try:
-            deep = [v for v in BD_STEPS if v <= -53.0]
-            for t in (ax.clabel(cs, levels=deep, inline=True, fontsize=6.5,
-                                fmt="%d") or []):
-                t.set_path_effects([pe.withStroke(linewidth=2.6,
+            keep = [v for v in (-63.0, -75.0) if v in BD_STEPS]
+            for t in (ax.clabel(cs, levels=keep, inline=True, fontsize=7.0,
+                                fmt="%d", inline_spacing=10) or []):
+                t.set_path_effects([pe.withStroke(linewidth=1.8,
                                                   foreground="#0a1019")])
         except Exception:                 # noqa: BLE001 - labels are a bonus
             pass
