@@ -258,6 +258,35 @@ def _ss_category(nature: Optional[str], wind_kt: Optional[float]) -> str:
     return "C5"
 
 
+# Which generic channels carry a BRIGHTNESS TEMPERATURE (so a min/max readout
+# in degrees is meaningful). Visible / true-colour pixels are reflectance and
+# get no readout rather than a number in the wrong units.
+_BT_BAND_TAGS: dict[str, str] = {
+    "clean_ir": "IR", "ir_window": "IR",
+    "wv_upper": "WV", "wv_lower": "WV",
+    "shortwave_ir": "SWIR",
+}
+
+
+def _bt_band_tag(data: FetchResult, channel: int) -> Optional[str]:
+    """Short band tag for the brightness-temperature readout, or None when the
+    product's pixels are not a temperature.
+
+    Deliberately coarse. The title already names the satellite, channel and
+    wavelength; this only has to say WHICH PHYSICAL QUANTITY the min/max
+    describe, because an IR-window extreme and a water-vapour-channel extreme
+    are read completely differently -- an unlabelled "min/max" invites reading
+    a WV frame's -60 C as a cloud-top temperature."""
+    bucket = data.bucket or ""
+    if bucket == "gesdisc-mergir":
+        return "IR"
+    if bucket.startswith("noaa-cdr-gridsat"):
+        return "IR" if channel == 1 else "WV"
+    if bucket == "ncei-gridsat-goes":
+        return {2: "SWIR", 3: "WV", 4: "IR"}.get(channel)
+    return _BT_BAND_TAGS.get(getattr(data, "generic_channel", "") or "")
+
+
 def render_png(
     data: FetchResult,
     bbox: list[float],
@@ -703,6 +732,14 @@ def render_png(
         transform=title_ax.transAxes,
     )
 
+    # Brightness-temperature min/max, in the HEADER beside the storm stats.
+    # Two rows INSIDE the existing 6% strip -- title_h must not change: the
+    # explorer's objfix georeferencing pins its data-axes constants to this
+    # layout (objfix_sources.js LAYOUT.dataY1), so growing the strip would
+    # silently shift every floater fix.
+    bt_tag = None if (is_rgb or is_visible) else _bt_band_tag(data, channel)
+    show_bt = bt_tag is not None and bt_min_c is not None and bt_max_c is not None
+
     # Storm badge (left of title strip) — only when /render is called with
     # storm context (poller path). Format:
     #   JANGMI · TS · 35 kt · 998 mb
@@ -721,7 +758,7 @@ def render_png(
             parts.append(f"{int(round(pressure_mb))} mb")
         badge_text = "  ·  ".join(p for p in parts if p)
         title_ax.text(
-            0.01, 0.5,
+            0.01, 0.72 if show_bt else 0.5,
             badge_text,
             ha="left", va="center",
             color=TEXT_COLOR, fontsize=10, fontweight="bold",
@@ -730,6 +767,20 @@ def render_png(
                 facecolor=cat_color, alpha=0.22, edgecolor=cat_color,
                 linewidth=1.0, boxstyle="round,pad=0.35",
             ),
+        )
+
+    if show_bt:
+        # Second header row under the storm badge (or vertically centred when
+        # there is no badge). This USED to sit at the bottom-left of the MAP
+        # axes, where its opaque backing box overwrote real data pixels --
+        # exactly the pixels the explorer's objfix reads brightness
+        # temperature back out of. In the header it occludes nothing.
+        title_ax.text(
+            0.01, 0.22 if storm else 0.5,
+            f"{bt_tag} BT   min {bt_min_c:+.1f} °C   max {bt_max_c:+.1f} °C",
+            ha="left", va="center",
+            color=ACCENT_COLOR, fontsize=8,
+            transform=title_ax.transAxes,
         )
 
     # Watermark: top-left of the map axes, mirroring the title strip's
@@ -749,21 +800,6 @@ def render_png(
         bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=4),
         zorder=10,
     )
-
-    # Brightness-temperature min/max readout: bottom-left of the map, the
-    # diagonal mirror of the top-left watermark. IR/WV only -- bt_min_c/
-    # bt_max_c stay None for visible + true-color, so this no-ops on those
-    # paths. Displayed in °C (analyst-standard for cloud-top temps).
-    if bt_min_c is not None and bt_max_c is not None:
-        ax.text(
-            0.01, 0.01,
-            f"min: {bt_min_c:.0f}°C  ·  max: {bt_max_c:.0f}°C",
-            ha="left", va="bottom",
-            color=ACCENT_COLOR, fontsize=9,
-            transform=ax.transAxes,
-            bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=4),
-            zorder=10,
-        )
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG, edgecolor="none")
