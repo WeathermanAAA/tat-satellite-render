@@ -238,6 +238,25 @@ class EyeScoreTests(unittest.TestCase):
         self.assertIsNone(prof["score"])    # ...the score is not
         self.assertTrue(prof["reason"])
 
+    def test_a_non_eye_scene_withholds_the_score(self):
+        # THE GATE THAT MATTERS MOST. A storm under a uniform CDO still has a
+        # warmest pixel and a coldest ring, and their difference is a real
+        # contrast that is NOT an eye score. Live 12W on 2026-07-28 reported
+        # 16.8 °C off a "warmest eye pixel" of -62.5 °C -- deep convective
+        # cloud -- while the method's own classifier said UNIFORM CDO.
+        f = _Fake()
+        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7,
+                            scene="UNIFORM CDO")
+        self.assertIsNotNone(prof)
+        self.assertIsNone(prof["score"])
+        self.assertIn("UNIFORM CDO", prof["reason"])
+
+    def test_an_eye_scene_is_still_scored(self):
+        f = _Fake()
+        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7,
+                            scene="EYE")
+        self.assertIsNotNone(prof["score"])
+
     def test_the_eyewall_floor_is_what_stops_a_zero_radius_eye(self):
         # Without it an eyeless field reports an "eye" of zero radius, scoring
         # the centre pixel against itself.
@@ -307,6 +326,25 @@ class CompositePlateTests(unittest.TestCase):
         _png, txt = self._plate(ir=_FakeNoEye())
         self.assertIn("EYE STRUCTURE", txt)
         self.assertNotIn("EYE SCORE", txt)
+
+    def test_a_cdo_scene_draws_the_profile_but_no_score(self):
+        # The plate must carry the ADT scene gate through, not just eye_score.
+        pts = [_pt("2026-07-28T05:30:00.000Z", 13.42, 170.68,
+                   scene="UNIFORM CDO")]
+        saved, self.PTS = self.PTS, pts
+        try:
+            _png, txt = self._plate()
+        finally:
+            self.PTS = saved
+        self.assertIn("EYE STRUCTURE", txt)
+        self.assertNotIn("EYE SCORE", txt)
+        self.assertIn("UNIFORM CDO", txt)
+
+    def test_the_chart_panel_labels_itself_without_covering_the_chart(self):
+        # The captured chart captions its own axes along its top edge, so the
+        # panel label needs a reserved strip rather than the image's top-left.
+        _png, txt = self._plate(wpace_png=_tiny_png())
+        self.assertIn("FROM CYCLOLAB", txt)
 
     def test_plate_header_carries_identity_valid_time_and_forecast_hour(self):
         adv = {"advisory": 8, "points": [

@@ -320,9 +320,17 @@ def _ring_width_km(lats, lons, clat: float, clon: float) -> float:
     return float(max(EYE_RING_MIN_KM, km))
 
 
+#: ADT scene types that HAVE an eye to score. The classification is the
+#: method's own — it comes back on every fix — so the gate uses it rather than
+#: inventing a brightness threshold to decide the same question worse.
+def _is_eye_scene(scene: Optional[str]) -> bool:
+    return "EYE" in str(scene or "").upper()
+
+
 def eye_score(ir_c, lats, lons, clat: float, clon: float,
               max_r_km: float = EYE_MAX_R_KM,
-              ring_km: Optional[float] = None) -> Optional[dict]:
+              ring_km: Optional[float] = None,
+              scene: Optional[str] = None) -> Optional[dict]:
     """ADT-style eye score: warmest eye pixel against the coldest eyewall ring.
 
     WHAT IS CITED AND WHAT IS OURS -- the number is only worth printing if its
@@ -343,10 +351,15 @@ def eye_score(ir_c, lats, lons, clat: float, clon: float,
       ring width and the EYE_MIN_EYEWALL_KM floor are our construction too.
       They are printed on the panel rather than left implicit.
 
-    Returns None when there is no eye signature to score -- the coldest ring is
-    at the centre (no clearing), or the eye is not warmer than its eyewall. A
-    withheld score is the honest output there; a negative "score" is not a
-    weak eye, it is the absence of one.
+    The score is WITHHELD, with the reason on the panel, when there is no eye
+    to score: the ADT's own scene classification is not an eye scene, the
+    coldest ring is at the centre (no clearing), or the eye is not warmer than
+    its eyewall. The scene gate matters more than it looks -- a storm under a
+    uniform CDO still produces a "warmest pixel" and a "coldest ring", and
+    their difference is a real contrast that is not an eye score. The method
+    already classifies the scene on every fix, so that answer is used rather
+    than a brightness threshold invented here to decide the same thing worse.
+    A negative "score" is not a weak eye, it is the absence of one.
     """
     bt = np.asarray(ir_c, dtype="float64")
     r = _km_grid(lats, lons, clat, clon)
@@ -376,9 +389,14 @@ def eye_score(ir_c, lats, lons, clat: float, clon: float,
             "eye_warm_c": None, "eyewall_cold_c": None,
             "reason": None}
 
+    if scene is not None and not _is_eye_scene(scene):
+        # The profile is real and worth drawing — it shows the CDO's structure.
+        # The SCORE is not: there is no eye here to contrast against a eyewall.
+        prof["reason"] = (f"scene is {str(scene).upper()} — no eye to score "
+                          "(the ADT's own classification)")
+        return prof
     if len(mids) < 8:
-        # The profile is real and worth drawing; it is just too coarse for the
-        # eyewall search to mean anything. Draw it, withhold the number.
+        # Too coarse for the eyewall search to mean anything. Draw it, withhold.
         prof["reason"] = ("profile too coarse to locate an eyewall — "
                           f"{len(mids)} rings at {ring_km:.0f} km")
         return prof
@@ -719,7 +737,10 @@ def panel_wpace(ax, sc: Scene, png: Optional[bytes],
             ax.imshow(img, aspect="equal", interpolation="antialiased",
                       zorder=1)
             ax.set_xlim(0, img.shape[1])
-            ax.set_ylim(img.shape[0], 0)
+            # RESERVE a strip above the raster for the panel label. The chart
+            # captions its own axes along its top edge, and drawing the label
+            # straight onto the image ran the two strings through each other.
+            ax.set_ylim(img.shape[0], -img.shape[0] * 0.155)
             ax.set_frame_on(True)
             age = ""
             if captured is not None:
@@ -729,9 +750,10 @@ def panel_wpace(ax, sc: Scene, png: Optional[bytes],
                 # two cycles ago beside fresh imagery, under one VALID stamp,
                 # is the failure mode this line exists to prevent.
                 if mins >= 45:
-                    age = f"   ·   CHART CAPTURED {mins / 60.0:.1f} H AGO"
-            _panel_label(ax, "WIND, PRESSURE & ACE   ·   OBSERVED + OFFICIAL "
-                             "FORECAST" + age)
+                    age = f"   ·   CAPTURED {mins / 60.0:.1f} H AGO"
+            # Short label + provenance: the chart labels its own series, so
+            # repeating them here would only compete with it.
+            _panel_label(ax, "WIND, PRESSURE & ACE   ·   FROM CYCLOLAB" + age)
             return
         except Exception as e:      # noqa: BLE001 - a bad raster is a placeholder
             log.warning("wpace raster unusable: %s", e)
@@ -1024,7 +1046,8 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
     if sc.emph is not None:
         prof = eye_score(sc.ir_c, sc.ir_lat, sc.ir_lon,
                          float(sc.emph["lat"]),
-                         _norm_lon(float(sc.emph["lon"]), sc.frame_lon))
+                         _norm_lon(float(sc.emph["lon"]), sc.frame_lon),
+                         scene=sc.emph.get("scene"))
     panel_eye(axes_bot[1], sc, prof)
 
     _draw_header(fig, sc, hdr_h, "STORM DIAGNOSTIC PLATE",
