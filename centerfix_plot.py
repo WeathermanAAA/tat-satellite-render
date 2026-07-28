@@ -15,7 +15,30 @@ WHAT IT SHOWS
              blending in.
 
     Panel 2  The same scene in the enhanced colour IR palette, with dmax/dmin
-             brightness-temperature readouts for the IR and water-vapour bands.
+             brightness-temperature readouts tagged by BAND (IR / WV / SWIR).
+             The tag is not decoration: an untagged -60 C invites reading a
+             water-vapour frame as a cloud top.
+
+THE COMPOSITE PLATE (render_composite)
+    The same two panels plus the intensity diagnostic and an eye-structure
+    panel, as ONE 2x2 PNG under one shared header, so the whole storm reads in
+    a single copy-pasteable image. It is an ADDITIONAL product: the two-panel
+    plot keeps publishing to its own key, unchanged.
+
+    Bottom-left is the CycloLab wind/pressure + observed/projected ACE chart,
+    captured from the REAL browser renderer by the collector lane (see
+    wpace_headless.cjs) and pasted in as a raster. It is NOT recomputed here.
+    That chart's ACE projection -- the 6-hourly regrid of forecast intensity,
+    the resume-from-latest-observed-fix rule -- exists in exactly one place,
+    and a matplotlib port of it would be a second copy drifting invisibly
+    while both render plausible curves. Same reasoning as objfix_headless.py.
+    When the capture is missing the panel says so; it never draws an empty
+    frame that reads as "no ACE".
+
+    Bottom-right is the eye-structure panel: a radial brightness-temperature
+    profile about the working centre with the BD ladder behind it, and the
+    ADT-style eye score (warmest eye pixel against the coldest eyewall ring)
+    called out. See eye_score() for what in it is cited and what is ours.
 
 HONESTY
     Everything objective here is an AUTOMATED SATELLITE ESTIMATE, never
@@ -35,6 +58,7 @@ INPUT
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import io
 import json
@@ -53,6 +77,7 @@ log = logging.getLogger("centerfix")
 
 CDN = os.environ.get("TAT_CDN", "https://cdn.triple-a-tropics.com")
 R2_PREFIX = os.environ.get("CENTERFIX_R2_PREFIX", "cyclolab/centerfix")
+WPACE_R2_PREFIX = os.environ.get("WPACE_R2_PREFIX", "cyclolab/wpace")
 BOX_DEG = float(os.environ.get("CENTERFIX_BOX_DEG", "6.0"))
 
 DARK_BG = "#0a1019"
@@ -68,6 +93,31 @@ C_ARCHER_WEAK = "#7f8fa6"  # rejected / weak candidate — grey, never blue
 C_OFFICIAL = "#ffe14d"    # official best-track position
 C_FORECAST = "#ff6bd6"    # official forecast track
 C_BOX = "#46c56a"         # floater / target box
+
+#: The Dvorak BD enhancement's own grey-shade boundaries (CIMSS), in °C. Used
+#: as panel-1 isotherms AND as the ladder behind the radial profile, so the two
+#: panels are reading the same steps rather than two similar-looking ones.
+BD_STEPS = [-80.0, -75.0, -69.0, -63.0, -53.0, -41.0, -30.0]
+
+#: BD shade names for the ladder, warmest first. WMG (Warm Medium Grey) is the
+#: warmest step, > +9 °C — a WMG pixel inside an eye is a deeply subsident,
+#: cloud-free eye. Labels are the citable part; see eye_score() for what is not.
+BD_LADDER = [
+    ("WMG", 9.0, 40.0),
+    ("OW", -30.0, 9.0),
+    ("DG", -41.0, -30.0),
+    ("MG", -53.0, -41.0),
+    ("LG", -63.0, -53.0),
+    ("B", -69.0, -63.0),
+    ("W", -75.0, -69.0),
+    ("CMG", -80.0, -75.0),
+    ("CDG", -95.0, -80.0),
+]
+
+#: Is the official position contemporaneous enough with the emphasised
+#: objective fix for their separation to mean anything? One synoptic step;
+#: beyond that the gap is dominated by storm motion, not by method.
+SEP_TOL_MIN = 90.0
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +138,33 @@ def _get_json(url: str) -> Optional[dict]:
         return None
 
 
+def _get_binary(url: str) -> tuple[Optional[bytes], Optional[dt.datetime]]:
+    """Bytes plus the object's Last-Modified, or (None, None).
+
+    The timestamp matters: a pasted-in raster from another lane has to be able
+    to say how old it is, or the plate silently presents a stale chart beside
+    fresh imagery under one VALID stamp.
+    """
+    import email.utils
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "tat-centerfix/1.0 (+https://triple-a-tropics.com)"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            lm = r.headers.get("Last-Modified")
+            when = None
+            if lm:
+                try:
+                    when = email.utils.parsedate_to_datetime(lm)
+                except Exception:      # noqa: BLE001 - a bad stamp is no stamp
+                    when = None
+            return raw, when
+    except Exception as e:  # noqa: BLE001 - a missing input is a placeholder
+        log.info("fetch failed %s: %s", url, e)
+        return None, None
+
+
 def load_fixes(storm_id: str) -> Optional[dict]:
     return _get_json(f"{CDN}/{os.environ.get('OBJFIX_R2_PREFIX', 'cyclolab/objfix')}"
                      f"/{storm_id}.json")
@@ -99,6 +176,11 @@ def load_advisory(storm_id: str) -> Optional[dict]:
 
 def load_floater_manifest(slug: str) -> Optional[dict]:
     return _get_json(f"{CDN}/floaters/{slug}/manifest.json")
+
+
+def load_wpace_png(storm_id: str) -> tuple[Optional[bytes], Optional[dt.datetime]]:
+    """The CycloLab wind/pressure + ACE chart, as captured by the browser lane."""
+    return _get_binary(f"{CDN}/{WPACE_R2_PREFIX}/{storm_id}.png")
 
 
 def load_official_fix(storm_id: str) -> dict:
@@ -186,57 +268,267 @@ def _km_between(lat1, lon1, lat2, lon2) -> float:
     return 6371.0 * math.hypot(x, y)
 
 
-# ---------------------------------------------------------------------------
-# the plot
-# ---------------------------------------------------------------------------
-def render(storm: dict, fixes: dict, adv: Optional[dict],
-           ir_data, wv_data, box: Optional[dict] = None,
-           satcon: Optional[dict] = None, dpi: int = 110,
-           bbox: Optional[list[float]] = None) -> bytes:
-    """Two-panel storm-centred centre-fix diagnostic -> PNG bytes."""
-    name = (storm.get("name") or "").upper()
-    sid = storm.get("id") or storm.get("sid") or ""
+def _km_grid(lats, lons, clat: float, clon: float) -> np.ndarray:
+    """Great-circle-ish distance in km from (clat, clon) to every grid cell.
 
+    Vectorised twin of _km_between, on the same small-angle approximation --
+    exact enough over a 6-degree box and it keeps the two distances consistent,
+    which matters because the panel prints one and shades by the other.
+    """
+    la = np.asarray(lats, dtype="float64")
+    lo = np.asarray(lons, dtype="float64")
+    if la.ndim == 1 and lo.ndim == 1:
+        lo, la = np.meshgrid(lo, la)
+    dlon = np.abs(lo - clon)
+    dlon = np.where(dlon > 180.0, 360.0 - dlon, dlon)
+    x = np.radians(dlon) * np.cos(np.radians((la + clat) / 2.0))
+    y = np.radians(la - clat)
+    return 6371.0 * np.hypot(x, y)
+
+
+# ---------------------------------------------------------------------------
+# eye structure
+# ---------------------------------------------------------------------------
+#: Rings inside this radius cannot BE the eyewall. Without a floor the coldest
+#: ring of a sheared, eyeless system sits at r~0 and the "eye" becomes an empty
+#: set -- a number would still come out, and it would be meaningless.
+EYE_MIN_EYEWALL_KM = 12.0
+EYE_MAX_R_KM = 140.0
+#: Floor on the ring width. The ACTUAL width is derived from the grid's own
+#: sample spacing (see _ring_width_km): rings finer than a pixel hold one or
+#: zero samples each, and the profile then reports sampling noise as structure
+#: -- which is exactly the resolution-dependence this panel exists to avoid.
+EYE_RING_MIN_KM = 4.0
+
+
+def _ring_width_km(lats, lons, clat: float, clon: float) -> float:
+    """Ring width from the grid's own spacing, floored at EYE_RING_MIN_KM."""
+    la = np.asarray(lats, dtype="float64")
+    lo = np.asarray(lons, dtype="float64")
+    if la.ndim == 1 and lo.ndim == 1:
+        dlat = float(np.median(np.abs(np.diff(la)))) if la.size > 1 else 0.0
+        dlon = float(np.median(np.abs(np.diff(lo)))) if lo.size > 1 else 0.0
+    else:
+        dlat = float(np.median(np.abs(np.diff(la, axis=0)))) if la.shape[0] > 1 else 0.0
+        dlon = float(np.median(np.abs(np.diff(lo, axis=1)))) if lo.shape[1] > 1 else 0.0
+    km = max(dlat, dlon * max(0.2, math.cos(math.radians(clat)))) * 111.0
+    if not np.isfinite(km) or km <= 0:
+        return EYE_RING_MIN_KM
+    # ONE pixel, not two. Structure finer than the sample spacing is not
+    # resolvable, so that is the floor; going coarser than it throws away real
+    # eyewall detail on a 2 km sensor for no gain.
+    return float(max(EYE_RING_MIN_KM, km))
+
+
+def eye_score(ir_c, lats, lons, clat: float, clon: float,
+              max_r_km: float = EYE_MAX_R_KM,
+              ring_km: Optional[float] = None) -> Optional[dict]:
+    """ADT-style eye score: warmest eye pixel against the coldest eyewall ring.
+
+    WHAT IS CITED AND WHAT IS OURS -- the number is only worth printing if its
+    construction is stated, so:
+
+    * The QUANTITY is the ADT's own documented relative: eye/eyewall brightness
+      temperature CONTRAST. A larger positive value is a warmer, better-cleared
+      eye inside a colder eyewall. It is a temperature difference in °C, so it
+      is resolution-robust in a way a pixel COUNT is not -- the same eye counts
+      differently on 2 km ABI than on a 4 km reprojection, which is why no
+      count-based product is reported here.
+    * The BD ladder the panel draws behind the profile is the citable
+      discretisation (CIMSS): 9 steps from OW (> -30 °C) down to CDG (< -81),
+      with WMG the warmest at > +9.
+    * The REGIONS are OURS. ADT runs its own eye/eyewall search; here the
+      eyewall is the coldest mean-BT ring of a radial profile about the working
+      centre, and the eye is everything inside that radius. The radius cap, the
+      ring width and the EYE_MIN_EYEWALL_KM floor are our construction too.
+      They are printed on the panel rather than left implicit.
+
+    Returns None when there is no eye signature to score -- the coldest ring is
+    at the centre (no clearing), or the eye is not warmer than its eyewall. A
+    withheld score is the honest output there; a negative "score" is not a
+    weak eye, it is the absence of one.
+    """
+    bt = np.asarray(ir_c, dtype="float64")
+    r = _km_grid(lats, lons, clat, clon)
+    if bt.shape != r.shape or not np.isfinite(bt).any():
+        return None
+    if ring_km is None:
+        ring_km = _ring_width_km(lats, lons, clat, clon)
+    edges = np.arange(0.0, max_r_km + ring_km, ring_km)
+    mids, means, mins, maxs = [], [], [], []
+    for i in range(len(edges) - 1):
+        m = (r >= edges[i]) & (r < edges[i + 1]) & np.isfinite(bt)
+        if not m.any():
+            continue
+        v = bt[m]
+        mids.append((edges[i] + edges[i + 1]) / 2.0)
+        means.append(float(np.mean(v)))
+        mins.append(float(np.min(v)))
+        maxs.append(float(np.max(v)))
+    if len(mids) < 4:
+        return None
+    mids = np.asarray(mids)
+    means = np.asarray(means)
+    prof = {"r_km": mids, "mean_c": means,
+            "min_c": np.asarray(mins), "max_c": np.asarray(maxs),
+            "ring_km": ring_km, "max_r_km": max_r_km,
+            "score": None, "eyewall_r_km": None,
+            "eye_warm_c": None, "eyewall_cold_c": None,
+            "reason": None}
+
+    if len(mids) < 8:
+        # The profile is real and worth drawing; it is just too coarse for the
+        # eyewall search to mean anything. Draw it, withhold the number.
+        prof["reason"] = ("profile too coarse to locate an eyewall — "
+                          f"{len(mids)} rings at {ring_km:.0f} km")
+        return prof
+    ok = mids >= EYE_MIN_EYEWALL_KM
+    if not ok.any():
+        prof["reason"] = "profile too short to locate an eyewall"
+        return prof
+    j = int(np.argmin(np.where(ok, means, np.inf)))
+    ew_r = float(mids[j])
+    # The coldest ring anywhere must BE that ring. If the profile is colder at
+    # the centre than at ew_r, there is no clearing and nothing to score.
+    if float(np.min(means)) < means[j] - 0.01:
+        prof["reason"] = "no eye signature — coldest cloud is at the centre"
+        return prof
+    inside = r < ew_r
+    if not (inside & np.isfinite(bt)).any():
+        prof["reason"] = "no pixels inside the eyewall radius"
+        return prof
+    eye_warm = float(np.nanmax(bt[inside]))
+    ann = (r >= ew_r - ring_km) & (r <= ew_r + ring_km) & np.isfinite(bt)
+    eyewall_cold = float(np.nanmin(bt[ann])) if ann.any() else float(means[j])
+    score = eye_warm - eyewall_cold
+    if score <= 0:
+        prof["reason"] = "eye is not warmer than its eyewall — no eye"
+        return prof
+    prof.update(score=score, eyewall_r_km=ew_r, eye_warm_c=eye_warm,
+                eyewall_cold_c=eyewall_cold)
+    return prof
+
+
+# ---------------------------------------------------------------------------
+# scene — everything both renderers derive from the same inputs, derived ONCE
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class Scene:
+    """The prepared inputs shared by the two-panel plot and the 2x2 plate.
+
+    Both products must key off the SAME emphasised fix, the SAME comparability
+    verdict and the SAME extremes, or the plate and the plot can disagree about
+    the storm while carrying the same VALID stamp.
+    """
+    name: str
+    sid: str
+    storm: dict
+    fixes: dict
+    adv: Optional[dict]
+    box: Optional[dict]
+    satcon: Optional[dict]
+    bbox: Optional[list]
+    ir_c: Any
+    ir_lat: Any
+    ir_lon: Any
+    ir_data: Any
+    ir_min: Optional[float]
+    ir_max: Optional[float]
+    wv_min: Optional[float]
+    wv_max: Optional[float]
+    swir_min: Optional[float]
+    swir_max: Optional[float]
+    frame_lon: float
+    pts: list
+    newest: Optional[dict]
+    acc: list
+    rej: list
+    emph: Optional[dict]
+    sep_ok: bool
+    sep_dt_min: Optional[float]
+
+
+def prepare_scene(storm: dict, fixes: dict, adv: Optional[dict],
+                  ir_data, wv_data, swir_data=None,
+                  box: Optional[dict] = None, satcon: Optional[dict] = None,
+                  bbox: Optional[list[float]] = None) -> Scene:
     ir_c = _bt_celsius(ir_data)
-    ir_lat, ir_lon = np.asarray(ir_data.lats), np.asarray(ir_data.lons)
     ir_min, ir_max = _extremes(ir_c)
-    wv_min = wv_max = None
+    wv_min = wv_max = swir_min = swir_max = None
     if wv_data is not None:
         wv_min, wv_max = _extremes(_bt_celsius(wv_data))
+    if swir_data is not None:
+        swir_min, swir_max = _extremes(_bt_celsius(swir_data))
 
+    ir_lat, ir_lon = np.asarray(ir_data.lats), np.asarray(ir_data.lons)
     frame_lon = float(np.nanmean(ir_lon))
     pts = [p for p in (fixes.get("points") or [])
            if p.get("lat") is not None and p.get("lon") is not None]
     newest = pts[-1] if pts else None
+    acc = [p for p in pts if p.get("fix")]
+    rej = [p for p in pts if not p.get("fix")]
+    # EMPHASIS + the disagreement measurement use the newest ACCEPTED fix.
+    # The newest FRAME's candidate is often rejected (shear, no eye), and
+    # hanging the headline crosshair, the certainty rings and the km label off
+    # a rejected candidate would present a number ARCHER itself refused.
+    # When they differ the header says so rather than quietly back-dating.
+    emph = acc[-1] if acc else None
+    sep_ok, sep_dt_min = False, None
+    if emph and storm.get("last_fix"):
+        try:
+            ot = dt.datetime.fromisoformat(
+                str(storm["last_fix"]).replace("Z", "+00:00"))
+            if ot.tzinfo is None:
+                ot = ot.replace(tzinfo=dt.timezone.utc)
+            ft = dt.datetime.fromisoformat(emph["t"].replace("Z", "+00:00"))
+            sep_dt_min = abs((ft - ot).total_seconds()) / 60.0
+            sep_ok = sep_dt_min <= SEP_TOL_MIN
+        except Exception:      # noqa: BLE001 - unparseable stamp -> no claim
+            sep_ok, sep_dt_min = False, None
+    return Scene(
+        name=(storm.get("name") or "").upper(),
+        sid=storm.get("id") or storm.get("sid") or "",
+        storm=storm, fixes=fixes, adv=adv, box=box, satcon=satcon, bbox=bbox,
+        ir_c=ir_c, ir_lat=ir_lat, ir_lon=ir_lon, ir_data=ir_data,
+        ir_min=ir_min, ir_max=ir_max, wv_min=wv_min, wv_max=wv_max,
+        swir_min=swir_min, swir_max=swir_max,
+        frame_lon=frame_lon, pts=pts, newest=newest, acc=acc, rej=rej,
+        emph=emph, sep_ok=sep_ok, sep_dt_min=sep_dt_min)
 
-    fig = plt.figure(figsize=(15.0, 8.2), facecolor=DARK_BG)
-    # Fixed layout: header strip, two equal map panels, footer strip.
-    hdr_h, ftr_h = 0.115, 0.055
-    panel_y, panel_h = ftr_h + 0.035, 1.0 - hdr_h - ftr_h - 0.075
-    axes = []
-    for i in range(2):
-        ax = fig.add_axes([0.035 + i * 0.483, panel_y, 0.455, panel_h])
-        ax.set_facecolor("#060a12")
-        axes.append(ax)
 
-    def _draw_field(ax, field, cmap, norm, contours: bool):
-        ax.pcolormesh(ir_lon, ir_lat, np.ma.masked_invalid(field),
-                      cmap=cmap, norm=norm, shading="auto", zorder=1)
-        if contours:
-            # BD-style step contours: the Dvorak enhancement's own grey-shade
-            # boundaries (CIMSS), drawn as isotherms over the grayscale so eye
-            # / eyewall structure reads without colour.
-            levels = [-80.0, -75.0, -69.0, -63.0, -53.0, -41.0, -30.0]
-            ax.contour(ir_lon, ir_lat, np.ma.masked_invalid(field),
-                       levels=levels, colors="#9fb3cc", linewidths=0.55,
-                       alpha=0.75, zorder=2)
-        ax.set_xticks([]); ax.set_yticks([])
-        for s in ax.spines.values():
-            s.set_color(GRID)
+# ---------------------------------------------------------------------------
+# panels
+# ---------------------------------------------------------------------------
+def _draw_field(ax, sc: Scene, field, cmap, norm, contours: bool):
+    ax.pcolormesh(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
+                  cmap=cmap, norm=norm, shading="auto", zorder=1)
+    if contours:
+        # BD-style step contours: the Dvorak enhancement's own grey-shade
+        # boundaries (CIMSS), drawn as isotherms over the grayscale so eye
+        # / eyewall structure reads without colour.
+        ax.contour(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
+                   levels=BD_STEPS, colors="#9fb3cc", linewidths=0.55,
+                   alpha=0.75, zorder=2)
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color(GRID)
 
-    # ---- panel 1: grayscale IR + every centre estimate ------------------
-    ax1 = axes[0]
-    _draw_field(ax1, ir_c, plt.get_cmap("gray_r"),
+
+def _panel_label(ax, text: str, fontsize: float = 8.5):
+    ax.text(0.012, 0.985, text, transform=ax.transAxes, ha="left", va="top",
+            color=TEXT_COLOR, fontsize=fontsize, fontweight="bold",
+            bbox=dict(facecolor="#0a1019", alpha=0.62, edgecolor="none",
+                      pad=3), zorder=12)
+
+
+def panel_centres(ax1, sc: Scene, legend_fontsize: float = 7.4,
+                  label_fontsize: float = 8.5):
+    """Panel 1 — grayscale IR + every centre estimate, keyed."""
+    storm, adv, box, bbox = sc.storm, sc.adv, sc.box, sc.bbox
+    frame_lon, acc, rej, emph = sc.frame_lon, sc.acc, sc.rej, sc.emph
+    sep_ok = sc.sep_ok
+
+    _draw_field(ax1, sc, sc.ir_c, plt.get_cmap("gray_r"),
                 Normalize(vmin=-90.0, vmax=30.0), contours=True)
 
     handles: list[tuple[str, dict]] = []
@@ -260,8 +552,6 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
                                                          ls="--")))
 
     # ARCHER/ADT objective fixes — the whole recent track
-    acc = [p for p in pts if p.get("fix")]
-    rej = [p for p in pts if not p.get("fix")]
     if len(acc) > 1:
         ax1.plot([_norm_lon(p["lon"], frame_lon) for p in acc],
                  [p["lat"] for p in acc], color=C_ARCHER, lw=1.1,
@@ -279,30 +569,6 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
                     zorder=7)
         handles.append(("ARCHER/ADT objective fix", dict(color=C_ARCHER,
                                                          marker="o")))
-    # EMPHASIS + the disagreement measurement use the newest ACCEPTED fix.
-    # The newest FRAME's candidate is often rejected (shear, no eye), and
-    # hanging the headline crosshair, the certainty rings and the km label off
-    # a rejected candidate would present a number ARCHER itself refused.
-    # When they differ the header says so rather than quietly back-dating.
-    emph = acc[-1] if acc else None
-    # Is the official position contemporaneous enough with the emphasised fix
-    # for their separation to mean anything? Tolerance is one synoptic step;
-    # beyond that the gap is dominated by storm motion, not by method.
-    SEP_TOL_MIN = 90.0
-    sep_ok, sep_dt_min = False, None
-    if emph and storm.get("last_fix"):
-        try:
-            ot = dt.datetime.fromisoformat(
-                str(storm["last_fix"]).replace("Z", "+00:00"))
-            if ot.tzinfo is None:
-                ot = ot.replace(tzinfo=dt.timezone.utc)
-            ft = dt.datetime.fromisoformat(emph["t"].replace("Z", "+00:00"))
-            sep_dt_min = abs((ft - ot).total_seconds()) / 60.0
-            sep_ok = sep_dt_min <= SEP_TOL_MIN
-        except Exception:      # noqa: BLE001 - unparseable stamp -> no claim
-            sep_ok, sep_dt_min = False, None
-    elif emph:
-        sep_dt_min = None
     if emph:
         nx, ny = _norm_lon(emph["lon"], frame_lon), emph["lat"]
         ax1.plot(nx, ny, marker="+", ms=17, mew=2.0, color=C_ARCHER, zorder=9)
@@ -374,13 +640,10 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
         ax1.set_xlim(float(bbox[0]), float(bbox[2]))
         ax1.set_ylim(float(bbox[1]), float(bbox[3]))
     else:
-        ax1.set_xlim(float(np.nanmin(ir_lon)), float(np.nanmax(ir_lon)))
-        ax1.set_ylim(float(np.nanmin(ir_lat)), float(np.nanmax(ir_lat)))
-    ax1.text(0.012, 0.985, "IR WINDOW · GRAYSCALE + BD-STEP CONTOURS",
-             transform=ax1.transAxes, ha="left", va="top", color=TEXT_COLOR,
-             fontsize=8.5, fontweight="bold",
-             bbox=dict(facecolor="#0a1019", alpha=0.62, edgecolor="none",
-                       pad=3), zorder=12)
+        ax1.set_xlim(float(np.nanmin(sc.ir_lon)), float(np.nanmax(sc.ir_lon)))
+        ax1.set_ylim(float(np.nanmin(sc.ir_lat)), float(np.nanmax(sc.ir_lat)))
+    _panel_label(ax1, "IR WINDOW · GRAYSCALE + BD-STEP CONTOURS",
+                 fontsize=label_fontsize)
 
     # legend — every source keyed, drawn as real proxies so nothing is
     # identified by position alone
@@ -394,14 +657,17 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
                               mew=1.2, ms=8, lw=1.4))
         labels.append(lab)
     if proxies:
-        leg = ax1.legend(proxies, labels, loc="lower left", fontsize=7.4,
+        leg = ax1.legend(proxies, labels, loc="lower left",
+                         fontsize=legend_fontsize,
                          framealpha=0.82, facecolor="#0a1019",
                          edgecolor=GRID, labelcolor=TEXT_COLOR,
                          borderpad=0.6, handlelength=2.4)
         leg.set_zorder(13)
 
-    # ---- panel 2: enhanced colour IR + BT extremes -----------------------
-    ax2 = axes[1]
+
+def panel_enhanced(ax2, sc: Scene, xlim, ylim, label_fontsize: float = 8.5,
+                   readout_fontsize: float = 8.6):
+    """Panel 2 — the same scene in enhanced colour, with BAND-TAGGED extremes."""
     try:
         # the SAME enhancement the floater renders use, so this panel reads
         # identically to the imagery elsewhere on the site
@@ -410,37 +676,189 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
         cmap2, norm2 = enh["cmap"], enhancement_norm("tat_neon")
     except Exception:                      # palette import is best-effort
         cmap2, norm2 = plt.get_cmap("turbo"), Normalize(vmin=-95.0, vmax=40.0)
-    _draw_field(ax2, ir_c, cmap2, norm2, contours=False)
-    ax2.set_xlim(*ax1.get_xlim())
-    ax2.set_ylim(*ax1.get_ylim())
-    ax2.text(0.012, 0.985, "IR WINDOW · ENHANCED COLOUR",
-             transform=ax2.transAxes, ha="left", va="top", color=TEXT_COLOR,
-             fontsize=8.5, fontweight="bold",
-             bbox=dict(facecolor="#0a1019", alpha=0.62, edgecolor="none",
-                       pad=3), zorder=12)
+    _draw_field(ax2, sc, sc.ir_c, cmap2, norm2, contours=False)
+    ax2.set_xlim(*xlim)
+    ax2.set_ylim(*ylim)
+    _panel_label(ax2, "IR WINDOW · ENHANCED COLOUR", fontsize=label_fontsize)
+    # BAND-TAGGED, always. An unlabelled min/max invites reading a WV frame's
+    # -60 C as a cloud top; a band that did not arrive says so rather than
+    # leaving a gap the reader fills in with the band above it.
     bt_lines = []
-    if ir_min is not None:
-        bt_lines.append(f"IR BT   min {ir_min:+.1f} °C   max {ir_max:+.1f} °C")
-    if wv_min is not None:
-        bt_lines.append(f"WV BT   min {wv_min:+.1f} °C   max {wv_max:+.1f} °C")
+    if sc.ir_min is not None:
+        bt_lines.append(f"IR BT     min {sc.ir_min:+.1f} °C   max {sc.ir_max:+.1f} °C")
+    if sc.wv_min is not None:
+        bt_lines.append(f"WV BT     min {sc.wv_min:+.1f} °C   max {sc.wv_max:+.1f} °C")
     else:
-        bt_lines.append("WV BT   unavailable this cycle")
+        bt_lines.append("WV BT     unavailable this cycle")
+    if sc.swir_min is not None:
+        bt_lines.append(f"SWIR BT   min {sc.swir_min:+.1f} °C   max {sc.swir_max:+.1f} °C")
+    else:
+        bt_lines.append("SWIR BT   unavailable this cycle")
     ax2.text(0.012, 0.022, "\n".join(bt_lines), transform=ax2.transAxes,
-             ha="left", va="bottom", color=TEXT_COLOR, fontsize=8.6,
+             ha="left", va="bottom", color=TEXT_COLOR, fontsize=readout_fontsize,
              family="monospace",
              bbox=dict(facecolor="#0a1019", alpha=0.72, edgecolor=GRID,
                        pad=4), zorder=12)
 
-    # ---- header ----------------------------------------------------------
+
+def panel_wpace(ax, sc: Scene, png: Optional[bytes],
+                captured: Optional[dt.datetime]):
+    """Panel 3 — the CycloLab wind/pressure + observed/projected ACE chart.
+
+    Pasted in as a raster from the browser lane's capture of the REAL renderer.
+    Nothing about the ACE method is recomputed here; see the module docstring.
+    """
+    ax.set_facecolor(DARK_BG)
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color(GRID)
+    if png:
+        try:
+            import matplotlib.image as mpimg
+            img = mpimg.imread(io.BytesIO(png), format="png")
+            ax.imshow(img, aspect="equal", interpolation="antialiased",
+                      zorder=1)
+            ax.set_xlim(0, img.shape[1])
+            ax.set_ylim(img.shape[0], 0)
+            ax.set_frame_on(True)
+            age = ""
+            if captured is not None:
+                mins = (dt.datetime.now(dt.timezone.utc) -
+                        captured).total_seconds() / 60.0
+                # Say the age whenever it is big enough to matter. A chart from
+                # two cycles ago beside fresh imagery, under one VALID stamp,
+                # is the failure mode this line exists to prevent.
+                if mins >= 45:
+                    age = f"   ·   CHART CAPTURED {mins / 60.0:.1f} H AGO"
+            _panel_label(ax, "WIND, PRESSURE & ACE   ·   OBSERVED + OFFICIAL "
+                             "FORECAST" + age)
+            return
+        except Exception as e:      # noqa: BLE001 - a bad raster is a placeholder
+            log.warning("wpace raster unusable: %s", e)
+    # HONEST PLACEHOLDER. An empty frame here would read as "this storm has no
+    # ACE", which is a claim; "not captured" is the truth.
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    _panel_label(ax, "WIND, PRESSURE & ACE")
+    ax.text(0.5, 0.5,
+            "chart not captured this cycle\n\n"
+            "the wind/pressure + observed/projected ACE panel is rendered by\n"
+            "CycloLab and captured from it; it is deliberately not recomputed\n"
+            "here, so when the capture is missing the panel stays empty",
+            transform=ax.transAxes, ha="center", va="center", color=MUTED,
+            fontsize=9.0, linespacing=1.7)
+
+
+def panel_eye(ax, sc: Scene, prof: Optional[dict]):
+    """Panel 4 — radial BT profile about the working centre + the eye score."""
+    ax.set_facecolor("#060a12")
+    for s in ax.spines.values():
+        s.set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    if prof is None:
+        ax.set_xticks([]); ax.set_yticks([])
+        _panel_label(ax, "EYE STRUCTURE")
+        why = ("no working centre this cycle — the profile is taken about the\n"
+               "emphasised objective fix, and every candidate was rejected"
+               if sc.emph is None else
+               "no radial profile this cycle — the IR field could not be\n"
+               "resolved into rings about the working centre")
+        ax.text(0.5, 0.5, why + "\n\n(the score is withheld, not defaulted)",
+                transform=ax.transAxes, ha="center", va="center", color=MUTED,
+                fontsize=9.0, linespacing=1.7)
+        return
+
+    r, mean_c = prof["r_km"], prof["mean_c"]
+    lo = float(min(np.nanmin(prof["min_c"]), -85.0))
+    hi = float(max(np.nanmax(prof["max_c"]), 15.0))
+    # Headroom at the top for the panel label + the score, and at the bottom
+    # for the construction note, so neither is drawn over the profile.
+    span = hi - lo
+    lo -= span * 0.30
+    hi += span * 0.22
+
+    # BD ladder behind the profile — the citable discretisation, and the same
+    # steps panel 1 contours, so the two panels read as one instrument.
+    for i, (lab, a, b) in enumerate(BD_LADDER):
+        a2, b2 = max(a, lo), min(b, hi)
+        if b2 <= a2:
+            continue
+        ax.axhspan(a2, b2, color="#ffffff" if i % 2 else "#7f8fa6",
+                   alpha=0.045 if i % 2 else 0.075, zorder=0)
+        ax.axhline(a2, color=GRID, lw=0.5, alpha=0.8, zorder=1)
+        if b2 - a2 > span * 0.055:      # skip labels with no room to sit in
+            # LEFT edge: the profile's own minimum sits at the eyewall radius
+            # and the construction note sits bottom-right, so the first few km
+            # of the x axis is the only strip nothing else wants.
+            ax.text(prof["max_r_km"] * 0.010, (a2 + b2) / 2.0, lab, ha="left",
+                    va="center", color=MUTED, fontsize=6.8, alpha=0.7,
+                    zorder=2)
+
+    ax.fill_between(r, prof["min_c"], prof["max_c"], color=C_ARCHER,
+                    alpha=0.13, lw=0, zorder=3)
+    ax.plot(r, mean_c, color=C_ARCHER, lw=1.8, zorder=5)
+
+    if prof.get("score") is not None:
+        import matplotlib.patheffects as pe
+        ew = prof["eyewall_r_km"]
+        ax.axvline(ew, color=C_OFFICIAL, lw=1.1, ls=(0, (4, 3)), zorder=6)
+        ax.plot([0.0], [prof["eye_warm_c"]], marker="o", ms=7,
+                mfc="none", mec=C_OFFICIAL, mew=1.6, zorder=7)
+        ax.plot([ew], [prof["eyewall_cold_c"]], marker="o", ms=7,
+                mfc="none", mec=C_FORECAST, mew=1.6, zorder=7)
+        # Sits BELOW the panel label, not under it, on a solid backing so a BD
+        # rung label can never end up reading through the number.
+        ax.text(0.012, 0.885, f"EYE SCORE  {prof['score']:.1f} °C",
+                transform=ax.transAxes, color=TEXT_COLOR, fontsize=12.5,
+                fontweight="bold", ha="left", va="top", zorder=9,
+                bbox=dict(facecolor="#060a12", alpha=0.9, edgecolor="none",
+                          pad=3),
+                path_effects=[pe.withStroke(linewidth=3,
+                              foreground="#060a12")])
+        detail = (f"warmest eye pixel {prof['eye_warm_c']:+.1f} °C   ·   "
+                  f"coldest eyewall ring {prof['eyewall_cold_c']:+.1f} °C\n"
+                  f"eyewall radius {ew:.0f} km")
+    else:
+        detail = prof.get("reason") or "no eye signature — score withheld"
+
+    ax.set_xlim(0.0, prof["max_r_km"])
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("radius from the objective centre (km)", color=MUTED,
+                  fontsize=8.2, labelpad=2)
+    ax.set_ylabel("brightness temperature (°C)", color=MUTED, fontsize=8.2,
+                  labelpad=2)
+    ax.grid(True, color=GRID, lw=0.4, alpha=0.55, zorder=1)
+    _panel_label(ax, "EYE STRUCTURE   ·   RADIAL IR PROFILE")
+    # The construction, on the panel. A contrast number without its regions is
+    # not reproducible, and the regions here are OURS, not the ADT's. Wrapped
+    # to short lines so nothing runs off the panel's right edge.
+    ax.text(0.988, 0.022,
+            detail + "\n"
+            f"mean (line) · min–max envelope (band) · {prof['ring_km']:.0f} km rings\n"
+            f"eyewall = coldest mean ring beyond {EYE_MIN_EYEWALL_KM:.0f} km "
+            "(our construction)\nBD ladder CIMSS",
+            transform=ax.transAxes, ha="right", va="bottom", color=MUTED,
+            fontsize=7.3, linespacing=1.55,
+            bbox=dict(facecolor="#060a12", alpha=0.86, edgecolor=GRID, pad=4),
+            zorder=10)
+
+
+# ---------------------------------------------------------------------------
+# shared chrome
+# ---------------------------------------------------------------------------
+def _draw_header(fig, sc: Scene, hdr_h: float, title: str,
+                 title_fontsize: float = 17.0, body_fontsize: float = 9.2):
+    """The ONE header both products carry: identity, valid time, forecast hour,
+    the diagnostic state, and the intensity readouts."""
     hax = fig.add_axes([0, 1.0 - hdr_h, 1.0, hdr_h])
     hax.axis("off")
     hax.set_facecolor(DARK_BG)
+    newest, emph, adv = sc.newest, sc.emph, sc.adv
     valid = newest["t"] if newest else None
     valid_txt = (valid.replace("T", " ").replace(".000Z", "Z")[:17] + "Z"
                  if valid else "—")
-    hax.text(0.012, 0.78, f"{name}  ·  OBJECTIVE CENTRE FIX", ha="left",
-             va="center", color=TEXT_COLOR, fontsize=17, fontweight="bold",
-             transform=hax.transAxes)
+    hax.text(0.012, 0.78, f"{sc.name}  ·  {title}", ha="left",
+             va="center", color=TEXT_COLOR, fontsize=title_fontsize,
+             fontweight="bold", transform=hax.transAxes)
     # TWO EXPLICIT ROWS, not a greedy wrap. Row 1 is identity; row 2 is the
     # diagnostic state and the HONESTY NOTES. A greedy wrap pushed the
     # "separation not comparable" caveat onto a third row that then got
@@ -464,21 +882,17 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
         row2.append("NEWEST FRAME: CANDIDATE REJECTED")
         if emph:
             row2.append(f"CROSSHAIR {emph['t'][:16].replace('T', ' ')}Z")
-    if fixes.get("truncated"):
+    if sc.fixes.get("truncated"):
         row2.append("TRACK TRUNCATED (run budget)")
-    if emph and sep_dt_min is not None and not sep_ok:
-        row2.append(f"OFFICIAL FIX {sep_dt_min / 60.0:.1f} H APART — "
+    if emph and sc.sep_dt_min is not None and not sc.sep_ok:
+        row2.append(f"OFFICIAL FIX {sc.sep_dt_min / 60.0:.1f} H APART — "
                     f"SEPARATION NOT COMPARABLE")
-    # Wrap the subhead rather than letting it run under the right-hand
-    # intensity block. The honesty notes ("separation not comparable", "track
-    # truncated") are the longest strings on the line and are exactly the ones
-    # that must stay readable.
     SEP = "   ·   "
     for i, row in enumerate((row1, row2)):
         if not row:
             continue
         hax.text(0.012, 0.44 - i * 0.30, SEP.join(row), ha="left",
-                 va="center", color=MUTED, fontsize=9.2,
+                 va="center", color=MUTED, fontsize=body_fontsize,
                  transform=hax.transAxes)
 
     # intensity readouts: ADT and, when its membership rule is met, SATCON
@@ -488,6 +902,7 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
         p_ = newest.get("mslp_mb")
         rows.append("ADT      " + (f"{v:.0f} kt" if v is not None else "— kt") +
                     (f"   {p_:.0f} mb" if p_ is not None else ""))
+    satcon = sc.satcon
     if satcon and satcon.get("vmax") and satcon["vmax"].get("value") is not None:
         sv = satcon["vmax"]["value"]
         sp = (satcon.get("mslp") or {}).get("value")
@@ -495,19 +910,20 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
                     (f"   {sp:.0f} mb" if sp is not None else ""))
     else:
         rows.append("SATCON   no consensus (needs ≥2 members)")
-    off_kt = storm.get("intensity_kt") or storm.get("vmax")
+    off_kt = sc.storm.get("intensity_kt") or sc.storm.get("vmax")
     if off_kt:
         rows.append(f"OFFICIAL {float(off_kt):.0f} kt")
     hax.text(0.985, 0.5, "\n".join(rows), ha="right", va="center",
-             color=TEXT_COLOR, fontsize=9.2, family="monospace",
+             color=TEXT_COLOR, fontsize=body_fontsize, family="monospace",
              transform=hax.transAxes, linespacing=1.5)
 
-    # ---- footer ----------------------------------------------------------
+
+def _draw_footer(fig, sc: Scene, ftr_h: float):
     fax = fig.add_axes([0, 0, 1.0, ftr_h])
     fax.axis("off")
     fax.set_facecolor(DARK_BG)
-    src = getattr(ir_data, "sat_name", "geostationary")
-    inp = fixes.get("input") or ""
+    src = getattr(sc.ir_data, "sat_name", "geostationary")
+    inp = sc.fixes.get("input") or ""
     # Two rows, not two columns: the disclosure and the provenance are both
     # long, and side-by-side they collided in the middle of the strip.
     fax.text(0.012, 0.68,
@@ -522,6 +938,98 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
              ha="left", va="center", color=MUTED, fontsize=7.6,
              transform=fax.transAxes)
 
+
+# ---------------------------------------------------------------------------
+# the plots
+# ---------------------------------------------------------------------------
+def render(storm: dict, fixes: dict, adv: Optional[dict],
+           ir_data, wv_data, box: Optional[dict] = None,
+           satcon: Optional[dict] = None, dpi: int = 110,
+           bbox: Optional[list[float]] = None, swir_data=None,
+           scene: Optional[Scene] = None) -> bytes:
+    """Two-panel storm-centred centre-fix diagnostic -> PNG bytes."""
+    sc = scene or prepare_scene(storm, fixes, adv, ir_data, wv_data,
+                                swir_data=swir_data, box=box, satcon=satcon,
+                                bbox=bbox)
+    fig = plt.figure(figsize=(15.0, 8.2), facecolor=DARK_BG)
+    # Fixed layout: header strip, two equal map panels, footer strip.
+    hdr_h, ftr_h = 0.115, 0.055
+    panel_y, panel_h = ftr_h + 0.035, 1.0 - hdr_h - ftr_h - 0.075
+    axes = []
+    for i in range(2):
+        ax = fig.add_axes([0.035 + i * 0.483, panel_y, 0.455, panel_h])
+        ax.set_facecolor("#060a12")
+        axes.append(ax)
+    panel_centres(axes[0], sc)
+    panel_enhanced(axes[1], sc, axes[0].get_xlim(), axes[0].get_ylim())
+    _draw_header(fig, sc, hdr_h, "OBJECTIVE CENTRE FIX")
+    _draw_footer(fig, sc, ftr_h)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
+                     ir_data, wv_data, box: Optional[dict] = None,
+                     satcon: Optional[dict] = None, dpi: int = 120,
+                     bbox: Optional[list[float]] = None, swir_data=None,
+                     wpace_png: Optional[bytes] = None,
+                     wpace_captured: Optional[dt.datetime] = None,
+                     scene: Optional[Scene] = None) -> bytes:
+    """The 2x2 STORM DIAGNOSTIC PLATE -> PNG bytes.
+
+        top-left      IR grayscale + BD contours + every centre estimate
+        top-right     the same scene, enhanced colour, band-tagged extremes
+        bottom-left   wind / pressure / observed + projected ACE (captured)
+        bottom-right  eye structure — radial IR profile + the eye score
+
+    One shared header, one shared footer. An additional product: render()
+    keeps publishing the two-panel plot to its own key.
+    """
+    sc = scene or prepare_scene(storm, fixes, adv, ir_data, wv_data,
+                                swir_data=swir_data, box=box, satcon=satcon,
+                                bbox=bbox)
+    # The bottom row is SHORTER than the top on purpose: the maps are square in
+    # data and the two charts are wide, so equal rows would letterbox the
+    # charts inside tall empty cells. 2:1 cells match the captured chart's own
+    # 1000x480 frame almost exactly.
+    fig = plt.figure(figsize=(15.0, 11.2), facecolor=DARK_BG)
+    hdr_h, ftr_h = 0.094, 0.0446
+    top_y, top_h = 0.397, 0.509
+    # The bottom row starts ABOVE the footer, not on it: the eye panel carries
+    # real tick labels and an x-label, and sitting the axes on ftr_h drew them
+    # straight through the disclosure strip.
+    bot_y, bot_h = 0.088, 0.262
+    col_x = (0.035, 0.518)
+    col_w = 0.447
+
+    axes_top = []
+    for x in col_x:
+        ax = fig.add_axes([x, top_y, col_w, top_h])
+        ax.set_facecolor("#060a12")
+        axes_top.append(ax)
+    axes_bot = []
+    for x in col_x:
+        ax = fig.add_axes([x, bot_y, col_w, bot_h])
+        ax.set_facecolor("#060a12")
+        axes_bot.append(ax)
+
+    panel_centres(axes_top[0], sc)
+    panel_enhanced(axes_top[1], sc, axes_top[0].get_xlim(),
+                   axes_top[0].get_ylim())
+    panel_wpace(axes_bot[0], sc, wpace_png, wpace_captured)
+
+    prof = None
+    if sc.emph is not None:
+        prof = eye_score(sc.ir_c, sc.ir_lat, sc.ir_lon,
+                         float(sc.emph["lat"]),
+                         _norm_lon(float(sc.emph["lon"]), sc.frame_lon))
+    panel_eye(axes_bot[1], sc, prof)
+
+    _draw_header(fig, sc, hdr_h, "STORM DIAGNOSTIC PLATE",
+                 title_fontsize=19.0, body_fontsize=9.6)
+    _draw_footer(fig, sc, ftr_h)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, facecolor=DARK_BG)
     plt.close(fig)
@@ -531,8 +1039,15 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
 # ---------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------
-def build_for_storm(entry: dict, sink=None, dpi: int = 110) -> Optional[str]:
-    """Fetch + render + publish one storm's centre-fix plot. Returns the key."""
+def build_for_storm(entry: dict, sink=None, dpi: int = 110,
+                    plate_dpi: int = 120) -> Optional[list]:
+    """Fetch + render + publish one storm's plots.
+
+    Returns a list of ``(key, png)`` — the two-panel centre-fix plot FIRST
+    (unchanged, its own key) and the 2x2 plate SECOND. The plate is additive:
+    if it fails to render, the two-panel plot has already been produced and is
+    still returned.
+    """
     sid = entry.get("id")
     slug = entry.get("slug")
     fixes = load_fixes(sid)
@@ -583,22 +1098,50 @@ def build_for_storm(entry: dict, sink=None, dpi: int = 110) -> Optional[str]:
 
     async def _fetch_all():
         ir = await _fetch_band(fetch_bbox, when, "clean_ir")
+        # WV and SWIR are READOUTS, not the plot. Each is guarded on its own so
+        # one missing band never costs the other, and never costs the render.
         try:
             wv = await _fetch_band(fetch_bbox, when, "wv_upper")
-        except Exception as e:      # noqa: BLE001 - WV is a readout, not the plot
+        except Exception as e:      # noqa: BLE001
             log.warning("%s: WV band unavailable (%s)", sid, e)
             wv = None
-        return ir, wv
+        try:
+            swir = await _fetch_band(fetch_bbox, when, "shortwave_ir")
+        except Exception as e:      # noqa: BLE001
+            log.info("%s: SWIR band unavailable (%s)", sid, e)
+            swir = None
+        return ir, wv, swir
 
-    ir, wv = asyncio.run(_fetch_all())
+    ir, wv, swir = asyncio.run(_fetch_all())
     adv = load_advisory(sid)
     box = target_box(load_floater_manifest(slug)) if slug else None
+    # ONE scene for both products, so the plate and the plot can never disagree
+    # about the emphasised fix or the comparability verdict.
+    sc = prepare_scene(entry, fixes, adv, ir, wv, swir_data=swir, box=box,
+                       satcon=fixes.get("satcon"), bbox=bbox)
+    out = []
     png = render(entry, fixes, adv, ir, wv, box=box,
-                 satcon=fixes.get("satcon"), dpi=dpi, bbox=bbox)
+                 satcon=fixes.get("satcon"), dpi=dpi, bbox=bbox,
+                 swir_data=swir, scene=sc)
     key = f"{R2_PREFIX}/{sid}.png"
     if sink is not None:
         sink.write_png(key, png)
-    return key, png
+    out.append((key, png))
+    try:
+        wp_png, wp_when = load_wpace_png(sid)
+        plate = render_composite(entry, fixes, adv, ir, wv, box=box,
+                                 satcon=fixes.get("satcon"), dpi=plate_dpi,
+                                 bbox=bbox, swir_data=swir,
+                                 wpace_png=wp_png, wpace_captured=wp_when,
+                                 scene=sc)
+        pkey = f"{R2_PREFIX}/{sid}_plate.png"
+        if sink is not None:
+            sink.write_png(pkey, plate)
+        out.append((pkey, plate))
+    except Exception as e:          # noqa: BLE001 - the plate is ADDITIVE
+        log.exception("%s: plate render failed (the two-panel plot still "
+                      "published): %s", sid, e)
+    return out
 
 
 def main(argv=None) -> int:
@@ -607,6 +1150,7 @@ def main(argv=None) -> int:
     ap.add_argument("--storm", help="only this storm id/name substring")
     ap.add_argument("--out-dir", help="write PNGs here instead of R2")
     ap.add_argument("--dpi", type=int, default=110)
+    ap.add_argument("--plate-dpi", type=int, default=120)
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -629,21 +1173,24 @@ def main(argv=None) -> int:
         try:
             # PER-STORM ISOLATION: one storm's missing band or bad geometry
             # must never take the whole lane down with it.
-            got = build_for_storm(dict(st), sink=sink, dpi=a.dpi)
+            got = build_for_storm(dict(st), sink=sink, dpi=a.dpi,
+                                  plate_dpi=a.plate_dpi)
             if not got:
                 continue
-            key, png = got
-            if a.out_dir:
-                path = os.path.join(a.out_dir, os.path.basename(key))
-                with open(path, "wb") as fh:
-                    fh.write(png)
-                log.info("%s -> %s (%d bytes)", st.get("name"), path, len(png))
-            else:
-                log.info("%s -> %s (%d bytes)", st.get("name"), key, len(png))
+            for key, png in got:
+                if a.out_dir:
+                    path = os.path.join(a.out_dir, os.path.basename(key))
+                    with open(path, "wb") as fh:
+                        fh.write(png)
+                    log.info("%s -> %s (%d bytes)", st.get("name"), path,
+                             len(png))
+                else:
+                    log.info("%s -> %s (%d bytes)", st.get("name"), key,
+                             len(png))
             n += 1
         except Exception as e:      # noqa: BLE001
             log.exception("%s: render failed: %s", st.get("name"), e)
-    log.info("rendered %d plot(s)", n)
+    log.info("rendered %d storm(s)", n)
     return 0
 
 

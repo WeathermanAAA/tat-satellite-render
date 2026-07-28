@@ -208,10 +208,18 @@ services:
     # 30 min: the fixes only move as fast as new satellite frames land, and
     # each pass is minutes of work.
     # /app is mounted READ-ONLY, so both installs must be global.
+    #
+    # The W&P/ACE capture rides this lane because it is the same kind of work
+    # on the same image: drive the real page, take what it produced. It runs
+    # AFTER the objfix pass, because it takes its storm list from the index
+    # that pass publishes, and it is cheap beside it (one page load per storm
+    # against a full loop workup). Each is `|| true` on its own so neither can
+    # cost the other its pass.
     command: >-
       bash -lc "apt-get update -qq && apt-get install -y -qq python3-boto3 || true;
       npm install -g playwright@1.49.0 --silent || true;
-      while true; do python3 objfix_headless.py --single || true; sleep 1800; done"
+      while true; do python3 objfix_headless.py --single || true;
+      python3 wpace_headless.py || true; sleep 1800; done"
     restart: unless-stopped
     mem_limit: 3g
     profiles: ["centerfix"]

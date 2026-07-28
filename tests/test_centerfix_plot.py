@@ -190,5 +190,151 @@ class RenderContractTests(unittest.TestCase):
         self.assertIn("CANDIDATE REJECTED", txt)
 
 
+class _FakeNoEye(_Fake):
+    """A sheared / eyeless system: the coldest cloud sits ON the centre, so
+    there is no clearing to score. The honest output is a withheld score, not
+    a number computed off an empty eye region."""
+
+    def __init__(self, clat=13.4, clon=170.7, half=3.0, n=48):
+        super().__init__(clat, clon, half, n)
+        r = np.hypot(self.lons - clon, self.lats - clat)
+        self.cmi = (-80.0 + 22.0 * r) + 273.15
+
+
+def _tiny_png() -> bytes:
+    import io as _io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    buf = _io.BytesIO()
+    f = plt.figure(figsize=(2, 1))
+    f.savefig(buf, format="png")
+    plt.close(f)
+    return buf.getvalue()
+
+
+class EyeScoreTests(unittest.TestCase):
+    """The eye score is a CONTRAST in °C, not a pixel count: a count is
+    resolution-dependent and would not compare across sensors. A system with
+    no eye must return nothing rather than a number computed off an empty
+    region."""
+
+    def test_finds_the_eyewall_and_scores_a_real_eye(self):
+        f = _Fake()
+        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7)
+        self.assertIsNotNone(prof)
+        self.assertIsNotNone(prof["score"])
+        # the synthetic eyewall ring sits at ~0.5 deg = ~55 km
+        self.assertGreater(prof["eyewall_r_km"], 30.0)
+        self.assertLess(prof["eyewall_r_km"], 85.0)
+        # a warm eye (+12 C) inside a deep cold ring -> a large positive score
+        self.assertGreater(prof["score"], 40.0)
+        self.assertGreater(prof["eye_warm_c"], prof["eyewall_cold_c"])
+
+    def test_no_eye_withholds_the_score_and_says_why(self):
+        f = _FakeNoEye()
+        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7)
+        self.assertIsNotNone(prof)          # the PROFILE is still real
+        self.assertIsNone(prof["score"])    # ...the score is not
+        self.assertTrue(prof["reason"])
+
+    def test_the_eyewall_floor_is_what_stops_a_zero_radius_eye(self):
+        # Without it an eyeless field reports an "eye" of zero radius, scoring
+        # the centre pixel against itself.
+        self.assertGreater(cf.EYE_MIN_EYEWALL_KM, 0.0)
+
+
+class CompositePlateTests(unittest.TestCase):
+    """The 2x2 plate is an ADDITIONAL product. It carries all four panels under
+    one header, never silently drops to three, and does not recompute the ACE
+    chart it pastes in."""
+
+    PTS = [_pt("2026-07-28T05:30:00.000Z", 13.42, 170.68)]
+
+    def _plate(self, wpace_png=None, captured=None, ir=None, adv=None):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.axes import Axes
+        seen = []
+        forig, aorig = plt.Figure.text, Axes.text
+
+        def fspy(self, x, y, s, *a, **k):
+            seen.append(str(s)); return forig(self, x, y, s, *a, **k)
+
+        def aspy(self, x, y, s, *a, **k):
+            seen.append(str(s)); return aorig(self, x, y, s, *a, **k)
+        plt.Figure.text, Axes.text = fspy, aspy
+        try:
+            png = cf.render_composite(
+                STORM, _track(self.PTS), adv, ir or _Fake(), _Fake(),
+                box=None, satcon=None, dpi=50, bbox=BBOX,
+                wpace_png=wpace_png, wpace_captured=captured)
+        finally:
+            plt.Figure.text, Axes.text = forig, aorig
+        self.assertEqual(png[1:4], b"PNG")
+        self.assertGreater(len(png), 5000)
+        return png, "\n".join(seen)
+
+    def test_plate_carries_all_four_panels(self):
+        _png, txt = self._plate()
+        self.assertIn("GRAYSCALE + BD-STEP CONTOURS", txt)   # top-left
+        self.assertIn("ENHANCED COLOUR", txt)                # top-right
+        self.assertIn("WIND, PRESSURE & ACE", txt)           # bottom-left
+        self.assertIn("EYE STRUCTURE", txt)                  # bottom-right
+
+    def test_missing_chart_capture_says_so_rather_than_drawing_nothing(self):
+        # An empty frame would read as "this storm has no ACE" -- a claim.
+        _png, txt = self._plate(wpace_png=None)
+        self.assertIn("not captured", txt)
+
+    def test_a_captured_chart_is_pasted_not_recomputed(self):
+        _png, txt = self._plate(wpace_png=_tiny_png())
+        self.assertIn("WIND, PRESSURE & ACE", txt)
+        self.assertNotIn("not captured", txt)
+
+    def test_a_stale_capture_declares_its_age(self):
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
+        _png, txt = self._plate(wpace_png=_tiny_png(), captured=old)
+        self.assertIn("CAPTURED", txt)
+
+    def test_a_fresh_capture_does_not_nag(self):
+        fresh = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
+        _png, txt = self._plate(wpace_png=_tiny_png(), captured=fresh)
+        self.assertNotIn("CAPTURED", txt)
+
+    def test_eyeless_storm_keeps_the_panel_and_withholds_the_number(self):
+        _png, txt = self._plate(ir=_FakeNoEye())
+        self.assertIn("EYE STRUCTURE", txt)
+        self.assertNotIn("EYE SCORE", txt)
+
+    def test_plate_header_carries_identity_valid_time_and_forecast_hour(self):
+        adv = {"advisory": 8, "points": [
+            {"lat": 13.9, "lon": 169.4, "tau_h": 12},
+            {"lat": 14.6, "lon": 167.9, "tau_h": 24}]}
+        _png, txt = self._plate(adv=adv)
+        self.assertIn("DOLPHIN", txt)
+        self.assertIn("VALID", txt)
+        self.assertIn("T+24H", txt)
+        self.assertIn("OFFICIAL", txt)
+
+    def test_band_readouts_are_tagged_ir_wv_and_swir(self):
+        # An untagged -60 C invites reading a WV frame as a cloud top, so every
+        # band names itself -- including the ones that did not arrive.
+        _png, txt = self._plate()
+        self.assertIn("IR BT", txt)
+        self.assertIn("WV BT", txt)
+        self.assertIn("SWIR BT", txt)
+
+    def test_the_two_panel_plot_is_still_its_own_product(self):
+        # The plate is additive: render() keeps working on its own inputs and
+        # stays the thing published to the existing key.
+        import matplotlib
+        matplotlib.use("Agg")
+        png = cf.render(STORM, _track(self.PTS), None, _Fake(), _Fake(),
+                        box=None, satcon=None, dpi=50, bbox=BBOX)
+        self.assertEqual(png[1:4], b"PNG")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
