@@ -50,6 +50,7 @@ import pandas as pd
 import requests
 
 import ace_core as ac
+from ace_core import jtwc_live as _ace_jtwc_live
 import poller_framework as pf
 import feed_recompute as fr
 import storm_ids
@@ -651,6 +652,25 @@ def make_basin_source(basin: str, session: requests.Session,
         cfg = ace_base["basin_cfg"]
         named = (live_fetcher(cfg, year) if live_fetcher is not None
                  else fetch_live_bdecks(session, cfg, year))
+        # TWO-LEG JTWC FEED. The b-decks survive the ATCF shutdown only through
+        # an unofficial mirror and are POST-ANALYSIS -- they land about one
+        # synoptic cycle late, which is what showed Noul as C1 while JTWC had
+        # 85 kt = C2. extend_with_tcvitals appends the tcvitals leading edge
+        # (NCEP's model-init pipe, structurally independent of the ATCF
+        # attrition) past the newest b-deck fix, keeping 1-minute winds so
+        # categories and ACE stay on the JTWC series.
+        #
+        # Opt-in per basin: returns the IDENTICAL frame object for any basin
+        # without tcvitals: true, so AL/EP are untouched. Every failure mode
+        # inside degrades to "return what we already had", and the try/except
+        # is belt-and-braces so a source outage can never take the poller down
+        # -- b-deck-only is a worse feed, not a broken one.
+        try:
+            named, _tcv_info = _ace_jtwc_live.extend_with_tcvitals(
+                named, year, cfg, log_prefix="[poller] ")
+        except Exception as e:                                   # noqa: BLE001
+            log.warning("tcvitals leg skipped (%s: %s) -- b-deck only this cycle",
+                        type(e).__name__, e)
         # Invests are tracks-only and per-source-guarded: a flaky knackwx returns
         # empty and never drops the named cards.
         invests = (invest_fetcher(cfg, year) if invest_fetcher is not None
