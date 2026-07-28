@@ -63,5 +63,5 @@ requests>=2.31
 # union) + designated-but-unnamed relabel (a spelled ATCF cardinal "ONE" ->
 # the ATCF short id "01E"/"10W"). Kills the duplicate UNNAMED WPAC ghost on
 # the tracks/global map. DISPLAY-NAME only: ACE math byte-identical.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.7#subdirectory=ace_core
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.8#subdirectory=ace_core
 pandas>=2.0
