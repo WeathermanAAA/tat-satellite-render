@@ -99,6 +99,12 @@ C_BOX = "#46c56a"         # floater / target box
 #: panels are reading the same steps rather than two similar-looking ones.
 BD_STEPS = [-80.0, -75.0, -69.0, -63.0, -53.0, -41.0, -30.0]
 
+#: TAT's house IR enhancement, from the shared palette package — the SAME table
+#: the satellite pages and floater frames use. Named once so the enhanced panel
+#: and the contour step colours can never drift apart, and so this is a palette
+#: LOOKUP rather than a ramp invented or borrowed here.
+IR_ENHANCEMENT = os.environ.get("CENTERFIX_IR_ENHANCEMENT", "rainbow_ir")
+
 #: BD shade names for the ladder, warmest first. WMG (Warm Medium Grey) is the
 #: warmest step, > +9 °C — a WMG pixel inside an eye is a deeply subsident,
 #: cloud-free eye. Labels are the citable part; see eye_score() for what is not.
@@ -517,16 +523,60 @@ def prepare_scene(storm: dict, fixes: dict, adv: Optional[dict],
 # ---------------------------------------------------------------------------
 # panels
 # ---------------------------------------------------------------------------
+def bd_step_colors():
+    """One colour per BD step, sampled from TAT's OWN IR table at that step's
+    temperature.
+
+    Two reasons this beats a hand-picked set. It is not invented — every hue
+    traces to the shared palette package, the same table the satellite pages
+    render with. And it makes the two top panels one instrument: a -60 °C
+    contour on the grayscale panel is the SAME hue as -60 °C fill on the
+    enhanced panel beside it, so a temperature reading carries across without
+    learning a second key.
+    """
+    try:
+        from colormaps import get_enhancement, enhancement_norm
+        enh = get_enhancement(IR_ENHANCEMENT)
+        norm = enhancement_norm(IR_ENHANCEMENT)
+        return [enh["cmap"](norm(t)) for t in BD_STEPS]
+    except Exception:                     # noqa: BLE001 - palette is optional
+        return ["#9fb3cc"] * len(BD_STEPS)
+
+
 def _draw_field(ax, sc: Scene, field, cmap, norm, contours: bool):
     ax.pcolormesh(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
                   cmap=cmap, norm=norm, shading="auto", zorder=1)
     if contours:
-        # BD-style step contours: the Dvorak enhancement's own grey-shade
-        # boundaries (CIMSS), drawn as isotherms over the grayscale so eye
-        # / eyewall structure reads without colour.
-        ax.contour(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
-                   levels=BD_STEPS, colors="#9fb3cc", linewidths=0.55,
-                   alpha=0.75, zorder=2)
+        # BD-step contours: the Dvorak enhancement's own grey-shade boundaries
+        # (CIMSS). These are the PRIMARY ANALYTICAL LAYER of this panel, not a
+        # decoration over the imagery — thin near-monochrome hairlines vanish
+        # against a bright CDO, which is exactly the scene they most need to
+        # resolve. Bold, per-step coloured, and casing-backed so every isotherm
+        # reads over both the white cloud tops and the dark ocean.
+        import matplotlib.patheffects as pe
+        cs = ax.contour(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
+                        levels=BD_STEPS, colors=bd_step_colors(),
+                        linewidths=1.7, alpha=0.98, zorder=3)
+        try:
+            for coll in cs.collections:
+                coll.set_path_effects([pe.withStroke(
+                    linewidth=3.0, foreground="#0a1019", alpha=0.55)])
+        except Exception:                 # noqa: BLE001 - mpl version drift
+            pass
+        # Inline step labels: an isotherm is only diagnostic if you can tell
+        # WHICH one it is without counting inwards from the panel edge.
+        # Label only the COLD steps. The two warmest catch every patch of
+        # shallow cloud in the box, so labelling them buries the deep-convection
+        # isotherms — the ones that actually describe the eyewall — under a
+        # confetti of repeated numbers.
+        try:
+            deep = [v for v in BD_STEPS if v <= -53.0]
+            for t in (ax.clabel(cs, levels=deep, inline=True, fontsize=6.5,
+                                fmt="%d") or []):
+                t.set_path_effects([pe.withStroke(linewidth=2.6,
+                                                  foreground="#0a1019")])
+        except Exception:                 # noqa: BLE001 - labels are a bonus
+            pass
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
         s.set_color(GRID)
@@ -687,11 +737,15 @@ def panel_enhanced(ax2, sc: Scene, xlim, ylim, label_fontsize: float = 8.5,
                    readout_fontsize: float = 8.6):
     """Panel 2 — the same scene in enhanced colour, with BAND-TAGGED extremes."""
     try:
-        # the SAME enhancement the floater renders use, so this panel reads
-        # identically to the imagery elsewhere on the site
+        # TAT's OWN IR table (IR_ENHANCEMENT), which is what the satellite
+        # pages and the floater frames render with — so this panel reads
+        # identically to the imagery everywhere else on the site and a reader
+        # carries one colour->temperature association across the whole product.
+        # It was tat_neon, which is a selectable knob rather than the house IR
+        # table: a magenta/cyan ramp nobody sees anywhere else on the site.
         from colormaps import get_enhancement, enhancement_norm
-        enh = get_enhancement("tat_neon")
-        cmap2, norm2 = enh["cmap"], enhancement_norm("tat_neon")
+        enh = get_enhancement(IR_ENHANCEMENT)
+        cmap2, norm2 = enh["cmap"], enhancement_norm(IR_ENHANCEMENT)
     except Exception:                      # palette import is best-effort
         cmap2, norm2 = plt.get_cmap("turbo"), Normalize(vmin=-95.0, vmax=40.0)
     _draw_field(ax2, sc, sc.ir_c, cmap2, norm2, contours=False)

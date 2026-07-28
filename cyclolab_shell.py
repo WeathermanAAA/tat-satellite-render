@@ -1254,7 +1254,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
       <div class="card cf-card" id="card-centerfix" hidden>
-        <h3>Objective centre fix</h3>
+        <h3>Storm diagnostic plate</h3>
         <div class="cf-sub" id="cf-sub"></div>
         <a id="cf-link" href="#" target="_blank" rel="noopener"
            title="Open the full-resolution plate">
@@ -1264,7 +1264,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <p class="hafs-caption" id="cf-note"></p>
       </div>
       <div class="card" id="card-centerfix-empty" hidden>
-        <h3>Objective centre fix</h3>
+        <h3>Storm diagnostic plate</h3>
         <div class="stub" id="cf-empty"></div>
       </div>
     </section>
@@ -3775,7 +3775,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     var note = document.getElementById("cf-note");
     var stub = document.getElementById("cf-empty");
     if (!card || !img) return;
-    var url = CENTERFIX_BASE + encodeURIComponent(SID) + ".png";
+    // The four-panel PLATE, not the two-panel plot: the plate is the whole
+    // storm diagnostic (centres, enhanced colour, wind/pressure/ACE, eye
+    // structure) and is what this card is for. "{sid}.png" is the two-panel
+    // subset, still published for anywhere a narrower figure is wanted.
+    var url = CENTERFIX_BASE + encodeURIComponent(SID) + "_plate.png";
     // cache-bust on the newest fix so a refreshed plate is picked up without
     // defeating caching between fixes
     var stamp = (storm && storm.latest_fix_valid_utc) || "";
@@ -3789,12 +3793,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (note) {
         note.textContent =
           "Automated objective satellite estimate — experimental, not " +
-          "official; see NHC / JTWC for official analyses. Left: IR window " +
-          "with every available centre estimate keyed — the objective " +
-          "ARCHER/ADT fix with its position-certainty rings, the official " +
-          "best-track position, the official forecast track and the target " +
-          "box. Right: the same scene in enhanced colour with IR and " +
-          "water-vapour brightness-temperature extremes. Click for the " +
+          "official; see NHC / JTWC for official analyses. Four panels: " +
+          "IR window in grayscale with the BD-step isotherms and every " +
+          "available centre estimate keyed (the objective ARCHER/ADT fix " +
+          "with its position-certainty rings, the official best-track " +
+          "position, the official forecast track, the target box); the " +
+          "same scene in TAT's enhanced IR colour with band-tagged " +
+          "brightness-temperature extremes; the wind, pressure and ACE " +
+          "diagnostic; and the eye structure profile. Click for the " +
           "full-resolution plate.";
       }
     };
