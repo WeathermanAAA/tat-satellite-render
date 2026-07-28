@@ -620,6 +620,15 @@ HTML_TEMPLATE = r"""<!doctype html>
   .wp-subhead { color: var(--muted); font-size: 11.5px; letter-spacing: .04em;
     text-transform: uppercase; margin: -2px 0 8px; min-height: 14px; }
   .wp-subhead .wp-sep { opacity: .45; padding: 0 6px; }
+  /* Objective centre-fix plate: full-width under the Overview grid, since the
+     plate is a wide two-panel figure and shrinking it into a column column
+     makes the fix markers unreadable. */
+  .cf-card { grid-column: 1 / -1; }
+  .cf-card img { width: 100%; height: auto; display: block; border-radius: 10px;
+    background: #0a1019; }
+  .cf-card a { display: block; text-decoration: none; }
+  .cf-sub { color: var(--muted); font-size: 11.5px; letter-spacing: .04em;
+    text-transform: uppercase; margin: -2px 0 8px; min-height: 14px; }
   /* --- Model guidance (Stage B; merged into the Models tab in Phase 3b, so
          the guidance SVGs are now scoped by id rather than by #sec-guidance) --- */
   #gtracks, #gintensity { width: 100%; height: auto; display: block;
@@ -1243,6 +1252,20 @@ HTML_TEMPLATE = r"""<!doctype html>
             <summary>How is this drawn?</summary>
             <div id="swath-method-body"></div></details></div>
         </div>
+      </div>
+      <div class="card cf-card" id="card-centerfix" hidden>
+        <h3>Objective centre fix</h3>
+        <div class="cf-sub" id="cf-sub"></div>
+        <a id="cf-link" href="#" target="_blank" rel="noopener"
+           title="Open the full-resolution plate">
+          <img id="cf-img" alt="Objective centre-fix diagnostic: grayscale IR
+               with every centre estimate overlaid, and enhanced colour IR with
+               brightness-temperature extremes"></a>
+        <p class="hafs-caption" id="cf-note"></p>
+      </div>
+      <div class="card" id="card-centerfix-empty" hidden>
+        <h3>Objective centre fix</h3>
+        <div class="stub" id="cf-empty"></div>
       </div>
     </section>
     <section class="sec" id="sec-satellite"><div class="wipe">
@@ -3733,6 +3756,61 @@ HTML_TEMPLATE = r"""<!doctype html>
   // ---------------------------------------------------------------- #8
   // The swath ALWAYS renders FILLED (verdict 2 - the outlined/hatched
   // variant was dropped; filled won). No treatment toggle.
+  // ---------------------------------------------------------------- #9
+  // Objective centre-fix plate. A server-rendered PNG (centerfix_plot.py)
+  // published per storm; this SURFACES it on the page. An R2 object nobody
+  // can click is storage, not a product.
+  //
+  // Existence is probed by letting the <img> load: the key is only written
+  // for storms the objective-fix lane actually produced a fix for, so a 404
+  // is the normal "not this storm / not yet" case and must read as an honest
+  // empty state, never as a broken image.
+  var CENTERFIX_BASE = CDN + "/cyclolab/centerfix/";
+  function renderCenterFix(storm) {
+    var card = document.getElementById("card-centerfix");
+    var empty = document.getElementById("card-centerfix-empty");
+    var img = document.getElementById("cf-img");
+    var link = document.getElementById("cf-link");
+    var sub = document.getElementById("cf-sub");
+    var note = document.getElementById("cf-note");
+    var stub = document.getElementById("cf-empty");
+    if (!card || !img) return;
+    var url = CENTERFIX_BASE + encodeURIComponent(SID) + ".png";
+    // cache-bust on the newest fix so a refreshed plate is picked up without
+    // defeating caching between fixes
+    var stamp = (storm && storm.latest_fix_valid_utc) || "";
+    img.onload = function () {
+      card.hidden = false;
+      if (empty) empty.hidden = true;
+      if (link) link.href = url;
+      if (sub) {
+        sub.textContent = "OBJECTIVE SATELLITE ESTIMATE · UPDATED EVERY 30 MIN";
+      }
+      if (note) {
+        note.textContent =
+          "Automated objective satellite estimate — experimental, not " +
+          "official; see NHC / JTWC for official analyses. Left: IR window " +
+          "with every available centre estimate keyed — the objective " +
+          "ARCHER/ADT fix with its position-certainty rings, the official " +
+          "best-track position, the official forecast track and the target " +
+          "box. Right: the same scene in enhanced colour with IR and " +
+          "water-vapour brightness-temperature extremes. Click for the " +
+          "full-resolution plate.";
+      }
+    };
+    img.onerror = function () {
+      card.hidden = true;
+      if (empty) empty.hidden = false;
+      if (stub) {
+        stub.textContent =
+          "No objective centre fix for this storm yet — the fix lane " +
+          "publishes one only when the automated analysis returns a usable " +
+          "centre, so nothing is shown rather than a placeholder.";
+      }
+    };
+    img.src = url + (stamp ? ("?t=" + encodeURIComponent(stamp)) : "");
+  }
+
   function renderSwathPlot(storm) {
     var svg = document.getElementById("swathplot");
     var empty = document.getElementById("swath-empty");
@@ -3958,6 +4036,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       try { renderSwathPlot(storm); } catch (e) {
         try { console.warn("[cyclolab] swath plot failed:", e); }
+        catch (e2) {}
+      }
+      try { renderCenterFix(storm); } catch (e) {
+        try { console.warn("[cyclolab] centre-fix plate failed:", e); }
         catch (e2) {}
       }
       lastFixKey = fixKey;
