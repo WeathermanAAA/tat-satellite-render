@@ -2837,13 +2837,43 @@ HTML_TEMPLATE = r"""<!doctype html>
   // FOLLOW-UP: BASEMAP.land is baked for the FORECAST extent - if the
   // observed track runs beyond it some edge land may be missing; a
   // track-extent basemap is a v1.x follow-up.
-  function fitProjection(extent, viewW, hMin, hMax, margin) {
-    var frameLon = (BASEMAP.window[2] + BASEMAP.window[3]) / 2.0;
-    function normLon(lon) {
-      while (lon - frameLon > 180) lon -= 360;
-      while (lon - frameLon < -180) lon += 360;
-      return lon;
+  // ---- shared longitude frame -----------------------------------------
+  // Every extent/projection helper MUST measure longitude in the SAME
+  // continuous frame centred on the basemap window, or a dateline-spanning
+  // track reads as ~360 deg wide instead of a few degrees. Hoisted to module
+  // scope (was private to fitProjection) so ensureMinExtent/sanitizeExtent
+  // normalise identically - the Dolphin (WP12 2026) bug was ensureMinExtent
+  // averaging -178.9 and 179.8 to 0.45degE, planting its pad points over
+  // Africa, exploding spanX ~10x and stretching the latitude axis past the
+  // poles (graticule labelled 130degN / 105degS).
+  var FRAME_LON = (BASEMAP.window[2] + BASEMAP.window[3]) / 2.0;
+  function normLon(lon) {
+    while (lon - FRAME_LON > 180) lon -= 360;
+    while (lon - FRAME_LON < -180) lon += 360;
+    return lon;
+  }
+
+  // Drop geometry that can never project: non-finite lat/lon (a NaN radius
+  // pad, an absent fix) and impossible latitudes. A single NaN poisons
+  // Math.min/Math.max for the whole extent, so this runs BEFORE any span
+  // maths. Latitude is clamped rather than dropped so a legitimate pad that
+  // merely overshoots the pole still contributes its (clamped) reach.
+  function sanitizeExtent(extent) {
+    if (!extent || !extent.length) return [];
+    var out = [];
+    for (var i = 0; i < extent.length; i++) {
+      var p = extent[i];
+      if (!p) continue;
+      var la = Number(p.lat), lo = Number(p.lon);
+      if (!isFinite(la) || !isFinite(lo)) continue;
+      out.push({ lat: Math.max(-90, Math.min(90, la)), lon: normLon(lo) });
     }
+    return out;
+  }
+
+  function fitProjection(extent, viewW, hMin, hMax, margin) {
+    extent = sanitizeExtent(extent);
+    if (!extent.length) extent = [{ lat: 0, lon: FRAME_LON }];
     var lats = [], lons = [];
     extent.forEach(function (p) {
       lats.push(p.lat); lons.push(normLon(p.lon));
@@ -2891,6 +2921,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   // pins H to the fixed panel height).
   function gFitFrame(points) {
     var FW = 1000, FH = 540, M = 18, MINDEG = 6;
+    // Same discipline as ensureMinExtent: measure the bbox in the SHARED
+    // continuous lon frame, or a dateline-spanning aid set reads ~360deg wide
+    // and centres on its own antipode. sanitizeExtent also drops non-finite
+    // aid points, which would poison Math.min/Math.max for the whole frame.
+    points = sanitizeExtent(points);
+    if (!points.length) points = [{ lat: 0, lon: FRAME_LON }];
     var lats = points.map(function (p) { return p.lat; });
     var lons = points.map(function (p) { return p.lon; });
     var loLat = Math.min.apply(null, lats), hiLat = Math.max.apply(null, lats);
@@ -2921,15 +2957,28 @@ HTML_TEMPLATE = r"""<!doctype html>
   // projection window widens to a sensible storm-centered default).
   function ensureMinExtent(extent, minDeg) {
     minDeg = minDeg || 8;
-    if (!extent || !extent.length) return extent;
+    // normLon FIRST: the raw feed carries a dateline crossing as a sign flip
+    // (-178.9 -> +179.8), whose raw midpoint is the ANTIPODE of the true
+    // centre. Measuring the span/centre in the shared continuous frame is
+    // what keeps a dateline storm's pad points next to the storm.
+    extent = sanitizeExtent(extent);
+    if (!extent.length) return extent;
     var lats = extent.map(function (p) { return p.lat; });
     var lons = extent.map(function (p) { return p.lon; });
     var loLat = Math.min.apply(null, lats), hiLat = Math.max.apply(null, lats);
     var loLon = Math.min.apply(null, lons), hiLon = Math.max.apply(null, lons);
     if ((hiLat - loLat) >= minDeg && (hiLon - loLon) >= minDeg) return extent;
     var cLat = (loLat + hiLat) / 2, cLon = (loLon + hiLon) / 2, h = minDeg / 2;
-    return extent.concat([{ lat: cLat + h, lon: cLon },
-                          { lat: cLat - h, lon: cLon },
+    // A storm within minDeg/2 of a pole would otherwise pad past it; clamp so
+    // the widened window stays on the globe (it stays >= minDeg tall because
+    // the opposite edge absorbs the shortfall).
+    var nLat = Math.min(90, cLat + h), sLat = Math.max(-90, cLat - h);
+    if (nLat - sLat < minDeg) {
+      if (nLat >= 90) sLat = Math.max(-90, 90 - minDeg);
+      else nLat = Math.min(90, sLat + minDeg);
+    }
+    return extent.concat([{ lat: nLat, lon: cLon },
+                          { lat: sLat, lon: cLon },
                           { lat: cLat, lon: cLon + h },
                           { lat: cLat, lon: cLon - h }]);
   }
@@ -2948,7 +2997,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     var x0 = (pr.x0 != null) ? pr.x0 : 0, y0 = (pr.y0 != null) ? pr.y0 : 0;
     var x1 = (pr.x1 != null) ? pr.x1 : W, y1 = (pr.y1 != null) ? pr.y1 : H;
     var lonL = pr.lonAt(x0), lonR = pr.lonAt(x1);
-    var latT = pr.latAt(y0), latB = pr.latAt(y1);
+    // Structural clamp: the aspect-FILL viewBox reaches beyond the data box,
+    // so latAt() at a panel edge can legitimately land off-globe on a very
+    // wide/short window. Parallels only exist on [-90,90] - clamp the sweep
+    // so an impossible label (130degN / 105degS) can never be drawn, whatever
+    // the extent maths upstream did.
+    var latT = Math.min(90, pr.latAt(y0)), latB = Math.max(-90, pr.latAt(y1));
     var sy0 = y0.toFixed(1), sy1 = y1.toFixed(1);
     var sx0 = x0.toFixed(1), sx1 = x1.toFixed(1);
     var cas = [], lin = [], lab = [];
@@ -3230,6 +3284,30 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
 
+  // ---- wind-radius sanitiser -------------------------------------------
+  // Four-quadrant radii come off the ATCF / best-track deck, where an absent
+  // value is sometimes a SENTINEL (999 / 9999 nm) rather than 0 or null. A
+  // sentinel is not just a wrong ring: 9999 nm pads the projection extent by
+  // 9999/60 = 167deg and blows the window apart the same way the dateline bug
+  // did. MAX_RADIUS_NM sits above the largest gale radius ever analysed
+  // (Tip 1979, ~600 nm) so every physical value survives and every sentinel,
+  // NaN and negative is rejected. Every radius read goes through this.
+  var MAX_RADIUS_NM = 900;
+  function radiusNm(v) {
+    var n = Number(v);
+    if (!isFinite(n) || n <= 0 || n > MAX_RADIUS_NM) return 0;
+    return n;
+  }
+  function maxRadiusNm(arr) {
+    if (!arr || !arr.length) return 0;
+    var m = 0;
+    for (var i = 0; i < arr.length; i++) {
+      var r = radiusNm(arr[i]);
+      if (r > m) m = r;
+    }
+    return m;
+  }
+
   // four-quadrant wind-radii arcs around a center (NE/SE/SW/NW). radii =
   // [ne,se,sw,nw] in NAUTICAL MILES -> degrees lat = nm/60. Each quadrant
   // is a 90deg pie sector; a 0/absent quadrant draws nothing. Returns one
@@ -3242,8 +3320,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     var quads = [[0, 90], [90, 180], [180, 270], [270, 360]];
     var dseg = [];
     for (var q = 0; q < 4; q++) {
-      var rn = radii[q];
-      if (!rn || rn <= 0) continue;
+      var rn = radiusNm(radii[q]);
+      if (!rn) continue;
       var rdeg = rn / 60.0;                  // nm -> degrees latitude
       // sample the arc; project each point (lon scales with cos lat).
       var a0 = quads[q][0], a1 = quads[q][1];
@@ -3277,7 +3355,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   // quality. (Stepped quadrant arcs stay correct for the visible rings.)
   function swathBlob(pr, lat, lon, radii) {
     if (!radii) return "";
-    var rv = [radii[0] || 0, radii[1] || 0, radii[2] || 0, radii[3] || 0];
+    var rv = [radiusNm(radii[0]), radiusNm(radii[1]),
+              radiusNm(radii[2]), radiusNm(radii[3])];
     if (Math.max(rv[0], rv[1], rv[2], rv[3]) <= 0) return "";
     var coslat = Math.max(0.2, Math.cos(lat * Math.PI / 180));
     function rAt(th) {
@@ -3298,8 +3377,11 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   function stormHasRadii(storm) {
     return (storm.points || []).some(function (p) {
-      return p && p.radii && (p.radii["34"] || p.radii["50"] ||
-        p.radii["64"]);
+      // maxRadiusNm, not truthiness: a deck carrying only sentinels has no
+      // usable radii, and claiming otherwise renders an empty swath panel
+      // instead of the honest "not yet available" state.
+      return p && p.radii && (maxRadiusNm(p.radii["34"]) ||
+        maxRadiusNm(p.radii["50"]) || maxRadiusNm(p.radii["64"]));
     });
   }
 
@@ -3320,8 +3402,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     var maxNm = 0;
     if (lastRad) {
       ["34", "50", "64"].forEach(function (k) {
-        (lastRad[k] || []).forEach(function (v) {
-          if (v && v > maxNm) maxNm = v; });
+        var m = maxRadiusNm(lastRad[k]);
+        if (m > maxNm) maxNm = m;
       });
     }
     if (maxNm > 0) {
@@ -3527,9 +3609,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     pts.forEach(function (p) {
       if (!p.radii) return;
       ["34", "64"].forEach(function (k) {
-        var arr = p.radii[k]; if (!arr) return;
-        var mx = Math.max.apply(null, arr.map(function (v) {
-          return v || 0; }));
+        var mx = maxRadiusNm(p.radii[k]);
         if (mx > 0) {
           var pad = mx / 60.0;
           var kc = Math.max(0.2, Math.cos(p.lat * Math.PI / 180));
@@ -3555,9 +3635,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     // drawn with one fill so overlaps visually UNION.
     function sweep(thr) {
       var withR = pts.filter(function (p) {
-        return p.radii && p.radii[thr] &&
-          Math.max.apply(null, p.radii[thr].map(function (v) {
-            return v || 0; })) > 0; });
+        return p.radii && maxRadiusNm(p.radii[thr]) > 0; });
       if (withR.length === 0) return [];
       var polys = [];
       function emit(lat, lon, radii) {
@@ -3568,9 +3646,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       // build a dense per-fix list (in track order, only ones with radii
       // for this threshold), interpolating sub-steps between neighbours.
       var ordered = pts.filter(function (p) {
-        return p.radii && p.radii[thr] &&
-          Math.max.apply(null, p.radii[thr].map(function (v) {
-            return v || 0; })) > 0; });
+        return p.radii && maxRadiusNm(p.radii[thr]) > 0; });
       for (var i = 0; i < ordered.length; i++) {
         var a = ordered[i];
         emit(a.lat, a.lon, a.radii[thr]);
@@ -3584,14 +3660,21 @@ HTML_TEMPLATE = r"""<!doctype html>
             Math.pow(pr.X(b.lon) - pr.X(a.lon), 2) +
             Math.pow(pr.Y(b.lat) - pr.Y(a.lat), 2));
           var STEPS = Math.max(6, Math.min(80, Math.ceil(dpx / 4)));
+          // Interpolate in the SHARED continuous lon frame. On the raw feed a
+          // dateline crossing is a sign flip (-178.9 -> +179.8); lerping those
+          // raw values walks the sub-steps the LONG way round the globe and
+          // smears the swath across every meridian. normLon puts both fixes in
+          // one continuous window, so the lerp takes the 1.3deg short hop.
+          var aLon = normLon(a.lon), bLon = normLon(b.lon);
           for (var s = 1; s < STEPS; s++) {
             var f = s / STEPS;
             var lat = a.lat + (b.lat - a.lat) * f;
-            var lon = a.lon + (b.lon - a.lon) * f;
+            var lon = aLon + (bLon - aLon) * f;
             var rr = [0, 0, 0, 0];
             for (var q = 0; q < 4; q++) {
-              rr[q] = (a.radii[thr][q] || 0) +
-                ((b.radii[thr][q] || 0) - (a.radii[thr][q] || 0)) * f;
+              var ra = radiusNm(a.radii[thr][q]);
+              var rb = radiusNm(b.radii[thr][q]);
+              rr[q] = ra + (rb - ra) * f;
             }
             emit(lat, lon, rr);
           }
@@ -3868,12 +3951,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     var pts = conePts;
 
     // ---- shared lon frame: everything joins the BASEMAP window ------
-    var frameLon = (BASEMAP.window[2] + BASEMAP.window[3]) / 2.0;
-    function normLon(lon) {
-      while (lon - frameLon > 180) lon -= 360;
-      while (lon - frameLon < -180) lon += 360;
-      return lon;
-    }
+    // (module-level normLon/FRAME_LON - this used to be a third verbatim
+    // copy of the same six lines; one definition means the cone can't drift
+    // out of frame with the track/swath maps.)
 
     // ---- uniform-scale auto-fit projection (S4-AD1 #3) --------------
     // nm-ish planar units (lon scaled by cos mid-lat) -> fitted into a

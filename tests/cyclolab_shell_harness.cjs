@@ -422,6 +422,32 @@ const scheduledDelays = [];
       return { circle: circ, square: sq, triangle: tri,
                total: circ + sq + tri };
     }
+    // Labelled graticule extent. The parallels/meridians the plot actually
+    // labels ARE its axes, so they are the honest probe for "is the
+    // projection window sane". A dateline storm whose extent maths ran on
+    // raw longitudes projected onto a near-global window labelled past the
+    // poles (130N/105S) and centred over Africa.
+    function gratLabels(svgEl) {
+      if (!svgEl) return [];
+      return [...svgEl.querySelectorAll(".ac-graticule text.grat-lab")]
+        .map((t) => t.textContent.trim());
+    }
+    function gratLat(svgEl) {
+      const v = gratLabels(svgEl).filter((s) => /^\d+°[NS]$/.test(s))
+        .map((s) => (s.endsWith("S") ? -1 : 1) * parseFloat(s));
+      return v.length ? { lo: Math.min(...v), hi: Math.max(...v),
+                          impossible: v.filter((x) => Math.abs(x) > 90) }
+                      : null;
+    }
+    // Meridian labels as TEXT (not signed numbers): longitude wraps, so a
+    // window straddling the dateline legitimately labels both 175°E and
+    // 175°W and a numeric min/max would read as a bogus 350° span. The test
+    // asserts on membership - "180° is labelled, 0° is not" is exactly the
+    // dateline-vs-Africa distinction.
+    function gratLon(svgEl) {
+      return [...new Set(gratLabels(svgEl)
+        .filter((s) => /^\d+°([EW]|)$/.test(s)))];
+    }
     const tpShapes = shapeCounts(tp, "tp-dot");
     return {
       // ---- track-history plot (#7) ----
@@ -476,6 +502,11 @@ const scheduledDelays = [];
       })(),
       swathMethodBody: text("swath-method-body"),
       swathNote: text("swathplot-note"),
+      // ---- graticule extent (dateline / impossible-latitude guard) ----
+      trackGratLat: gratLat(tp),
+      trackGratLon: gratLon(tp),
+      swathGratLat: gratLat(sw),
+      swathGratLon: gratLon(sw),
       // ---- two-column layout (#11) ----
       ovGridCols: gridCols,
       ovCols: document.querySelectorAll("#sec-overview .ov-col").length,

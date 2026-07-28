@@ -41,11 +41,19 @@ from storm_ids import InvestSidError  # noqa: E402
 HARNESS = HERE / "cyclolab_shell_harness.cjs"
 FIXTURE = HERE / "fixtures" / "cyclolab" / "synth_storm.json"
 RADII_FIXTURE = HERE / "fixtures" / "cyclolab" / "synth_storm_radii.json"
+DATELINE_FIXTURE = (HERE / "fixtures" / "cyclolab" /
+                    "synth_storm_dateline.json")
 NODE = shutil.which("node")
 
 
 def load_radii_storm() -> dict:
     return json.loads(RADII_FIXTURE.read_text(encoding="utf-8"))
+
+
+def load_dateline_storm() -> dict:
+    """Real JTWC WP12 2026 (DOLPHIN) geometry - crosses the antimeridian, so
+    the raw feed lons run -178.9 -> +179.8 and span 358.7deg."""
+    return json.loads(DATELINE_FIXTURE.read_text(encoding="utf-8"))
 
 # The harness needs jsdom on NODE_PATH. Honour an inherited NODE_PATH (the
 # documented invocation) but fall back to the main repo's node_modules so a
@@ -2118,6 +2126,119 @@ class TestMobileCopyGesture(unittest.TestCase):
         self.assertEqual(
             writes, [1, 1, 1, 2],
             f"long-press must copy; tap/scroll must not (clipWrites={writes})")
+
+
+@unittest.skipIf(NODE is None, "node not on PATH")
+class TestPlotExtentGeometry(unittest.TestCase):
+    """Projection-window guards for the two map plots (#7 track history,
+    #8 wind history) - the only two callers of ensureMinExtent.
+
+    Live bug (DOLPHIN / JTWC_WP122026, 2026-07-28): both plots rendered on a
+    near-global window whose graticule was labelled to 130degN and 105degS,
+    with the storm a speck. ensureMinExtent measured the longitude span and
+    centre on RAW feed longitudes, and a dateline crossing arrives as a sign
+    flip (-178.9 -> +179.8) whose raw midpoint is the ANTIPODE of the true
+    centre. Its four pad points landed near 0degE (over Africa), the fitted
+    x-span blew up ~10x, fit-to-contain collapsed the scale, and because the
+    panel height is fixed the LATITUDE axis stretched past both poles.
+
+    The SST hero and the wind/pressure chart were unaffected because neither
+    goes through this projection - which is exactly why the two broken
+    surfaces looked like "the wind-radii plots"."""
+
+    def setUp(self):
+        self.storm = load_dateline_storm()
+        self.html = cyclolab_shell.render_page(self.storm, feed_url=FEED_URL,
+                                               loader="")
+
+    def _ov(self, storm=None):
+        st = storm or self.storm
+        recs = run_harness(self.html,
+                           {"feed": {"storms": [st]},
+                            "ops": [{"op": "apply", "storm": st}]})
+        return recs[-1]["state"]["overview"]
+
+    def test_fixture_really_straddles_the_antimeridian(self):
+        # Guard the guard: if the fixture ever stops crossing the dateline
+        # the tests below would pass vacuously.
+        lons = [p["lon"] for p in self.storm["points"]]
+        self.assertGreater(max(lons) - min(lons), 180,
+                           "fixture must straddle the antimeridian")
+
+    def test_dateline_track_window_is_not_global(self):
+        ov = self._ov()
+        self.assertTrue(ov["trackRendered"])
+        for key in ("trackGratLat", "swathGratLat"):
+            lat = ov[key]
+            self.assertIsNotNone(lat, f"{key}: no parallels labelled")
+            self.assertEqual(lat["impossible"], [],
+                             f"{key}: impossible latitude labels "
+                             f"{lat['impossible']} - parallels only exist "
+                             f"on [-90,90]")
+            # the storm lives at 10.4-13.4degN; a sane auto-fit stays within
+            # a few tens of degrees of it, nowhere near the ~200deg the bug
+            # produced.
+            self.assertGreaterEqual(lat["lo"], -30, f"{key} too far south")
+            self.assertLessEqual(lat["hi"], 55, f"{key} too far north")
+            self.assertLess(lat["hi"] - lat["lo"], 60,
+                            f"{key}: window spans {lat['hi'] - lat['lo']}deg "
+                            f"of latitude for a 3deg-tall track")
+
+    def test_dateline_window_is_centred_on_the_dateline_not_africa(self):
+        # The tell of the raw-longitude midpoint bug: the window centred on
+        # 0degE. Assert the plot labels the antimeridian and does NOT label
+        # the prime meridian.
+        ov = self._ov()
+        for key in ("trackGratLon", "swathGratLon"):
+            labs = ov[key] or []
+            self.assertIn("180°", labs,
+                          f"{key}: a dateline-crossing storm must show the "
+                          f"antimeridian; got {labs}")
+            self.assertNotIn("0°", labs,
+                             f"{key}: window centred on the prime meridian "
+                             f"(the Africa signature); got {labs}")
+
+    def test_contiguous_storm_window_unchanged(self):
+        # The non-dateline path must be untouched: an EPac storm still fits
+        # its own basin, with no impossible labels and no 180deg meridian.
+        storm = load_radii_storm()
+        html = cyclolab_shell.render_page(storm, feed_url=FEED_URL, loader="")
+        recs = run_harness(html, {"feed": {"storms": [storm]},
+                                  "ops": [{"op": "apply", "storm": storm}]})
+        ov = recs[-1]["state"]["overview"]
+        self.assertTrue(ov["trackRendered"])
+        self.assertEqual(ov["trackGratLat"]["impossible"], [])
+        self.assertNotIn("180°", ov["trackGratLon"] or [])
+        # the fixture runs 11.5-31.9degN / 122-129degW.
+        self.assertGreaterEqual(ov["trackGratLat"]["lo"], -20)
+        self.assertLessEqual(ov["trackGratLat"]["hi"], 65)
+
+    def test_sentinel_radii_do_not_inflate_the_window(self):
+        # ATCF decks encode "missing" as 999/9999 nm on some feeds. Fed into
+        # the extent maths a 9999 nm radius pads the window by 167deg - the
+        # same failure mode by a different route. radiusNm() rejects it.
+        storm = copy.deepcopy(self.storm)
+        last = storm["points"][-1]
+        last["radii"]["34"] = [9999, 9999, 9999, 9999]
+        storm["points"][-2]["radii"]["50"] = [999, 999, 999, 999]
+        ov = self._ov(storm)
+        lat = ov["trackGratLat"]
+        self.assertEqual(lat["impossible"], [])
+        self.assertLess(lat["hi"] - lat["lo"], 60,
+                        "sentinel radii inflated the projection window")
+
+    def test_non_finite_geometry_is_rejected_not_propagated(self):
+        # A null / unparseable radius must not poison Math.min/Math.max for
+        # the whole extent (one NaN makes every span NaN and the plot
+        # vanishes). JSON cannot carry a literal NaN, so the way a non-finite
+        # value really reaches the client is null or a mis-parsed string.
+        storm = copy.deepcopy(self.storm)
+        storm["points"][3]["radii"] = {"34": [None, "n/a", 0, 40]}
+        ov = self._ov(storm)
+        self.assertTrue(ov["trackRendered"], "a NaN radius blanked the plot")
+        lat = ov["trackGratLat"]
+        self.assertIsNotNone(lat, "no parallels labelled - extent went NaN")
+        self.assertEqual(lat["impossible"], [])
 
 
 if __name__ == "__main__":
