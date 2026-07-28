@@ -211,7 +211,7 @@ services:
     command: >-
       bash -lc "apt-get update -qq && apt-get install -y -qq python3-boto3 || true;
       npm install -g playwright@1.49.0 --silent || true;
-      while true; do python3 objfix_headless.py || true; sleep 1800; done"
+      while true; do python3 objfix_headless.py --single || true; sleep 1800; done"
     restart: unless-stopped
     mem_limit: 3g
     profiles: ["centerfix"]

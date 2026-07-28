@@ -101,6 +101,22 @@ def load_floater_manifest(slug: str) -> Optional[dict]:
     return _get_json(f"{CDN}/floaters/{slug}/manifest.json")
 
 
+def load_official_fix(storm_id: str) -> dict:
+    """The official position AND the time it is valid at.
+
+    The explorer's storm list (which rides along in the published track as
+    storm_feed) carries lat/lon but NO timestamp, and a position without its
+    valid time cannot be compared to an objective fix — the difference would
+    be storm motion. The floaters INDEX carries last_fix, so that is where the
+    time comes from.
+    """
+    man = _get_json(f"{CDN}/floaters/manifest.json") or {}
+    for s in (man.get("storms") or []):
+        if s.get("id") == storm_id:
+            return s
+    return {}
+
+
 def target_box(man: Optional[dict]) -> Optional[dict]:
     """The floater's TARGET box from its newest frame.
 
@@ -268,10 +284,25 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
     # hanging the headline crosshair, the certainty rings and the km label off
     # a rejected candidate would present a number ARCHER itself refused.
     # When they differ the header says so rather than quietly back-dating.
-    emph = None
-    for p in reversed(acc):
-        emph = p
-        break
+    emph = acc[-1] if acc else None
+    # Is the official position contemporaneous enough with the emphasised fix
+    # for their separation to mean anything? Tolerance is one synoptic step;
+    # beyond that the gap is dominated by storm motion, not by method.
+    SEP_TOL_MIN = 90.0
+    sep_ok, sep_dt_min = False, None
+    if emph and storm.get("last_fix"):
+        try:
+            ot = dt.datetime.fromisoformat(
+                str(storm["last_fix"]).replace("Z", "+00:00"))
+            if ot.tzinfo is None:
+                ot = ot.replace(tzinfo=dt.timezone.utc)
+            ft = dt.datetime.fromisoformat(emph["t"].replace("Z", "+00:00"))
+            sep_dt_min = abs((ft - ot).total_seconds()) / 60.0
+            sep_ok = sep_dt_min <= SEP_TOL_MIN
+        except Exception:      # noqa: BLE001 - unparseable stamp -> no claim
+            sep_ok, sep_dt_min = False, None
+    elif emph:
+        sep_dt_min = None
     if emph:
         nx, ny = _norm_lon(emph["lon"], frame_lon), emph["lat"]
         ax1.plot(nx, ny, marker="+", ms=17, mew=2.0, color=C_ARCHER, zorder=9)
@@ -297,21 +328,30 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
                  mec="#0a1019", mew=1.0, zorder=10)
         handles.append(("official best-track position",
                         dict(color=C_OFFICIAL, marker="P")))
-        # the DISAGREEMENT is the point: draw it and label the separation
+        # The DISAGREEMENT is the point — but only when the two positions are
+        # CONTEMPORANEOUS. The official position is a snapshot at its own fix
+        # time; the objective fix is valid at its frame time. Measuring across
+        # an 8 h offset reports the storm's own MOTION as method disagreement
+        # (a 10 kt storm covers ~150 km in 8 h) and overstates it badly.
+        # Within tolerance: draw the connector and the number. Outside it:
+        # draw both markers, omit the number, and say why in the header.
         if emph:
             import matplotlib.patheffects as pe
             ex = _norm_lon(emph["lon"], frame_lon)
             d_km = _km_between(float(off_lat), float(off_lon),
                                emph["lat"], emph["lon"])
-            ax1.plot([ox, ex], [float(off_lat), emph["lat"]], color="#ffffff",
-                     lw=0.9, ls=(0, (2, 2)), alpha=0.85, zorder=9)
-            ax1.annotate(f"{d_km:.0f} km",
-                         xy=((ox + ex) / 2,
-                             (float(off_lat) + emph["lat"]) / 2),
-                         color="#ffffff", fontsize=9, fontweight="bold",
-                         ha="center", va="bottom", zorder=11,
-                         path_effects=[pe.withStroke(linewidth=3,
-                                                     foreground="#0a1019")])
+            ax1.plot([ox, ex], [float(off_lat), emph["lat"]],
+                     color="#ffffff" if sep_ok else C_ARCHER_WEAK,
+                     lw=0.9, ls=(0, (2, 2)),
+                     alpha=0.85 if sep_ok else 0.5, zorder=9)
+            if sep_ok:
+                ax1.annotate(f"{d_km:.0f} km",
+                             xy=((ox + ex) / 2,
+                                 (float(off_lat) + emph["lat"]) / 2),
+                             color="#ffffff", fontsize=9, fontweight="bold",
+                             ha="center", va="bottom", zorder=11,
+                             path_effects=[pe.withStroke(linewidth=3,
+                                           foreground="#0a1019")])
 
     # official forecast track
     if adv and (adv.get("points") or []):
@@ -398,30 +438,48 @@ def render(storm: dict, fixes: dict, adv: Optional[dict],
     valid = newest["t"] if newest else None
     valid_txt = (valid.replace("T", " ").replace(".000Z", "Z")[:17] + "Z"
                  if valid else "—")
-    hax.text(0.012, 0.70, f"{name}  ·  OBJECTIVE CENTRE FIX", ha="left",
+    hax.text(0.012, 0.78, f"{name}  ·  OBJECTIVE CENTRE FIX", ha="left",
              va="center", color=TEXT_COLOR, fontsize=17, fontweight="bold",
              transform=hax.transAxes)
-    sub = [f"VALID {valid_txt}"]
+    # TWO EXPLICIT ROWS, not a greedy wrap. Row 1 is identity; row 2 is the
+    # diagnostic state and the HONESTY NOTES. A greedy wrap pushed the
+    # "separation not comparable" caveat onto a third row that then got
+    # dropped -- losing precisely the line that must never be lost.
+    row1 = [f"VALID {valid_txt}"]
     if adv and adv.get("points"):
-        taus = [p.get("tau_h") for p in adv["points"] if p.get("tau_h") is not None]
+        taus = [p.get("tau_h") for p in adv["points"]
+                if p.get("tau_h") is not None]
         if taus:
-            sub.append(f"FCST T+0 … T+{int(max(taus))}H")
+            row1.append(f"FCST T+0 … T+{int(max(taus))}H")
         if adv.get("advisory") is not None:
-            sub.append(f"ADVISORY {adv['advisory']}")
+            row1.append(f"ADVISORY {adv['advisory']}")
     if newest:
-        sub.append(f"SCENE {newest.get('scene') or '—'}")
+        row1.append(f"SCENE {newest.get('scene') or '—'}")
         if newest.get("confidence_score") is not None:
-            sub.append(f"CONF {newest['confidence_score']:.2f}")
-        if not newest.get("fix"):
-            # The crosshair is on an OLDER accepted fix; never let that pass
-            # silently, or the plot reads as a current objective centre.
-            sub.append("NEWEST FRAME: CANDIDATE REJECTED")
-            if emph:
-                sub.append(f"CROSSHAIR {emph['t'][:16].replace('T', ' ')}Z")
+            row1.append(f"CONF {newest['confidence_score']:.2f}")
+    row2 = []
+    if newest and not newest.get("fix"):
+        # The crosshair is on an OLDER accepted fix; never let that pass
+        # silently, or the plot reads as a current objective centre.
+        row2.append("NEWEST FRAME: CANDIDATE REJECTED")
+        if emph:
+            row2.append(f"CROSSHAIR {emph['t'][:16].replace('T', ' ')}Z")
     if fixes.get("truncated"):
-        sub.append("TRACK TRUNCATED (run budget)")
-    hax.text(0.012, 0.24, "   ·   ".join(sub), ha="left", va="center",
-             color=MUTED, fontsize=9.5, transform=hax.transAxes)
+        row2.append("TRACK TRUNCATED (run budget)")
+    if emph and sep_dt_min is not None and not sep_ok:
+        row2.append(f"OFFICIAL FIX {sep_dt_min / 60.0:.1f} H APART — "
+                    f"SEPARATION NOT COMPARABLE")
+    # Wrap the subhead rather than letting it run under the right-hand
+    # intensity block. The honesty notes ("separation not comparable", "track
+    # truncated") are the longest strings on the line and are exactly the ones
+    # that must stay readable.
+    SEP = "   ·   "
+    for i, row in enumerate((row1, row2)):
+        if not row:
+            continue
+        hax.text(0.012, 0.44 - i * 0.30, SEP.join(row), ha="left",
+                 va="center", color=MUTED, fontsize=9.2,
+                 transform=hax.transAxes)
 
     # intensity readouts: ADT and, when its membership rule is met, SATCON
     rows = []
@@ -485,6 +543,25 @@ def build_for_storm(entry: dict, sink=None, dpi: int = 110) -> Optional[str]:
     if not pts:
         log.warning("%s: track has no positions — skipped", sid)
         return None
+    # The INDEX entry carries only identity + counts; the OFFICIAL position
+    # lives in the track's storm_feed snapshot. Without this merge the plot
+    # silently loses the official marker AND the objective-vs-official
+    # separation - i.e. the entire point of the panel - while still rendering
+    # a confident-looking image. (Missed locally because the dev path passed
+    # the storm_feed dict straight in.)
+    feed = fixes.get("storm_feed") or {}
+    for k, v in feed.items():
+        entry.setdefault(k, v)
+    # last_fix (the official position's VALID TIME) lives only in the floater
+    # index; without it the separation cannot be shown as a like-for-like
+    # measurement. Its own lat/lon win, since they are stamped with that time.
+    off = load_official_fix(sid)
+    for k in ("lat", "lon", "last_fix", "intensity_kt", "nature", "category"):
+        if off.get(k) is not None:
+            entry[k] = off[k]
+    if entry.get("lat") is None or entry.get("lon") is None:
+        log.warning("%s: no official position available — the separation "
+                    "measurement will be omitted", sid)
     # Newest by TIME, not by position in the array: a truncated loop run can
     # leave the list ordered but short, and the plot dates itself off this.
     newest = max(pts, key=lambda p: p["t"])
@@ -497,11 +574,17 @@ def build_for_storm(entry: dict, sink=None, dpi: int = 110) -> Optional[str]:
     half = BOX_DEG / 2.0
     # bbox is [W, S, E, N] (lon first) — the render service's convention.
     bbox = [clon - half, clat - half, clon + half, clat + half]
+    # FETCH wider than we DISPLAY. A geostationary grid is not axis-aligned in
+    # lat/lon, so a fetch of exactly the display box comes back as a rotated
+    # patch whose corners fall short of it — the panel then shows slanted data
+    # edges. The margin is thrown away by the display crop.
+    fm = half * 0.35
+    fetch_bbox = [bbox[0] - fm, bbox[1] - fm, bbox[2] + fm, bbox[3] + fm]
 
     async def _fetch_all():
-        ir = await _fetch_band(bbox, when, "clean_ir")
+        ir = await _fetch_band(fetch_bbox, when, "clean_ir")
         try:
-            wv = await _fetch_band(bbox, when, "wv_upper")
+            wv = await _fetch_band(fetch_bbox, when, "wv_upper")
         except Exception as e:      # noqa: BLE001 - WV is a readout, not the plot
             log.warning("%s: WV band unavailable (%s)", sid, e)
             wv = None
