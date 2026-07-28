@@ -207,6 +207,47 @@ def fetch_manifest(session: requests.Session, url: str = MANIFEST_URL, timeout: 
     return r.json()
 
 
+def workflow_already_running(session: requests.Session, token: Optional[str], repo: str,
+                            workflow: str, *, timeout: float = 20.0) -> bool:
+    """Is a run of ``workflow`` already queued or in progress?
+
+    The watchdog decides from the PUBLISHED MANIFEST plus a cooldown timer, and
+    never used to look at GitHub at all. That is fine for the failure it was
+    written for -- a cron that silently did not fire -- but it livelocks on the
+    one it was given a token to fix.
+
+    Observed 2026-07-27/28: the manifest's own ``in_progress`` flag had been
+    stuck true since the 07-19 wedge, so "stuck build" age was EIGHT DAYS and
+    cleared any threshold. The watchdog therefore re-dispatched every cooldown
+    (40 min) while a legitimate multi-hour recovery render was running, and
+    under update-hafs.yml's `concurrency: group: update-hafs` each new dispatch
+    superseded the previously QUEUED run -- a train of runs cancelled at
+    exactly 40m05s while the manifest never advanced.
+
+    A recovery already under way is not a reason to start another one. Failing
+    OPEN (returning False on any API error) keeps the old behaviour when GitHub
+    is unreachable: better a redundant dispatch than a watchdog that goes quiet
+    exactly when it cannot see.
+    """
+    if not token:
+        return False
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/runs"
+    hdrs = {"Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+    for status in ("in_progress", "queued"):
+        try:
+            r = session.get(url, params={"status": status, "per_page": 1},
+                            headers=hdrs, timeout=timeout)
+            if r.status_code != 200:
+                return False
+            if (r.json() or {}).get("total_count", 0) > 0:
+                return True
+        except Exception:                                    # noqa: BLE001
+            return False
+    return False
+
+
 def dispatch_workflow(session: requests.Session, token: str, repo: str, workflow: str,
                       *, ref: str = "main", timeout: float = 20.0) -> int:
     """Fire workflow_dispatch with a BLANK cycle (never-miss backfill). Returns the
@@ -244,6 +285,13 @@ def run_once(session: requests.Session, token: Optional[str], repo: str,
             log.info("ens_watchdog: WOULD dispatch %s (%s) [%s]", wf, reason,
                      "dry-run" if dry_run else "no token")
             continue
+        # Same guard as the HAFS path: a recovery already under way is not a
+        # reason to start another one, and re-dispatching into a concurrency
+        # group just cancels the run that was going to fix things.
+        if workflow_already_running(session, token, repo, wf):
+            log.info("ens_watchdog: %s already queued/in progress (%s) -- "
+                     "recovery under way, not dispatching another", wf, reason)
+            continue
         try:
             code = dispatch(wf)
             if 200 <= code < 300:
@@ -280,6 +328,10 @@ def hafs_run_once(session: requests.Session, token: Optional[str], repo: str,
     if dry_run or not token:
         log.info("hafs_watchdog: WOULD dispatch %s (%s) [%s]", HAFS_WORKFLOW, reason,
                  "dry-run" if dry_run else "no token")
+        return None
+    if workflow_already_running(session, token, repo, HAFS_WORKFLOW):
+        log.info("hafs_watchdog: %s already queued/in progress (%s) -- "
+                 "recovery under way, not dispatching another", HAFS_WORKFLOW, reason)
         return None
     try:
         code = dispatch(HAFS_WORKFLOW)
