@@ -141,6 +141,22 @@ def _parse_utc(v) -> Optional[dt.datetime]:
     return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
 
 
+#: The five isotherms the panel draws. NOT the full BD ladder: nine levels on
+#: a 2 km field is a mesh over the frame, and storm-scale structure is what
+#: this panel is for. Warm -> cold.
+#: ASCENDING — matplotlib requires it. Cold -> warm.
+CONTOUR_LEVELS = [-80.0, -75.0, -63.0, -53.0, -30.0]
+#: One saturated, hue-separated colour per level, for contrast against
+#: grayscale. Deliberately NOT sampled from the IR fill ramp: across -40..-80
+#: that ramp is dark blue and violet, which over a mid-grey IR image has almost
+#: no luminance contrast, so the isotherms vanished exactly where the deep
+#: convection is.
+CONTOUR_COLORS = ["#b98cff", "#4dd2ff", "#7CFC4D", "#FFE14D", "#FF5E5E"]
+#: Gaussian sigma, in PIXELS, applied before contouring.
+CONTOUR_SIGMA_PX = 2.0
+#: Closed loops smaller than this are specks, not structure (~15 x 15 km).
+CONTOUR_MIN_AREA_KM2 = 225.0
+
 #: BD-step contour colours — a CATEGORICAL, high-contrast set chosen to be seen
 #: against GRAYSCALE, not to match the fill ramp.
 #:
@@ -473,13 +489,24 @@ def eye_score(ir_c, lats, lons, clat: float, clon: float,
         return None
     mids = np.asarray(mids)
     means = np.asarray(means)
+    # px_km and the search floor are properties of the GRID and the search,
+    # not of a successful score, so they are set for EVERY profile. They used
+    # to be assigned only on the scored path, which is why a withheld panel
+    # printed "0.0 km pixels" and "beyond a 0 km floor" — quantities that were
+    # never computed, rendered as though they had been measured.
     prof = {"r_km": mids, "mean_c": means,
             "min_c": np.asarray(mins), "max_c": np.asarray(maxs),
             "ring_km": ring_km, "max_r_km": max_r_km,
+            "px_km": _pixel_km(lats, lons),
+            "eyewall_floor_km": max(EYE_MIN_EYEWALL_KM_MIN, 2.0 * ring_km),
             "score": None, "eyewall_r_km": None,
             "eye_warm_c": None, "eyewall_cold_c": None,
             "reason": None}
 
+    if scene == "__NO_OBJECTIVE_CENTRE__":
+        prof["reason"] = ("no objective centre this cycle — profile is about "
+                          "the OFFICIAL position, so no score")
+        return prof
     if scene is not None and not _is_eye_scene(scene):
         # The profile is real and worth drawing — it shows the CDO's structure.
         # The SCORE is not: there is no eye here to contrast against a eyewall.
@@ -747,40 +774,83 @@ def _panel_cbar(fig, rect, cmap, norm, ticks=None, unit="°C"):
     return cb
 
 
+def _poly_area_km2(poly, lat0: float) -> float:
+    """Shoelace area of a lon/lat polygon, in km^2."""
+    a = np.asarray(poly, dtype="float64")
+    if a.ndim != 2 or len(a) < 3:
+        return 0.0
+    x = a[:, 0] * 111.0 * float(np.cos(np.radians(lat0)))
+    y = a[:, 1] * 111.0
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2)
+
+
+def _despeckle(cs, lat0: float, min_area_km2: float) -> None:
+    """Drop CLOSED contours smaller than ``min_area_km2``.
+
+    Every level closes a loop around every cloud speck in the domain, and at
+    2 km pixels that is hundreds of them: the panel becomes a mesh and the
+    storm-scale curves are lost inside it. Only whole closed loops are
+    dropped — an open curve that leaves the frame is structure, not a speck.
+    """
+    from matplotlib.path import Path as MPath
+    try:
+        paths = list(cs.get_paths())
+    except Exception:                     # noqa: BLE001 - mpl version drift
+        return
+    out = []
+    for path in paths:
+        try:
+            polys = path.to_polygons(closed_only=False)
+        except Exception:                 # noqa: BLE001
+            out.append(path)
+            continue
+        keep = []
+        for poly in polys:
+            closed = (len(poly) > 2
+                      and bool(np.allclose(poly[0], poly[-1], atol=1e-9)))
+            if closed and _poly_area_km2(poly, lat0) < min_area_km2:
+                continue
+            keep.append(MPath(np.asarray(poly), closed=closed))
+        out.append(MPath.make_compound_path(*keep) if keep
+                   else MPath(np.empty((0, 2))))
+    try:
+        cs.set_paths(out)
+    except Exception:                     # noqa: BLE001
+        pass
+
+
 def _draw_field(ax, sc: Scene, field, cmap, norm, contours: bool):
     ax.pcolormesh(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
                   cmap=cmap, norm=norm, shading="auto", zorder=1)
     if contours:
-        # BD-step contours: the Dvorak enhancement's own grey-shade boundaries
-        # (CIMSS). These are the PRIMARY ANALYTICAL LAYER of this panel, not a
-        # decoration over the imagery — thin near-monochrome hairlines vanish
-        # against a bright CDO, which is exactly the scene they most need to
-        # resolve. Bold, per-step coloured, and casing-backed so every isotherm
-        # reads over both the white cloud tops and the dark ocean.
+        # BD-step isotherms — this panel's analytical layer.
+        #
+        # FIVE levels on a SMOOTHED field, despeckled. Contouring the raw 2 km
+        # field at every BD step traces pixel noise: each level closes a curve
+        # around every cloud speck and the result is a mesh over the whole
+        # frame rather than a few curves you can read the storm through.
+        # Smoothing first, cutting to five levels and dropping the specks is
+        # what turns noise back into structure.
         import matplotlib.patheffects as pe
-        cs = ax.contour(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
-                        levels=BD_STEPS, colors=bd_step_colors(),
-                        linewidths=1.7, alpha=0.98, zorder=3)
+        f = np.ma.masked_invalid(field)
         try:
-            for coll in cs.collections:
-                coll.set_path_effects([pe.withStroke(
-                    linewidth=3.0, foreground="#0a1019", alpha=0.55)])
-        except Exception:                 # noqa: BLE001 - mpl version drift
+            from scipy.ndimage import gaussian_filter
+            arr = np.asarray(field, dtype="float64")
+            ok = np.isfinite(arr)
+            filled = np.where(ok, arr, np.nanmean(arr[ok]) if ok.any() else 0.0)
+            f = np.ma.masked_where(~ok, gaussian_filter(filled,
+                                                        sigma=CONTOUR_SIGMA_PX))
+        except Exception:                 # noqa: BLE001 - scipy optional
             pass
-        # Inline step labels: an isotherm is only diagnostic if you can tell
-        # WHICH one it is without counting inwards from the panel edge.
-        # SPARSE labels. Every BD step closes a contour around every scrap of
-        # shallow cloud in the box, so labelling many of them produced dozens
-        # of haloed numbers that read as dark smudges at this size and buried
-        # the isotherms they were annotating. Two cold steps carry the reading;
-        # the colour ladder carries the rest.
+        cs = ax.contour(sc.ir_lon, sc.ir_lat, f, levels=CONTOUR_LEVELS,
+                        colors=CONTOUR_COLORS, linewidths=1.2, alpha=0.9,
+                        zorder=3)
+        _despeckle(cs, float(np.nanmean(sc.ir_lat)), CONTOUR_MIN_AREA_KM2)
         try:
-            keep = [v for v in (-63.0, -75.0) if v in BD_STEPS]
-            for t in (ax.clabel(cs, levels=keep, inline=True, fontsize=7.0,
-                                fmt="%d", inline_spacing=10) or []):
-                t.set_path_effects([pe.withStroke(linewidth=1.8,
-                                                  foreground="#0a1019")])
-        except Exception:                 # noqa: BLE001 - labels are a bonus
+            cs.set_path_effects([pe.withStroke(linewidth=2.4,
+                                               foreground="#0a1019",
+                                               alpha=0.7)])
+        except Exception:                 # noqa: BLE001
             pass
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
@@ -989,7 +1059,7 @@ def panel_enhanced(ax2, sc: Scene, xlim, ylim, label_fontsize: float = 8.5,
 #: table was never wrong, the compositing was eating it.
 SSHWS_BANDS = [(0, 34, "TD"), (34, 64, "TS"), (64, 83, "C1"), (83, 96, "C2"),
                (96, 113, "C3"), (113, 137, "C4"), (137, 999, "C5")]
-BAND_ALPHA = 0.92
+BAND_ALPHA = 0.25
 
 
 def load_track_history(storm_id: str, basin: Optional[str]) -> Optional[dict]:
@@ -1217,7 +1287,8 @@ def panel_wpace(ax, sc: Scene, hist: Optional[dict]):
              va="bottom", color=MUTED, fontsize=FS_NOTE)
 
 
-def panel_eye(ax, sc: Scene, prof: Optional[dict]):
+def panel_eye(ax, sc: Scene, prof: Optional[dict],
+              about: Optional[str] = None):
     """Panel 4 — radial BT profile about the working centre + the eye score."""
     ax.set_facecolor("#060a12")
     for s in ax.spines.values():
@@ -1296,18 +1367,30 @@ def panel_eye(ax, sc: Scene, prof: Optional[dict]):
     ax.set_ylabel("brightness temperature (°C)", color=MUTED, fontsize=8.2,
                   labelpad=2)
     ax.grid(True, color=GRID, lw=0.4, alpha=0.55, zorder=1)
-    _panel_label(ax, "EYE STRUCTURE   ·   RADIAL IR PROFILE")
+    _panel_label(ax, "EYE STRUCTURE   ·   RADIAL IR PROFILE"
+                 + (f"   ·   ABOUT THE {about.upper()}"
+                    if about and about != "objective centre"
+                    else ""))
     # The construction, on the panel. A contrast number without its regions is
     # not reproducible, and the regions here are OURS, not the ADT's. Wrapped
     # to short lines so nothing runs off the panel's right edge.
+    # NEVER print a 0.0 as if it were a measurement: an unset value is omitted,
+    # not rendered as zero. (This panel printed "0.0 km pixels" and "beyond a
+    # 0 km floor" whenever the score was withheld early, because those keys
+    # were only set on the scored path.)
+    grid_bits = [f"{prof['ring_km']:.0f} km rings"]
+    if prof.get("px_km"):
+        grid_bits.append(f"{prof['px_km']:.1f} km pixels")
+    floor = prof.get("eyewall_floor_km")
+    wall_line = ("eyewall = inner edge of the coldest annulus within "
+                 f"{EYE_SEARCH_R_KM:.0f} km"
+                 + (f", beyond a {floor:.0f} km floor" if floor else "")
+                 + " (our construction)")
     ax.text(0.988, 0.022,
             detail + "\n"
             f"mean (line) · min–max envelope (band) · "
-            f"{prof['ring_km']:.0f} km rings · "
-            f"{prof.get('px_km') or 0:.1f} km pixels\n"
-            f"eyewall = inner edge of the coldest annulus within "
-            f"{EYE_SEARCH_R_KM:.0f} km, beyond a "
-            f"{prof.get('eyewall_floor_km', 0):.0f} km floor (our construction)\n"
+            + " · ".join(grid_bits) + "\n"
+            + wall_line + "\n"
             "BD ladder CIMSS",
             transform=ax.transAxes, ha="right", va="bottom", color=MUTED,
             fontsize=7.3, linespacing=1.55,
@@ -1318,6 +1401,25 @@ def panel_eye(ax, sc: Scene, prof: Optional[dict]):
 # ---------------------------------------------------------------------------
 # shared chrome
 # ---------------------------------------------------------------------------
+def _adt_unconstrained(fixes: Optional[dict],
+                       newest: Optional[dict]) -> bool:
+    """True when the ADT estimate had no history to constrain it.
+
+    The ADT applies time-averaging and constraint rules across prior
+    estimates; with a single independent frame none of them engage and the
+    raw, final and CI T-numbers collapse onto each other.
+    """
+    if not newest:
+        return False
+    pts = (fixes or {}).get("points") or []
+    if len(pts) <= 1:
+        return True
+    raw, fin, ci = (newest.get("rawT"), newest.get("finalT"),
+                    newest.get("CI"))
+    vals = [v for v in (raw, fin, ci) if v is not None]
+    return len(vals) == 3 and max(vals) - min(vals) < 1e-6
+
+
 def _draw_header(fig, sc: Scene, hdr_h: float, title: str,
                  title_fontsize: float = 17.0, body_fontsize: float = 9.2):
     """The ONE header both products carry: identity, valid time, forecast hour,
@@ -1375,6 +1477,15 @@ def _draw_header(fig, sc: Scene, hdr_h: float, title: str,
         p_ = newest.get("mslp_mb")
         rows.append("ADT      " + (f"{v:.0f} kt" if v is not None else "— kt") +
                     (f"   {p_:.0f} mb" if p_ is not None else ""))
+        # THE ADT IS A TIME SERIES, NOT A SNAPSHOT. Its constraint rules and
+        # time-averaging are what keep the T# from jumping between frames; run
+        # one frame at a time they never engage, and rawT == finalT == CI is
+        # the tell. That is a materially weaker estimate than a constrained
+        # one and must not be printed as though it were the same number —
+        # 12W swung 125 -> 100 -> 61 kt in a few hours on an unweakening storm
+        # purely from this.
+        if _adt_unconstrained(sc.fixes, newest):
+            rows.append("         single frame · no time constraint")
     satcon = sc.satcon
     if satcon and satcon.get("vmax") and satcon["vmax"].get("value") is not None:
         sv = satcon["vmax"]["value"]
@@ -1497,7 +1608,9 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
         ax = fig.add_axes([x, top_y, map_w, top_h])
         ax.set_facecolor("#060a12")
         axes_top.append(ax)
-        cbar_rects.append([x + cbar_dx, top_y, cbar_w, top_h])
+        # attached to the panel, 60% of its height, centred
+        cbar_rects.append([x + cbar_dx, top_y + top_h * 0.20,
+                           cbar_w, top_h * 0.60])
     axes_bot = []
     for x in col_x:
         ax = fig.add_axes([x, bot_y, col_w, bot_h])
@@ -1526,13 +1639,31 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
         _graticule(ax, sc.bbox)
     panel_wpace(axes_bot[0], sc, track_history)
 
-    prof = None
+    prof, prof_about = None, None
     if sc.emph is not None:
         prof = eye_score(sc.ir_c, sc.ir_lat, sc.ir_lon,
                          float(sc.emph["lat"]),
                          _norm_lon(float(sc.emph["lon"]), sc.frame_lon),
                          scene=sc.emph.get("scene"))
-    panel_eye(axes_bot[1], sc, prof)
+        prof_about = "objective centre"
+    elif (sc.storm.get("lat") is not None
+          and sc.storm.get("lon") is not None):
+        # No objective centre this cycle. A blank quarter-plate is honest but
+        # useless; the RADIAL STRUCTURE is still real and still worth reading,
+        # so the profile is taken about the OFFICIAL position instead — said
+        # plainly, because a profile about a different centre is a different
+        # measurement. The SCORE stays withheld: scoring an eye about a centre
+        # the objective method could not find is exactly the overreach the
+        # rest of this panel refuses.
+        prof = eye_score(sc.ir_c, sc.ir_lat, sc.ir_lon,
+                         float(sc.storm["lat"]),
+                         _norm_lon(float(sc.storm["lon"]), sc.frame_lon),
+                         scene="__NO_OBJECTIVE_CENTRE__")
+        prof_about = "official position"
+        if prof is not None:
+            prof["reason"] = ("no objective centre this cycle — profile is "
+                              "about the OFFICIAL position, so no score")
+    panel_eye(axes_bot[1], sc, prof, about=prof_about)
 
     _draw_header(fig, sc, hdr_h, "STORM DIAGNOSTIC PLATE",
                  title_fontsize=19.0, body_fontsize=9.6)

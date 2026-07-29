@@ -426,3 +426,49 @@ class CompositePlateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ProfileMetadataTests(unittest.TestCase):
+    """Grid facts belong to the PROFILE, not to a successful score.
+
+    They were assigned only on the scored path, so a withheld panel printed
+    "0.0 km pixels" and "beyond a 0 km floor" — quantities that were never
+    computed, rendered as though they had been measured. A zero that means
+    "unset" is worse than a blank, because it reads as data.
+    """
+
+    def _prof(self, scene):
+        bt, la, lo, clat, clon = _eye_field()
+        return cf.eye_score(bt, la, lo, clat, clon, scene=scene)
+
+    def test_pixel_size_and_floor_are_set_even_when_withheld(self):
+        for scene in ("EYE", "UNIFORM CDO", "SHEAR"):
+            with self.subTest(scene):
+                p = self._prof(scene)
+                self.assertIsNotNone(p["px_km"])
+                self.assertGreater(p["px_km"], 0.0)
+                self.assertIsNotNone(p["eyewall_floor_km"])
+                self.assertGreater(p["eyewall_floor_km"], 0.0)
+
+    def test_contours_are_five_levels_not_the_full_ladder(self):
+        # Nine levels on a 2 km field is a mesh over the whole frame; the
+        # storm-scale curves are what this panel is for.
+        self.assertEqual(len(cf.CONTOUR_LEVELS), 5)
+        # ascending, as matplotlib requires
+        self.assertEqual(cf.CONTOUR_LEVELS,
+                         [-80.0, -75.0, -63.0, -53.0, -30.0])
+        self.assertEqual(len(cf.CONTOUR_COLORS), len(cf.CONTOUR_LEVELS))
+
+    def test_category_bands_are_a_background_tint(self):
+        # Full strength made the panel read as the bands with a line on top.
+        self.assertLessEqual(cf.BAND_ALPHA, 0.35)
+        self.assertGreater(cf.BAND_ALPHA, 0.15)
+
+    def test_speck_filter_drops_small_closed_loops(self):
+        import numpy as _np
+        # a 5 km box is a speck; a 40 km box is structure
+        small = _np.array([[0, 0], [0.045, 0], [0.045, 0.045], [0, 0.045],
+                           [0, 0]])
+        big = _np.array([[0, 0], [0.36, 0], [0.36, 0.36], [0, 0.36], [0, 0]])
+        self.assertLess(cf._poly_area_km2(small, 15.0), cf.CONTOUR_MIN_AREA_KM2)
+        self.assertGreater(cf._poly_area_km2(big, 15.0), cf.CONTOUR_MIN_AREA_KM2)
