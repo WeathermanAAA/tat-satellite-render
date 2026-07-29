@@ -81,14 +81,24 @@ HAFS_PRODUCTS = _env("HAFS_PRODUCTS")           # None -> generator default (all
 # Railway Pro: 8 vCPU for this service -> 8 render workers (2x the 4-core runner).
 HAFS_JOBS = int(_env("HAFS_JOBS", "8"))
 
-# INGEST runs at a LOWER width than render. Each ingest decodes a large
-# multi-field GRIB (the parent.atm / hafsb domains are the heaviest) -> the stage
-# is memory-bound, and 8 concurrent heavy decodes OOM'd the pool on this
-# memory-tighter host (BrokenProcessPool), dropping exactly the heavy
-# parent.atm/hafsb frames. 4-wide ingest fits in memory; render stays 8-wide
-# (CPU-bound, reads small cached fields). The generator's halving backoff is the
-# safety net if a cycle is heavy enough to still OOM at 4.
-HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "4"))
+# INGEST runs at a LOWER width than render: each ingest decodes a large
+# multi-field GRIB (parent.atm is the heaviest) so the stage is memory-bound,
+# while render is CPU-bound off small cached fields.
+#
+# This was 4 because a parent env frame peaked at 3.64 GB and 8 concurrent
+# decodes OOM'd the pool (BrokenProcessPool), dropping exactly the heavy
+# parent.atm frames. hafs-render v0.13.0 fixes the USAGE rather than the width:
+# the frame peak is 1.96 GB measured, and per-worker peak is INDEPENDENT of pool
+# width (1956 and 1927 MB for two workers at width 2), so the budget is just
+# width x ~2.3 GB (allowing ~17% for the largest parent grid seen). Against this
+# container's 24 GB mem_limit that is 8 x 2.3 = 18.4 GB, 5.6 GB spare.
+#
+# 8 is a MEMORY ceiling, not a throughput promise: the box has 8 vCPU shared
+# with the render stack and the pollers, so the wall-clock gain from 4 -> 8 is
+# core-bound (1 -> 2 measured 1.47x on a 2-core sandbox). Watch the first cycle
+# after this lands; the generator's halving backoff is still the safety net, and
+# HAFS_INGEST_JOBS in the box .env overrides this without a redeploy.
+HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "8"))
 
 # Concurrent R2 PNG uploads (Pass 1 only). The render is CPU-bound; the upload is
 # I/O/latency-bound (each put_object is a network round-trip), so a thread pool of
