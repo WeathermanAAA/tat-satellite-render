@@ -244,95 +244,6 @@ def _eye_field(clat=18.0, clon=-117.0, half=1.6, n=200,
     return bt, LAT, LON, clat, clon
 
 
-class EyeScoreTests(unittest.TestCase):
-    """The eye score is a CONTRAST in °C, not a pixel count: a count is
-    resolution-dependent and would not compare across sensors. A system with
-    no eye must return nothing rather than a number computed off an empty
-    region."""
-
-    def test_finds_the_eyewall_and_scores_a_real_eye(self):
-        # THE BUG THIS PINS: the eyewall used to be the coldest ring ANYWHERE
-        # in a 140 km profile, which on a large storm is the outer canopy.
-        # Verified against GENEVIEVE, whose eye is ~16 km across but whose
-        # globally-coldest ring sat at 62 km -- so "inside the eyewall"
-        # swallowed most of the CDO and the score measured eye-centre against
-        # outer-canopy contrast: a real number answering the wrong question.
-        bt, la, lo, clat, clon = _eye_field()
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        self.assertIsNotNone(prof["score"], prof.get("reason"))
-        # the eyewall's INNER EDGE is the eye radius (12 km) -- the search must
-        # land there, not out in the canopy
-        self.assertLess(abs(prof["eyewall_r_km"] - 12.0), 10.0,
-                        f"eyewall at {prof['eyewall_r_km']} km, true ~12 km")
-        self.assertGreater(prof["score"], 40.0)
-        self.assertGreater(prof["eye_warm_c"], prof["eyewall_cold_c"])
-
-    def test_a_cloud_filled_eye_does_not_score_like_a_cleared_one(self):
-        bt, la, lo, clat, clon = _eye_field(eye_c=-68.0)
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        if prof["score"] is not None:
-            self.assertLess(prof["score"], 15.0)
-
-    def test_a_warm_notch_against_the_eyewall_is_withheld(self):
-        # Not a cleared eye: the warm spot is out against the wall, which is
-        # also what a mislocated centre looks like.
-        bt, la, lo, clat, clon = _eye_field(warm_at_km=10.0)
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        self.assertIsNone(prof["score"])
-        self.assertIn("notch", (prof["reason"] or "").lower())
-
-    def test_an_unresolved_eye_is_withheld_not_estimated(self):
-        # A few pixels across cannot resolve its own warm minimum; the warmest
-        # pixel is then an artefact of where the grid falls.
-        bt, la, lo, clat, clon = _eye_field(n=24, eye_r_km=4.0, wall_w_km=5.0)
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        self.assertIsNone(prof["score"])
-        self.assertIn("resolved", (prof["reason"] or "").lower())
-
-    def test_the_search_floor_is_adaptive_not_a_bare_12_km(self):
-        # A fixed 12 km floor pushed the search PAST the eyewall of a small
-        # storm, which is how GENEVIEVE lost its score entirely.
-        bt, la, lo, clat, clon = _eye_field()
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        self.assertLessEqual(prof["eyewall_floor_km"], 12.0)
-
-    def test_resolution_is_reported_so_the_number_can_be_judged(self):
-        bt, la, lo, clat, clon = _eye_field()
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        self.assertGreater(prof["px_km"], 0.0)
-        self.assertGreater(prof["eye_across_px"], cf.EYE_MIN_ACROSS_PX)
-
-    def test_no_eye_withholds_the_score_and_says_why(self):
-        f = _FakeNoEye()
-        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7)
-        self.assertIsNotNone(prof)          # the PROFILE is still real
-        self.assertIsNone(prof["score"])    # ...the score is not
-        self.assertTrue(prof["reason"])
-
-    def test_a_non_eye_scene_withholds_the_score(self):
-        # THE GATE THAT MATTERS MOST. A storm under a uniform CDO still has a
-        # warmest pixel and a coldest ring, and their difference is a real
-        # contrast that is NOT an eye score. Live 12W on 2026-07-28 reported
-        # 16.8 °C off a "warmest eye pixel" of -62.5 °C -- deep convective
-        # cloud -- while the method's own classifier said UNIFORM CDO.
-        f = _Fake()
-        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7,
-                            scene="UNIFORM CDO")
-        self.assertIsNotNone(prof)
-        self.assertIsNone(prof["score"])
-        self.assertIn("UNIFORM CDO", prof["reason"])
-
-    def test_an_eye_scene_is_still_scored(self):
-        bt, la, lo, clat, clon = _eye_field()
-        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
-        self.assertIsNotNone(prof["score"], prof.get("reason"))
-
-    def test_the_eyewall_floor_is_what_stops_a_zero_radius_eye(self):
-        # Without it an eyeless field reports an "eye" of zero radius, scoring
-        # the centre pixel against itself.
-        self.assertGreater(cf.EYE_MIN_EYEWALL_KM_MIN, 0.0)
-
-
 class CompositePlateTests(unittest.TestCase):
     """The 2x2 plate is an ADDITIONAL product. It carries all four panels under
     one header, never silently drops to three, and does not recompute the ACE
@@ -428,47 +339,101 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
-class ProfileMetadataTests(unittest.TestCase):
-    """Grid facts belong to the PROFILE, not to a successful score.
+def _sanabia_field(clat=18.0, clon=-117.0, half=2.6, n=260,
+                   eye_r=14.0, wall_w=16.0,
+                   eye_c=8.0, wall_c=-82.0, canopy_c=-52.0, amb_c=-8.0):
+    """A TC with a cleared warm eye, a cold eyewall annulus and a canopy."""
+    lat = np.linspace(clat - half, clat + half, n)
+    lon = np.linspace(clon - half, clon + half, n)
+    LON, LAT = np.meshgrid(lon, lat)
+    kmy = (LAT - clat) * 111.0
+    kmx = (LON - clon) * 111.0 * np.cos(np.radians(clat))
+    r = np.hypot(kmx, kmy)
+    wall_out = eye_r + wall_w
+    bt = np.full(r.shape, amb_c, dtype="float64")
+    bt[r <= 190.0] = canopy_c
+    bt[(r > eye_r) & (r <= wall_out)] = wall_c
+    bt[r <= eye_r] = eye_c - 6.0 * (r[r <= eye_r] / eye_r)
+    return bt, LAT, LON, clat, clon
 
-    They were assigned only on the scored path, so a withheld panel printed
-    "0.0 km pixels" and "beyond a 0 km floor" — quantities that were never
-    computed, rendered as though they had been measured. A zero that means
-    "unset" is worse than a blank, because it reads as data.
+
+class SanabiaProfileTests(unittest.TestCase):
+    """Sanabia, Barrett & Fine (2014), Mon. Wea. Rev. 142, 4581-4599.
+
+    The panel used to print an eye "score" of our own invention. This is the
+    published diagnostic it was reaching for: an azimuthally-averaged
+    inner-core IR radial profile with four named critical points.
     """
 
-    def _prof(self, scene):
-        bt, la, lo, clat, clon = _eye_field()
-        return cf.eye_score(bt, la, lo, clat, clon, scene=scene)
+    def test_grid_matches_the_paper(self):
+        # 1 deg azimuth, every 2 km, to 200 km (their s2b).
+        self.assertEqual(cf.SANABIA_DR_KM, 2.0)
+        self.assertEqual(cf.SANABIA_DTHETA_DEG, 1.0)
+        self.assertEqual(cf.SANABIA_R_MAX_KM, 200.0)
+        self.assertEqual(cf.SANABIA_ANGLE_DEG, 45.0)
+        # eq (1) uses the innermost 100 km; eq (2) the innermost 15 km
+        self.assertEqual(cf.SANABIA_BTMAX_R_KM, 100.0)
+        self.assertEqual(cf.SANABIA_RMAX_R_KM, 15.0)
 
-    def test_pixel_size_and_floor_are_set_even_when_withheld(self):
-        for scene in ("EYE", "UNIFORM CDO", "SHEAR"):
-            with self.subTest(scene):
-                p = self._prof(scene)
-                self.assertIsNotNone(p["px_km"])
-                self.assertGreater(p["px_km"], 0.0)
-                self.assertIsNotNone(p["eyewall_floor_km"])
-                self.assertGreater(p["eyewall_floor_km"], 0.0)
+    def test_azimuthal_profile_shape_and_rings(self):
+        bt, la, lo, clat, clon = _sanabia_field()
+        r, th, pol = cf.azimuthal_profile(bt, la, lo, clat, clon)
+        self.assertEqual(len(th), 360)                  # 1 deg intervals
+        self.assertAlmostEqual(float(r[1] - r[0]), 2.0)  # 2 km rings
+        self.assertLessEqual(float(r[-1]), 200.0)
+        self.assertEqual(pol.shape, (len(r), len(th)))
 
-    def test_contours_are_five_levels_not_the_full_ladder(self):
-        # Nine levels on a 2 km field is a mesh over the whole frame; the
-        # storm-scale curves are what this panel is for.
-        self.assertEqual(len(cf.CONTOUR_LEVELS), 5)
-        # ascending, as matplotlib requires
-        self.assertEqual(cf.CONTOUR_LEVELS,
-                         [-80.0, -75.0, -63.0, -53.0, -30.0])
-        self.assertEqual(len(cf.CONTOUR_COLORS), len(cf.CONTOUR_LEVELS))
+    def test_azimuthal_mean_recovers_a_known_ring_structure(self):
+        bt, la, lo, clat, clon = _sanabia_field()
+        r, _th, pol = cf.azimuthal_profile(bt, la, lo, clat, clon)
+        mean = np.nanmean(pol, axis=1)
+        # inside the eye it is warm; in the eyewall annulus it is ~ -82
+        self.assertGreater(mean[np.argmin(np.abs(r - 4))], -10.0)
+        self.assertLess(mean[np.argmin(np.abs(r - 22))], -70.0)
 
-    def test_category_bands_are_a_background_tint(self):
-        # Full strength made the panel read as the bands with a line on top.
-        self.assertLessEqual(cf.BAND_ALPHA, 0.35)
-        self.assertGreater(cf.BAND_ALPHA, 0.15)
+    def test_finds_all_four_critical_points_on_a_clear_eye(self):
+        bt, la, lo, clat, clon = _sanabia_field()
+        wv = bt + np.where(np.isfinite(bt), 2.0, 0.0)   # WV-IR > 0 everywhere
+        p = cf.sanabia_profile(bt, la, lo, clat, clon, wv_c=wv)
+        self.assertIsNotNone(p)
+        for k in ("cct", "fot", "l45", "u45"):
+            self.assertIsNotNone(p[k], f"{k} not located: {p['notes']}")
+        # CCT must land in the cold eyewall annulus, not in the warm eye
+        self.assertGreater(p["cct"]["r_km"], 14.0)
+        self.assertLess(p["cct"]["bt_c"], -70.0)
+        # L45 is inside U45 by construction (their s2b ordering)
+        self.assertLess(p["l45"]["r_km"], p["u45"]["r_km"])
 
-    def test_speck_filter_drops_small_closed_loops(self):
-        import numpy as _np
-        # a 5 km box is a speck; a 40 km box is structure
-        small = _np.array([[0, 0], [0.045, 0], [0.045, 0.045], [0, 0.045],
-                           [0, 0]])
-        big = _np.array([[0, 0], [0.36, 0], [0.36, 0.36], [0, 0.36], [0, 0]])
-        self.assertLess(cf._poly_area_km2(small, 15.0), cf.CONTOUR_MIN_AREA_KM2)
-        self.assertGreater(cf._poly_area_km2(big, 15.0), cf.CONTOUR_MIN_AREA_KM2)
+    def test_spread_is_one_standard_deviation_not_min_max(self):
+        # Sanabia plot +/- 1 s.d. around the mean (their Fig. 2). A min-max
+        # envelope is two extreme pixels per ring and no product uses it.
+        bt, la, lo, clat, clon = _sanabia_field()
+        p = cf.sanabia_profile(bt, la, lo, clat, clon)
+        self.assertIn("ir_sd", p)
+        self.assertNotIn("min_c", p)
+        self.assertNotIn("max_c", p)
+
+    def test_no_wv_means_no_fot_and_says_so(self):
+        bt, la, lo, clat, clon = _sanabia_field()
+        p = cf.sanabia_profile(bt, la, lo, clat, clon, wv_c=None)
+        self.assertIsNone(p["fot"])
+        self.assertTrue(any("no WV" in n for n in p["notes"]))
+
+    def test_no_inner_core_convection_withholds_everything(self):
+        # A sheared remnant: the innermost 200 km is clear ocean, so the
+        # "coldest cloud top" would be a sea-surface pixel.
+        bt, la, lo, clat, clon = _sanabia_field(eye_c=20.0, wall_c=18.0,
+                                                canopy_c=16.0, amb_c=15.0)
+        p = cf.sanabia_profile(bt, la, lo, clat, clon)
+        self.assertIsNone(p["cct"])
+        self.assertTrue(any("no inner-core convection" in n
+                            for n in p["notes"]))
+
+    def test_cct_at_the_centre_leaves_l45_u45_undefined(self):
+        # Their own documented failure mode (16.5% of their profiles).
+        bt, la, lo, clat, clon = _sanabia_field(eye_c=-80.0, wall_c=-78.0,
+                                                canopy_c=-50.0)
+        p = cf.sanabia_profile(bt, la, lo, clat, clon)
+        self.assertIsNone(p["l45"])
+        self.assertIsNone(p["u45"])
+        self.assertTrue(any("centre" in n or "45" in n for n in p["notes"]))

@@ -65,6 +65,7 @@ import json
 import logging
 import math
 import os
+import warnings
 from typing import Any, Optional
 
 import matplotlib
@@ -376,25 +377,18 @@ def _km_grid(lats, lons, clat: float, clon: float) -> np.ndarray:
 #: adaptive (3 ring widths, see eye_score) so it tracks the grid rather than
 #: assuming a pixel size; this only stops it collapsing onto the eye itself on
 #: a very fine grid. OURS, not cited — printed on the panel.
-EYE_MIN_EYEWALL_KM_MIN = 8.0
-EYE_MAX_R_KM = 140.0
 #: Floor on the ring width. The ACTUAL width is derived from the grid's own
 #: sample spacing (see _ring_width_km): rings finer than a pixel hold one or
 #: zero samples each, and the profile then reports sampling noise as structure
 #: -- which is exactly the resolution-dependence this panel exists to avoid.
-EYE_RING_MIN_KM = 4.0
 
 #: An eye narrower than this many pixels across cannot resolve its own warm
 #: minimum — the warmest pixel becomes an artefact of where the grid falls.
-EYE_MIN_ACROSS_PX = 8.0
 #: Outer limit of the eyewall search. Beyond this the profile is describing the
 #: storm's canopy, not its core. OURS.
-EYE_SEARCH_R_KM = 100.0
 #: How close to the coldest ring in the window counts as "the eyewall". OURS.
-EYE_EYEWALL_TOL_C = 2.0
 #: A cleared eye puts its warmest pixel near the centre. Beyond this fraction
 #: of the eyewall radius it is a warm notch or a mislocated centre. OURS.
-EYE_WARM_MAX_FRAC = 0.6
 
 
 def _pixel_km(lats, lons) -> float:
@@ -430,181 +424,408 @@ def _ring_width_km(lats, lons, clat: float, clon: float) -> float:
 #: ADT scene types that HAVE an eye to score. The classification is the
 #: method's own — it comes back on every fix — so the gate uses it rather than
 #: inventing a brightness threshold to decide the same question worse.
+# ---------------------------------------------------------------------------
+# SANABIA, BARRETT & FINE (2014) — inner-core IR radial profile
+# ---------------------------------------------------------------------------
+#: Sanabia, E. R., B. S. Barrett, and C. M. Fine, 2014: "Relationships between
+#: tropical cyclone intensity and eyewall structure as determined by radial
+#: profiles of inner-core infrared brightness temperature." Mon. Wea. Rev.
+#: 142, 4581-4599, doi:10.1175/MWR-D-13-00336.1  (method read in full: §2b
+#: "Methods", eqs 1-3, and Fig. 2).
+#:
+#: Their grid: MTSAT-2 IR ch1 (10.8 um) + WV ch3 (6.8 um), 4 km, ~30 min.
+#: Their profile: Cartesian lat/lon -> polar (r, theta), azimuthally averaged
+#: at 1.0 deg theta intervals every 2 km from the centre, following Bankert
+#: and Tag (2002). Critical points sought within 200 km (the TC core, after
+#: Maclay et al. 2008). They report results insensitive to r spacing over
+#: 1-4 km and theta over 1-4 deg.
+SANABIA_DR_KM = 2.0
+SANABIA_DTHETA_DEG = 1.0
+SANABIA_R_MAX_KM = 200.0
+#: eq (1) uses the warmest BT in the innermost 100 km; eq (2) uses the radius
+#: of the warmest BT in the innermost 15 km (eye size, after Shapiro and
+#: Willoughby 1982).
+SANABIA_BTMAX_R_KM = 100.0
+SANABIA_RMAX_R_KM = 15.0
+#: The inflection criterion. 45 deg follows observational studies finding the
+#: eyewall slope often exceeds it (Hawkins and Imbembo 1976; Marks 1985;
+#: Black et al. 1994; Corbosiero et al. 2005; Hazelton and Hart 2013).
+SANABIA_ANGLE_DEG = 45.0
+#: OURS, not Sanabia's. Their dataset is 14 typhoons — every profile has deep
+#: inner-core convection by construction. Ours runs on whatever is in the
+#: basin, including sheared remnants whose innermost 200 km is clear ocean;
+#: there the "coldest cloud top" is a sea-surface pixel and the four points
+#: describe nothing. -30 C is the warmest BD step, i.e. the coldest a scene
+#: can be while still not being deep convection.
+SANABIA_MIN_CLOUD_C = -30.0
+
+
+def azimuthal_profile(bt, lats, lons, clat: float, clon: float,
+                      dr_km: float = SANABIA_DR_KM,
+                      r_max_km: float = SANABIA_R_MAX_KM,
+                      dtheta_deg: float = SANABIA_DTHETA_DEG):
+    """Cartesian -> polar, sampled on a (radius x azimuth) grid.
+
+    Returns (r_km, theta_deg, polar) where ``polar`` is (n_r, n_theta) with
+    NaN outside the source grid. Bilinear, pure numpy — the transform is a
+    dozen lines and every TC package that offers one does radial WIND, not
+    satellite brightness temperature.
+    """
+    la = np.asarray(lats, dtype="float64")
+    lo = np.asarray(lons, dtype="float64")
+    a = np.asarray(bt, dtype="float64")
+    if la.ndim != 2 or la.shape != a.shape:
+        return None, None, None
+    lat_ax, lon_ax = la[:, 0], lo[0, :]
+    # np.interp needs an increasing sequence; remember if we flipped.
+    flip_i = lat_ax[0] > lat_ax[-1]
+    flip_j = lon_ax[0] > lon_ax[-1]
+    li = lat_ax[::-1] if flip_i else lat_ax
+    lj = lon_ax[::-1] if flip_j else lon_ax
+    ni, nj = len(li), len(lj)
+
+    km_per_deg_lat = 111.0
+    km_per_deg_lon = 111.0 * float(np.cos(np.radians(clat)))
+    r = np.arange(dr_km, r_max_km + dr_km * 0.5, dr_km)
+    th = np.radians(np.arange(0.0, 360.0, dtheta_deg))
+    R, TH = np.meshgrid(r, th, indexing="ij")
+    plat = clat + (R * np.cos(TH)) / km_per_deg_lat
+    plon = clon + (R * np.sin(TH)) / max(km_per_deg_lon, 1e-9)
+
+    fi = np.interp(plat, li, np.arange(ni), left=np.nan, right=np.nan)
+    fj = np.interp(plon, lj, np.arange(nj), left=np.nan, right=np.nan)
+    if flip_i:
+        fi = (ni - 1) - fi
+    if flip_j:
+        fj = (nj - 1) - fj
+    ok = np.isfinite(fi) & np.isfinite(fj)
+    out = np.full(R.shape, np.nan)
+    if ok.any():
+        i0 = np.clip(np.floor(fi[ok]).astype(int), 0, la.shape[0] - 2)
+        j0 = np.clip(np.floor(fj[ok]).astype(int), 0, la.shape[1] - 2)
+        di = fi[ok] - i0
+        dj = fj[ok] - j0
+        out[ok] = ((1 - di) * (1 - dj) * a[i0, j0]
+                   + (1 - di) * dj * a[i0, j0 + 1]
+                   + di * (1 - dj) * a[i0 + 1, j0]
+                   + di * dj * a[i0 + 1, j0 + 1])
+    return r, np.degrees(th), out
+
+
+def sanabia_profile(ir_c, lats, lons, clat: float, clon: float,
+                    wv_c=None) -> Optional[dict]:
+    """The four Sanabia et al. (2014) critical points on an IR radial profile.
+
+    CCT  minimum azimuthally-averaged IR BT within 200 km.
+    FOT  first overshooting top: the SMALLEST radius at which a positive
+         WV - IR brightness-temperature difference occurs at ANY azimuth
+         (convection that penetrated the tropopause; Fritz and Laszlo 1993,
+         Olander and Velden 2009). The point is assigned the IR BT at that
+         radius, not the WV or the difference.
+    L45  first 45 deg UPTURN inflection - the profile turning from horizontal
+         to vertical - on the NON-DIMENSIONAL profile (eqs 1-3).
+    U45  first point outward of L45 where the angle falls back below 45 deg.
+
+    Returns None only when there is no usable profile at all. Individual
+    points are None when the paper's own procedure cannot locate them; that
+    is expected, not a failure — Sanabia found L45/U45 in 71% of profiles
+    (96.7% at >= 100 kt, 44.4% below 64 kt), and they cannot exist when the
+    CCT sits at the storm centre (16.5% of their cases, CDO-like).
+    """
+    r, _th, pol = azimuthal_profile(ir_c, lats, lons, clat, clon)
+    if r is None or pol is None:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        ir_mean = np.nanmean(pol, axis=1)
+        ir_sd = np.nanstd(pol, axis=1)
+    good = np.isfinite(ir_mean)
+    if good.sum() < 8:
+        return None
+
+    prof = {"r_km": r, "ir_mean": ir_mean, "ir_sd": ir_sd,
+            "dr_km": SANABIA_DR_KM, "dtheta_deg": SANABIA_DTHETA_DEG,
+            "r_max_km": SANABIA_R_MAX_KM,
+            "cct": None, "fot": None, "l45": None, "u45": None,
+            "notes": []}
+
+    # ---- CCT: minimum azimuthally-averaged IR BT inside 200 km ----------
+    i_cct = int(np.nanargmin(np.where(good, ir_mean, np.inf)))
+    prof["cct"] = {"r_km": float(r[i_cct]), "bt_c": float(ir_mean[i_cct])}
+    if prof["cct"]["bt_c"] > SANABIA_MIN_CLOUD_C:
+        # No deep convection in the core at all: the "coldest cloud top" is a
+        # sea-surface pixel and every point downstream of it is meaningless.
+        prof["cct"] = None
+        prof["notes"].append(
+            f"no inner-core convection — coldest BT in {SANABIA_R_MAX_KM:.0f}"
+            f" km is {float(ir_mean[i_cct]):+.0f} C, warmer than the "
+            f"{SANABIA_MIN_CLOUD_C:.0f} C deep-convection floor (our gate)")
+        return prof
+
+    # ---- FOT: smallest radius with a positive WV-IR at ANY azimuth ------
+    if wv_c is not None:
+        _r2, _t2, wpol = azimuthal_profile(wv_c, lats, lons, clat, clon)
+        if wpol is not None and wpol.shape == pol.shape:
+            diff = wpol - pol
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                any_pos = np.nansum(diff > 0.0, axis=1) > 0
+            idx = np.flatnonzero(any_pos & good)
+            if idx.size:
+                i = int(idx[0])
+                prof["fot"] = {"r_km": float(r[i]),
+                               "bt_c": float(ir_mean[i])}
+        else:
+            prof["notes"].append("WV grid did not match IR — no FOT")
+    else:
+        prof["notes"].append("no WV band this cycle — no FOT")
+
+    # ---- L45 / U45 on the NON-DIMENSIONAL profile (eqs 1-3) -------------
+    # eq (1): NBT = (BTmax - BT) / (BTmax - BT_CCT), BTmax = warmest in 100 km
+    # eq (2): Nr  = (rmax - r) / (rmax - r_CCT),  rmax = radius of the warmest
+    #               BT inside 15 km (eye size; Shapiro and Willoughby 1982)
+    if float(r[i_cct]) <= SANABIA_DR_KM:
+        # Their own stated failure mode: with the CCT at the centre there is
+        # no upturn to find. 16.5% of their profiles.
+        prof["notes"].append("CCT at the storm centre — L45/U45 undefined "
+                             "(Sanabia §2b; 16.5% of their profiles)")
+        return prof
+    in100 = good & (r <= SANABIA_BTMAX_R_KM)
+    in15 = good & (r <= SANABIA_RMAX_R_KM)
+    if not in100.any() or not in15.any():
+        return prof
+    bt_max = float(np.nanmax(np.where(in100, ir_mean, -np.inf)))
+    r_max = float(r[int(np.nanargmax(np.where(in15, ir_mean, -np.inf)))])
+    bt_cct, r_cct = prof["cct"]["bt_c"], prof["cct"]["r_km"]
+    if abs(bt_max - bt_cct) < 1e-9 or abs(r_max - r_cct) < 1e-9:
+        return prof
+    nbt = (bt_max - ir_mean) / (bt_max - bt_cct)
+    nr = (r_max - r) / (r_max - r_cct)
+    # eq (3): centred difference angle at every radius
+    alpha = np.full(r.shape, np.nan)
+    dn = nbt[2:] - nbt[:-2]
+    dr_ = nr[2:] - nr[:-2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        alpha[1:-1] = np.degrees(np.arctan2(dn, dr_))
+    prof["alpha_deg"] = alpha
+    up = np.flatnonzero(np.isfinite(alpha) & (alpha > SANABIA_ANGLE_DEG))
+    if up.size:
+        i_l = int(up[0])
+        prof["l45"] = {"r_km": float(r[i_l]), "bt_c": float(ir_mean[i_l])}
+        down = np.flatnonzero(np.isfinite(alpha) & (alpha < SANABIA_ANGLE_DEG))
+        down = down[down > i_l]
+        if down.size:
+            i_u = int(down[0])
+            prof["u45"] = {"r_km": float(r[i_u]),
+                           "bt_c": float(ir_mean[i_u])}
+    else:
+        prof["notes"].append("profile never reaches a 45° upturn — no "
+                             "eye/eyewall structure (expected below ~64 kt)")
+    return prof
+
+
 def _is_eye_scene(scene: Optional[str]) -> bool:
     return "EYE" in str(scene or "").upper()
 
 
-def eye_score(ir_c, lats, lons, clat: float, clon: float,
-              max_r_km: float = EYE_MAX_R_KM,
-              ring_km: Optional[float] = None,
-              scene: Optional[str] = None) -> Optional[dict]:
-    """ADT-style eye score: warmest eye pixel against the coldest eyewall ring.
+# ---------------------------------------------------------------------------
+# SANABIA, BARRETT & FINE (2014) — inner-core IR radial profile
+# ---------------------------------------------------------------------------
+#: Sanabia, E. R., B. S. Barrett, and C. M. Fine, 2014: "Relationships between
+#: tropical cyclone intensity and eyewall structure as determined by radial
+#: profiles of inner-core infrared brightness temperature." Mon. Wea. Rev.
+#: 142, 4581-4599, doi:10.1175/MWR-D-13-00336.1  (method read in full: §2b
+#: "Methods", eqs 1-3, and Fig. 2).
+#:
+#: Their grid: MTSAT-2 IR ch1 (10.8 um) + WV ch3 (6.8 um), 4 km, ~30 min.
+#: Their profile: Cartesian lat/lon -> polar (r, theta), azimuthally averaged
+#: at 1.0 deg theta intervals every 2 km from the centre, following Bankert
+#: and Tag (2002). Critical points sought within 200 km (the TC core, after
+#: Maclay et al. 2008). They report results insensitive to r spacing over
+#: 1-4 km and theta over 1-4 deg.
+SANABIA_DR_KM = 2.0
+SANABIA_DTHETA_DEG = 1.0
+SANABIA_R_MAX_KM = 200.0
+#: eq (1) uses the warmest BT in the innermost 100 km; eq (2) uses the radius
+#: of the warmest BT in the innermost 15 km (eye size, after Shapiro and
+#: Willoughby 1982).
+SANABIA_BTMAX_R_KM = 100.0
+SANABIA_RMAX_R_KM = 15.0
+#: The inflection criterion. 45 deg follows observational studies finding the
+#: eyewall slope often exceeds it (Hawkins and Imbembo 1976; Marks 1985;
+#: Black et al. 1994; Corbosiero et al. 2005; Hazelton and Hart 2013).
+SANABIA_ANGLE_DEG = 45.0
+#: OURS, not Sanabia's. Their dataset is 14 typhoons — every profile has deep
+#: inner-core convection by construction. Ours runs on whatever is in the
+#: basin, including sheared remnants whose innermost 200 km is clear ocean;
+#: there the "coldest cloud top" is a sea-surface pixel and the four points
+#: describe nothing. -30 C is the warmest BD step, i.e. the coldest a scene
+#: can be while still not being deep convection.
+SANABIA_MIN_CLOUD_C = -30.0
 
-    WHAT IS CITED AND WHAT IS OURS -- the number is only worth printing if its
-    construction is stated, so:
 
-    * The QUANTITY is the ADT's own documented relative: eye/eyewall brightness
-      temperature CONTRAST. A larger positive value is a warmer, better-cleared
-      eye inside a colder eyewall. It is a temperature difference in °C, so it
-      is resolution-robust in a way a pixel COUNT is not -- the same eye counts
-      differently on 2 km ABI than on a 4 km reprojection, which is why no
-      count-based product is reported here.
-    * The BD ladder the panel draws behind the profile is the citable
-      discretisation (CIMSS): 9 steps from OW (> -30 °C) down to CDG (< -81),
-      with WMG the warmest at > +9.
-    * The REGIONS are OURS. ADT runs its own eye/eyewall search; here the
-      eyewall is the coldest mean-BT ring of a radial profile about the working
-      centre, and the eye is everything inside that radius. The radius cap, the
-      ring width and the EYE_MIN_EYEWALL_KM_MIN floor are our construction too.
-      They are printed on the panel rather than left implicit.
+def azimuthal_profile(bt, lats, lons, clat: float, clon: float,
+                      dr_km: float = SANABIA_DR_KM,
+                      r_max_km: float = SANABIA_R_MAX_KM,
+                      dtheta_deg: float = SANABIA_DTHETA_DEG):
+    """Cartesian -> polar, sampled on a (radius x azimuth) grid.
 
-    The score is WITHHELD, with the reason on the panel, when there is no eye
-    to score: the ADT's own scene classification is not an eye scene, the
-    coldest ring is at the centre (no clearing), or the eye is not warmer than
-    its eyewall. The scene gate matters more than it looks -- a storm under a
-    uniform CDO still produces a "warmest pixel" and a "coldest ring", and
-    their difference is a real contrast that is not an eye score. The method
-    already classifies the scene on every fix, so that answer is used rather
-    than a brightness threshold invented here to decide the same thing worse.
-    A negative "score" is not a weak eye, it is the absence of one.
+    Returns (r_km, theta_deg, polar) where ``polar`` is (n_r, n_theta) with
+    NaN outside the source grid. Bilinear, pure numpy — the transform is a
+    dozen lines and every TC package that offers one does radial WIND, not
+    satellite brightness temperature.
     """
-    bt = np.asarray(ir_c, dtype="float64")
-    r = _km_grid(lats, lons, clat, clon)
-    if bt.shape != r.shape or not np.isfinite(bt).any():
-        return None
-    if ring_km is None:
-        ring_km = _ring_width_km(lats, lons, clat, clon)
-    edges = np.arange(0.0, max_r_km + ring_km, ring_km)
-    mids, means, mins, maxs = [], [], [], []
-    for i in range(len(edges) - 1):
-        m = (r >= edges[i]) & (r < edges[i + 1]) & np.isfinite(bt)
-        if not m.any():
-            continue
-        v = bt[m]
-        mids.append((edges[i] + edges[i + 1]) / 2.0)
-        means.append(float(np.mean(v)))
-        mins.append(float(np.min(v)))
-        maxs.append(float(np.max(v)))
-    if len(mids) < 4:
-        return None
-    mids = np.asarray(mids)
-    means = np.asarray(means)
-    # px_km and the search floor are properties of the GRID and the search,
-    # not of a successful score, so they are set for EVERY profile. They used
-    # to be assigned only on the scored path, which is why a withheld panel
-    # printed "0.0 km pixels" and "beyond a 0 km floor" — quantities that were
-    # never computed, rendered as though they had been measured.
-    prof = {"r_km": mids, "mean_c": means,
-            "min_c": np.asarray(mins), "max_c": np.asarray(maxs),
-            "ring_km": ring_km, "max_r_km": max_r_km,
-            "px_km": _pixel_km(lats, lons),
-            "eyewall_floor_km": max(EYE_MIN_EYEWALL_KM_MIN, 2.0 * ring_km),
-            "score": None, "eyewall_r_km": None,
-            "eye_warm_c": None, "eyewall_cold_c": None,
-            "reason": None}
+    la = np.asarray(lats, dtype="float64")
+    lo = np.asarray(lons, dtype="float64")
+    a = np.asarray(bt, dtype="float64")
+    if la.ndim != 2 or la.shape != a.shape:
+        return None, None, None
+    lat_ax, lon_ax = la[:, 0], lo[0, :]
+    # np.interp needs an increasing sequence; remember if we flipped.
+    flip_i = lat_ax[0] > lat_ax[-1]
+    flip_j = lon_ax[0] > lon_ax[-1]
+    li = lat_ax[::-1] if flip_i else lat_ax
+    lj = lon_ax[::-1] if flip_j else lon_ax
+    ni, nj = len(li), len(lj)
 
-    if scene == "__NO_OBJECTIVE_CENTRE__":
-        prof["reason"] = ("no objective centre this cycle — profile is about "
-                          "the OFFICIAL position, so no score")
-        return prof
-    if scene is not None and not _is_eye_scene(scene):
-        # The profile is real and worth drawing — it shows the CDO's structure.
-        # The SCORE is not: there is no eye here to contrast against a eyewall.
-        prof["reason"] = (f"scene is {str(scene).upper()} — no eye to score "
-                          "(the ADT's own classification)")
-        return prof
-    if len(mids) < 8:
-        # Too coarse for the eyewall search to mean anything. Draw it, withhold.
-        prof["reason"] = ("profile too coarse to locate an eyewall — "
-                          f"{len(mids)} rings at {ring_km:.0f} km")
-        return prof
-    # The eyewall is the FIRST cold minimum going outward, not the coldest ring
-    # anywhere. Taking the global minimum over 0..140 km finds the outer cold
-    # canopy of a large storm instead of its eyewall: verified on GENEVIEVE,
-    # whose eye is ~16 km across but whose globally-coldest ring sat at 62 km,
-    # so "inside the eyewall" swallowed most of the CDO and the score was
-    # measuring eye-centre against outer-canopy contrast — a real number
-    # answering the wrong question.
-    #
-    # The floor is ADAPTIVE, not a bare 12 km: it has to clear the first few
-    # rings (which are dominated by the eye itself) without being wider than
-    # the eye of a small storm. Three ring widths, with 8 km as the hard lower
-    # bound, tracks the grid instead of assuming one.
-    # The floor only has to clear the eye's own innermost ring, so it is small
-    # and grid-derived. A 12 km floor pushed the search past the eyewall
-    # entirely on GENEVIEVE, whose eye is ~16 km across.
-    floor_km = max(EYE_MIN_EYEWALL_KM_MIN, 2.0 * ring_km)
-    prof["eyewall_floor_km"] = floor_km
-    ok = mids >= floor_km
-    win = ok & (mids <= EYE_SEARCH_R_KM)
-    if not win.any():
-        prof["reason"] = "profile too short to locate an eyewall"
-        return prof
-    # The eyewall is the INNER EDGE of the coldest annulus within the search
-    # window — the first radius that gets essentially as cold as the coldest
-    # cloud near the core. Neither of the obvious alternatives works: the
-    # GLOBAL minimum over the whole profile finds the outer canopy of a large
-    # storm (GENEVIEVE: 62 km, against a ~16 km eye), and the first LOCAL
-    # minimum finds whatever shoulder happens to turn over first (46 km on the
-    # same storm). Both produced a real number answering the wrong question.
-    cold = float(np.min(np.where(win, means, np.inf)))
-    cand = np.flatnonzero(win & (means <= cold + EYE_EYEWALL_TOL_C))
-    j = int(cand[0]) if cand.size else int(np.argmin(
-        np.where(win, means, np.inf)))
-    ew_r = float(mids[j])
-    # RESOLUTION GATE. An eye only a handful of pixels across cannot resolve
-    # its own warm minimum: the warmest pixel is then a sampling artefact of
-    # where the grid happens to fall, and the score is resolution-limited
-    # rather than meteorological. Withhold and say so.
-    px_km = _pixel_km(lats, lons)
-    across_px = (2.0 * ew_r / px_km) if px_km else 0.0
-    prof["px_km"] = px_km
-    prof["eye_across_px"] = across_px
-    if across_px < EYE_MIN_ACROSS_PX:
-        prof["reason"] = (f"eye spans only {across_px:.0f} px at "
-                          f"{px_km:.1f} km — not resolved")
+    km_per_deg_lat = 111.0
+    km_per_deg_lon = 111.0 * float(np.cos(np.radians(clat)))
+    r = np.arange(dr_km, r_max_km + dr_km * 0.5, dr_km)
+    th = np.radians(np.arange(0.0, 360.0, dtheta_deg))
+    R, TH = np.meshgrid(r, th, indexing="ij")
+    plat = clat + (R * np.cos(TH)) / km_per_deg_lat
+    plon = clon + (R * np.sin(TH)) / max(km_per_deg_lon, 1e-9)
+
+    fi = np.interp(plat, li, np.arange(ni), left=np.nan, right=np.nan)
+    fj = np.interp(plon, lj, np.arange(nj), left=np.nan, right=np.nan)
+    if flip_i:
+        fi = (ni - 1) - fi
+    if flip_j:
+        fj = (nj - 1) - fj
+    ok = np.isfinite(fi) & np.isfinite(fj)
+    out = np.full(R.shape, np.nan)
+    if ok.any():
+        i0 = np.clip(np.floor(fi[ok]).astype(int), 0, la.shape[0] - 2)
+        j0 = np.clip(np.floor(fj[ok]).astype(int), 0, la.shape[1] - 2)
+        di = fi[ok] - i0
+        dj = fj[ok] - j0
+        out[ok] = ((1 - di) * (1 - dj) * a[i0, j0]
+                   + (1 - di) * dj * a[i0, j0 + 1]
+                   + di * (1 - dj) * a[i0 + 1, j0]
+                   + di * dj * a[i0 + 1, j0 + 1])
+    return r, np.degrees(th), out
+
+
+def sanabia_profile(ir_c, lats, lons, clat: float, clon: float,
+                    wv_c=None) -> Optional[dict]:
+    """The four Sanabia et al. (2014) critical points on an IR radial profile.
+
+    CCT  minimum azimuthally-averaged IR BT within 200 km.
+    FOT  first overshooting top: the SMALLEST radius at which a positive
+         WV - IR brightness-temperature difference occurs at ANY azimuth
+         (convection that penetrated the tropopause; Fritz and Laszlo 1993,
+         Olander and Velden 2009). The point is assigned the IR BT at that
+         radius, not the WV or the difference.
+    L45  first 45 deg UPTURN inflection - the profile turning from horizontal
+         to vertical - on the NON-DIMENSIONAL profile (eqs 1-3).
+    U45  first point outward of L45 where the angle falls back below 45 deg.
+
+    Returns None only when there is no usable profile at all. Individual
+    points are None when the paper's own procedure cannot locate them; that
+    is expected, not a failure — Sanabia found L45/U45 in 71% of profiles
+    (96.7% at >= 100 kt, 44.4% below 64 kt), and they cannot exist when the
+    CCT sits at the storm centre (16.5% of their cases, CDO-like).
+    """
+    r, _th, pol = azimuthal_profile(ir_c, lats, lons, clat, clon)
+    if r is None or pol is None:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        ir_mean = np.nanmean(pol, axis=1)
+        ir_sd = np.nanstd(pol, axis=1)
+    good = np.isfinite(ir_mean)
+    if good.sum() < 8:
+        return None
+
+    prof = {"r_km": r, "ir_mean": ir_mean, "ir_sd": ir_sd,
+            "dr_km": SANABIA_DR_KM, "dtheta_deg": SANABIA_DTHETA_DEG,
+            "r_max_km": SANABIA_R_MAX_KM,
+            "cct": None, "fot": None, "l45": None, "u45": None,
+            "notes": []}
+
+    # ---- CCT: minimum azimuthally-averaged IR BT inside 200 km ----------
+    i_cct = int(np.nanargmin(np.where(good, ir_mean, np.inf)))
+    prof["cct"] = {"r_km": float(r[i_cct]), "bt_c": float(ir_mean[i_cct])}
+    if prof["cct"]["bt_c"] > SANABIA_MIN_CLOUD_C:
+        # No deep convection in the core at all: the "coldest cloud top" is a
+        # sea-surface pixel and every point downstream of it is meaningless.
+        prof["cct"] = None
+        prof["notes"].append(
+            f"no inner-core convection — coldest BT in {SANABIA_R_MAX_KM:.0f}"
+            f" km is {float(ir_mean[i_cct]):+.0f} C, warmer than the "
+            f"{SANABIA_MIN_CLOUD_C:.0f} C deep-convection floor (our gate)")
         return prof
 
-    # There must be CLEARING: the innermost ring has to be warmer than the
-    # eyewall ring, or there is no eye to contrast against it.
-    #
-    # This previously tested "is the coldest ring anywhere the eyewall ring",
-    # which was correct only while the search took the GLOBAL minimum. Against
-    # a first-local-minimum eyewall it is inverted — the outer canopy of a big
-    # storm is routinely colder than the eyewall — and it withheld the score on
-    # GENEVIEVE while a textbook eye sat in the middle of the panel.
-    if means[0] <= means[j] + 0.01:
-        prof["reason"] = ("no eye signature — the centre is no warmer than "
-                          "the eyewall")
+    # ---- FOT: smallest radius with a positive WV-IR at ANY azimuth ------
+    if wv_c is not None:
+        _r2, _t2, wpol = azimuthal_profile(wv_c, lats, lons, clat, clon)
+        if wpol is not None and wpol.shape == pol.shape:
+            diff = wpol - pol
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                any_pos = np.nansum(diff > 0.0, axis=1) > 0
+            idx = np.flatnonzero(any_pos & good)
+            if idx.size:
+                i = int(idx[0])
+                prof["fot"] = {"r_km": float(r[i]),
+                               "bt_c": float(ir_mean[i])}
+        else:
+            prof["notes"].append("WV grid did not match IR — no FOT")
+    else:
+        prof["notes"].append("no WV band this cycle — no FOT")
+
+    # ---- L45 / U45 on the NON-DIMENSIONAL profile (eqs 1-3) -------------
+    # eq (1): NBT = (BTmax - BT) / (BTmax - BT_CCT), BTmax = warmest in 100 km
+    # eq (2): Nr  = (rmax - r) / (rmax - r_CCT),  rmax = radius of the warmest
+    #               BT inside 15 km (eye size; Shapiro and Willoughby 1982)
+    if float(r[i_cct]) <= SANABIA_DR_KM:
+        # Their own stated failure mode: with the CCT at the centre there is
+        # no upturn to find. 16.5% of their profiles.
+        prof["notes"].append("CCT at the storm centre — L45/U45 undefined "
+                             "(Sanabia §2b; 16.5% of their profiles)")
         return prof
-    inside = r < ew_r
-    if not (inside & np.isfinite(bt)).any():
-        prof["reason"] = "no pixels inside the eyewall radius"
+    in100 = good & (r <= SANABIA_BTMAX_R_KM)
+    in15 = good & (r <= SANABIA_RMAX_R_KM)
+    if not in100.any() or not in15.any():
         return prof
-    eye_warm = float(np.nanmax(bt[inside]))
-    # WHERE is that warmest pixel? A cleared eye puts it near the centre. If it
-    # sits out against the eyewall it is a warm notch or a mislocated centre,
-    # not a cleared eye, and the contrast is not an eye score.
-    wi = np.unravel_index(int(np.nanargmax(np.where(inside, bt, -np.inf))),
-                          bt.shape)
-    warm_r = float(r[wi])
-    prof["eye_warm_r_km"] = warm_r
-    prof["eye_warm_frac"] = (warm_r / ew_r) if ew_r else None
-    ann = (r >= ew_r - ring_km) & (r <= ew_r + ring_km) & np.isfinite(bt)
-    eyewall_cold = float(np.nanmin(bt[ann])) if ann.any() else float(means[j])
-    score = eye_warm - eyewall_cold
-    if score <= 0:
-        prof["reason"] = "eye is not warmer than its eyewall — no eye"
+    bt_max = float(np.nanmax(np.where(in100, ir_mean, -np.inf)))
+    r_max = float(r[int(np.nanargmax(np.where(in15, ir_mean, -np.inf)))])
+    bt_cct, r_cct = prof["cct"]["bt_c"], prof["cct"]["r_km"]
+    if abs(bt_max - bt_cct) < 1e-9 or abs(r_max - r_cct) < 1e-9:
         return prof
-    if ew_r and warm_r / ew_r > EYE_WARM_MAX_FRAC:
-        prof["reason"] = (f"warmest pixel sits at {warm_r/ew_r*100:.0f}% of "
-                          "the eyewall radius — a warm notch, not a cleared "
-                          "eye")
-        return prof
-    prof.update(score=score, eyewall_r_km=ew_r, eye_warm_c=eye_warm,
-                eyewall_cold_c=eyewall_cold)
+    nbt = (bt_max - ir_mean) / (bt_max - bt_cct)
+    nr = (r_max - r) / (r_max - r_cct)
+    # eq (3): centred difference angle at every radius
+    alpha = np.full(r.shape, np.nan)
+    dn = nbt[2:] - nbt[:-2]
+    dr_ = nr[2:] - nr[:-2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        alpha[1:-1] = np.degrees(np.arctan2(dn, dr_))
+    prof["alpha_deg"] = alpha
+    up = np.flatnonzero(np.isfinite(alpha) & (alpha > SANABIA_ANGLE_DEG))
+    if up.size:
+        i_l = int(up[0])
+        prof["l45"] = {"r_km": float(r[i_l]), "bt_c": float(ir_mean[i_l])}
+        down = np.flatnonzero(np.isfinite(alpha) & (alpha < SANABIA_ANGLE_DEG))
+        down = down[down > i_l]
+        if down.size:
+            i_u = int(down[0])
+            prof["u45"] = {"r_km": float(r[i_u]),
+                           "bt_c": float(ir_mean[i_u])}
+    else:
+        prof["notes"].append("profile never reaches a 45° upturn — no "
+                             "eye/eyewall structure (expected below ~64 kt)")
     return prof
-
 
 # ---------------------------------------------------------------------------
 # scene — everything both renderers derive from the same inputs, derived ONCE
@@ -631,6 +852,9 @@ class Scene:
     ir_data: Any
     ir_min: Optional[float]
     ir_max: Optional[float]
+    #: the WV field itself, in C — the Sanabia FOT needs WV-IR per
+    #: azimuth, not just the WV extremes.
+    wv_c: Any
     wv_min: Optional[float]
     wv_max: Optional[float]
     swir_min: Optional[float]
@@ -652,8 +876,10 @@ def prepare_scene(storm: dict, fixes: dict, adv: Optional[dict],
     ir_c = _bt_celsius(ir_data)
     ir_min, ir_max = _extremes(ir_c)
     wv_min = wv_max = swir_min = swir_max = None
+    wv_c_grid = None                    # no WV this cycle -> no FOT, said so
     if wv_data is not None:
-        wv_min, wv_max = _extremes(_bt_celsius(wv_data))
+        wv_c_grid = _bt_celsius(wv_data)
+        wv_min, wv_max = _extremes(wv_c_grid)
     if swir_data is not None:
         swir_min, swir_max = _extremes(_bt_celsius(swir_data))
 
@@ -687,7 +913,8 @@ def prepare_scene(storm: dict, fixes: dict, adv: Optional[dict],
         sid=storm.get("id") or storm.get("sid") or "",
         storm=storm, fixes=fixes, adv=adv, box=box, satcon=satcon, bbox=bbox,
         ir_c=ir_c, ir_lat=ir_lat, ir_lon=ir_lon, ir_data=ir_data,
-        ir_min=ir_min, ir_max=ir_max, wv_min=wv_min, wv_max=wv_max,
+        ir_min=ir_min, ir_max=ir_max, wv_c=wv_c_grid,
+        wv_min=wv_min, wv_max=wv_max,
         swir_min=swir_min, swir_max=swir_max,
         frame_lon=frame_lon, pts=pts, newest=newest, acc=acc, rej=rej,
         emph=emph, sep_ok=sep_ok, sep_dt_min=sep_dt_min)
@@ -1289,118 +1516,116 @@ def panel_wpace(ax, sc: Scene, hist: Optional[dict]):
 
 def panel_eye(ax, sc: Scene, prof: Optional[dict],
               about: Optional[str] = None):
-    """Panel 4 — radial BT profile about the working centre + the eye score."""
+    """Panel 4 — the Sanabia et al. (2014) inner-core IR radial profile.
+
+    Azimuthally-averaged IR BT against radius, with the paper's four critical
+    points marked: CCT, FOT, L45, U45. Spread is +/- 1 standard deviation,
+    which is what Sanabia plot around their own means (Fig. 2, dashed lines);
+    the min-max envelope this panel used to draw was two extreme pixels per
+    ring and no published product uses it.
+    """
     ax.set_facecolor("#060a12")
-    for s in ax.spines.values():
-        s.set_color(GRID)
-    ax.tick_params(colors=MUTED, labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=FS_TICK, length=3, width=0.7)
+    label = "EYE STRUCTURE   ·   INNER-CORE IR RADIAL PROFILE"
+    if about and about != "objective centre":
+        label += f"   ·   ABOUT THE {about.upper()}"
+    _panel_label(ax, label, fontsize=FS_PANEL)
+
     if prof is None:
         ax.set_xticks([]); ax.set_yticks([])
-        _panel_label(ax, "EYE STRUCTURE")
-        why = ("no working centre this cycle — the profile is taken about the\n"
-               "emphasised objective fix, and every candidate was rejected"
-               if sc.emph is None else
-               "no radial profile this cycle — the IR field could not be\n"
-               "resolved into rings about the working centre")
-        ax.text(0.5, 0.5, why + "\n\n(the score is withheld, not defaulted)",
+        ax.text(0.5, 0.5,
+                ("no working centre this cycle — the profile is taken about\n"
+                 "the emphasised objective fix, and every candidate was "
+                 "rejected"
+                 if sc.emph is None else
+                 "no radial profile this cycle — the IR field could not be\n"
+                 "resolved into rings about the working centre"),
                 transform=ax.transAxes, ha="center", va="center", color=MUTED,
-                fontsize=9.0, linespacing=1.7)
+                fontsize=FS_NOTE, linespacing=1.7)
         return
 
-    r, mean_c = prof["r_km"], prof["mean_c"]
-    lo = float(min(np.nanmin(prof["min_c"]), -85.0))
-    hi = float(max(np.nanmax(prof["max_c"]), 15.0))
-    # Headroom at the top for the panel label + the score, and at the bottom
-    # for the construction note, so neither is drawn over the profile.
+    r = prof["r_km"]
+    mean = prof["ir_mean"]
+    sd = prof.get("ir_sd")
+    ok = np.isfinite(mean)
+    if ok.sum() < 4:
+        return
+
+    # +/- 1 SD, as the paper plots
+    if sd is not None and np.isfinite(sd).any():
+        ax.fill_between(r, mean - sd, mean + sd, color="#1b3a5c", alpha=0.55,
+                        lw=0, zorder=2)
+    ax.plot(r, mean, color="#4dd2ff", lw=2.2, zorder=4)
+
+    lo = float(np.nanmin(mean - (sd if sd is not None else 0)))
+    hi = float(np.nanmax(mean + (sd if sd is not None else 0)))
+    lo, hi = min(lo, -85.0), max(hi, 20.0)
     span = hi - lo
-    lo -= span * 0.30
-    hi += span * 0.22
+    ax.set_ylim(lo - span * 0.06, hi + span * 0.30)
+    ax.set_xlim(0, prof.get("r_max_km", SANABIA_R_MAX_KM))
+    ax.set_xlabel("radius from the working centre (km)", color=MUTED,
+                  fontsize=FS_NOTE)
+    ax.set_ylabel("azimuthally-averaged IR BT (°C)", color=MUTED,
+                  fontsize=FS_NOTE)
 
-    # BD ladder behind the profile — the citable discretisation, and the same
-    # steps panel 1 contours, so the two panels read as one instrument.
-    for i, (lab, a, b) in enumerate(BD_LADDER):
-        a2, b2 = max(a, lo), min(b, hi)
-        if b2 <= a2:
+    # BD ladder as the y reference (CIMSS) — kept from the previous panel
+    for name, t_lo, t_hi in BD_LADDER:
+        if t_hi < lo or t_lo > hi:
             continue
-        ax.axhspan(a2, b2, color="#ffffff" if i % 2 else "#7f8fa6",
-                   alpha=0.045 if i % 2 else 0.075, zorder=0)
-        ax.axhline(a2, color=GRID, lw=0.5, alpha=0.8, zorder=1)
-        if b2 - a2 > span * 0.055:      # skip labels with no room to sit in
-            # LEFT edge: the profile's own minimum sits at the eyewall radius
-            # and the construction note sits bottom-right, so the first few km
-            # of the x axis is the only strip nothing else wants.
-            ax.text(prof["max_r_km"] * 0.010, (a2 + b2) / 2.0, lab, ha="left",
-                    va="center", color=MUTED, fontsize=6.8, alpha=0.7,
-                    zorder=2)
+        ax.axhline(t_lo, color=GRID, lw=0.5, alpha=0.55, zorder=1)
+        ax.text(0.004, t_lo, f" {name}", transform=ax.get_yaxis_transform(),
+                ha="left", va="bottom", color=MUTED, fontsize=6.6, alpha=0.85,
+                zorder=3)
 
-    ax.fill_between(r, prof["min_c"], prof["max_c"], color=C_ARCHER,
-                    alpha=0.13, lw=0, zorder=3)
-    ax.plot(r, mean_c, color=C_ARCHER, lw=1.8, zorder=5)
+    # the four critical points
+    import matplotlib.patheffects as pe
+    cas = [pe.withStroke(linewidth=2.4, foreground="#0a1019")]
+    # L45 and U45 sit within a few km of each other on a strong eyewall, so
+    # their labels are offset in opposite directions rather than stacked.
+    marks = (("cct", "CCT", "#2f6fff", "o", (0, 10), "center"),
+             ("fot", "FOT", "#4dd2ff", "^", (0, -17), "center"),
+             ("l45", "L45", "#e33ad4", "s", (-13, 11), "right"),
+             ("u45", "U45", "#b98cff", "D", (13, -19), "left"))
+    drawn = []
+    for key, name, colr, mk, off, ha in marks:
+        pt = prof.get(key)
+        if not pt:
+            continue
+        ax.plot(pt["r_km"], pt["bt_c"], marker=mk, ms=9, mfc=colr,
+                mec="#0a1019", mew=1.1, zorder=6, linestyle="none")
+        ax.annotate(name, xy=(pt["r_km"], pt["bt_c"]), xytext=off,
+                    textcoords="offset points", ha=ha, color=colr,
+                    fontsize=FS_NOTE, fontweight="bold", path_effects=cas,
+                    zorder=7)
+        drawn.append(f"{name} {pt['r_km']:.0f} km / {pt['bt_c']:+.0f} °C")
 
-    if prof.get("score") is not None:
-        import matplotlib.patheffects as pe
-        ew = prof["eyewall_r_km"]
-        ax.axvline(ew, color=C_OFFICIAL, lw=1.1, ls=(0, (4, 3)), zorder=6)
-        ax.plot([0.0], [prof["eye_warm_c"]], marker="o", ms=7,
-                mfc="none", mec=C_OFFICIAL, mew=1.6, zorder=7)
-        ax.plot([ew], [prof["eyewall_cold_c"]], marker="o", ms=7,
-                mfc="none", mec=C_FORECAST, mew=1.6, zorder=7)
-        # Sits BELOW the panel label, not under it, on a solid backing so a BD
-        # rung label can never end up reading through the number.
-        ax.text(0.012, 0.885, f"EYE SCORE  {prof['score']:.1f} °C",
-                transform=ax.transAxes, color=TEXT_COLOR, fontsize=12.5,
-                fontweight="bold", ha="left", va="top", zorder=9,
-                bbox=dict(facecolor="#060a12", alpha=0.9, edgecolor="none",
-                          pad=3),
-                path_effects=[pe.withStroke(linewidth=3,
-                              foreground="#060a12")])
-        detail = (f"warmest eye pixel {prof['eye_warm_c']:+.1f} °C   ·   "
-                  f"coldest eyewall ring {prof['eyewall_cold_c']:+.1f} °C\n"
-                  f"eyewall radius {ew:.0f} km")
-    else:
-        detail = prof.get("reason") or "no eye signature — score withheld"
+    head = "   ·   ".join(drawn) if drawn else "no critical points located"
+    ax.text(0.012, 0.955, head, transform=ax.transAxes, ha="left", va="top",
+            color=TEXT_COLOR, fontsize=FS_NOTE, fontweight="bold",
+            path_effects=cas, zorder=8)
+    for i, note in enumerate(prof.get("notes") or []):
+        ax.text(0.012, 0.895 - i * 0.052, "— " + note,
+                transform=ax.transAxes, ha="left", va="top", color=MUTED,
+                fontsize=6.8, zorder=8)
 
-    ax.set_xlim(0.0, prof["max_r_km"])
-    ax.set_ylim(lo, hi)
-    ax.set_xlabel("radius from the objective centre (km)", color=MUTED,
-                  fontsize=8.2, labelpad=2)
-    ax.set_ylabel("brightness temperature (°C)", color=MUTED, fontsize=8.2,
-                  labelpad=2)
-    ax.grid(True, color=GRID, lw=0.4, alpha=0.55, zorder=1)
-    _panel_label(ax, "EYE STRUCTURE   ·   RADIAL IR PROFILE"
-                 + (f"   ·   ABOUT THE {about.upper()}"
-                    if about and about != "objective centre"
-                    else ""))
-    # The construction, on the panel. A contrast number without its regions is
-    # not reproducible, and the regions here are OURS, not the ADT's. Wrapped
-    # to short lines so nothing runs off the panel's right edge.
-    # NEVER print a 0.0 as if it were a measurement: an unset value is omitted,
-    # not rendered as zero. (This panel printed "0.0 km pixels" and "beyond a
-    # 0 km floor" whenever the score was withheld early, because those keys
-    # were only set on the scored path.)
-    grid_bits = [f"{prof['ring_km']:.0f} km rings"]
-    if prof.get("px_km"):
-        grid_bits.append(f"{prof['px_km']:.1f} km pixels")
-    floor = prof.get("eyewall_floor_km")
-    wall_line = ("eyewall = inner edge of the coldest annulus within "
-                 f"{EYE_SEARCH_R_KM:.0f} km"
-                 + (f", beyond a {floor:.0f} km floor" if floor else "")
-                 + " (our construction)")
+    # method, cited
     ax.text(0.988, 0.022,
-            detail + "\n"
-            f"mean (line) · min–max envelope (band) · "
-            + " · ".join(grid_bits) + "\n"
-            + wall_line + "\n"
-            "BD ladder CIMSS",
+            "method: Sanabia, Barrett & Fine (2014), Mon. Wea. Rev. 142, "
+            "4581–4599\n"
+            f"azimuthal mean at {prof['dtheta_deg']:.0f}° intervals every "
+            f"{prof['dr_km']:.0f} km to {prof['r_max_km']:.0f} km · band = "
+            "±1 s.d. (their Fig. 2)\n"
+            "L45/U45 = first 45° up/down inflection of the non-dimensional "
+            "profile (their eqs 1–3)\n"
+            "BD ladder CIMSS · deep-convection gate and centre are ours",
             transform=ax.transAxes, ha="right", va="bottom", color=MUTED,
-            fontsize=7.3, linespacing=1.55,
+            fontsize=6.8, linespacing=1.5,
             bbox=dict(facecolor="#060a12", alpha=0.86, edgecolor=GRID, pad=4),
             zorder=10)
 
 
-# ---------------------------------------------------------------------------
-# shared chrome
-# ---------------------------------------------------------------------------
 def _adt_unconstrained(fixes: Optional[dict],
                        newest: Optional[dict]) -> bool:
     """True when the ADT estimate had no history to constrain it.
@@ -1641,10 +1866,10 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
 
     prof, prof_about = None, None
     if sc.emph is not None:
-        prof = eye_score(sc.ir_c, sc.ir_lat, sc.ir_lon,
-                         float(sc.emph["lat"]),
-                         _norm_lon(float(sc.emph["lon"]), sc.frame_lon),
-                         scene=sc.emph.get("scene"))
+        prof = sanabia_profile(sc.ir_c, sc.ir_lat, sc.ir_lon,
+                               float(sc.emph["lat"]),
+                               _norm_lon(float(sc.emph["lon"]), sc.frame_lon),
+                               wv_c=sc.wv_c)
         prof_about = "objective centre"
     elif (sc.storm.get("lat") is not None
           and sc.storm.get("lon") is not None):
@@ -1655,14 +1880,16 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
         # measurement. The SCORE stays withheld: scoring an eye about a centre
         # the objective method could not find is exactly the overreach the
         # rest of this panel refuses.
-        prof = eye_score(sc.ir_c, sc.ir_lat, sc.ir_lon,
-                         float(sc.storm["lat"]),
-                         _norm_lon(float(sc.storm["lon"]), sc.frame_lon),
-                         scene="__NO_OBJECTIVE_CENTRE__")
+        prof = sanabia_profile(sc.ir_c, sc.ir_lat, sc.ir_lon,
+                               float(sc.storm["lat"]),
+                               _norm_lon(float(sc.storm["lon"]),
+                                         sc.frame_lon),
+                               wv_c=sc.wv_c)
         prof_about = "official position"
         if prof is not None:
-            prof["reason"] = ("no objective centre this cycle — profile is "
-                              "about the OFFICIAL position, so no score")
+            prof.setdefault("notes", []).insert(
+                0, "no objective centre this cycle — profile is about the "
+                   "OFFICIAL position, which is a different measurement")
     panel_eye(axes_bot[1], sc, prof, about=prof_about)
 
     _draw_header(fig, sc, hdr_h, "STORM DIAGNOSTIC PLATE",
