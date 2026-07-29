@@ -105,6 +105,64 @@ BD_STEPS = [-80.0, -75.0, -69.0, -63.0, -53.0, -41.0, -30.0]
 #: LOOKUP rather than a ramp invented or borrowed here.
 IR_ENHANCEMENT = os.environ.get("CENTERFIX_IR_ENHANCEMENT", "rainbow_ir")
 
+# ---------------------------------------------------------------------------
+# ONE typographic scale for the whole plate. Every panel draws from these, so
+# a label cannot be 8.5 pt in one cell and 6.5 pt in the next — four panels at
+# four scales is what makes a plate read as four plots pasted together.
+# ---------------------------------------------------------------------------
+FS_TITLE = 20.0      # storm name / plate title
+FS_SUB = 10.0        # header sub-rows, footer
+FS_PANEL = 9.5       # in-panel corner labels
+FS_TICK = 8.5        # axis tick labels
+FS_LEGEND = 8.0      # legend entries, in-panel keys
+FS_ANNO = 9.0        # callouts on the imagery
+FS_NOTE = 8.0        # small print inside a panel
+
+ACE_HUE = "#ffbe34"          # house wind-tier gold, as on the CycloLab chart
+
+#: The canonical SSHWS category palette — imported, never re-derived. Same
+#: table the home map, the track plots and CycloLab key off.
+try:
+    from ace_core import SSHS_COLORS
+except Exception:                       # noqa: BLE001 - render must not die
+    SSHS_COLORS = {"TD": "#3fa4ff", "TS": "#46c56a", "C1": "#ffe14d",
+                   "C2": "#ff9a2f", "C3": "#f5333c", "C4": "#e33ad4",
+                   "C5": "#b03bff"}
+
+
+def _parse_utc(v) -> Optional[dt.datetime]:
+    """Feed stamps are naive ISO; treat them as UTC (they are)."""
+    if not v:
+        return None
+    try:
+        d = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:                   # noqa: BLE001
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+
+
+#: BD-step contour colours — a CATEGORICAL, high-contrast set chosen to be seen
+#: against GRAYSCALE, not to match the fill ramp.
+#:
+#: The previous version sampled these from the IR table at each step's own
+#: temperature. That was a nice-sounding property (a -60 C contour matching
+#: -60 C fill) and it cost the layer its entire purpose: across -40..-80 C the
+#: IR ramp is dark blue and violet, which over a mid-grey IR image has almost
+#: no luminance contrast, so the isotherms disappeared exactly where the deep
+#: convection is. Legibility over grayscale wins; the two top panels do not
+#: need to agree on colour and the reference's do not either.
+#:
+#: Warm -> cold, bright and hue-separated at every step.
+BD_STEP_COLORS = [
+    "#b98cff",   # -80  violet
+    "#4dd2ff",   # -75  cyan
+    "#2ee6a8",   # -69  spring green
+    "#7CFC4D",   # -63  bright green
+    "#FFE14D",   # -53  yellow
+    "#FFA033",   # -41  orange
+    "#FF5E5E",   # -30  coral
+]
+
 #: BD shade names for the ladder, warmest first. WMG (Warm Medium Grey) is the
 #: warmest step, > +9 °C — a WMG pixel inside an eye is a deeply subsident,
 #: cloud-free eye. Labels are the citable part; see eye_score() for what is not.
@@ -298,13 +356,40 @@ def _km_grid(lats, lons, clat: float, clon: float) -> np.ndarray:
 #: Rings inside this radius cannot BE the eyewall. Without a floor the coldest
 #: ring of a sheared, eyeless system sits at r~0 and the "eye" becomes an empty
 #: set -- a number would still come out, and it would be meaningless.
-EYE_MIN_EYEWALL_KM = 12.0
+#: Hard lower bound on the eyewall-search floor. The EFFECTIVE floor is
+#: adaptive (3 ring widths, see eye_score) so it tracks the grid rather than
+#: assuming a pixel size; this only stops it collapsing onto the eye itself on
+#: a very fine grid. OURS, not cited — printed on the panel.
+EYE_MIN_EYEWALL_KM_MIN = 8.0
 EYE_MAX_R_KM = 140.0
 #: Floor on the ring width. The ACTUAL width is derived from the grid's own
 #: sample spacing (see _ring_width_km): rings finer than a pixel hold one or
 #: zero samples each, and the profile then reports sampling noise as structure
 #: -- which is exactly the resolution-dependence this panel exists to avoid.
 EYE_RING_MIN_KM = 4.0
+
+#: An eye narrower than this many pixels across cannot resolve its own warm
+#: minimum — the warmest pixel becomes an artefact of where the grid falls.
+EYE_MIN_ACROSS_PX = 8.0
+#: Outer limit of the eyewall search. Beyond this the profile is describing the
+#: storm's canopy, not its core. OURS.
+EYE_SEARCH_R_KM = 100.0
+#: How close to the coldest ring in the window counts as "the eyewall". OURS.
+EYE_EYEWALL_TOL_C = 2.0
+#: A cleared eye puts its warmest pixel near the centre. Beyond this fraction
+#: of the eyewall radius it is a warm notch or a mislocated centre. OURS.
+EYE_WARM_MAX_FRAC = 0.6
+
+
+def _pixel_km(lats, lons) -> float:
+    """Mean grid spacing in km — the resolution the profile actually has."""
+    la, lo = np.asarray(lats), np.asarray(lons)
+    if la.ndim != 2 or la.shape[0] < 2 or la.shape[1] < 2:
+        return 0.0
+    dy = float(np.nanmean(np.abs(np.diff(la[:, 0])))) * 111.0
+    dx = (float(np.nanmean(np.abs(np.diff(lo[0, :])))) * 111.0
+          * float(np.cos(np.radians(np.nanmean(la)))))
+    return float((dx + dy) / 2.0)
 
 
 def _ring_width_km(lats, lons, clat: float, clon: float) -> float:
@@ -354,7 +439,7 @@ def eye_score(ir_c, lats, lons, clat: float, clon: float,
     * The REGIONS are OURS. ADT runs its own eye/eyewall search; here the
       eyewall is the coldest mean-BT ring of a radial profile about the working
       centre, and the eye is everything inside that radius. The radius cap, the
-      ring width and the EYE_MIN_EYEWALL_KM floor are our construction too.
+      ring width and the EYE_MIN_EYEWALL_KM_MIN floor are our construction too.
       They are printed on the panel rather than left implicit.
 
     The score is WITHHELD, with the reason on the panel, when there is no eye
@@ -406,27 +491,88 @@ def eye_score(ir_c, lats, lons, clat: float, clon: float,
         prof["reason"] = ("profile too coarse to locate an eyewall — "
                           f"{len(mids)} rings at {ring_km:.0f} km")
         return prof
-    ok = mids >= EYE_MIN_EYEWALL_KM
-    if not ok.any():
+    # The eyewall is the FIRST cold minimum going outward, not the coldest ring
+    # anywhere. Taking the global minimum over 0..140 km finds the outer cold
+    # canopy of a large storm instead of its eyewall: verified on GENEVIEVE,
+    # whose eye is ~16 km across but whose globally-coldest ring sat at 62 km,
+    # so "inside the eyewall" swallowed most of the CDO and the score was
+    # measuring eye-centre against outer-canopy contrast — a real number
+    # answering the wrong question.
+    #
+    # The floor is ADAPTIVE, not a bare 12 km: it has to clear the first few
+    # rings (which are dominated by the eye itself) without being wider than
+    # the eye of a small storm. Three ring widths, with 8 km as the hard lower
+    # bound, tracks the grid instead of assuming one.
+    # The floor only has to clear the eye's own innermost ring, so it is small
+    # and grid-derived. A 12 km floor pushed the search past the eyewall
+    # entirely on GENEVIEVE, whose eye is ~16 km across.
+    floor_km = max(EYE_MIN_EYEWALL_KM_MIN, 2.0 * ring_km)
+    prof["eyewall_floor_km"] = floor_km
+    ok = mids >= floor_km
+    win = ok & (mids <= EYE_SEARCH_R_KM)
+    if not win.any():
         prof["reason"] = "profile too short to locate an eyewall"
         return prof
-    j = int(np.argmin(np.where(ok, means, np.inf)))
+    # The eyewall is the INNER EDGE of the coldest annulus within the search
+    # window — the first radius that gets essentially as cold as the coldest
+    # cloud near the core. Neither of the obvious alternatives works: the
+    # GLOBAL minimum over the whole profile finds the outer canopy of a large
+    # storm (GENEVIEVE: 62 km, against a ~16 km eye), and the first LOCAL
+    # minimum finds whatever shoulder happens to turn over first (46 km on the
+    # same storm). Both produced a real number answering the wrong question.
+    cold = float(np.min(np.where(win, means, np.inf)))
+    cand = np.flatnonzero(win & (means <= cold + EYE_EYEWALL_TOL_C))
+    j = int(cand[0]) if cand.size else int(np.argmin(
+        np.where(win, means, np.inf)))
     ew_r = float(mids[j])
-    # The coldest ring anywhere must BE that ring. If the profile is colder at
-    # the centre than at ew_r, there is no clearing and nothing to score.
-    if float(np.min(means)) < means[j] - 0.01:
-        prof["reason"] = "no eye signature — coldest cloud is at the centre"
+    # RESOLUTION GATE. An eye only a handful of pixels across cannot resolve
+    # its own warm minimum: the warmest pixel is then a sampling artefact of
+    # where the grid happens to fall, and the score is resolution-limited
+    # rather than meteorological. Withhold and say so.
+    px_km = _pixel_km(lats, lons)
+    across_px = (2.0 * ew_r / px_km) if px_km else 0.0
+    prof["px_km"] = px_km
+    prof["eye_across_px"] = across_px
+    if across_px < EYE_MIN_ACROSS_PX:
+        prof["reason"] = (f"eye spans only {across_px:.0f} px at "
+                          f"{px_km:.1f} km — not resolved")
+        return prof
+
+    # There must be CLEARING: the innermost ring has to be warmer than the
+    # eyewall ring, or there is no eye to contrast against it.
+    #
+    # This previously tested "is the coldest ring anywhere the eyewall ring",
+    # which was correct only while the search took the GLOBAL minimum. Against
+    # a first-local-minimum eyewall it is inverted — the outer canopy of a big
+    # storm is routinely colder than the eyewall — and it withheld the score on
+    # GENEVIEVE while a textbook eye sat in the middle of the panel.
+    if means[0] <= means[j] + 0.01:
+        prof["reason"] = ("no eye signature — the centre is no warmer than "
+                          "the eyewall")
         return prof
     inside = r < ew_r
     if not (inside & np.isfinite(bt)).any():
         prof["reason"] = "no pixels inside the eyewall radius"
         return prof
     eye_warm = float(np.nanmax(bt[inside]))
+    # WHERE is that warmest pixel? A cleared eye puts it near the centre. If it
+    # sits out against the eyewall it is a warm notch or a mislocated centre,
+    # not a cleared eye, and the contrast is not an eye score.
+    wi = np.unravel_index(int(np.nanargmax(np.where(inside, bt, -np.inf))),
+                          bt.shape)
+    warm_r = float(r[wi])
+    prof["eye_warm_r_km"] = warm_r
+    prof["eye_warm_frac"] = (warm_r / ew_r) if ew_r else None
     ann = (r >= ew_r - ring_km) & (r <= ew_r + ring_km) & np.isfinite(bt)
     eyewall_cold = float(np.nanmin(bt[ann])) if ann.any() else float(means[j])
     score = eye_warm - eyewall_cold
     if score <= 0:
         prof["reason"] = "eye is not warmer than its eyewall — no eye"
+        return prof
+    if ew_r and warm_r / ew_r > EYE_WARM_MAX_FRAC:
+        prof["reason"] = (f"warmest pixel sits at {warm_r/ew_r*100:.0f}% of "
+                          "the eyewall radius — a warm notch, not a cleared "
+                          "eye")
         return prof
     prof.update(score=score, eyewall_r_km=ew_r, eye_warm_c=eye_warm,
                 eyewall_cold_c=eyewall_cold)
@@ -523,24 +669,35 @@ def prepare_scene(storm: dict, fixes: dict, adv: Optional[dict],
 # ---------------------------------------------------------------------------
 # panels
 # ---------------------------------------------------------------------------
-def bd_step_colors():
-    """One colour per BD step, sampled from TAT's OWN IR table at that step's
-    temperature.
+#: Grayscale IR range. NOT the full -90..+30: spending the whole ramp on
+#: 120 degrees leaves the entire CDO in the top sliver of it, so every cloud
+#: top renders the same flat paper-white and the contours have nothing to sit
+#: against. Compressing to the cloud-relevant range spends the tonal
+#: separation where the structure actually is; the warm ocean saturates dark,
+#: which is also what the reference does.
+IR_GRAY_COLD = -85.0
+IR_GRAY_WARM = 18.0
 
-    Two reasons this beats a hand-picked set. It is not invented — every hue
-    traces to the shared palette package, the same table the satellite pages
-    render with. And it makes the two top panels one instrument: a -60 °C
-    contour on the grayscale panel is the SAME hue as -60 °C fill on the
-    enhanced panel beside it, so a temperature reading carries across without
-    learning a second key.
+
+def ir_gray_cmap():
+    """gray_r TRUNCATED at both ends so neither blows out.
+
+    Full-range gray_r puts pure #fff at the cold end and pure #000 at the
+    warm end; the first flattens the deep convection into a white slab and
+    the second crushes the low-cloud field. Clipping to 0.08..0.93 keeps a
+    visible step between the coldest tops and the merely-cold ones.
     """
-    try:
-        from colormaps import get_enhancement, enhancement_norm
-        enh = get_enhancement(IR_ENHANCEMENT)
-        norm = enhancement_norm(IR_ENHANCEMENT)
-        return [enh["cmap"](norm(t)) for t in BD_STEPS]
-    except Exception:                     # noqa: BLE001 - palette is optional
-        return ["#9fb3cc"] * len(BD_STEPS)
+    from matplotlib.colors import LinearSegmentedColormap
+    base = plt.get_cmap("gray_r")
+    return LinearSegmentedColormap.from_list(
+        "tat_ir_gray", base(np.linspace(0.08, 0.93, 256)))
+
+
+def bd_step_colors():
+    """The BD-step contour colours: a fixed CATEGORICAL set (BD_STEP_COLORS),
+    chosen for contrast against grayscale rather than derived from the fill
+    ramp. See the constant for why sampling the IR table failed."""
+    return list(BD_STEP_COLORS[:len(BD_STEPS)])
 
 
 def _draw_field(ax, sc: Scene, field, cmap, norm, contours: bool):
@@ -597,8 +754,9 @@ def panel_centres(ax1, sc: Scene, legend_fontsize: float = 7.4,
     frame_lon, acc, rej, emph = sc.frame_lon, sc.acc, sc.rej, sc.emph
     sep_ok = sc.sep_ok
 
-    _draw_field(ax1, sc, sc.ir_c, plt.get_cmap("gray_r"),
-                Normalize(vmin=-90.0, vmax=30.0), contours=True)
+    _draw_field(ax1, sc, sc.ir_c, ir_gray_cmap(),
+                Normalize(vmin=IR_GRAY_COLD, vmax=IR_GRAY_WARM),
+                contours=True)
 
     handles: list[tuple[str, dict]] = []
 
@@ -774,55 +932,242 @@ def panel_enhanced(ax2, sc: Scene, xlim, ylim, label_fontsize: float = 8.5,
                        pad=4), zorder=12)
 
 
-def panel_wpace(ax, sc: Scene, png: Optional[bytes],
-                captured: Optional[dt.datetime]):
-    """Panel 3 — the CycloLab wind/pressure + observed/projected ACE chart.
+#: SSHWS category bands, from the SHARED table (ace_core.SSHS_COLORS) that the
+#: home map, the track plots and CycloLab all key off. Thresholds are the
+#: Saffir-Simpson wind speeds: 34 / 64 / 83 / 96 / 113 / 137 kt.
+#:
+#: Drawn near-opaque here on purpose. The CycloLab chart lays these over a dark
+#: page at 0.38 alpha, which is what turned C1 yellow into olive, sank C2
+#: orange into brown and collapsed C4 pink into the C5 purple beside it — the
+#: table was never wrong, the compositing was eating it.
+SSHWS_BANDS = [(0, 34, "TD"), (34, 64, "TS"), (64, 83, "C1"), (83, 96, "C2"),
+               (96, 113, "C3"), (113, 137, "C4"), (137, 999, "C5")]
+BAND_ALPHA = 0.92
 
-    Pasted in as a raster from the browser lane's capture of the REAL renderer.
-    Nothing about the ACE method is recomputed here; see the module docstring.
+
+def load_track_history(storm_id: str, basin: Optional[str]) -> Optional[dict]:
+    """The storm's own best-track history from the live tracks feed.
+
+    The plate used to paste in a browser CAPTURE of the CycloLab chart, which
+    meant the panel could be hours stale ("captured 3.2 h ago"), letterboxed
+    into its cell at a fixed aspect, and carried the page's own compositing —
+    including the muted category bands. Drawing it natively from the same feed
+    the page reads fixes all three.
+    """
+    b = (basin or "").lower()
+    b = "ep" if b == "cp" else b
+    if b not in ("wp", "al", "ep"):
+        return None
+    feed = _get_json(f"{CDN}/feeds/{b}_tracks_data.json") or {}
+    for s in (feed.get("storms") or []):
+        if s.get("sid") == storm_id:
+            return s
+    return None
+
+
+def _ace_series(hist: dict, basin: Optional[str], adv: Optional[dict]):
+    """(observed cumulative ACE, projected ACE) — via ace_core, not re-derived.
+
+    ace_core owns the gate (6-hourly synoptic, >= 34 kt, the basin's NATURE
+    set, the invest guard) and the increment. This only walks the points and
+    accumulates, so the panel can never disagree with the season totals.
+    """
+    import ace_core as ac
+    b = (basin or "al").lower()
+    b = "ep" if b == "cp" else b
+    if b not in ("wp", "al", "ep"):
+        b = "al"
+    obs, run = [], 0.0
+    invest = bool(hist.get("is_invest"))
+    for p in (hist.get("points") or []):
+        t = _parse_utc(p.get("t"))
+        if t is None:
+            continue
+        if not invest and ac.fix_ace_eligible(t.replace(tzinfo=None),
+                                              p.get("wind_kt"),
+                                              p.get("nature"), b):
+            run += ac.fix_increment(float(p["wind_kt"]))
+        obs.append((t, run))
+    proj = []
+    if obs and adv and (adv.get("points") or []):
+        fp = []
+        for p in adv["points"]:
+            t = _parse_utc(p.get("valid_utc"))
+            if t is not None and p.get("intensity_kt") is not None:
+                fp.append((t, float(p["intensity_kt"])))
+        fp.sort()
+        if len(fp) >= 2:
+            last_t, run2 = obs[-1][0], obs[-1][1]
+            proj = [(last_t, run2)]
+            # ACE is defined on the 6-hourly synoptic grid but forecasts are
+            # issued at 12/24/36/48/72/96/120 h — interpolate onto the grid
+            # before summing, and count only steps AFTER the last observed fix
+            # so the overlap is not double-counted.
+            step = dt.timedelta(hours=6)
+            t0 = fp[0][0].replace(minute=0, second=0, microsecond=0)
+            while t0.hour % 6 or t0 < fp[0][0]:
+                t0 += dt.timedelta(hours=1)
+            t = t0
+            while t <= fp[-1][0]:
+                kt = None
+                for i in range(1, len(fp)):
+                    if t <= fp[i][0]:
+                        a, bb = fp[i - 1], fp[i]
+                        f = 0.0 if bb[0] == a[0] else (
+                            (t - a[0]).total_seconds()
+                            / (bb[0] - a[0]).total_seconds())
+                        kt = a[1] + (bb[1] - a[1]) * f
+                        break
+                if kt is None:
+                    kt = fp[-1][1]
+                if t > last_t:
+                    if kt >= 34:
+                        run2 += ac.fix_increment(kt)
+                    proj.append((t, run2))
+                t += step
+    return obs, proj
+
+
+def panel_wpace(ax, sc: Scene, hist: Optional[dict]):
+    """Panel 3 — wind / pressure / ACE, drawn NATIVELY into its own cell.
+
+    Two stacked strips inside one axes slot: wind + pressure on top, cumulative
+    ACE beneath, on a shared time axis. Category shading comes from the shared
+    SSHWS table at full strength.
     """
     ax.set_facecolor(DARK_BG)
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
         s.set_color(GRID)
-    if png:
-        try:
-            import matplotlib.image as mpimg
-            img = mpimg.imread(io.BytesIO(png), format="png")
-            ax.imshow(img, aspect="equal", interpolation="antialiased",
-                      zorder=1)
-            ax.set_xlim(0, img.shape[1])
-            # RESERVE a strip above the raster for the panel label. The chart
-            # captions its own axes along its top edge, and drawing the label
-            # straight onto the image ran the two strings through each other.
-            ax.set_ylim(img.shape[0], -img.shape[0] * 0.155)
-            ax.set_frame_on(True)
-            age = ""
-            if captured is not None:
-                mins = (dt.datetime.now(dt.timezone.utc) -
-                        captured).total_seconds() / 60.0
-                # Say the age whenever it is big enough to matter. A chart from
-                # two cycles ago beside fresh imagery, under one VALID stamp,
-                # is the failure mode this line exists to prevent.
-                if mins >= 45:
-                    age = f"   ·   CAPTURED {mins / 60.0:.1f} H AGO"
-            # Short label + provenance: the chart labels its own series, so
-            # repeating them here would only compete with it.
-            _panel_label(ax, "WIND, PRESSURE & ACE   ·   FROM CYCLOLAB" + age)
-            return
-        except Exception as e:      # noqa: BLE001 - a bad raster is a placeholder
-            log.warning("wpace raster unusable: %s", e)
-    # HONEST PLACEHOLDER. An empty frame here would read as "this storm has no
-    # ACE", which is a claim; "not captured" is the truth.
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    _panel_label(ax, "WIND, PRESSURE & ACE")
-    ax.text(0.5, 0.5,
-            "chart not captured this cycle\n\n"
-            "the wind/pressure + observed/projected ACE panel is rendered by\n"
-            "CycloLab and captured from it; it is deliberately not recomputed\n"
-            "here, so when the capture is missing the panel stays empty",
-            transform=ax.transAxes, ha="center", va="center", color=MUTED,
-            fontsize=9.0, linespacing=1.7)
+    _panel_label(ax, "WIND, PRESSURE & ACE", fontsize=FS_PANEL)
+    if not hist or not (hist.get("points") or []):
+        ax.text(0.5, 0.5, "no best-track history for this storm yet",
+                transform=ax.transAxes, ha="center", va="center",
+                color=MUTED, fontsize=FS_NOTE)
+        return
+
+    pos = ax.get_position()
+    fig = ax.figure
+    ax.set_frame_on(False)
+    # inner strips: wind 62%, ACE 38%, sharing the x axis
+    pad_l, pad_r, pad_t, pad_b, gap = 0.052, 0.030, 0.115, 0.105, 0.020
+    x0 = pos.x0 + pos.width * pad_l
+    w = pos.width * (1 - pad_l - pad_r)
+    h_all = pos.height * (1 - pad_t - pad_b)
+    h_ace = h_all * 0.36
+    h_w = h_all - h_ace - pos.height * gap
+    y_ace = pos.y0 + pos.height * pad_b
+    y_w = y_ace + h_ace + pos.height * gap
+    axw = fig.add_axes([x0, y_w, w, h_w])
+    axa = fig.add_axes([x0, y_ace, w, h_ace])
+
+    basin = (sc.storm.get("basin") or sc.sid[-6:-4])
+    pts = []
+    for p in (hist.get("points") or []):
+        t = _parse_utc(p.get("t"))
+        if t is not None and p.get("wind_kt") is not None:
+            pts.append((t, float(p["wind_kt"]), p.get("pressure_mb")))
+    if len(pts) < 2:
+        return
+    fwind = []
+    if sc.adv and (sc.adv.get("points") or []):
+        for p in sc.adv["points"]:
+            t = _parse_utc(p.get("valid_utc"))
+            if t is not None and p.get("intensity_kt") is not None:
+                fwind.append((t, float(p["intensity_kt"]),
+                              int(p.get("tau_h") or 0)))
+        fwind.sort()
+    obs_ace, proj_ace = _ace_series(hist, basin, sc.adv)
+
+    t_all = [p[0] for p in pts] + [f[0] for f in fwind] + \
+            [a[0] for a in proj_ace]
+    tmin, tmax = min(t_all), max(t_all)
+    obs_peak = max(p[1] for p in pts)
+    f_peak = max((f[1] for f in fwind), default=0.0)
+    wmax = max(160.0, obs_peak + 12, f_peak + 12)
+
+    for lo, hi, cat in SSHWS_BANDS:
+        if lo >= wmax:
+            continue
+        axw.axhspan(lo, min(hi, wmax), color=SSHS_COLORS.get(cat, "#555"),
+                    alpha=BAND_ALPHA, zorder=0, linewidth=0)
+    for a in (axw, axa):
+        a.set_xlim(tmin, tmax)
+        a.set_facecolor("#0c1422")
+        a.tick_params(colors=MUTED, labelsize=FS_TICK, length=3, width=0.8)
+        for s in a.spines.values():
+            s.set_color(GRID)
+    axw.set_ylim(0, wmax)
+    axw.set_yticks([t for t in (0, 35, 65, 85, 100, 115, 140, 160)
+                    if t <= wmax])
+    axw.set_xticklabels([])
+
+    axw.plot([p[0] for p in pts], [p[1] for p in pts], color="#ffffff",
+             lw=2.4, zorder=4, solid_joinstyle="round")
+    axw.scatter([p[0] for p in pts], [p[1] for p in pts], s=16,
+                facecolors="#0a1324", edgecolors="#ffffff", linewidths=1.1,
+                zorder=5)
+    if len(fwind) >= 2:
+        axw.plot([f[0] for f in fwind], [f[1] for f in fwind], color="#ffffff",
+                 lw=1.9, ls=(0, (2, 3)), zorder=4)
+        axw.scatter([f[0] for f in fwind], [f[1] for f in fwind], s=11,
+                    facecolors="#0a1324", edgecolors="#ffffff",
+                    linewidths=1.0, zorder=5)
+    prs = [(p[0], p[2]) for p in pts if p[2] is not None]
+    if len(prs) >= 2:
+        axp = axw.twinx()
+        axp.set_xlim(tmin, tmax)
+        axp.plot([p[0] for p in prs], [p[1] for p in prs], color="#cfe0f5",
+                 lw=1.7, ls=(0, (5, 3)), zorder=3)
+        axp.tick_params(colors=MUTED, labelsize=FS_TICK, length=3, width=0.8)
+        for s in axp.spines.values():
+            s.set_color(GRID)
+        axp.set_ylabel("mb", color=MUTED, fontsize=FS_NOTE)
+
+    import matplotlib.patheffects as pe
+    cas = [pe.withStroke(linewidth=2.6, foreground="#0a1019")]
+    axw.annotate(f"OBS MAX {obs_peak:.0f} kt",
+                 xy=(max(pts, key=lambda p: p[1])[0], obs_peak),
+                 xytext=(0, 7), textcoords="offset points", ha="center",
+                 color="#ffffff", fontsize=FS_ANNO, fontweight="bold",
+                 path_effects=cas, zorder=6)
+    if fwind:
+        fp = max(fwind, key=lambda f: f[1])
+        axw.annotate(f"FCST PEAK {fp[1]:.0f} kt · T+{fp[2]}h",
+                     xy=(fp[0], fp[1]), xytext=(0, 7),
+                     textcoords="offset points", ha="center", color="#ffffff",
+                     fontsize=FS_ANNO, fontweight="bold", path_effects=cas,
+                     zorder=6)
+    axw.set_ylabel("kt", color=MUTED, fontsize=FS_NOTE)
+
+    if obs_ace:
+        amax = max([a[1] for a in obs_ace] + [a[1] for a in proj_ace] + [1.0])
+        axa.set_ylim(0, amax * 1.20)
+        axa.plot([a[0] for a in obs_ace], [a[1] for a in obs_ace],
+                 color=ACE_HUE, lw=2.3, drawstyle="steps-post", zorder=4)
+        axa.annotate(f"ACE {obs_ace[-1][1]:.2f}",
+                     xy=(obs_ace[-1][0], obs_ace[-1][1]), xytext=(-4, 6),
+                     textcoords="offset points", ha="right", color=ACE_HUE,
+                     fontsize=FS_ANNO, fontweight="bold", path_effects=cas,
+                     zorder=6)
+        if proj_ace:
+            axa.plot([a[0] for a in proj_ace], [a[1] for a in proj_ace],
+                     color=ACE_HUE, lw=1.9, ls=(0, (2, 3)),
+                     drawstyle="steps-post", zorder=4)
+            axa.annotate(f"PROJ {proj_ace[-1][1]:.2f}",
+                         xy=(proj_ace[-1][0], proj_ace[-1][1]),
+                         xytext=(-2, 6), textcoords="offset points",
+                         ha="right", color=ACE_HUE, fontsize=FS_ANNO,
+                         fontweight="bold", path_effects=cas, zorder=6)
+    axa.set_ylabel("ACE (10⁴ kt²)", color=MUTED, fontsize=FS_NOTE)
+    import matplotlib.dates as mdates
+    axa.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%HZ"))
+    axa.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=5))
+
+    axw.text(0.008, 1.045,
+             "observed (solid) · official forecast (dotted) · pressure "
+             "(dashed, right)", transform=axw.transAxes, ha="left",
+             va="bottom", color=MUTED, fontsize=FS_NOTE)
 
 
 def panel_eye(ax, sc: Scene, prof: Optional[dict]):
@@ -910,9 +1255,13 @@ def panel_eye(ax, sc: Scene, prof: Optional[dict]):
     # to short lines so nothing runs off the panel's right edge.
     ax.text(0.988, 0.022,
             detail + "\n"
-            f"mean (line) · min–max envelope (band) · {prof['ring_km']:.0f} km rings\n"
-            f"eyewall = coldest mean ring beyond {EYE_MIN_EYEWALL_KM:.0f} km "
-            "(our construction)\nBD ladder CIMSS",
+            f"mean (line) · min–max envelope (band) · "
+            f"{prof['ring_km']:.0f} km rings · "
+            f"{prof.get('px_km') or 0:.1f} km pixels\n"
+            f"eyewall = inner edge of the coldest annulus within "
+            f"{EYE_SEARCH_R_KM:.0f} km, beyond a "
+            f"{prof.get('eyewall_floor_km', 0):.0f} km floor (our construction)\n"
+            "BD ladder CIMSS",
             transform=ax.transAxes, ha="right", va="bottom", color=MUTED,
             fontsize=7.3, linespacing=1.55,
             bbox=dict(facecolor="#060a12", alpha=0.86, edgecolor=GRID, pad=4),
@@ -1051,8 +1400,7 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
                      ir_data, wv_data, box: Optional[dict] = None,
                      satcon: Optional[dict] = None, dpi: int = 120,
                      bbox: Optional[list[float]] = None, swir_data=None,
-                     wpace_png: Optional[bytes] = None,
-                     wpace_captured: Optional[dt.datetime] = None,
+                     track_history: Optional[dict] = None,
                      scene: Optional[Scene] = None) -> bytes:
     """The 2x2 STORM DIAGNOSTIC PLATE -> PNG bytes.
 
@@ -1067,19 +1415,28 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
     sc = scene or prepare_scene(storm, fixes, adv, ir_data, wv_data,
                                 swir_data=swir_data, box=box, satcon=satcon,
                                 bbox=bbox)
-    # The bottom row is SHORTER than the top on purpose: the maps are square in
-    # data and the two charts are wide, so equal rows would letterbox the
-    # charts inside tall empty cells. 2:1 cells match the captured chart's own
-    # 1000x480 frame almost exactly.
-    fig = plt.figure(figsize=(15.0, 11.2), facecolor=DARK_BG)
-    hdr_h, ftr_h = 0.094, 0.0446
-    top_y, top_h = 0.397, 0.509
-    # The bottom row starts ABOVE the footer, not on it: the eye panel carries
-    # real tick labels and an x-label, and sitting the axes on ftr_h drew them
-    # straight through the disclosure strip.
-    bot_y, bot_h = 0.088, 0.262
-    col_x = (0.035, 0.518)
-    col_w = 0.447
+    # ---- ONE 2x2 GRID -------------------------------------------------
+    # Geometry is derived, not hand-tuned per cell. Both imagery cells are the
+    # SAME size and SQUARE in figure inches (the data box is square in degrees,
+    # so a square cell fills it with no letterbox and the two panels come out
+    # pixel-identical). Both analysis cells are the same size as each other at
+    # exactly half the imagery height. Header and footer span the full width.
+    FIG_W = 16.0
+    MARGIN = 0.035                      # left = right = gutter, in fig fraction
+    col_w = (1.0 - MARGIN * 3.0) / 2.0
+    col_x = (MARGIN, MARGIN * 2.0 + col_w)
+    # Everything below is in INCHES first, then converted once — so the cells
+    # are equal by construction rather than by hand-tuned fractions.
+    cell_w_in = col_w * FIG_W
+    top_in = cell_w_in                  # imagery cells are SQUARE
+    bot_in = cell_w_in * 0.75           # analysis cells: equal to each other
+    hdr_in, ftr_in, gap_in, tick_in = 1.00, 0.45, 0.75, 0.80
+    FIG_H = hdr_in + top_in + gap_in + bot_in + tick_in + ftr_in
+    top_h, bot_h = top_in / FIG_H, bot_in / FIG_H
+    hdr_h, ftr_h = hdr_in / FIG_H, ftr_in / FIG_H
+    bot_y = (ftr_in + tick_in) / FIG_H
+    top_y = bot_y + bot_h + gap_in / FIG_H
+    fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=DARK_BG)
 
     axes_top = []
     for x in col_x:
@@ -1095,7 +1452,7 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
     panel_centres(axes_top[0], sc)
     panel_enhanced(axes_top[1], sc, axes_top[0].get_xlim(),
                    axes_top[0].get_ylim())
-    panel_wpace(axes_bot[0], sc, wpace_png, wpace_captured)
+    panel_wpace(axes_bot[0], sc, track_history)
 
     prof = None
     if sc.emph is not None:
@@ -1206,11 +1563,11 @@ def build_for_storm(entry: dict, sink=None, dpi: int = 110,
         sink.write_png(key, png)
     out.append((key, png))
     try:
-        wp_png, wp_when = load_wpace_png(sid)
+        hist = load_track_history(sid, entry.get("basin"))
         plate = render_composite(entry, fixes, adv, ir, wv, box=box,
                                  satcon=fixes.get("satcon"), dpi=plate_dpi,
                                  bbox=bbox, swir_data=swir,
-                                 wpace_png=wp_png, wpace_captured=wp_when,
+                                 track_history=hist,
                                  scene=sc)
         pkey = f"{R2_PREFIX}/{sid}_plate.png"
         if sink is not None:

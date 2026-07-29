@@ -213,6 +213,37 @@ def _tiny_png() -> bytes:
     return buf.getvalue()
 
 
+def _eye_field(clat=18.0, clon=-117.0, half=1.6, n=200,
+               eye_r_km=12.0, wall_w_km=14.0, eye_c=-6.0, wall_c=-72.0,
+               canopy_c=-58.0, amb_c=-30.0, warm_at_km=0.0):
+    """A REALISTIC synthetic storm at ~2 km pixels.
+
+    Warm eye that is warmest at its own centre (so the warmest-pixel search is
+    not picking an arbitrary member of a flat disc), a cold eyewall ANNULUS of
+    finite width, a cooler canopy outside it, then ambient. An "eyewall"
+    modelled as a filled disc is not an eyewall: its inner edge, which is what
+    the search looks for, would sit at the eye's own edge.
+
+    ``warm_at_km`` offsets the warm spot, which is how a warm NOTCH against the
+    eyewall's inner edge is simulated.
+    """
+    lat = np.linspace(clat - half, clat + half, n)
+    lon = np.linspace(clon - half, clon + half, n)
+    LON, LAT = np.meshgrid(lon, lat)
+    kmy = (LAT - clat) * 111.0
+    kmx = (LON - clon) * 111.0 * np.cos(np.radians(clat))
+    r = np.hypot(kmx, kmy)
+    wall_out = eye_r_km + wall_w_km
+    bt = np.full(r.shape, amb_c, dtype="float64")
+    bt[r > wall_out] = canopy_c
+    bt[r > wall_out * 2.6] = amb_c
+    bt[(r > eye_r_km) & (r <= wall_out)] = wall_c
+    rw = np.hypot(kmx - warm_at_km, kmy)
+    inside = r <= eye_r_km
+    bt[inside] = eye_c - 8.0 * (rw[inside] / max(eye_r_km, 1e-6))
+    return bt, LAT, LON, clat, clon
+
+
 class EyeScoreTests(unittest.TestCase):
     """The eye score is a CONTRAST in °C, not a pixel count: a count is
     resolution-dependent and would not compare across sensors. A system with
@@ -220,16 +251,56 @@ class EyeScoreTests(unittest.TestCase):
     region."""
 
     def test_finds_the_eyewall_and_scores_a_real_eye(self):
-        f = _Fake()
-        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7)
-        self.assertIsNotNone(prof)
-        self.assertIsNotNone(prof["score"])
-        # the synthetic eyewall ring sits at ~0.5 deg = ~55 km
-        self.assertGreater(prof["eyewall_r_km"], 30.0)
-        self.assertLess(prof["eyewall_r_km"], 85.0)
-        # a warm eye (+12 C) inside a deep cold ring -> a large positive score
+        # THE BUG THIS PINS: the eyewall used to be the coldest ring ANYWHERE
+        # in a 140 km profile, which on a large storm is the outer canopy.
+        # Verified against GENEVIEVE, whose eye is ~16 km across but whose
+        # globally-coldest ring sat at 62 km -- so "inside the eyewall"
+        # swallowed most of the CDO and the score measured eye-centre against
+        # outer-canopy contrast: a real number answering the wrong question.
+        bt, la, lo, clat, clon = _eye_field()
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        self.assertIsNotNone(prof["score"], prof.get("reason"))
+        # the eyewall's INNER EDGE is the eye radius (12 km) -- the search must
+        # land there, not out in the canopy
+        self.assertLess(abs(prof["eyewall_r_km"] - 12.0), 10.0,
+                        f"eyewall at {prof['eyewall_r_km']} km, true ~12 km")
         self.assertGreater(prof["score"], 40.0)
         self.assertGreater(prof["eye_warm_c"], prof["eyewall_cold_c"])
+
+    def test_a_cloud_filled_eye_does_not_score_like_a_cleared_one(self):
+        bt, la, lo, clat, clon = _eye_field(eye_c=-68.0)
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        if prof["score"] is not None:
+            self.assertLess(prof["score"], 15.0)
+
+    def test_a_warm_notch_against_the_eyewall_is_withheld(self):
+        # Not a cleared eye: the warm spot is out against the wall, which is
+        # also what a mislocated centre looks like.
+        bt, la, lo, clat, clon = _eye_field(warm_at_km=10.0)
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        self.assertIsNone(prof["score"])
+        self.assertIn("notch", (prof["reason"] or "").lower())
+
+    def test_an_unresolved_eye_is_withheld_not_estimated(self):
+        # A few pixels across cannot resolve its own warm minimum; the warmest
+        # pixel is then an artefact of where the grid falls.
+        bt, la, lo, clat, clon = _eye_field(n=24, eye_r_km=4.0, wall_w_km=5.0)
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        self.assertIsNone(prof["score"])
+        self.assertIn("resolved", (prof["reason"] or "").lower())
+
+    def test_the_search_floor_is_adaptive_not_a_bare_12_km(self):
+        # A fixed 12 km floor pushed the search PAST the eyewall of a small
+        # storm, which is how GENEVIEVE lost its score entirely.
+        bt, la, lo, clat, clon = _eye_field()
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        self.assertLessEqual(prof["eyewall_floor_km"], 12.0)
+
+    def test_resolution_is_reported_so_the_number_can_be_judged(self):
+        bt, la, lo, clat, clon = _eye_field()
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        self.assertGreater(prof["px_km"], 0.0)
+        self.assertGreater(prof["eye_across_px"], cf.EYE_MIN_ACROSS_PX)
 
     def test_no_eye_withholds_the_score_and_says_why(self):
         f = _FakeNoEye()
@@ -252,15 +323,14 @@ class EyeScoreTests(unittest.TestCase):
         self.assertIn("UNIFORM CDO", prof["reason"])
 
     def test_an_eye_scene_is_still_scored(self):
-        f = _Fake()
-        prof = cf.eye_score(cf._bt_celsius(f), f.lats, f.lons, 13.4, 170.7,
-                            scene="EYE")
-        self.assertIsNotNone(prof["score"])
+        bt, la, lo, clat, clon = _eye_field()
+        prof = cf.eye_score(bt, la, lo, clat, clon, scene="EYE")
+        self.assertIsNotNone(prof["score"], prof.get("reason"))
 
     def test_the_eyewall_floor_is_what_stops_a_zero_radius_eye(self):
         # Without it an eyeless field reports an "eye" of zero radius, scoring
         # the centre pixel against itself.
-        self.assertGreater(cf.EYE_MIN_EYEWALL_KM, 0.0)
+        self.assertGreater(cf.EYE_MIN_EYEWALL_KM_MIN, 0.0)
 
 
 class CompositePlateTests(unittest.TestCase):
@@ -270,7 +340,7 @@ class CompositePlateTests(unittest.TestCase):
 
     PTS = [_pt("2026-07-28T05:30:00.000Z", 13.42, 170.68)]
 
-    def _plate(self, wpace_png=None, captured=None, ir=None, adv=None):
+    def _plate(self, hist=None, ir=None, adv=None):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -288,7 +358,7 @@ class CompositePlateTests(unittest.TestCase):
             png = cf.render_composite(
                 STORM, _track(self.PTS), adv, ir or _Fake(), _Fake(),
                 box=None, satcon=None, dpi=50, bbox=BBOX,
-                wpace_png=wpace_png, wpace_captured=captured)
+                track_history=hist)
         finally:
             plt.Figure.text, Axes.text = forig, aorig
         self.assertEqual(png[1:4], b"PNG")
@@ -301,26 +371,6 @@ class CompositePlateTests(unittest.TestCase):
         self.assertIn("ENHANCED COLOUR", txt)                # top-right
         self.assertIn("WIND, PRESSURE & ACE", txt)           # bottom-left
         self.assertIn("EYE STRUCTURE", txt)                  # bottom-right
-
-    def test_missing_chart_capture_says_so_rather_than_drawing_nothing(self):
-        # An empty frame would read as "this storm has no ACE" -- a claim.
-        _png, txt = self._plate(wpace_png=None)
-        self.assertIn("not captured", txt)
-
-    def test_a_captured_chart_is_pasted_not_recomputed(self):
-        _png, txt = self._plate(wpace_png=_tiny_png())
-        self.assertIn("WIND, PRESSURE & ACE", txt)
-        self.assertNotIn("not captured", txt)
-
-    def test_a_stale_capture_declares_its_age(self):
-        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
-        _png, txt = self._plate(wpace_png=_tiny_png(), captured=old)
-        self.assertIn("CAPTURED", txt)
-
-    def test_a_fresh_capture_does_not_nag(self):
-        fresh = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
-        _png, txt = self._plate(wpace_png=_tiny_png(), captured=fresh)
-        self.assertNotIn("CAPTURED", txt)
 
     def test_eyeless_storm_keeps_the_panel_and_withholds_the_number(self):
         _png, txt = self._plate(ir=_FakeNoEye())
@@ -343,8 +393,8 @@ class CompositePlateTests(unittest.TestCase):
     def test_the_chart_panel_labels_itself_without_covering_the_chart(self):
         # The captured chart captions its own axes along its top edge, so the
         # panel label needs a reserved strip rather than the image's top-left.
-        _png, txt = self._plate(wpace_png=_tiny_png())
-        self.assertIn("FROM CYCLOLAB", txt)
+        _png, txt = self._plate()
+        self.assertIn("WIND, PRESSURE & ACE", txt)
 
     def test_plate_header_carries_identity_valid_time_and_forecast_hour(self):
         adv = {"advisory": 8, "points": [
