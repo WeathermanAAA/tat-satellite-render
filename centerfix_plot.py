@@ -123,12 +123,13 @@ ACE_HUE = "#ffbe34"          # house wind-tier gold, as on the CycloLab chart
 
 #: The canonical SSHWS category palette — imported, never re-derived. Same
 #: table the home map, the track plots and CycloLab key off.
-try:
-    from ace_core import SSHS_COLORS
-except Exception:                       # noqa: BLE001 - render must not die
-    SSHS_COLORS = {"TD": "#3fa4ff", "TS": "#46c56a", "C1": "#ffe14d",
-                   "C2": "#ff9a2f", "C3": "#f5333c", "C4": "#e33ad4",
-                   "C5": "#b03bff"}
+#:
+#: The ``except`` fallback that used to sit here is deliberately GONE. It was a
+#: verbatim copy of the palette and it HAD drifted, so any import hiccup drew a
+#: whole plate in stale colors with nothing to say so. tat-palettes is a pinned
+#: requirement of this service, so a failure is a broken deploy that should die
+#: loudly at import - not a quietly miscolored plate at render time.
+from tat_palettes.categories import CATEGORY_HEX as SSHS_COLORS
 
 
 def _parse_utc(v) -> Optional[dt.datetime]:

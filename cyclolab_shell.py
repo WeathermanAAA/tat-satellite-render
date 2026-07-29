@@ -95,6 +95,7 @@ import html as _html
 import json
 
 from ace_core import SSHS_COLORS  # the canonical category palette
+from tat_palettes.categories import CATEGORY_ORDER
 from cyclolab_pages import adv_key, page_url_path
 from cyclolab_basemap import basemap_for
 from cyclolab_intensity import basin_entry
@@ -137,6 +138,18 @@ def _ramp(c: dict) -> str:
             f"{c['accent']} 50%,{c['mid']} 78%,{c['edge']} 100%)")
 
 
+def cat_default_css() -> str:
+    """The :root category tokens, used before html[data-cat] is set.
+
+    Derived from the palette's weakest class rather than hardcoded: these were
+    a literal copy of TD's old blue, so a recolor left the pre-hydration banner
+    (and any storm with no category yet) wearing last season's color.
+    """
+    c = CAT_TOKENS[CATEGORY_ORDER[0]]
+    return (f"--cat-ramp: {_ramp(c)};\n"
+            f"    --cat-accent: {c['accent']}; --cat-ink: {c['ink']};")
+
+
 def cat_css() -> str:
     rules = []
     for cat, c in CAT_TOKENS.items():
@@ -171,14 +184,21 @@ HTML_TEMPLATE = r"""<!doctype html>
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://triple-a-tropics.com__PAGE_PATH__">__OG_IMAGE__
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
+<!-- Canonical SSHWS category palette, generated from the main repo's
+     palette/tat_palettes/categories.py. EAGER (not lazy) because the two
+     components this shell mounts on demand - cyclolab_map.js and
+     guidance/guidance.js - read window.TATPalette with no fallback copy; the
+     stylesheet backs cyclolab_map.js's var(--cat-*) fallbacks. Absolute
+     origin: this page is served by the render box, not the Pages site root. -->
+<link rel="stylesheet" href="https://triple-a-tropics.com/tat_palette.css">
+<script src="https://triple-a-tropics.com/tat_palette.js"></script>
 <style>
   __FONT_CSS__
 
   :root {
     --bg: #0b0e13; --panel: #11161f; --border: #232a36;
     --fg: #e8eef5; --muted: #8ea2bd; --navy-deep: #0a1a2e;
-    --cat-ramp: linear-gradient(180deg,#132c40,#3fa4ff,#132c40);
-    --cat-accent: #3fa4ff; --cat-ink: #ffffff;
+    __CAT_DEFAULT_CSS__
     /* ONE sizing token (FG-R3 widget-size pass): every content panel/SVG
        caps its height here so the auto-fit cone + plots stay "a panel, not a
        poster" - the whole content fits WITHOUT scrolling, composing with the
@@ -6692,6 +6712,7 @@ def render_page(storm: dict, *, feed_url: str, adv_url: str | None = None,
     html = (HTML_TEMPLATE
             .replace("__FONT_CSS__", font_css())
             .replace("__CAT_CSS__", cat_css())
+            .replace("__CAT_DEFAULT_CSS__", cat_default_css())
             .replace("__HPATH__", HURRICANE_PATH)
             .replace("__CAT__", cat)
             .replace("__CAT_LABEL__",
