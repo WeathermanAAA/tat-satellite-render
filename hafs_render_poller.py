@@ -87,16 +87,23 @@ HAFS_JOBS = int(_env("HAFS_JOBS", "8"))
 #
 # This was 4 because a parent env frame peaked at 3.64 GB and 8 concurrent
 # decodes OOM'd the pool (BrokenProcessPool), dropping exactly the heavy
-# parent.atm frames. hafs-render v0.13.0 fixes the USAGE rather than the width:
-# the frame peak is 1.96 GB measured, and per-worker peak is INDEPENDENT of pool
-# width (1956 and 1927 MB for two workers at width 2), so the budget is just
-# width x ~2.3 GB (allowing ~17% for the largest parent grid seen). Against this
-# container's 24 GB mem_limit that is 8 x 2.3 = 18.4 GB, 5.6 GB spare.
+# parent.atm frames. hafs-render v0.13.0 fixes the USAGE rather than the width.
 #
-# 8 is a MEMORY ceiling, not a throughput promise: the box has 8 vCPU shared
-# with the render stack and the pollers, so the wall-clock gain from 4 -> 8 is
-# core-bound (1 -> 2 measured 1.47x on a 2-core sandbox). Watch the first cycle
-# after this lands; the generator's halving backoff is still the safety net, and
+# MEMORY. A worker's high-water is 2.17 GB over a full 12-frame recycle life
+# (one frame alone is 1.91 GB; it ratchets +21 MB/frame), and it does not depend
+# on pool width. So 8 x 2.17 = 17.4 GB against this container's 24 GB mem_limit,
+# ~7 GB spare. hafs-render's own _fit_ingest_width re-checks that at runtime and
+# clamps if the box is tighter than expected, so this is a ceiling, not a bet.
+#
+# THROUGHPUT, measured on box2 (8 vCPU, ~2.5 cores of emit work already running,
+# 8 real parent frames per pass):
+#     width 1   383 s   1.00x   100% efficiency
+#     width 2   203 s   1.89x    94%
+#     width 4   112 s   3.43x    86%
+#     width 8    83 s   4.61x    58%
+# The knee is between 4 and 8. 8 is still the fastest absolute wall clock and is
+# what is set here, but it buys +34% over width 4 for 2x the RAM and 2x the
+# cores - so on a box carrying heavy co-tenants, 4-6 is the better citizen.
 # HAFS_INGEST_JOBS in the box .env overrides this without a redeploy.
 HAFS_INGEST_JOBS = int(_env("HAFS_INGEST_JOBS", "8"))
 
