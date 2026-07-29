@@ -700,6 +700,53 @@ def bd_step_colors():
     return list(BD_STEP_COLORS[:len(BD_STEPS)])
 
 
+def _graticule(ax, bbox, step: Optional[float] = None):
+    """Lat/lon graticule with edge labels.
+
+    SUBTLE BY CONSTRUCTION: a thin dotted line at low alpha, under the
+    contours in z-order. The BD isotherms are this panel's analytical layer
+    and a heavy graticule competes with them for exactly the same reading —
+    "which line am I looking at". This one is there to let a reader place a
+    feature, not to be read itself.
+    """
+    if not bbox or len(bbox) != 4:
+        return
+    w, s, e, n = (float(v) for v in bbox)
+    span = max(e - w, n - s)
+    if step is None:
+        step = 1.0 if span <= 4.5 else (2.0 if span <= 10 else 5.0)
+
+    def _lon(v):
+        vv = ((v + 180.0) % 360.0) - 180.0
+        return f"{abs(vv):.0f}°{'E' if vv >= 0 else 'W'}"
+
+    def _lat(v):
+        return f"{abs(v):.0f}°{'N' if v >= 0 else 'S'}"
+
+    xs = np.arange(np.ceil(w / step) * step, e + 1e-9, step)
+    ys = np.arange(np.ceil(s / step) * step, n + 1e-9, step)
+    ax.set_xticks(xs)
+    ax.set_yticks(ys)
+    ax.set_xticklabels([_lon(v) for v in xs])
+    ax.set_yticklabels([_lat(v) for v in ys])
+    ax.tick_params(colors=MUTED, labelsize=FS_TICK, length=3, width=0.7)
+    ax.grid(True, which="major", color="#ffffff", alpha=0.15, lw=0.6,
+            ls=(0, (1, 3)), zorder=2)
+    ax.set_axisbelow(False)
+
+
+def _panel_cbar(fig, rect, cmap, norm, ticks=None, unit="°C"):
+    """A per-panel vertical colorbar, in the plate's own typographic scale."""
+    from matplotlib.colorbar import ColorbarBase
+    cax = fig.add_axes(rect)
+    cb = ColorbarBase(cax, cmap=cmap, norm=norm, orientation="vertical",
+                      ticks=ticks)
+    cb.ax.tick_params(colors=MUTED, labelsize=FS_TICK, length=3, width=0.7)
+    cb.outline.set_edgecolor(GRID)
+    cax.set_title(unit, color=MUTED, fontsize=FS_NOTE, pad=5)
+    return cb
+
+
 def _draw_field(ax, sc: Scene, field, cmap, norm, contours: bool):
     ax.pcolormesh(sc.ir_lon, sc.ir_lat, np.ma.masked_invalid(field),
                   cmap=cmap, norm=norm, shading="auto", zorder=1)
@@ -1428,7 +1475,11 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
     # Everything below is in INCHES first, then converted once — so the cells
     # are equal by construction rather than by hand-tuned fractions.
     cell_w_in = col_w * FIG_W
-    top_in = cell_w_in                  # imagery cells are SQUARE
+    # Each imagery column now carries map + colorbar. The MAP stays square, so
+    # the colorbar strip (bar + its tick labels) comes off the column width.
+    CBAR_W_IN, CBAR_GAP_IN, CBAR_LBL_IN = 0.17, 0.12, 0.52
+    map_in = cell_w_in - (CBAR_W_IN + CBAR_GAP_IN + CBAR_LBL_IN)
+    top_in = map_in                     # imagery cells are SQUARE
     bot_in = cell_w_in * 0.75           # analysis cells: equal to each other
     hdr_in, ftr_in, gap_in, tick_in = 1.00, 0.45, 0.75, 0.80
     FIG_H = hdr_in + top_in + gap_in + bot_in + tick_in + ftr_in
@@ -1438,11 +1489,15 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
     top_y = bot_y + bot_h + gap_in / FIG_H
     fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=DARK_BG)
 
-    axes_top = []
+    map_w = map_in / FIG_W
+    cbar_w = CBAR_W_IN / FIG_W
+    cbar_dx = (map_in + CBAR_GAP_IN) / FIG_W
+    axes_top, cbar_rects = [], []
     for x in col_x:
-        ax = fig.add_axes([x, top_y, col_w, top_h])
+        ax = fig.add_axes([x, top_y, map_w, top_h])
         ax.set_facecolor("#060a12")
         axes_top.append(ax)
+        cbar_rects.append([x + cbar_dx, top_y, cbar_w, top_h])
     axes_bot = []
     for x in col_x:
         ax = fig.add_axes([x, bot_y, col_w, bot_h])
@@ -1452,6 +1507,23 @@ def render_composite(storm: dict, fixes: dict, adv: Optional[dict],
     panel_centres(axes_top[0], sc)
     panel_enhanced(axes_top[1], sc, axes_top[0].get_xlim(),
                    axes_top[0].get_ylim())
+    # Graticule + per-panel colorbar on BOTH imagery panels, matching each
+    # panel's own mapping: the grayscale panel is a different ramp from the
+    # enhanced one, so one shared bar would be wrong for at least one of them.
+    gray_norm = Normalize(vmin=IR_GRAY_COLD, vmax=IR_GRAY_WARM)
+    _panel_cbar(fig, cbar_rects[0], ir_gray_cmap(), gray_norm,
+                ticks=[t for t in (10, 0, -20, -40, -60, -80)
+                       if IR_GRAY_COLD <= t <= IR_GRAY_WARM])
+    try:
+        from colormaps import get_enhancement, enhancement_norm
+        enh = get_enhancement(IR_ENHANCEMENT)
+        _panel_cbar(fig, cbar_rects[1], enh["cmap"],
+                    enhancement_norm(IR_ENHANCEMENT),
+                    ticks=enh.get("ticks"))
+    except Exception:                   # noqa: BLE001 - palette is optional
+        pass
+    for ax in axes_top:
+        _graticule(ax, sc.bbox)
     panel_wpace(axes_bot[0], sc, track_history)
 
     prof = None
