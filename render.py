@@ -28,8 +28,6 @@ from matplotlib.colors import Normalize
 from shapely.geometry import shape
 
 from colormaps import get_enhancement, enhancement_norm, normalize_visible
-# The canonical SSHWS category palette (shared with the whole site).
-from tat_palettes.categories import CATEGORY_HEX
 from satellites import FetchResult
 
 log = logging.getLogger("tat-satellite.render")
@@ -226,12 +224,14 @@ def _coast_resolution(span_deg: float) -> str:
 # Per Andrew's spec (2026-05-28): TD neon blue, TS lime, C1 yellow, C2 amber,
 # C3 red, C4 pink, C5 magenta/purple. Tuned to read clearly against DARK_BG
 # (each is used as a tinted/translucent bbox face for the text, not a fill).
-# The seven categories come from the shared palette; only EX is local, because
-# "extratropical" is not an SSHWS category and has no swatch there. This block
-# used to be a ninth hand-tuned ramp of its own, so the same storm wore one
-# color on a satellite title strip and another everywhere else on the site.
 _SS_COLORS: dict[str, str] = {
-    **CATEGORY_HEX,
+    "TD": "#3b82f6",   # tropical depression — neon blue
+    "TS": "#84cc16",   # tropical storm — lime green
+    "C1": "#fde047",   # cat 1 — yellow
+    "C2": "#f59e0b",   # cat 2 — amber
+    "C3": "#dc2626",   # cat 3 — red
+    "C4": "#ec4899",   # cat 4 — pink
+    "C5": "#a855f7",   # cat 5 — magenta / purple
     "EX": "#9199a4",   # extratropical / post-tropical / remnant low — gray
 }
 
