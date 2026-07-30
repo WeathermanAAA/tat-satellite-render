@@ -72,5 +72,5 @@ requests>=2.31
 # feeds the cron generators write, and a version split shows up as the
 # baked page and the live overlay disagreeing about peak intensity
 # (observed 2026-07-30: page 145 kt, overlay 140 kt, same storm).
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.11#subdirectory=ace_core
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.12#subdirectory=ace_core
 pandas>=2.0
