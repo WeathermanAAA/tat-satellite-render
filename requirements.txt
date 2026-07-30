@@ -63,5 +63,14 @@ requests>=2.31
 # union) + designated-but-unnamed relabel (a spelled ATCF cardinal "ONE" ->
 # the ATCF short id "01E"/"10W"). Kills the duplicate UNNAMED WPAC ghost on
 # the tracks/global map. DISPLAY-NAME only: ACE math byte-identical.
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.8#subdirectory=ace_core
+# v0.8.10: the JTWC warning TEXT becomes a fix source, not just a type
+# source -- parse_prose reads the analysis position/wind/radii and
+# resolves its month-less DDHHMM against the ATCG twin's stamp.
+# v0.8.11: fourth intensity leg (knackwx) + resolve_conflicts, which
+# lets a live leg LEAD the b-deck at a shared hour instead of only
+# filling gaps. THE POLLER MUST TRACK THIS: it writes the same R2
+# feeds the cron generators write, and a version split shows up as the
+# baked page and the live overlay disagreeing about peak intensity
+# (observed 2026-07-30: page 145 kt, overlay 140 kt, same storm).
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.11#subdirectory=ace_core
 pandas>=2.0
