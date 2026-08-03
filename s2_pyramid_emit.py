@@ -217,10 +217,18 @@ def _reconcile_manifest(entry, store, prefix: str, covered_dts, keep) -> None:
     root = entry.tile_stamp_prefix(prefix, "")
     same_geom = []
     for s in orphans:
-        zdirs, _keys = store.list_level(root + s + "/")
+        zdirs, keys = store.list_level(root + s + "/")
         zs = [int(z[len(root) + len(s) + 1:].strip("/")) for z in zdirs
               if z[len(root) + len(s) + 1:].strip("/").isdigit()]
-        if zs and max(zs) == cur["maxzoom"]:
+        mz = max(zs) if zs else None
+        if mz is None:
+            import s2_container as C
+            for k in keys:                   # container frame: maxzoom rides
+                kmz = C.maxzoom_from_index_key(k)   # the index filename
+                if kmz is not None:
+                    mz = kmz
+                    break
+        if mz == cur["maxzoom"]:
             same_geom.append(s)
     if not same_geom:
         return                               # foreign geometry: heal tick's job

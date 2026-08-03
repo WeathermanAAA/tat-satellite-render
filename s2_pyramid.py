@@ -277,31 +277,54 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
         cut = s2_webmerc.cut_webmerc_pyramid(raster, bounds, spec, maxzoom=max_zoom)
     else:
         cut = cut_pyramid(raster, spec)
-    # BOUNDED-PARALLEL tile PUTs: the serial loop was the deep-pyramid wall
-    # (~610 tiles at z7 ≈ 6.5 min serial). A worker pool bounded by
-    # S2_PUT_WORKERS (default 8; the store's client pool is sized to match)
-    # uploads them concurrently. The atomicity contract is unchanged: any
-    # failed PUT raises here, BEFORE the ready marker — a partial frame is
-    # never marked whole, and the next pass re-renders it.
-    items = list(cut["tiles"].items())
-    workers = max(1, int(os.environ.get("S2_PUT_WORKERS", "8")))
 
-    def _put_tile(item):
-        (z, x, y), data = item
-        if not store.put_bytes(entry.tile_key(prefix, stamp, z, x, y),
-                               data, TILE_CONTENT_TYPE, CACHE_FRAME):
-            raise IOError(
-                f"tile PUT failed: {entry.tile_key(prefix, stamp, z, x, y)}")
-
-    if workers > 1 and len(items) > 8:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            # list() drains the iterator so the FIRST failure re-raises here
-            list(ex.map(_put_tile, items))
+    n = len(cut["tiles"])
+    if os.environ.get("S2_CONTAINER_TILES", "0") == "1":
+        # CONTAINER publishing (2026-08-03, the R2 cost incident; the
+        # hafs_render #27 pattern): the frame's tiles pack into a handful of
+        # zoom-banded USTAR blocks + one byte-offset index instead of one
+        # object per tile (~305 -> ~6 Class A PUTs on a full-disk frame).
+        # The read path stays per-tile via HTTP Range; the index filename
+        # carries maxzoom so complete_stamps' delimiter probe still answers
+        # geometry from key layout alone. Same atomicity: every block/index
+        # PUT must succeed BEFORE the ready marker.
+        import s2_container as C
+        built = C.build_frame_containers(cut["tiles"], cut["maxzoom"],
+                                         ext=entry.frame_ext)
+        stamp_dir = entry.tile_stamp_prefix(prefix, stamp)
+        for key, data in built["blocks"].items():
+            if not store.put_bytes(stamp_dir + key, data,
+                                   "application/x-tar", CACHE_FRAME):
+                raise IOError(f"container block PUT failed: {stamp_dir}{key}")
+        idx_key = stamp_dir + C.index_key_name(cut["maxzoom"])
+        if not store.put_bytes(idx_key, C.dumps_index(built["index"]),
+                               "application/json", CACHE_FRAME):
+            raise IOError(f"container index PUT failed: {idx_key}")
     else:
-        for it in items:
-            _put_tile(it)
-    n = len(items)
+        # BOUNDED-PARALLEL tile PUTs: the serial loop was the deep-pyramid wall
+        # (~610 tiles at z7 ≈ 6.5 min serial). A worker pool bounded by
+        # S2_PUT_WORKERS (default 8; the store's client pool is sized to match)
+        # uploads them concurrently. The atomicity contract is unchanged: any
+        # failed PUT raises here, BEFORE the ready marker — a partial frame is
+        # never marked whole, and the next pass re-renders it.
+        items = list(cut["tiles"].items())
+        workers = max(1, int(os.environ.get("S2_PUT_WORKERS", "8")))
+
+        def _put_tile(item):
+            (z, x, y), data = item
+            if not store.put_bytes(entry.tile_key(prefix, stamp, z, x, y),
+                                   data, TILE_CONTENT_TYPE, CACHE_FRAME):
+                raise IOError(
+                    f"tile PUT failed: {entry.tile_key(prefix, stamp, z, x, y)}")
+
+        if workers > 1 and len(items) > 8:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                # list() drains the iterator so the FIRST failure re-raises here
+                list(ex.map(_put_tile, items))
+        else:
+            for it in items:
+                _put_tile(it)
     # Calibrated BT data raster beside the tiles (before the marker, so it is part
     # of the atomically-completed frame the inspector can rely on).
     if bt_png is not None:
@@ -417,6 +440,14 @@ def complete_stamps(entry, store, prefix: str, *, limit: int = 0,
             return None                      # partial emit: never advertised
         zs = [int(z[len(root) + len(s) + 1:].strip("/")) for z in zdirs
               if z[len(root) + len(s) + 1:].strip("/").isdigit()]
+        if not zs:
+            # container frame: no {z}/ dirs -- the tiles.z{N}.json index
+            # filename carries the pyramid maxzoom (s2_container layout)
+            import s2_container as C
+            for k in keys:
+                mz = C.maxzoom_from_index_key(k)
+                if mz is not None:
+                    return (s, mz)
         return (s, max(zs) if zs else 0)
 
     # keep this in step with s1_ingest.R2's max_pool_connections, which is
