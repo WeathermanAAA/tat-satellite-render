@@ -292,6 +292,16 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
         built = C.build_frame_containers(cut["tiles"], cut["maxzoom"],
                                          ext=entry.frame_ext)
         stamp_dir = entry.tile_stamp_prefix(prefix, stamp)
+        # Hygiene: reaching here means the ready marker is ABSENT (dedup
+        # returned above otherwise), so any keys under this stamp are debris
+        # from a partial/interrupted emit -- possibly the LEGACY layout from
+        # before the container flip. Mixed layouts make the geometry probes
+        # ambiguous (review finding 2026-08-03); one delimiter listing +
+        # free DeleteObjects clears them before publishing.
+        if hasattr(store, "list_keys"):
+            stale = store.list_keys(stamp_dir)
+            if stale:
+                store.delete(stale)
         for key, data in built["blocks"].items():
             if not store.put_bytes(stamp_dir + key, data,
                                    "application/x-tar", CACHE_FRAME):
@@ -349,7 +359,8 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
                          spec: PyramidSpec = PyramidSpec(),
                          scheme: str = "flat-native-xyz",
                          bt: Optional[dict] = None,
-                         members: Optional[list] = None) -> dict:
+                         members: Optional[list] = None,
+                         containers_hint: bool = False) -> dict:
     """Build + PUT the tiled slider manifest (§4.1 tiled variant, superset).
 
     The viewer NEVER lists the bucket: `tile` is a product-relative path
@@ -360,6 +371,13 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
         stamps, bounds=bounds, image_px=image_px, maxzoom=maxzoom, as_of=as_of,
         tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme, bt=bt,
         members=members)
+    # Container hint, STICKY through rollback: the viewer probes a frame's
+    # tiles.z{N}.json only when the manifest says the product has ever
+    # published containers (kills the per-frame 404 probe on never-flipped
+    # products), and once ANY advertised frame may be a container the hint
+    # must survive turning the flag off or those frames go unreadable.
+    if os.environ.get("S2_CONTAINER_TILES", "0") == "1" or containers_hint:
+        lt["containers"] = True
     # Checked PUT (2026-08-03): under incremental manifest maintenance a
     # silently-failed manifest PUT is a phantom success -- the frame is
     # complete in R2 but never advertised, and no later append re-adds it.
@@ -387,6 +405,14 @@ def prune_tiles(entry, store, prefix: str, dead_stamps: Iterable[str]) -> int:
 #: Stamp format shared with s1_slots / s2_prune (lexicographic == chronological,
 #: which is what makes ``after`` a valid S3 StartAfter bound).
 STAMP_FMT = "%Y%m%dT%H%M%SZ"
+
+
+def _STAMP_OK(seg: str) -> bool:
+    try:
+        _dt.datetime.strptime(seg, STAMP_FMT)
+        return True
+    except ValueError:
+        return False
 
 
 def complete_stamps(entry, store, prefix: str, *, limit: int = 0,
@@ -438,16 +464,21 @@ def complete_stamps(entry, store, prefix: str, *, limit: int = 0,
         zdirs, keys = store.list_level(root + s + "/")
         if not any(k.endswith("/_ready.json") for k in keys):
             return None                      # partial emit: never advertised
+        # container frame: the tiles.z{N}.json index filename carries the
+        # pyramid maxzoom (s2_container layout). The index is AUTHORITATIVE
+        # over {z}/ dirs when both exist: a partial legacy emit that crashed
+        # before its marker can leave stale z-dirs beside a completed
+        # container re-emit, and preferring the dirs wedges the product in
+        # the geometry guard (review finding 2026-08-03). Multiple indexes
+        # (crash between index PUT and marker, then re-emit) resolve to the
+        # NEWEST completed geometry = max, compared numerically.
+        import s2_container as C
+        idx_mzs = [mz for mz in (C.maxzoom_from_index_key(k) for k in keys)
+                   if mz is not None]
+        if idx_mzs:
+            return (s, max(idx_mzs))
         zs = [int(z[len(root) + len(s) + 1:].strip("/")) for z in zdirs
               if z[len(root) + len(s) + 1:].strip("/").isdigit()]
-        if not zs:
-            # container frame: no {z}/ dirs -- the tiles.z{N}.json index
-            # filename carries the pyramid maxzoom (s2_container layout)
-            import s2_container as C
-            for k in keys:
-                mz = C.maxzoom_from_index_key(k)
-                if mz is not None:
-                    return (s, mz)
         return (s, max(zs) if zs else 0)
 
     # keep this in step with s1_ingest.R2's max_pool_connections, which is
@@ -502,19 +533,31 @@ def has_complete_frame(entry, store, prefix: str) -> bool:
 def _complete_stamps_flat(entry, store, prefix: str) -> list:
     """The pre-2026-07-25 whole-subtree walk. Retained as the fallback for
     stores that expose only ``list_keys`` (test fakes, older adapters)."""
+    import s2_container as C
     ready: set = set()
     maxz: dict = {}
+    idxz: dict = {}
     for key in store.list_keys(entry.tile_stamp_prefix(prefix, "")):
         rs = entry.stamp_from_ready_key(key)
         if rs is not None:
             ready.add(rs)
+            continue
+        imz = C.maxzoom_from_index_key(key)
+        if imz is not None:
+            iseg = key.rsplit("/", 2)
+            if len(iseg) == 3 and _STAMP_OK(iseg[1]):
+                if imz > idxz.get(iseg[1], -1):
+                    idxz[iseg[1]] = imz          # container frame
             continue
         ts = entry.stamp_from_tile_key(key)
         if ts is not None:
             z = int(key[: -len(entry.frame_ext)].split("/")[-3])
             if z > maxz.get(ts, -1):
                 maxz[ts] = z
-    return [(s, maxz.get(s, 0)) for s in sorted(ready)]
+    # index authoritative over stale z-dirs, same precedence as the
+    # delimiter probe above
+    return [(s, idxz[s] if s in idxz else maxz.get(s, 0))
+            for s in sorted(ready)]
 
 
 def stamps_from_store(entry, store, prefix: str) -> list:

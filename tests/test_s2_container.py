@@ -127,3 +127,86 @@ class TestEmitPyramidContainerMode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReviewFixes(unittest.TestCase):
+    """2026-08-03 cutb adversarial panel: probe precedence, flat fallback,
+    stamp-dir hygiene, sticky containers hint."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = P.FilesystemStore(self.tmp)
+        self.entry = next(e for e in R.REGISTRY if e.tiled)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(os.environ.pop, "S2_CONTAINER_TILES", None)
+
+    def _raster(self, px):
+        return np.full((px, px, 4), 180, dtype=np.uint8)
+
+    def test_index_wins_over_stale_legacy_zdirs(self):
+        # partial LEGACY emit (tiles, no marker) then a container re-emit of
+        # the SAME stamp: the stale z-dirs must not shadow the index
+        stamp = "20260803T120000Z"
+        self.store.put_bytes(self.entry.tile_key("shadow", stamp, 0, 0, 0),
+                             b"x", "image/webp", "c")
+        self.store.put_bytes(self.entry.tile_key("shadow", stamp, 1, 0, 0),
+                             b"x", "image/webp", "c")
+        os.environ["S2_CONTAINER_TILES"] = "1"
+        meta = P.emit_pyramid(self.entry, self.store, "shadow", stamp,
+                              self._raster(1200), (-125.0, 15.0, -66.0, 49.0),
+                              P.PyramidSpec(quality=60),
+                              scheme="flat-native-xyz")
+        self.assertEqual(meta["outcome"], "rendered")
+        frames = P.complete_stamps(self.entry, self.store, "shadow")
+        self.assertEqual(frames, [(stamp, meta["maxzoom"])])
+        # hygiene: the stale legacy tiles were cleared before publishing
+        keys = self.store.list_keys(
+            self.entry.tile_stamp_prefix("shadow", stamp))
+        self.assertFalse(any(k.endswith(".webp") for k in keys))
+
+    def test_two_indexes_resolve_to_max_numerically(self):
+        stamp = "20260803T120000Z"
+        d = self.entry.tile_stamp_prefix("shadow", stamp)
+        self.store.put_bytes(d + "tiles.z5.json", b"{}", "application/json", "c")
+        self.store.put_bytes(d + "tiles.z10.json", b"{}", "application/json", "c")
+        self.store.put_json(self.entry.ready_key("shadow", stamp),
+                            {"maxzoom": 10}, "c")
+        frames = P.complete_stamps(self.entry, self.store, "shadow")
+        self.assertEqual(frames, [(stamp, 10)])    # numeric, not lexicographic
+
+    def test_flat_walk_reads_container_maxzoom(self):
+        class FlatOnly:
+            def __init__(self, inner): self.inner = inner
+            def list_keys(self, prefix): return self.inner.list_keys(prefix)
+            def put_bytes(self, *a): return True
+            def head(self, k): return self.inner.head(k)
+        os.environ["S2_CONTAINER_TILES"] = "1"
+        stamp = "20260803T120000Z"
+        P.emit_pyramid(self.entry, self.store, "shadow", stamp,
+                       self._raster(1200), (-125.0, 15.0, -66.0, 49.0),
+                       P.PyramidSpec(quality=60), scheme="flat-native-xyz")
+        flat = FlatOnly(self.store)
+        frames = P.complete_stamps(self.entry, flat, "shadow")
+        self.assertEqual(len(frames), 1)
+        self.assertGreater(frames[0][1], 0)        # not the maxzoom-0 lie
+
+    def test_manifest_containers_hint_sticky(self):
+        import datetime as dt
+        os.environ["S2_CONTAINER_TILES"] = "1"
+        m = P.write_tiled_manifest(self.entry, self.store, "shadow",
+                                   ["20260803T120000Z"],
+                                   [-125.0, 15.0, -66.0, 49.0], [256, 256], 0,
+                                   dt.datetime.now(dt.timezone.utc))
+        self.assertTrue(m.get("containers"))
+        os.environ["S2_CONTAINER_TILES"] = "0"     # rollback
+        m2 = P.write_tiled_manifest(self.entry, self.store, "shadow",
+                                    ["20260803T120000Z"],
+                                    [-125.0, 15.0, -66.0, 49.0], [256, 256], 0,
+                                    dt.datetime.now(dt.timezone.utc),
+                                    containers_hint=True)
+        self.assertTrue(m2.get("containers"))      # carried forward
+        m3 = P.write_tiled_manifest(self.entry, self.store, "shadow",
+                                    ["20260803T120000Z"],
+                                    [-125.0, 15.0, -66.0, 49.0], [256, 256], 0,
+                                    dt.datetime.now(dt.timezone.utc))
+        self.assertIsNone(m3.get("containers"))    # never-flipped: absent

@@ -241,6 +241,8 @@ def _reconcile_manifest(entry, store, prefix: str, covered_dts, keep) -> None:
         tile_size=cur.get("tile_size", 512), min_zoom=cur.get("minzoom", 0),
         scheme=cur.get("scheme"), bt=cur.get("bt"),
         members=cur.get("members"))
+    if cur.get("containers") or os.environ.get("S2_CONTAINER_TILES", "0") == "1":
+        lt["containers"] = True          # sticky through rollback
     if store.put_json(entry.latest_times_key(prefix), lt, P.CACHE_MANIFEST):
         print(f"[manifest] reconciled {len(same_geom)} orphan frame(s) for "
               f"{entry.product_id}: {same_geom[:3]}")
@@ -387,7 +389,8 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
                                           img.bounds, image_px, cur["maxzoom"],
                                           dt.datetime.now(UTC), spec=spec,
                                           scheme=scheme, bt=bt_desc,
-                                          members=getattr(img, "members", None))
+                                          members=getattr(img, "members", None),
+                                          containers_hint=bool(cur.get("containers")))
         print(f"[done] {entry.product_id}: frames={manifest['count']} "
               f"latest={manifest['latest']} zoom={manifest['minzoom']}..{manifest['maxzoom']} (incremental)")
         return {"stamp": img.stamp, "outcome": meta["outcome"],
@@ -429,7 +432,8 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
                                       img.bounds, image_px, maxzoom,
                                       dt.datetime.now(UTC), spec=spec, scheme=scheme,
                                       bt=bt_desc,
-                                      members=getattr(img, "members", None))
+                                      members=getattr(img, "members", None),
+                                      containers_hint=bool(cur and cur.get("containers")))
     _state_touch(heal_path)
     print(f"[done] {entry.product_id}: frames={manifest['count']} "
           f"latest={manifest['latest']} zoom={manifest['minzoom']}..{manifest['maxzoom']} (rebuild)")
