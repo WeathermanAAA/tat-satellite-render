@@ -49,6 +49,9 @@ STALE_S="${S2_CANARY_STALE_S:-2100}"           # 35 min
 REBUILD_REACH_S="${S2_CANARY_REACH_S:-2400}"   # 40 min: inside backfill reach
 
 log() { echo "[canary $(date -u +%H:%M:%S)] $*"; }
+TRIP_REASON=""   # set by lane_log_bad (same shell); check_round runs in a
+                 # command-substitution SUBSHELL, so its reason is derived
+                 # from the captured output + exit code instead
 
 check_round() {  # -> writes trip reason to $TRIP_REASON, returns 0 if healthy
   TRIP_REASON=""
@@ -109,13 +112,7 @@ for p in products:
 print("INDEXMISS " + ";".join(missing) if missing else "OK")
 sys.exit(0)
 PYEOF
-  rc=$?
-  case $rc in
-    0) return 0 ;;
-    2) TRIP_REASON="byte-mismatch"; return 1 ;;
-    3) TRIP_REASON="stale"; return 1 ;;
-    *) TRIP_REASON="checker-error rc=$rc"; return 2 ;;   # transient: no trip
-  esac
+  return $?    # 0 ok | 2 byte-mismatch | 3 stale | other transient
 }
 
 lane_log_bad() {
@@ -184,9 +181,12 @@ while :; do
   fi
   out=$(check_round 2>&1); rc=$?
   echo "$out" | tail -2 | sed 's/^/[canary-check] /'
-  if [ $rc -eq 1 ]; then
-    do_rollback "$TRIP_REASON: $(echo "$out" | grep TRIP | head -1)"
-  fi
+  case $rc in
+    2) do_rollback "byte-mismatch: $(echo "$out" | grep TRIP | head -1)" ;;
+    3) do_rollback "stale: $(echo "$out" | grep TRIP | head -1)" ;;
+    0) : ;;
+    *) log "checker transient rc=$rc (no trip)" ;;
+  esac
   if echo "$out" | grep -q "^INDEXMISS .*[a-z]"; then
     misses=$((misses + 1))
     log "index-missing round $misses/2: $(echo "$out" | grep INDEXMISS)"
