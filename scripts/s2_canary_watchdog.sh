@@ -60,8 +60,14 @@ import calendar, json, random, sys, time, urllib.request
 
 cdn, stale_s, products = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 
+UA = {"User-Agent": "tat-canary/1 (+https://triple-a-tropics.com)"}
+
 def get(url, headers=None, timeout=25):
-    req = urllib.request.Request(url, headers=headers or {})
+    # a REAL User-Agent is load-bearing: Cloudflare 403s the default
+    # Python-urllib UA from the box IP, which false-tripped the first
+    # canary run within seconds of arming (2026-08-03 22:59Z)
+    h = dict(UA); h.update(headers or {})
+    req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read()
 
@@ -70,9 +76,12 @@ for p in products:
     try:
         _s, raw = get(f"{cdn}/shadow/sat/{p}/latest_times.json")
         m = json.loads(raw)
-    except Exception as e:  # manifest unreachable: treat as stale-equivalent
-        print(f"TRIP stale manifest-unreachable {p}: {e}")
-        sys.exit(3)
+    except Exception as e:
+        # manifest unreachable FROM THIS VANTAGE is not a canary failure
+        # (a CDN outage breaks everyone regardless of publish format);
+        # report it and let the parent escalate only if it persists
+        print(f"UNREACHABLE {p}: {e}")
+        sys.exit(4)
     latest = m.get("latest")
     if latest:
         # timegm, not mktime: the stamp is UTC and the box TZ must not
@@ -112,7 +121,7 @@ for p in products:
 print("INDEXMISS " + ";".join(missing) if missing else "OK")
 sys.exit(0)
 PYEOF
-  return $?    # 0 ok | 2 byte-mismatch | 3 stale | other transient
+  return $?    # 0 ok | 2 byte-mismatch | 3 stale | 4 unreachable | other transient
 }
 
 lane_log_bad() {
@@ -171,6 +180,7 @@ for p in ["goes19/conus/ir", "goes19/conus/irbd",
 log "watching lane=$LANE_PROJ flag=$FLAG interval=${INTERVAL_S}s window=${WATCH_S}s"
 start=$(date +%s)
 misses=0
+unreachable=0
 while :; do
   now=$(date +%s)
   if [ $((now - start)) -ge "$WATCH_S" ]; then
@@ -184,7 +194,12 @@ while :; do
   case $rc in
     2) do_rollback "byte-mismatch: $(echo "$out" | grep TRIP | head -1)" ;;
     3) do_rollback "stale: $(echo "$out" | grep TRIP | head -1)" ;;
-    0) : ;;
+    4) unreachable=$((unreachable + 1))
+       log "manifest unreachable round $unreachable/5 (CDN vantage, no trip yet)"
+       [ "$unreachable" -ge 5 ] && \
+         do_rollback "unreachable (5 consecutive rounds: cannot verify canary health)"
+       ;;
+    0) unreachable=0 ;;
     *) log "checker transient rc=$rc (no trip)" ;;
   esac
   if echo "$out" | grep -q "^INDEXMISS .*[a-z]"; then
