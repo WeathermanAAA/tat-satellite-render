@@ -99,7 +99,19 @@ for p in products:
         st, raw = get(idx_url)
         idx = json.loads(raw)
     except Exception:
-        missing.append(f"{p}/{latest}")
+        # TRANSITION CASE (false-trip caught live 2026-08-03 23:00Z): a
+        # hinted product's newest frame can legitimately be a LEGACY
+        # per-tile frame (hint went sticky before the first container frame
+        # published). Missing index + present per-tile z0 object = healthy
+        # legacy frame, exactly what the viewer's fallback reads. Missing
+        # BOTH = the frame is truly unreadable -> count toward C1.
+        try:
+            st0, _ = get(f"{cdn}/shadow/sat/{p}/{latest}/0/0/0.webp")
+            legacy_ok = (st0 == 200)
+        except Exception:
+            legacy_ok = False
+        if not legacy_ok:
+            missing.append(f"{p}/{latest}")
         continue
     tiles = list(idx.get("tiles", {}).items())
     if not tiles:
