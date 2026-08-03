@@ -22,7 +22,7 @@
 #     -f docker-compose.s2.prune.yml --profile cron up -d --no-build emit-cron
 services:
   emit-cron:
-    mem_limit: 1g
+    mem_limit: 2g
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

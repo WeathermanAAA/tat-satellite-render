@@ -166,6 +166,35 @@ def make_client():
         config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
 
 
+def _product_prefixes(s3, bucket: str, prefix: str):
+    """Delimiter-walk {prefix} down to the product level (the level whose
+    children are stamp dirs). A child whose immediate subdirs parse as
+    stamps IS a product; anything else recurses. Depth-capped defensively."""
+    def children(pfx):
+        # manual list_objects_v2 pagination, matching list_objects below
+        # (and the FakeS3 the tests inject -- no get_paginator there)
+        out, kw = [], {"Bucket": bucket, "Prefix": pfx, "Delimiter": "/"}
+        while True:
+            resp = s3.list_objects_v2(**kw)
+            out.extend(c["Prefix"] for c in resp.get("CommonPrefixes", []))
+            if not resp.get("IsTruncated"):
+                return out
+            kw["ContinuationToken"] = resp.get("NextContinuationToken")
+
+    stack, found = [(prefix, 0)], []
+    while stack:
+        pfx, depth = stack.pop()
+        kids = children(pfx)
+        if not kids:
+            continue
+        if any(parse_stamp(k[len(pfx):].strip("/")) for k in kids):
+            found.append(pfx)
+            continue
+        if depth < 6:
+            stack.extend((k, depth + 1) for k in kids)
+    return sorted(found)
+
+
 def list_objects(s3, bucket: str, prefix: str):
     """Yield (key, size) for every object under prefix (paginated)."""
     token = None
@@ -260,8 +289,19 @@ def main(argv=None, s3=None):
     print(f"[prune] {mode} prefix={args.prefix} ttl={args.days}d "
           f"keep-min={args.keep_min} bucket={args.bucket}")
 
-    plans = plan_prune(list_objects(s3, args.bucket, args.prefix),
-                       days=args.days, keep_min=args.keep_min, now=now)
+    # PER-PRODUCT walk (2026-08-03): one flat listing of the whole tree held
+    # every key string in memory at once -- ~50M keys at current retention,
+    # which OOM-killed the prune lane (rc=137) on its first run back. The
+    # planner and every safety rail are unchanged; only the WALK is scoped:
+    # delimiter-derive the product prefixes, then list+plan+apply one product
+    # at a time, so peak memory is the largest single product (~1.6M keys)
+    # instead of the tree. Same answer by construction -- plan_prune groups
+    # by product anyway, and products share no keys.
+    plans = []
+    for prod_prefix in _product_prefixes(s3, args.bucket, args.prefix):
+        plans.extend(plan_prune(list_objects(s3, args.bucket, prod_prefix),
+                                days=args.days, keep_min=args.keep_min,
+                                now=now))
     todo = [p for p in plans if p.condemned]
     n_keys = sum(len(p.keys) for p in todo)
     n_bytes = sum(p.bytes for p in todo)

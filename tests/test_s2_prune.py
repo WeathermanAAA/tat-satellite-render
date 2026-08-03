@@ -36,8 +36,24 @@ class FakeS3:
         self.deleted_order = []
         self.puts = {}
 
-    def list_objects_v2(self, Bucket, Prefix, MaxKeys=1000, ContinuationToken=None):
+    def list_objects_v2(self, Bucket, Prefix, MaxKeys=1000,
+                        ContinuationToken=None, Delimiter=None):
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
+        if Delimiter:
+            # grouped listing (the per-product walk uses this): keys with the
+            # delimiter beyond Prefix collapse into CommonPrefixes
+            pres, own = [], []
+            for k in keys:
+                rest = k[len(Prefix):]
+                if Delimiter in rest:
+                    pre = Prefix + rest.split(Delimiter, 1)[0] + Delimiter
+                    if pre not in pres:
+                        pres.append(pre)
+                else:
+                    own.append(k)
+            return {"CommonPrefixes": [{"Prefix": p} for p in pres],
+                    "Contents": [{"Key": k, "Size": self._size(k)} for k in own],
+                    "IsTruncated": False}
         start = int(ContinuationToken or 0)
         page = keys[start:start + 1]          # 1-key pages: exercise pagination
         out = {"Contents": [{"Key": k, "Size": self._size(k)} for k in page],
