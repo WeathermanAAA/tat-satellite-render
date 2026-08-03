@@ -72,5 +72,13 @@ requests>=2.31
 # feeds the cron generators write, and a version split shows up as the
 # baked page and the live overlay disagreeing about peak intensity
 # (observed 2026-07-30: page 145 kt, overlay 140 kt, same storm).
-ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.12#subdirectory=ace_core
+# v0.8.13: pre-genesis guard on the PTC promotion (a decaying former TC
+# under NHC post-tropical advisories matched the gate — GENEVIEVE
+# 2026-08-03, 26.117 ACE dropped from the baked global header) + header
+# season ACE sums every storm's ledger ACE flags-ignored + "PTC" removed
+# from the potential-TC classification synonyms (NHC's code means
+# POST-tropical). The poller writes the feed headers the live overlay
+# repaints, so lagging this pin re-opens the header-vs-strip split in
+# the next decay window.
+ace-core @ git+https://github.com/WeathermanAAA/Triple-A-Tropics.git@ace-core-v0.8.13#subdirectory=ace_core
 pandas>=2.0
