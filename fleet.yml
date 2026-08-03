@@ -34,7 +34,7 @@
 #   lanes[].box         which box.name owns it  <-- the assignment map
 #   lanes[].cost        measured steady-state cores / peak RAM, for planning
 
-updated: 2026-07-25
+updated: 2026-08-03
 
 boxes:
   - name: box1
@@ -79,6 +79,7 @@ boxes:
       - tat-s2-mtg
       - tat-s2-geo
       - tat-s2-conus-fast
+      - tat-s2-prune
     services: []
 
 lanes:
@@ -126,6 +127,10 @@ lanes:
     compose: docker-compose.s2.conus-lane.yml
     box: box1
     cost: ~0.1 cores steady / ~0.6 GB peak
+  - project: tat-s2-prune
+    compose: docker-compose.s2.prune.yml
+    box: box2
+    cost: ~0 cores (one daily list walk + free deletes; IO-bound minutes/day)
 
 # Every key that must exist in /root/tsr-s2/.env on a box running lanes.
 # provision_box.sh refuses to start lanes if any is missing.

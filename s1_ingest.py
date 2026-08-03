@@ -171,8 +171,20 @@ class R2:
                                   int(os.environ.get("S2_LIST_WORKERS", "16")))
                               + 4),
         )
+        # Request accounting (2026-08-03, the R2 Class A cost incident): every
+        # billable REQUEST -- one per LIST page, not per list() call -- so the
+        # emit logs carry measured op counts instead of projections.
+        # list_pages/put are Class A ($4.50/M); head/get are Class B; delete
+        # requests are free but counted for completeness.
+        self.ops: dict = {}
+        self._ops_lock = threading.Lock()
+
+    def _op(self, name: str, n: int = 1) -> None:
+        with self._ops_lock:
+            self.ops[name] = self.ops.get(name, 0) + n
 
     def put_bytes(self, key: str, data: bytes, content_type: str, cache: str) -> bool:
+        self._op("put")
         try:
             self.s3.put_object(Bucket=R2_BUCKET, Key=key, Body=data,
                                ContentType=content_type, CacheControl=cache)
@@ -186,16 +198,29 @@ class R2:
                               "application/json", cache)
 
     def head(self, key: str) -> bool:
+        self._op("head")
         try:
             self.s3.head_object(Bucket=R2_BUCKET, Key=key)
             return True
         except Exception:  # noqa: BLE001 - NoSuchKey / 404 -> False
             return False
 
+    def get_bytes(self, key: str) -> Optional[bytes]:
+        """Object body, or None (missing key / any error). Class B -- 12.5x
+        cheaper than a LIST page; the emitter's manifest-incremental path
+        (2026-08-03) needs this to exist HERE, not just on FilesystemStore,
+        or it silently degrades to full listing rebuilds on the box."""
+        self._op("get")
+        try:
+            return self.s3.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+        except Exception:  # noqa: BLE001 - NoSuchKey / 404 -> None
+            return None
+
     def delete(self, keys) -> None:
         keys = [k for k in keys if k]
         for i in range(0, len(keys), 1000):
             batch = keys[i:i + 1000]
+            self._op("delete_req")
             try:
                 self.s3.delete_objects(Bucket=R2_BUCKET,
                                        Delete={"Objects": [{"Key": k} for k in batch]})
@@ -206,6 +231,7 @@ class R2:
         keys: list[str] = []
         for page in self.s3.get_paginator("list_objects_v2").paginate(
                 Bucket=R2_BUCKET, Prefix=prefix):
+            self._op("list_pages")
             keys.extend(o["Key"] for o in page.get("Contents", []))
         return keys
 
@@ -221,6 +247,7 @@ class R2:
         if start_after:
             kw["StartAfter"] = start_after
         for page in self.s3.get_paginator("list_objects_v2").paginate(**kw):
+            self._op("list_pages")
             out.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
         return out
 
@@ -230,6 +257,7 @@ class R2:
         keys: list[str] = []
         for page in self.s3.get_paginator("list_objects_v2").paginate(
                 Bucket=R2_BUCKET, Prefix=prefix, Delimiter="/"):
+            self._op("list_pages")
             pres.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
             keys.extend(o["Key"] for o in page.get("Contents", []))
         return pres, keys

@@ -47,7 +47,9 @@ Deletes `shadow/sat/**` frames whose **stamp** is older than 14 days
 (`S2_PRUNE_KEEP_MIN`) so an emitter outage can never empty a product.
 Ready markers are deleted first (an interrupted prune never leaves an
 advertised half-frame); manifests that still list a pruned stamp are
-rewritten (cron-emitted products self-heal anyway on the next tick).
+rewritten (mainly for retired products -- active emitters append
+incrementally with a prune-horizon filter and full-rebuild only on the
+heal tick; see §3b).
 Non-frame keys (`latest_times.json`, `products.json`, `health.json`)
 are never touched, and prefixes outside `shadow/` are refused outright.
 
@@ -95,6 +97,42 @@ to age those out too.
 - suite z0–5 ≈ 950 PUTs/emit → 15-min cron ≈ **2.8 M/mo ≈ $8–13/mo**
 - suite z0–5 @ 30 min ≈ 1.4 M/mo ≈ **~$2/mo**; single product @ 5 min ≈ 0.35 M/mo ≈ free tier
 - storage is minor (the prune keeps ≈14 days; manifests list only the newest 90 frames)
+- ⚠️ those per-lane numbers stopped describing the FLEET once 11 lanes ran at
+  native cadence: 2026-08 measured ~2.1M tile PUTs/day **plus ~7M LIST
+  pages/day** — listing, not writing, was 65% of a $445/16-days bill. See the
+  ops-discipline rules below before adding any listing to a loop path.
+
+## 3b) Ops discipline (2026-08-03 — the R2 Class A cost incident)
+
+Every `list_objects_v2` **page** bills like a PUT ($4.50/M); HEAD/GET are
+Class B ($0.36/M); DeleteObjects is free. The emitter now enforces:
+
+- **Coverage listing is tail-bounded**: `_covered_times` passes
+  `after=now-(backfill+2·step)` so `complete_stamps` probes only stamps that
+  could still cover a slot (~6–30 LISTs/pass, was min(retention, 300)).
+- **Slot re-checks are in-memory**: each successful `emit_one` returns its
+  rendered stamp and the loop appends it to `covered` — the per-slot
+  re-listing (~3M LISTs/day fleet-wide) is gone. Single writer per product
+  (fleet.yml) is what makes this sound.
+- **Manifests update incrementally**: one Class B GET + append + PUT. The
+  full rebuild-from-listing runs only on cold start, geometry change (the
+  refuse-to-clobber guard is unchanged), or the `S2_MANIFEST_HEAL_S` heal
+  tick (default 6 h) which reconciles marker-present/manifest-absent
+  orphans from interrupted runs. A duplicate already advertised writes
+  nothing.
+- **products.json is gated + throttled**: rebuilt only after a pass that
+  rendered ≥1 frame, at most once per `S2_INDEX_MIN_S` (default 30 min) per
+  sector; one-shot/manual emits bypass with force. `has_complete_frame`
+  answers from a 72 h tail listing first, falling back to the full history
+  so a paused product never drops out of the index.
+- **Cross-pass state** (heal/throttle stamps) lives in
+  `S2_STATE_DIR=/var/tmp/s2_state` inside the container — the shell loop
+  re-execs python per pass but the container persists; a recreate just means
+  one cold rebuild pass.
+- **Measured, not projected**: `s1_ingest.R2` counts every billable request
+  and each pass logs `[ops] … list_pages=N put=N …`. When judging any
+  future change, read those lines from the lane logs — this incident's
+  10× step was invisible in the code and obvious in the request counts.
 
 ## 4) Verify (anyone, no creds — the CDN serves shadow/)
 

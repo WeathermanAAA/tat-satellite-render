@@ -44,6 +44,7 @@ TILE SCHEME (flat-native XYZ, top-left origin, y increases SOUTHWARD)
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import io
 import json
 import math
@@ -336,7 +337,15 @@ def write_tiled_manifest(entry, store, prefix: str, stamps: Iterable[str],
         stamps, bounds=bounds, image_px=image_px, maxzoom=maxzoom, as_of=as_of,
         tile_size=spec.tile_size, min_zoom=spec.min_zoom, scheme=scheme, bt=bt,
         members=members)
-    store.put_json(entry.latest_times_key(prefix), lt, CACHE_MANIFEST)
+    # Checked PUT (2026-08-03): under incremental manifest maintenance a
+    # silently-failed manifest PUT is a phantom success -- the frame is
+    # complete in R2 but never advertised, and no later append re-adds it.
+    # Raising mirrors the tile/marker contract in emit_pyramid: the emit
+    # fails loudly, the heal stamp is NOT touched (the caller touches it
+    # only after this returns), and the pass-level reconcile re-advertises
+    # the frame within one pass.
+    if not store.put_json(entry.latest_times_key(prefix), lt, CACHE_MANIFEST):
+        raise IOError(f"manifest PUT failed: {entry.latest_times_key(prefix)}")
     return lt
 
 
@@ -352,7 +361,13 @@ def prune_tiles(entry, store, prefix: str, dead_stamps: Iterable[str]) -> int:
     return n
 
 
-def complete_stamps(entry, store, prefix: str, *, limit: int = 0) -> list:
+#: Stamp format shared with s1_slots / s2_prune (lexicographic == chronological,
+#: which is what makes ``after`` a valid S3 StartAfter bound).
+STAMP_FMT = "%Y%m%dT%H%M%SZ"
+
+
+def complete_stamps(entry, store, prefix: str, *, limit: int = 0,
+                    after: Optional[str] = None) -> list:
     """Recover COMPLETE frames from R2 reality (cold start / manifest rebuild):
     every stamp that has a ``_ready.json`` marker, paired with its pyramid
     maxzoom (the max tile z present). Partial emits (tiles but no marker) are
@@ -372,12 +387,26 @@ def complete_stamps(entry, store, prefix: str, *, limit: int = 0) -> list:
     child prefixes ARE the zoom dirs. Same answer, constant cost (~1.4 s).
     ``limit`` keeps only the newest N stamps (the manifest window) -- the older
     ones cannot change what the manifest says. Stores without the delimiter
-    methods fall back to the flat walk, so a FakeR2 in a test still works."""
+    methods fall back to the flat walk, so a FakeR2 in a test still works.
+
+    OPS CONTRACT (2026-08-03, the R2 Class A incident): every stamp this
+    function probes is ONE LIST request. The 2026-07-25 fix made the cost
+    independent of pyramid depth, but it still scaled with RETENTION --
+    min(stamps, limit) probes per call, ~300 LISTs per product-pass at the
+    measured retention, ~7M LISTs/day fleet-wide (~65% of the whole R2 bill).
+    ``after`` (a stamp string) tail-bounds the listing with S3 StartAfter:
+    callers that only need the recent window (backfill coverage) pass it and
+    probe ~6-30 stamps instead of 300. Chronology == lexicography for these
+    stamps, so the bound is exact; the ``after`` stamp itself may be included
+    (S3 StartAfter re-derives its CommonPrefix from the keys beneath it) --
+    inclusive is harmless for every caller."""
     root = entry.tile_stamp_prefix(prefix, "")
     if not (hasattr(store, "list_prefixes") and hasattr(store, "list_level")):
         return _complete_stamps_flat(entry, store, prefix)
 
-    stamps = [p[len(root):].strip("/") for p in store.list_prefixes(root)]
+    start = (root + after) if after else ""
+    stamps = [p[len(root):].strip("/")
+              for p in store.list_prefixes(root, start_after=start)]
     stamps = sorted(s for s in stamps if s)
     if limit and len(stamps) > limit:
         stamps = stamps[-limit:]
@@ -411,13 +440,32 @@ def has_complete_frame(entry, store, prefix: str) -> bool:
     root = entry.tile_stamp_prefix(prefix, "")
     if not (hasattr(store, "list_prefixes") and hasattr(store, "list_level")):
         return bool(_complete_stamps_flat(entry, store, prefix))
-    stamps = sorted(p[len(root):].strip("/")
-                    for p in store.list_prefixes(root))
-    for s in reversed(stamps[-8:]):          # newest few: cheap + decisive
+    # RECENT fast path (2026-08-03 ops discipline): a healthy product has a
+    # complete frame within the last 72 h, answered by ONE tail listing + a
+    # probe or two -- the unbounded list_prefixes pages the product's WHOLE
+    # stamp history (grows with retention) for an answer the newest stamp
+    # already gives. Stale/retired products fall through to the full answer
+    # below: "has EVER published" must not become "published recently", or a
+    # paused product silently drops out of products.json and the explorer
+    # greys a domain that has frames.
+    after = (_dt.datetime.now(_dt.timezone.utc)
+             - _dt.timedelta(hours=72)).strftime(STAMP_FMT)
+    recent = sorted(p[len(root):].strip("/")
+                    for p in store.list_prefixes(root, start_after=root + after))
+    for s in reversed(recent[-8:]):
         _z, keys = store.list_level(root + s + "/")
         if any(k.endswith("/_ready.json") for k in keys):
             return True
-    return bool(stamps) and bool(complete_stamps(entry, store, prefix, limit=64))
+    stamps = sorted(p[len(root):].strip("/")
+                    for p in store.list_prefixes(root))
+    probed = set(recent[-8:])
+    for s in reversed(stamps):               # newest-first, early exit on the
+        if s in probed:                      # first complete frame; skips the
+            continue                         # stamps the fast path already saw
+        _z, keys = store.list_level(root + s + "/")
+        if any(k.endswith("/_ready.json") for k in keys):
+            return True
+    return False
 
 
 def _complete_stamps_flat(entry, store, prefix: str) -> list:

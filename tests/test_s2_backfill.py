@@ -80,11 +80,13 @@ class TestBackfillLoop(unittest.TestCase):
             emitted.append(when)
             if emit_effect:
                 emit_effect(when)
-            return {"count": 1, "latest": _stamp(when), "minzoom": 0, "maxzoom": 5}
+            return {"stamp": _stamp(when), "outcome": "rendered",
+                    "manifest": {"count": 1, "latest": _stamp(when),
+                                 "minzoom": 0, "maxzoom": 5}}
 
         cov = {"times": list(covered_times)}
 
-        def fake_complete(entry, store, prefix, limit=0):
+        def fake_complete(entry, store, prefix, limit=0, after=None):
             return [(_stamp(t), 5) for t in cov["times"]]
 
         entry = next(e for e in E.R.REGISTRY
@@ -128,11 +130,13 @@ class TestBackfillLoop(unittest.TestCase):
 
         def fake_emit(entry, when, store, args, band_cache=None):
             emitted.append(when)
-            # the rendered scan sits between the two missing slots (2:45)
-            cov_state["times"].append(dt.datetime(2026, 7, 12, 2, 45, tzinfo=UTC))
-            return {"count": 1}
+            # the rendered scan sits between the two missing slots (2:45);
+            # the loop learns it from the emit RETURN (in-memory append,
+            # 2026-08-03 ops discipline) -- not by re-listing the store
+            return {"stamp": _stamp(dt.datetime(2026, 7, 12, 2, 45,
+                                                tzinfo=UTC))}
 
-        def fake_complete(entry, store, prefix, limit=0):
+        def fake_complete(entry, store, prefix, limit=0, after=None):
             return [(_stamp(t), 5) for t in cov_state["times"]]
 
         entry = next(e for e in E.R.REGISTRY
@@ -171,9 +175,10 @@ class TestSuitePinDedup(unittest.TestCase):
 
         def fake_emit(entry, when, store, args, band_cache=None):
             emitted.append((entry.product_id, when))
-            return {"count": 1}
+            return {"stamp": _stamp(when), "outcome": "rendered",
+                    "manifest": {"count": 1}}
 
-        def fake_complete(entry, store, prefix, limit=0):
+        def fake_complete(entry, store, prefix, limit=0, after=None):
             return [(_stamp(t), 5) for t in covered_times]
 
         with mock.patch.object(E, "emit_one", side_effect=fake_emit), \
@@ -212,7 +217,8 @@ class TestSuitePinDedup(unittest.TestCase):
 
         def fake_emit(entry, when, store, args, band_cache=None):
             emitted.append((entry.product_id, when))
-            return {"count": 1}
+            return {"stamp": _stamp(when), "outcome": "rendered",
+                    "manifest": {"count": 1}}
 
         with mock.patch.object(E, "emit_one", side_effect=fake_emit), \
              mock.patch.object(E, "_pin_suite_scan", side_effect=flaky_pin), \
@@ -238,8 +244,9 @@ class TestProductsIndexStoreTruth(unittest.TestCase):
         class _Store:
             def put_json(self, key, obj, cache):
                 puts[key] = obj
+                return True
 
-        def fake_complete(entry, store, prefix, limit=0):
+        def fake_complete(entry, store, prefix, limit=0, after=None):
             return frames_by_id.get(entry.product_id, [])
 
         # the store-truth contract is unchanged; only HOW the boolean is
@@ -249,7 +256,7 @@ class TestProductsIndexStoreTruth(unittest.TestCase):
 
         with mock.patch.object(E.P, "complete_stamps", side_effect=fake_complete), \
              mock.patch.object(E.P, "has_complete_frame", side_effect=fake_has):
-            E._write_products_index(_Store(), "shadow", "mtgi1", "fd")
+            E._write_products_index(_Store(), "shadow", "mtgi1", "fd", force=True)
         return puts
 
     def test_partial_failure_drops_frameless_products(self):

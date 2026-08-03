@@ -1,0 +1,37 @@
+# RETENTION PRUNE LANE (2026-08-03, out of the R2 cost incident).
+#
+# Nothing had pruned shadow/sat/** since the 07-25 lane restructure: the old
+# rotation container carried prune-cron; the per-suite lanes that replaced it
+# did not, so retention grew ~288 stamps/day/product on the 5-min CONUS
+# products. Unbounded retention compounds BOTH bills: every stamp is a page
+# of list_prefixes on the cold/heal listing paths, and every frame is
+# ~50-500 tile objects of storage.
+#
+# Shaped as an emit-cron override (like the conus lanes) so fleet.sh deploy's
+# fixed `up -d emit-cron` machinery runs it unchanged: the service NAME is
+# emit-cron, the JOB is s2_prune. ONE box only (fleet.yml assigns box2) --
+# two prune walkers would double a ~50k-LIST-page daily walk for nothing.
+# DeleteObjects requests are free on R2; the walk is the only Class A cost.
+#
+# Knobs via .env: S2_PRUNE_DAYS (14), S2_PRUNE_KEEP_MIN (2),
+# S2_PRUNE_INTERVAL_S (86400). Dry-run rehearsal:
+#   docker compose -f docker-compose.s2.yml run --rm prune --days 14
+#
+# Start (or just: fleet.sh deploy box2):
+#   docker compose -p tat-s2-prune -f docker-compose.s2.yml \
+#     -f docker-compose.s2.prune.yml --profile cron up -d --no-build emit-cron
+services:
+  emit-cron:
+    mem_limit: 1g
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[s2-prune-lane] days=$${S2_PRUNE_DAYS:-14} keep-min=$${S2_PRUNE_KEEP_MIN:-2} prefix=$${S2_PRUNE_PREFIX:-shadow/sat/} interval=$${S2_PRUNE_INTERVAL_S:-86400}s"
+        while true; do
+          python s2_prune.py --apply \
+            --days "$${S2_PRUNE_DAYS:-14}" \
+            --keep-min "$${S2_PRUNE_KEEP_MIN:-2}" \
+            --prefix "$${S2_PRUNE_PREFIX:-shadow/sat/}" \
+            || echo "[s2-prune-lane] prune failed rc=$$? (next tick retries)"
+          sleep "$${S2_PRUNE_INTERVAL_S:-86400}"
+        done

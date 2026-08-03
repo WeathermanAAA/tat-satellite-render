@@ -26,8 +26,12 @@ Safety rails: dry-run by DEFAULT (``--apply`` deletes); refuses any prefix
 that does not start with ``shadow/``; keeps the newest ``--keep-min`` stamps
 per product regardless of age (an emitter outage must never empty a product);
 after deleting, rewrites any latest_times.json that still lists a pruned
-stamp (products the cron still emits self-heal on the next tick anyway --
-the manifest is rebuilt from ``complete_stamps``; this covers retired ones).
+stamp. NOTE (2026-08-03): active products no longer rebuild their manifest
+from ``complete_stamps`` on every emit -- they append incrementally and
+filter times[] to the S2_PRUNE_DAYS horizon, full-rebuilding only on the
+S2_MANIFEST_HEAL_S tick -- so this rewrite is the main between-tick
+correction for RETIRED products, and the emitter's horizon filter is what
+prevents an in-flight append from resurrecting stamps this prune deletes.
 
 Box usage (same R2 env as the emit services; see docker-compose.s2.yml):
   python s2_prune.py                          # dry-run report, 14d/keep-2

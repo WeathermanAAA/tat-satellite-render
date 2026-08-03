@@ -11,7 +11,8 @@ routes through the declarative recipe engine (s2_recipes + s2_imagery), and
 `--suite` emits EVERY tiled product of a sector off ONE pinned scan with a
 shared band cache (each ABI band is downloaded once per scan, not once per
 product). A `products.json` index (the viewer picker's on-R2 SSOT) is
-refreshed after every emit.
+refreshed after passes that rendered a frame, throttled to S2_INDEX_MIN_S
+per sector (one-shot emits bypass with force).
 
 STORES (the injected R2 interface, key-for-key):
   * --store local:/path  -> FilesystemStore (Codespace verification, no creds)
@@ -36,6 +37,8 @@ import argparse
 import asyncio
 import dataclasses
 import datetime as dt
+import json
+import os
 import sys
 import traceback
 
@@ -45,6 +48,55 @@ import s2_registry as R
 
 UTC = dt.timezone.utc
 CDN = "https://cdn.triple-a-tropics.com"
+
+# ---------------------------------------------------------------------------
+# Ops discipline (2026-08-03, the R2 Class A incident: ~10.7M ops/day, ~65%
+# of it listing). Cross-pass state lives on the CONTAINER filesystem -- the
+# lane loop re-execs this script every pass, but the container (and so this
+# dir) persists between passes. Losing it (container recreate) just means one
+# cold full-rebuild pass, which is also the correct cold behavior.
+# ---------------------------------------------------------------------------
+STATE_DIR = os.environ.get("S2_STATE_DIR", "/var/tmp/s2_state")
+#: Full manifest-rebuild-from-R2 cadence per product. Between heals the
+#: manifest is maintained INCREMENTALLY (append the frame just emitted); the
+#: heal pass reconciles anything an interrupted run failed to append.
+MANIFEST_HEAL_S = int(os.environ.get("S2_MANIFEST_HEAL_S", "21600"))
+#: products.json rebuild throttle per sector (it probes every sibling product).
+INDEX_MIN_S = int(os.environ.get("S2_INDEX_MIN_S", "1800"))
+
+
+def _state_path(kind: str, *parts: str) -> str:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except OSError:
+        pass          # state is an optimization: an uncreatable dir just
+                      # means _state_fresh stays False (heal/rebuild path)
+    safe = "_".join(p.replace("/", "-") for p in parts)
+    return os.path.join(STATE_DIR, f"{kind}_{safe}")
+
+
+def _state_fresh(path: str, max_age_s: int) -> bool:
+    try:
+        import time
+        return (time.time() - os.stat(path).st_mtime) < max_age_s
+    except OSError:
+        return False
+
+
+def _state_touch(path: str) -> None:
+    try:
+        with open(path, "w") as fh:
+            fh.write(dt.datetime.now(UTC).isoformat())
+    except OSError:
+        pass                                  # state is an optimization only
+
+
+def _print_ops(store, label: str) -> None:
+    """Per-pass R2 op accounting -- the measured before/after evidence for the
+    cost incident lives in these log lines, not in projections."""
+    ops = getattr(store, "ops", None)
+    if ops:
+        print(f"[ops] {label}: " + " ".join(f"{k}={v}" for k, v in sorted(ops.items())))
 
 
 def _parse_stamp(s: str) -> dt.datetime:
@@ -62,8 +114,8 @@ def _backfill_slots(step_min: int, backfill_min: int,
     remains, and a killed run costs only old-slot work (ready-marker dedup
     resumes it next tick). Slots are grid times (:00/:10/:20 for step 10);
     the actual scan each slot renders is resolved nearest-to-slot by the
-    fetchers. Emit order is safe to change: manifests rebuild from R2
-    reality per emit and frames dedup by ready marker, so no consumer
+    fetchers. Emit order is safe to change: manifest appends are a sorted
+    set-union of times[] and frames dedup by ready marker, so no consumer
     depends on slot arrival order."""
     now = now or dt.datetime.now(UTC)
     newest = now.replace(second=0, microsecond=0)
@@ -76,20 +128,126 @@ def _backfill_slots(step_min: int, backfill_min: int,
     return slots
 
 
-def _covered_times(entries, store, prefix: str) -> list:
-    """Per entry: the sorted datetimes of its COMPLETE frames in the store."""
+def _covered_times(entries, store, prefix: str,
+                   window_min: int | None = None) -> list:
+    """Per entry: the sorted datetimes of its COMPLETE frames in the store.
+
+    ``window_min`` tail-bounds the listing (S3 StartAfter): only stamps young
+    enough to cover a backfill slot are probed -- ~6-30 LISTs per entry
+    instead of min(retention, 300). The limit=300 cap stays as the ceiling
+    for callers that pass no window."""
+    after = None
+    if window_min:
+        after = (dt.datetime.now(UTC)
+                 - dt.timedelta(minutes=window_min)).strftime("%Y%m%dT%H%M%SZ")
     out = []
     for e in entries:
         ts = []
         # only the recent tail can cover a backfill slot (deepest production
         # window is 150 min), so bound this at O(window), not O(retention)
-        for s, _mz in P.complete_stamps(e, store, prefix, limit=300):
+        for s, _mz in P.complete_stamps(e, store, prefix, limit=300,
+                                        after=after):
             try:
                 ts.append(_parse_stamp(s))
             except ValueError:
                 pass                     # legacy/foreign stamp shape: ignore
         out.append(sorted(ts))
     return out
+
+
+def _cover_window_min(args) -> int:
+    """The listing window that can still cover a backfill slot: the backfill
+    span plus tolerance margin. Pins can legitimately resolve OLDER than
+    this (GK-2A's hour-pair listing reaches ~2 h back; FCI's licence lookback
+    reaches 6 h) -- those are handled by _probe_stale_pin, not by widening
+    this window (review finding 2026-08-03)."""
+    step = args.step or 10
+    return (args.backfill or step * 6) + 2 * step
+
+
+def _probe_stale_pin(entries, covered, pinned, store, prefix: str,
+                     window_min: int) -> None:
+    """Restore the pre-fetch dedup for pins OLDER than the coverage window.
+
+    The windowed `covered` listing cannot contain such a pin's stamp by
+    construction, so during an upstream publication stall the 90 s re-check
+    would report every entry missing and the suite would re-download the
+    band set and re-render everything each pass, deduping only at the ready
+    marker AFTER the fetch (review finding 2026-08-03: gk2a re-fetching its
+    band set every ~60 s pass, mtg an ~800 MB FCI product every 600 s, for
+    the stall's duration). One Class B HEAD per entry against the pin's own
+    ready marker -- the very key emit_pyramid's dedup checks -- appends the
+    stamp to `covered` when the frame already exists. Fresh pins never enter
+    (zero ops in the healthy path); a HEAD miss just means the entry really
+    does need rendering."""
+    floor = dt.datetime.now(UTC) - dt.timedelta(minutes=window_min)
+    if pinned >= floor:
+        return
+    stamp = pinned.strftime("%Y%m%dT%H%M%SZ")
+    tol = dt.timedelta(seconds=90)
+    for i, e in enumerate(entries):
+        if any(abs(t - pinned) <= tol for t in covered[i]):
+            continue
+        if store.head(e.ready_key(prefix, stamp)):
+            covered[i].append(pinned)
+
+
+def _reconcile_manifest(entry, store, prefix: str, covered_dts, keep) -> None:
+    """Re-advertise marker-complete frames missing from times[] within ONE
+    pass instead of the 6 h heal tick (review finding 2026-08-03: a kill --
+    or a failed manifest PUT -- between the ready marker and the manifest
+    leaves a complete frame invisible; pre-incident code healed it on the
+    next emit because every emit re-listed R2). Cost: one Class B GET per
+    entry per pass; the per-orphan geometry probe (one LIST) runs only when
+    a discrepancy actually exists. Runs at PASS level so an idle product
+    still reconciles."""
+    try:
+        raw = store.get_bytes(entry.latest_times_key(prefix))
+        cur = json.loads(raw) if raw else None
+    except Exception:                        # noqa: BLE001
+        cur = None
+    if (not isinstance(cur, dict) or not isinstance(cur.get("times"), list)
+            or cur.get("maxzoom") is None):
+        return                               # cold/invalid: first emit rebuilds
+    known = set(cur["times"])
+    orphans = [t.strftime("%Y%m%dT%H%M%SZ") for t in covered_dts]
+    orphans = [s for s in orphans if s not in known]
+    if not orphans:
+        return
+    root = entry.tile_stamp_prefix(prefix, "")
+    same_geom = []
+    for s in orphans:
+        zdirs, _keys = store.list_level(root + s + "/")
+        zs = [int(z[len(root) + len(s) + 1:].strip("/")) for z in zdirs
+              if z[len(root) + len(s) + 1:].strip("/").isdigit()]
+        if zs and max(zs) == cur["maxzoom"]:
+            same_geom.append(s)
+    if not same_geom:
+        return                               # foreign geometry: heal tick's job
+    times = sorted(known | set(same_geom))
+    if keep and len(times) > keep:
+        times = times[-keep:]
+    lt = entry.build_tiled_latest_times(
+        times, bounds=cur.get("bounds"), image_px=cur.get("image_px"),
+        maxzoom=cur["maxzoom"], as_of=dt.datetime.now(UTC),
+        tile_size=cur.get("tile_size", 512), min_zoom=cur.get("minzoom", 0),
+        scheme=cur.get("scheme"), bt=cur.get("bt"),
+        members=cur.get("members"))
+    if store.put_json(entry.latest_times_key(prefix), lt, P.CACHE_MANIFEST):
+        print(f"[manifest] reconciled {len(same_geom)} orphan frame(s) for "
+              f"{entry.product_id}: {same_geom[:3]}")
+
+
+#: Manifest times[] never advertises stamps older than the prune horizon
+#: (S2_PRUNE_DAYS minus a day of margin): an incremental append built from a
+#: pre-prune GET could otherwise resurrect just-deleted stamps for up to a
+#: heal tick and the viewer would 404 them (review finding 2026-08-03). With
+#: keep=90 the window is <=30 h in practice, so this filter only ever bites
+#: in that pathological race.
+def _horizon_stamp() -> str:
+    days = max(1, int(os.environ.get("S2_PRUNE_DAYS", "14")) - 1)
+    return (dt.datetime.now(UTC)
+            - dt.timedelta(days=days)).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _slot_missing(slot: dt.datetime, covered: list, tol: dt.timedelta) -> bool:
@@ -112,6 +270,28 @@ def _make_store(spec: str):
     if spec.startswith("local:"):
         return P.FilesystemStore(spec.split(":", 1)[1]), False
     sys.exit(f"ERROR: --store must be 'r2' or 'local:/path', got {spec!r}")
+
+
+def _manifest_action(cur, stamp: str, frame_mz, scheme: str,
+                     heal_due: bool) -> str:
+    """How the per-product manifest is updated for this frame attempt:
+    'skip' (nothing changed -- no PUT), 'append' (incremental: add the stamp
+    to the fetched manifest), or 'rebuild' (the full list-from-R2 path with
+    the geometry guard). Pure function -- unit-tested directly.
+
+    frame_mz is None on a duplicate (its geometry was not re-derived): a
+    duplicate already advertised is a no-op, one NOT advertised takes the
+    rebuild path -- appending a frame of unknown geometry is exactly the
+    z5-cron/z6-on-demand manifest-clobber trap."""
+    if (not isinstance(cur, dict) or cur.get("scheme") != scheme
+            or not isinstance(cur.get("times"), list)
+            or cur.get("maxzoom") is None or heal_due):
+        return "rebuild"
+    if frame_mz is None:
+        return "skip" if stamp in cur["times"] else "rebuild"
+    if frame_mz != cur["maxzoom"]:
+        return "rebuild"
+    return "skip" if stamp in cur["times"] else "append"
 
 
 def emit_one(entry, when, store, args, band_cache=None) -> dict:
@@ -156,12 +336,60 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
         print(f"[emit] wrote {meta['n_tiles']} tiles  maxzoom={meta['maxzoom']}  "
               f"per-zoom={meta['tile_counts']}")
 
-    # Rebuild the manifest from R2 reality so re-runs accumulate a real series.
+    # Manifest update. The pre-incident behavior rebuilt the manifest FROM
+    # R2 LISTING on every frame attempt -- min(retention, 200) LIST requests
+    # per emit, ~2.2M LISTs/day fleet-wide (measured 2026-08-03). Under the
+    # single-writer-per-product fleet contract the lane already KNOWS what
+    # changed: the frame it just wrote. So the manifest is now maintained
+    # incrementally (one Class B GET + append + PUT), and the full
+    # rebuild-from-R2-reality pass survives as (a) the cold/invalid-manifest
+    # path, (b) the geometry-change path -- which keeps the existing
+    # refuse-to-clobber guard EXACTLY as before -- and (c) a periodic heal
+    # tick (S2_MANIFEST_HEAL_S, default 6 h) that reconciles anything an
+    # interrupted run failed to append. A duplicate frame already advertised
+    # skips the manifest PUT entirely (it used to trigger a full rebuild:
+    # 3,472 rebuild+PUTs/day on the wpac lane alone).
+    image_px = [img.rgba.shape[1], img.rgba.shape[0]]
+    heal_path = _state_path("heal", args.prefix, entry.product_id)
+    cur = None
+    try:
+        raw = store.get_bytes(entry.latest_times_key(args.prefix))
+        if raw:
+            cur = json.loads(raw)
+    except Exception:                          # noqa: BLE001 -- any bad read
+        cur = None                             # is just the rebuild path
+    action = _manifest_action(cur, img.stamp, meta.get("maxzoom"), scheme,
+                              heal_due=not _state_fresh(heal_path,
+                                                        MANIFEST_HEAL_S))
+    if action == "skip":
+        print(f"[manifest] unchanged -- {img.stamp} already advertised, "
+              f"PUT skipped")
+        print(f"[done] {entry.product_id}: frames={cur.get('count')} "
+              f"latest={cur.get('latest')} "
+              f"zoom={cur.get('minzoom')}..{cur.get('maxzoom')}")
+        return {"stamp": img.stamp, "outcome": meta["outcome"],
+                "manifest": cur}
+    if action == "append":
+        horizon = _horizon_stamp()
+        times = sorted(s for s in set(cur["times"]) | {img.stamp}
+                       if s >= horizon)
+        if args.keep and len(times) > args.keep:
+            times = times[-args.keep:]   # viewer window; R2 keeps the rest until TTL
+        manifest = P.write_tiled_manifest(entry, store, args.prefix, times,
+                                          img.bounds, image_px, cur["maxzoom"],
+                                          dt.datetime.now(UTC), spec=spec,
+                                          scheme=scheme, bt=bt_desc,
+                                          members=getattr(img, "members", None))
+        print(f"[done] {entry.product_id}: frames={manifest['count']} "
+              f"latest={manifest['latest']} zoom={manifest['minzoom']}..{manifest['maxzoom']} (incremental)")
+        return {"stamp": img.stamp, "outcome": meta["outcome"],
+                "manifest": manifest}
+
+    # Full rebuild from R2 reality (cold start / geometry change / heal tick).
     # The current frame's maxzoom is read from its OWN tiles in the store
     # (scheme-agnostic; works on a 'duplicate' too); times[] then keeps only
     # COMPLETE frames at that same maxzoom, so the viewer's grid derivation
     # never 404s. A frame at a different geometry is dropped + logged.
-    image_px = [img.rgba.shape[1], img.rgba.shape[0]]
     # bounded to the advertised window (+margin): frames older than `keep` can
     # never appear in times[], so probing them is pure cost. The geometry guard
     # below still covers everything the manifest can advertise.
@@ -194,12 +422,26 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
                                       dt.datetime.now(UTC), spec=spec, scheme=scheme,
                                       bt=bt_desc,
                                       members=getattr(img, "members", None))
+    _state_touch(heal_path)
     print(f"[done] {entry.product_id}: frames={manifest['count']} "
-          f"latest={manifest['latest']} zoom={manifest['minzoom']}..{manifest['maxzoom']}")
-    return manifest
+          f"latest={manifest['latest']} zoom={manifest['minzoom']}..{manifest['maxzoom']} (rebuild)")
+    return {"stamp": img.stamp, "outcome": meta["outcome"],
+            "manifest": manifest}
 
 
-def _write_products_index(store, prefix: str, sat_key: str, sector_key: str):
+def _write_products_index(store, prefix: str, sat_key: str, sector_key: str,
+                          force: bool = False):
+    # Throttle (2026-08-03 ops discipline): the store-truth filter below
+    # probes EVERY sibling product, and the loops used to rebuild the index
+    # after every product pass -- 517 rebuild+PUTs/day on the gk2a lane
+    # alone, most proving the same membership. Product membership changes on
+    # the order of onboarding events, not passes; once per S2_INDEX_MIN_S
+    # per sector is honest. One-shot/manual emits pass force=True.
+    gate = _state_path("idx", prefix, sat_key, sector_key)
+    if not force and _state_fresh(gate, INDEX_MIN_S):
+        print(f"[index] throttled ({sat_key}/{sector_key}: refreshed "
+              f"<{INDEX_MIN_S}s ago)")
+        return None
     idx = R.build_products_index(sat_key, sector_key, dt.datetime.now(UTC))
     # STORE-TRUTH filter: the registry-derived index advertises every row,
     # but the explorer un-greys purely off this file -- a product that has
@@ -220,7 +462,12 @@ def _write_products_index(store, prefix: str, sat_key: str, sector_key: str):
     idx["products"] = kept
     idx["count"] = len(kept)
     key = R.products_index_key(prefix, sat_key, sector_key)
-    store.put_json(key, idx, P.CACHE_MANIFEST)
+    if not store.put_json(key, idx, P.CACHE_MANIFEST):
+        # gate NOT stamped: the next rendering pass retries immediately
+        # instead of waiting out the throttle on a phantom success
+        print(f"[index] PUT FAILED {key} -- will retry next rendering pass")
+        return None
+    _state_touch(gate)
     print(f"[index] {key}: {idx['count']} products")
     return key
 
@@ -357,15 +604,22 @@ def main(argv=None) -> int:
         if args.step:
             slots = _backfill_slots(args.step, args.backfill or args.step * 6)
             tol = dt.timedelta(minutes=args.step / 2.0)
-            covered = _covered_times([entry], store, args.prefix)
+            covered = _covered_times([entry], store, args.prefix,
+                                     window_min=_cover_window_min(args))
+            _reconcile_manifest(entry, store, args.prefix, covered[0],
+                                args.keep)
             todo = [s for s in slots if _slot_missing(s, covered, tol)]
             print(f"[backfill] {entry.product_id}: {len(todo)}/{len(slots)} "
                   f"slot(s) missing at step {args.step}m")
             n_ok = n_fail = 0
             for slot in todo:
                 # re-check against frames written THIS run: two adjacent slots
-                # can resolve to the same scan near the sat's native cadence
-                covered = _covered_times([entry], store, args.prefix) if n_ok else covered
+                # can resolve to the same scan near the sat's native cadence.
+                # The re-check is IN-MEMORY -- each successful emit appends
+                # its rendered stamp to `covered` below. Re-listing R2 here
+                # cost min(retention,300) LISTs per slot (~3M LISTs/day
+                # fleet-wide, measured 2026-08-03) to learn what this very
+                # loop had just written.
                 if not _slot_missing(slot, covered, tol):
                     print(f"[backfill] {slot.isoformat()} now covered -- skip")
                     continue
@@ -382,29 +636,44 @@ def main(argv=None) -> int:
                         n_fail += 1
                         print(f"[FAIL] pin for {slot.isoformat()}: {e}")
                         continue
+                    _probe_stale_pin([entry], covered, when_arg, store,
+                                     args.prefix, _cover_window_min(args))
                     if not _slot_missing(when_arg, covered,
                                          dt.timedelta(seconds=90)):
                         print(f"[backfill] {slot.isoformat()} pins to covered "
                               f"scan {when_arg.isoformat()} -- skip")
                         continue
                 try:
-                    emit_one(entry, when_arg, store, args)
+                    res = emit_one(entry, when_arg, store, args)
                     n_ok += 1
+                    try:
+                        covered[0].append(_parse_stamp(res["stamp"]))
+                    except (KeyError, TypeError, ValueError):
+                        pass             # no stamp: the slot re-check just
+                                         # stays conservative for this frame
                 except Exception as e:   # noqa: BLE001 -- one bad slot must not
                     n_fail += 1          # kill the rest of the window
                     print(f"[FAIL] {entry.product_id} @ {slot.isoformat()}: {e}")
                     traceback.print_exc()
-            if n_ok or not n_fail:
+            if n_ok:
+                # index membership only changes when a frame actually landed
+                # (a product enters products.json on its FIRST complete
+                # frame); idle passes used to rebuild it anyway -- ~250k
+                # sibling probes/day fleet-wide for a no-op answer.
                 _write_products_index(store, args.prefix, entry.sat_key,
                                       entry.sector_key)
-            else:
+            elif n_fail:
                 print("[index] SKIPPED (total failure): products.json left "
                       "untouched")
+            else:
+                print("[index] SKIPPED (idle pass: no frame rendered)")
+            _print_ops(store, f"{entry.product_id} pass")
             print(f"\n=== BACKFILL SUMMARY === ok={n_ok} failed={n_fail} "
                   f"skipped={len(slots) - len(todo)}")
             return 1 if (n_fail and not n_ok) else 0
-        manifest = emit_one(entry, when, store, args)
-        _write_products_index(store, args.prefix, entry.sat_key, entry.sector_key)
+        manifest = emit_one(entry, when, store, args)["manifest"]
+        _write_products_index(store, args.prefix, entry.sat_key,
+                              entry.sector_key, force=True)
         mkey = entry.latest_times_key(args.prefix)
         print("\n=== SHADOW PYRAMID WRITTEN ===")
         print(f" product      : {entry.product_id}  ({entry.product_path})")
@@ -433,7 +702,10 @@ def main(argv=None) -> int:
     if args.step:
         slots = _backfill_slots(args.step, args.backfill or args.step * 6)
         tol = dt.timedelta(minutes=args.step / 2.0)
-        covered = _covered_times(entries, store, args.prefix)
+        covered = _covered_times(entries, store, args.prefix,
+                                 window_min=_cover_window_min(args))
+        for i, e in enumerate(entries):
+            _reconcile_manifest(e, store, args.prefix, covered[i], args.keep)
         todo = [s for s in slots if _slot_missing(s, covered, tol)]
         print(f"[backfill] suite {args.suite}: {len(todo)}/{len(slots)} "
               f"slot(s) missing at step {args.step}m")
@@ -473,8 +745,16 @@ def main(argv=None) -> int:
                 print(f"[suite] {slot.isoformat()} pins to already-rendered "
                       f"{pinned.isoformat()} -- skip")
                 continue
-            if ok_all:
-                covered = _covered_times(entries, store, args.prefix)
+            # cross-slot coverage is maintained IN-MEMORY: each successful
+            # emit below appends its rendered stamp per entry. The old
+            # re-list here cost entries x min(retention,300) LISTs per slot
+            # (the wpac lane alone: ~1M LISTs/day, measured 2026-08-03).
+            # Pins older than the coverage window (an upstream stall: GK-2A
+            # reaches ~2 h back, FCI 6 h) are dedup-probed against their
+            # ready markers so the stall never becomes a per-pass
+            # re-download (review finding 2026-08-03).
+            _probe_stale_pin(entries, covered, pinned, store, args.prefix,
+                             _cover_window_min(args))
             if not _slot_missing(pinned, covered, dt.timedelta(seconds=90)):
                 print(f"[suite] {slot.isoformat()} pins to already-covered "
                       f"scan {pinned.isoformat()} -- skip")
@@ -482,25 +762,34 @@ def main(argv=None) -> int:
         rendered_pins.add(pinned)
         print(f"[suite] {args.suite}: {len(entries)} products @ scan {pinned.isoformat()}")
         band_cache: dict = {}             # per-scan: bands download once per slot
-        for entry in entries:
+        for i, entry in enumerate(entries):
             try:
-                emit_one(entry, pinned, store, args, band_cache=band_cache)
+                res = emit_one(entry, pinned, store, args, band_cache=band_cache)
                 ok_all.append(entry.product_id)
+                if args.step:
+                    try:
+                        covered[i].append(_parse_stamp(res["stamp"]))
+                    except (KeyError, TypeError, ValueError):
+                        covered[i].append(pinned)   # conservative: the pin
             except Exception as e:   # noqa: BLE001  (per-product isolation: one bad
                 # band/recipe never kills the rest of the suite; non-zero exit below)
                 failed_all.append(entry.product_id)
                 print(f"[FAIL] {entry.product_id}: {e}")
                 traceback.print_exc()
-    if ok_all or not failed_all:
-        _write_products_index(store, args.prefix, suite_sat, suite_sector)
-    else:
+    if ok_all:
+        _write_products_index(store, args.prefix, suite_sat, suite_sector,
+                              force=not args.step)
+    elif failed_all:
         # total failure: never advertise a product list with zero frames
         # behind it (a still-gated suite -- e.g. FCI pre-licence -- would
         # un-grey the explorer domain and 404 every manifest). The viewer's
         # availability probe stays honestly dark until an emit succeeds.
         print(f"[index] SKIPPED (total failure -- {len(failed_all)} products, "
               f"0 ok): products.json left untouched")
+    else:
+        print("[index] SKIPPED (idle pass: no frame rendered)")
 
+    _print_ops(store, f"suite {args.suite} pass")
     print("\n=== SUITE EMIT SUMMARY ===")
     print(f" slots  : {len(todo)}")
     print(f" ok     : {len(ok_all)}  {sorted(set(ok_all))}")
