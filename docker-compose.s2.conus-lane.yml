@@ -9,6 +9,10 @@
 #     -f docker-compose.s2.conus-lane.yml --profile cron up -d --no-build emit-cron
 services:
   emit-cron:
+    environment:
+      # container-publish flip switch (see conus-fast + 
+      # scripts/s2_canary_watchdog.sh; position lives in the box .env)
+      S2_CONTAINER_TILES: "${S2_CONTAINER_TILES_CONUS:-0}"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

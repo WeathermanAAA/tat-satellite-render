@@ -20,6 +20,9 @@
 services:
   emit-cron:
     environment:
+      # container-publish flip switch (see conus-fast + 
+      # scripts/s2_canary_watchdog.sh; position lives in the box .env)
+      S2_CONTAINER_TILES: "${S2_CONTAINER_TILES_HWFD_LEADS:-0}"
       S2_CUT_WORKERS: "3"
     mem_limit: 12g
     entrypoint: ["/bin/sh", "-c"]

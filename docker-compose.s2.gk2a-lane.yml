@@ -15,6 +15,9 @@
 services:
   emit-cron:
     environment:
+      # container-publish flip switch (see conus-fast + 
+      # scripts/s2_canary_watchdog.sh; position lives in the box .env)
+      S2_CONTAINER_TILES: "${S2_CONTAINER_TILES_GK2A:-0}"
       S2_CRON_SUITES: gk2a-fd
       S2_CRON_INTERVAL_S: "60"
       S2_CRON_BACKFILL_MIN: "90"

@@ -134,6 +134,37 @@ Class B ($0.36/M); DeleteObjects is free. The emitter now enforces:
   future change, read those lines from the lane logs — this incident's
   10× step was invisible in the code and obvious in the request counts.
 
+## 3c) Container-publish flip (per lane, watchdog-guarded)
+
+Every emit lane has a compose-mapped flip switch (`S2_CONTAINER_TILES_<LANE>`
+in the box `.env`; unset = per-tile publishing). The canary order and the
+verified procedure (conus-fast, 2026-08-03):
+
+1. Baseline gate: every product of the lane fresh (< ~4x step) and zero
+   recent `[FAIL]`s.
+2. `sed -i 's/^S2_CONTAINER_TILES_<LANE>=.*/S2_CONTAINER_TILES_<LANE>=1/' .env`
+   (append if absent) + force-recreate the lane.
+3. Arm the watchdog BEFORE walking away — it rolls back on its own:
+   `systemd-run --unit s2canary-<lane> --working-directory=/root/tsr-s2 \
+      --property=Restart=on-failure --property=RestartSec=30 \
+      --property=SuccessExitStatus="0 42" \
+      --setenv=S2_CANARY_LANE_PROJ=tat-s2-<lane> \
+      --setenv=S2_CANARY_LANE_COMPOSE=docker-compose.s2.<lane-file>.yml \
+      --setenv=S2_CANARY_FLAG=S2_CONTAINER_TILES_<LANE> \
+      --setenv=S2_CANARY_PRODUCTS="<sat/sector/product ...>" \
+      --setenv=S2_CANARY_STALE_S=<7x lane step in seconds> \
+      /root/tsr-s2/scripts/s2_canary_watchdog.sh`
+4. Verify like the canary: `[ops] put=` collapses to ~6-8/frame while
+   `[emit] wrote N tiles` is unchanged; `tiles.z{N}.json` + `t*.tar` on the
+   CDN; a ranged read byte-matches the block slice; the explorer renders the
+   newest frame.
+5. Verdict in `/root/s2_canary_verdict_<proj>.txt` (PASS after 12 h).
+
+Stale thresholds by lane step: 5 min -> 2100 s, 10 min -> 4200 s,
+20 min -> 8400 s. The viewer needs no action in any direction: the manifest
+`containers` hint is sticky, container frames stay readable after a
+rollback, and legacy frames always read via the per-frame fallback.
+
 ## 4) Verify (anyone, no creds — the CDN serves shadow/)
 
 ```bash

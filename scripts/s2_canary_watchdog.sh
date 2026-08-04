@@ -36,13 +36,21 @@ set -u
 cd "$(dirname "$0")/.."
 
 CDN="https://cdn.triple-a-tropics.com"
-PRODUCTS="goes19/conus/ir goes19/conus/irbd goes19/conus/truecolor goes19/conus/c02"
-LANE_PROJ="tat-s2-conus-fast"
-LANE_COMPOSE="docker-compose.s2.conus-fast.yml"
-LANE_CONTAINER="tat-s2-conus-fast-emit-cron-1"
+# Parameterized per lane (2026-08-04, staging the fleet-wide flip): defaults
+# are the original conus-fast canary. Retarget with env, e.g.
+#   S2_CANARY_LANE_PROJ=tat-s2-gk2a \
+#   S2_CANARY_LANE_COMPOSE=docker-compose.s2.gk2a-lane.yml \
+#   S2_CANARY_FLAG=S2_CONTAINER_TILES_GK2A \
+#   S2_CANARY_PRODUCTS="gk2a/fd/ir gk2a/fd/irbd gk2a/fd/truecolor" \
+#   S2_CANARY_STALE_S=4200 ...
+# STALE_S must track the lane cadence (rule of thumb: 7x the step).
+PRODUCTS="${S2_CANARY_PRODUCTS:-goes19/conus/ir goes19/conus/irbd goes19/conus/truecolor goes19/conus/c02}"
+LANE_PROJ="${S2_CANARY_LANE_PROJ:-tat-s2-conus-fast}"
+LANE_COMPOSE="${S2_CANARY_LANE_COMPOSE:-docker-compose.s2.conus-fast.yml}"
+LANE_CONTAINER="${LANE_PROJ}-emit-cron-1"
 ENV_FILE=".env"
-FLAG="S2_CONTAINER_TILES_CONUS_FAST"
-VERDICT="/root/s2_canary_verdict.txt"
+FLAG="${S2_CANARY_FLAG:-S2_CONTAINER_TILES_CONUS_FAST}"
+VERDICT="${S2_CANARY_VERDICT:-/root/s2_canary_verdict_${LANE_PROJ}.txt}"
 INTERVAL_S="${S2_CANARY_INTERVAL_S:-120}"
 WATCH_S="${S2_CANARY_WATCH_S:-43200}"          # 12 h then PASS
 STALE_S="${S2_CANARY_STALE_S:-2100}"           # 35 min
@@ -163,6 +171,7 @@ do_rollback() {
   # per-tile (bounded to REBUILD_REACH_S; older container frames stay and are
   # readable via the sticky hint)
   docker run --rm --env-file "$ENV_FILE" -e REACH_S="$REBUILD_REACH_S" \
+    -e CANARY_PRODUCTS="$PRODUCTS" \
     --entrypoint python tat-s2:latest -c '
 import datetime as dt, os, sys
 sys.path.insert(0, "/app")
@@ -170,8 +179,7 @@ import s1_ingest
 store = s1_ingest.R2()
 reach = int(os.environ.get("REACH_S", "2400"))
 floor = (dt.datetime.utcnow() - dt.timedelta(seconds=reach)).strftime("%Y%m%dT%H%M%SZ")
-for p in ["goes19/conus/ir", "goes19/conus/irbd",
-          "goes19/conus/truecolor", "goes19/conus/c02"]:
+for p in os.environ.get("CANARY_PRODUCTS", "").split():
     root = f"shadow/sat/{p}/"
     for pre in store.list_prefixes(root, start_after=root + floor):
         stamp = pre[len(root):].strip("/")
