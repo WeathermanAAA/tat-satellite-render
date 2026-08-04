@@ -297,37 +297,47 @@ def main(argv=None, s3=None):
     # at a time, so peak memory is the largest single product (~1.6M keys)
     # instead of the tree. Same answer by construction -- plan_prune groups
     # by product anyway, and products share no keys.
-    plans = []
+    # STREAMING apply (2026-08-04): plan AND apply one product at a time.
+    # The first per-product restructure bounded the LISTING but still
+    # accumulated every condemned key fleet-wide before applying -- ~20M+
+    # key strings at 26 days of retention, which would OOM the 2g lane a
+    # second time a few hours into the walk. Per-product plans free as soon
+    # as that product's deletes land; only counters survive the loop.
+    tot_stamps = tot_keys = tot_bytes = 0
+    n_products_touched = 0
     for prod_prefix in _product_prefixes(s3, args.bucket, args.prefix):
-        plans.extend(plan_prune(list_objects(s3, args.bucket, prod_prefix),
-                                days=args.days, keep_min=args.keep_min,
-                                now=now))
-    todo = [p for p in plans if p.condemned]
-    n_keys = sum(len(p.keys) for p in todo)
-    n_bytes = sum(p.bytes for p in todo)
-    for p in plans:
-        note = f" (keep-min held {len(p.kept_old)} over-age)" if p.kept_old else ""
-        if p.condemned:
+        for p in plan_prune(list_objects(s3, args.bucket, prod_prefix),
+                            days=args.days, keep_min=args.keep_min, now=now):
+            note = (f" (keep-min held {len(p.kept_old)} over-age)"
+                    if p.kept_old else "")
+            if not p.condemned:
+                if p.kept_old:
+                    print(f"  {p.product}: nothing to delete{note}")
+                continue
             print(f"  {p.product}: {len(p.condemned)}/{p.total_stamps} stamps -> "
-                  f"{len(p.keys)} objects, {p.bytes/1e6:.1f} MB{note}")
-        elif p.kept_old:
-            print(f"  {p.product}: nothing to delete{note}")
+                  f"{len(p.keys)} objects, {p.bytes/1e6:.1f} MB{note}",
+                  flush=True)
+            tot_stamps += len(p.condemned)
+            tot_keys += len(p.keys)
+            tot_bytes += p.bytes
+            n_products_touched += 1
+            if args.apply:
+                deleted = delete_keys(s3, args.bucket, p.keys)
+                fixed = fix_manifest(s3, args.bucket, p.product,
+                                     set(p.condemned), True)
+                print(f"  deleted {deleted} objects from {p.product}"
+                      + (" + manifest rewritten" if fixed else ""), flush=True)
+            else:
+                if fix_manifest(s3, args.bucket, p.product,
+                                set(p.condemned), False):
+                    print(f"  (would also rewrite {p.product}/{MANIFEST})")
 
-    if not todo:
+    if not n_products_touched:
         print("[prune] nothing older than the TTL; done.")
         return 0
-    print(f"[prune] TOTAL: {sum(len(p.condemned) for p in todo)} stamps, "
-          f"{n_keys} objects, {n_bytes/1e6:.1f} MB")
-    if args.apply:
-        for p in todo:
-            deleted = delete_keys(s3, args.bucket, p.keys)
-            fixed = fix_manifest(s3, args.bucket, p.product, set(p.condemned), True)
-            print(f"  deleted {deleted} objects from {p.product}"
-                  + (" + manifest rewritten" if fixed else ""))
-    else:
-        for p in todo:
-            if fix_manifest(s3, args.bucket, p.product, set(p.condemned), False):
-                print(f"  (would also rewrite {p.product}/{MANIFEST})")
+    print(f"[prune] TOTAL: {tot_stamps} stamps, {tot_keys} objects, "
+          f"{tot_bytes/1e6:.1f} MB across {n_products_touched} products")
+    if not args.apply:
         print("[prune] dry-run only -- re-run with --apply to delete.")
     return 0
 
