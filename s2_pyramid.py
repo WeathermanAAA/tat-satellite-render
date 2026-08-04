@@ -279,6 +279,20 @@ def emit_pyramid(entry, store, prefix: str, stamp: str, raster: np.ndarray,
         cut = cut_pyramid(raster, spec)
 
     n = len(cut["tiles"])
+    if n == 0:
+        # An all-empty cut means the source raster was fully transparent --
+        # in practice a render against a still-uploading upstream scan.
+        # Publishing it (with a ready marker) freezes a BLANK frame into the
+        # loop forever: the marker blocks re-render and the manifest
+        # advertises nothing-to-see. Pre-existing in per-tile mode (where it
+        # was invisible); surfaced 2026-08-04 when six conus products
+        # published empty container indexes at one stamp during a lane
+        # restart and the flip watchdogs correctly tripped on them. Refuse
+        # loudly: the emit fails, per-product isolation contains it, the
+        # slot stays open, and the next pass re-renders a complete scan.
+        raise IOError(
+            f"refusing to publish EMPTY frame {entry.product_id} @ {stamp}: "
+            f"0 tiles after the cut (incomplete upstream scan?)")
     if os.environ.get("S2_CONTAINER_TILES", "0") == "1":
         # CONTAINER publishing (2026-08-03, the R2 cost incident; the
         # hafs_render #27 pattern): the frame's tiles pack into a handful of

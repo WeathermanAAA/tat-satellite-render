@@ -210,3 +210,33 @@ class TestReviewFixes(unittest.TestCase):
                                     [-125.0, 15.0, -66.0, 49.0], [256, 256], 0,
                                     dt.datetime.now(dt.timezone.utc))
         self.assertIsNone(m3.get("containers"))    # never-flipped: absent
+
+
+class TestEmptyFrameRefused(unittest.TestCase):
+    """An all-transparent cut (render against an incomplete upstream scan)
+    must FAIL the emit, not publish a marker-complete blank frame -- in both
+    publish modes (2026-08-04: six conus products froze empty container
+    frames at one stamp; the flip watchdogs tripped on exactly this)."""
+
+    def _emit(self, container):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        store = P.FilesystemStore(tmp)
+        entry = next(e for e in R.REGISTRY if e.tiled)
+        if container:
+            os.environ["S2_CONTAINER_TILES"] = "1"
+            self.addCleanup(os.environ.pop, "S2_CONTAINER_TILES", None)
+        raster = np.zeros((600, 600, 4), dtype=np.uint8)   # alpha 0 everywhere
+        with self.assertRaises(IOError):
+            P.emit_pyramid(entry, store, "shadow", "20260804T160000Z",
+                           raster, (-125.0, 15.0, -66.0, 49.0),
+                           P.PyramidSpec(quality=60),
+                           scheme="flat-native-xyz")
+        self.assertFalse(store.head(
+            entry.ready_key("shadow", "20260804T160000Z")))
+
+    def test_per_tile_mode_refuses(self):
+        self._emit(container=False)
+
+    def test_container_mode_refuses(self):
+        self._emit(container=True)
