@@ -34,6 +34,11 @@ QUEUE_URL="${QUEUE_URL:-${S1_QUEUE_URL:?set QUEUE_URL or S1_QUEUE_URL}}"
 QUEUE_NAME="${QUEUE_URL##*/}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PEEK_WAIT="${S1_PEEK_WAIT:-20}"
+# Which source's policy the peeked keys are judged against (part B) and which
+# source part C validates. Default matches the original single-source check.
+S1_SOURCE="${S1_SOURCE:-goes19}"
+S1_REPO_ROOT="$(cd "${HERE}/.." && pwd)"
+export S1_SOURCE S1_REPO_ROOT
 fail=0
 
 echo "============================================================"
@@ -99,14 +104,36 @@ if not keys:
     print("   !! WARN: 0 messages peeked this window (could be a quiet moment); "
           "rely on the SQS sent-metric + offline proof below.")
     sys.exit(0)
-non_cmipm = [k for k in keys if not k.startswith("ABI-L2-CMIPM/")]
-if non_cmipm:
-    print(f"   !! FAIL: {len(non_cmipm)} non-CMIPM key(s) slipped the filter:")
-    for k in non_cmipm: print("       ", k)
+# Judge the peeked keys against THIS source's committed policy (the local
+# matcher must agree with what SNS just passed) + count our product among
+# them via the worker's own predicate. NOTE: right after a policy edit, SNS
+# applies the change eventually (~up to 15 min) -- messages passed by the
+# OLD policy may still be in flight; warn, don't fail, on those.
+import os
+sys.path.insert(0, os.environ["S1_REPO_ROOT"])
+sys.path.insert(0, os.path.join(os.environ["S1_REPO_ROOT"], "infra"))
+import s1_filter_check as F
+import s1_sources as SRC
+source = SRC.get_source(os.environ.get("S1_SOURCE", "goes19"))
+policy = SRC.filter_policy(source)
+prefix_ok = [k for k in keys if k.startswith(source.filter_prefix)]
+foreign = [k for k in keys if not k.startswith(source.filter_prefix)]
+policy_pass = [k for k in keys
+               if F.matches({"Records": [{"s3": {"object": {"key": k}}}]}, policy)]
+ours = [k for k in keys if SRC.is_ours(source, SRC.parse(source, k))]
+if foreign:
+    print(f"   !! FAIL: {len(foreign)} key(s) outside {source.filter_prefix} "
+          "slipped the filter:")
+    for k in foreign: print("       ", k)
     sys.exit(1)
-c13 = [k for k in keys if "CMIPM2-M6C13" in k]
-print(f"   OK: all {len(keys)} peeked keys are ABI-L2-CMIPM/; "
-      f"{len(c13)} are CMIPM2-C13 (the S1 product).")
+stale_policy = [k for k in prefix_ok if k not in policy_pass]
+if stale_policy:
+    print(f"   ?? {len(stale_policy)} peeked key(s) match the product prefix but "
+          "NOT the committed band-tight policy -- expected for ~15 min after a "
+          "policy edit (SNS eventual consistency); re-run to confirm it drains.")
+print(f"   OK: all {len(keys)} peeked keys are {source.filter_prefix}; "
+      f"{len(policy_pass)} match the committed policy; "
+      f"{len(ours)} are the S1 product ({source.product_path}).")
 PY
 
 # In-account SQS metric: NumberOfMessagesSent > 0 over the last 15 min.
@@ -127,10 +154,10 @@ echo
 echo "============================================================"
 echo "C. OFFLINE -- committed filter vs CAPTURED real NOAA firehose"
 echo "============================================================"
-if python3 "${HERE}/s1_filter_check.py"; then
-  echo "   OK: filter agrees with real keys (CMIPM pass, rest reject)."
+if python3 "${HERE}/s1_filter_check.py" --source "${S1_SOURCE}"; then
+  echo "   OK: ${S1_SOURCE} policy agrees with real keys (product pass, rest reject)."
 else
-  echo "   !! FAIL: filter disagrees with real keys."
+  echo "   !! FAIL: ${S1_SOURCE} policy disagrees with real keys."
   fail=1
 fi
 

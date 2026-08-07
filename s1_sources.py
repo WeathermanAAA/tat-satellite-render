@@ -151,6 +151,34 @@ def is_ours(source: SatSource, slot: Optional[S.Slot]) -> bool:
             and slot.sat == source.abi_sat_num)
 
 
+def filter_policy(source: SatSource) -> dict:
+    """The SNS MessageBody filter policy for this source's subscription.
+
+    Band-tight via the SNS ``wildcard`` operator (GA 2025-07-31). The old
+    prefix-only policy delivered every band of every sector -- ~46k msgs/day
+    on goes19 of which the worker discarded 95.5% as not_ours, ~94 SQS
+    requests per published frame. One anchored wildcard keeps the product
+    prefix AND isolates our band server-side.
+
+    Deliberate looseness: the ABI scan mode is NOT hardcoded (``M*``, not
+    ``M6``) -- pinning M6 would silently zero the SQS path if ABI ever
+    changes mode (the silent-match-nothing trap, INGEST-1's cousin). Blast
+    radius of an over-narrow filter is bounded either way: backfill_once
+    LISTs the NOAA bucket directly, independent of SNS, so a filter mistake
+    degrades to backfill latency, never data loss. NOTE: AWS applies filter
+    policy edits eventually (~up to 15 min) -- judge a change after that.
+
+    Any NEW operator used here must be implemented in
+    infra/s1_filter_check.py._scalar_matches in the same commit, or the
+    acceptance check goes blind (it would report a false MISMATCH)."""
+    if source.family == "abi":
+        pattern = (f"{source.filter_prefix}*OR_ABI-L2-{source.abi_sector_token}"
+                   f"-M*C{source.band:02d}_G{source.abi_sat_num}_s*")
+    else:  # ahi -- FLDK segment keys: HS_H09_YYYYMMDD_HHMM_B13_FLDK_R20_Sss10...
+        pattern = f"{source.filter_prefix}*_B{source.band:02d}_FLDK_*"
+    return {"Records": {"s3": {"object": {"key": [{"wildcard": pattern}]}}}}
+
+
 # ---------------------------------------------------------------------------
 # Completeness gate wiring (the CompletenessGate is reused verbatim; we only
 # choose its required-set + per-slot key/item).

@@ -129,10 +129,14 @@ echo "   subscription_arn=${SUB_ARN}"
 # so SQS receives the bare S3 event the worker parses (no SNS envelope to unwrap).
 SUB_ATTRS_FILE="$(mktmp)"
 python3 - "${FILTER_PREFIX}" > "${SUB_ATTRS_FILE}" <<'PY'
-import json, sys
-# Generate the body-path prefix policy from S1_FILTER_PREFIX (per-sat), so the
-# ONE IaC script subscribes ABI (ABI-L2-CMIPM/) or AHI (AHI-L1b-FLDK/) products.
-policy = {"Records": {"s3": {"object": {"key": [{"prefix": sys.argv[1]}]}}}}
+import json, os, sys
+# Preferred: the full band-tight wildcard policy from s1_sources.filter_policy
+# (exported by s1_create_source.sh as S1_FILTER_POLICY_JSON). Fallback when run
+# standalone: the legacy body-path prefix policy from S1_FILTER_PREFIX -- over-
+# broad (every band x every sector, ~32x the traffic) but never match-nothing.
+raw = os.environ.get("S1_FILTER_POLICY_JSON")
+policy = (json.loads(raw) if raw
+          else {"Records": {"s3": {"object": {"key": [{"prefix": sys.argv[1]}]}}}})
 # ORDER MATTERS: FilterPolicyScope MUST be set to MessageBody BEFORE FilterPolicy.
 # AWS rejects a nested body policy while the scope is still the default
 # MessageAttributes ("Filter policy scope MessageAttributes does not support

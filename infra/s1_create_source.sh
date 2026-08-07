@@ -19,12 +19,18 @@ REPO="$(cd "${HERE}/.." && pwd)"
 cd "${REPO}"
 
 eval "$(python3 - "$SRC" <<'PY'
+import json
+import shlex
 import sys
 import s1_sources as SRC
 s = SRC.get_source(sys.argv[1])
 for k, v in (("S1_TOPIC_ARN", s.topic_arn), ("S1_QUEUE_NAME", s.queue_name),
              ("S1_DLQ_NAME", s.dlq_name), ("S1_FILTER_PREFIX", s.filter_prefix)):
     print(f"export {k}={v}")
+# The band-tight wildcard policy (s1_sources.filter_policy is the single
+# source of truth); s1_sqs_sns.sh applies it verbatim.
+policy = json.dumps(SRC.filter_policy(s), separators=(",", ":"))
+print(f"export S1_FILTER_POLICY_JSON={shlex.quote(policy)}")
 PY
 )"
 
