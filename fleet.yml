@@ -56,7 +56,20 @@ boxes:
       - tat-render (cyclolab + floater/guidance/intensity pollers)
       - tat-satellite-render (meso render, hot + cold)
       - tat-radar-render
-      - tat-s1 (legacy single-frame ingest)
+      - >-
+        tat-s1 (S1 shadow ingest, docker-compose.s1.yml run from
+        /root/tat-sat-s1 tracking MAIN since 2026-08-07 -- it ran from the
+        never-merged s1-multisat-copyplots branch for 7 weeks before that,
+        the drift this entry exists to prevent recurring. FOUR services:
+        s1-render + three SQS-fed ingest lanes -- s1-ingest goes19 :8091,
+        s1-ingest-goes18 :8092, s1-ingest-himawari9 :8093 -- one NOAA NODD
+        queue each on AWS acct 532918216657. NOT a fleet.sh lane on purpose:
+        cmd_deploy builds and ups the s2 emit-cron image family, while
+        tat-s1 is its own image + multi-service compose; deploy it per
+        RUNBOOK-S1-MULTISAT.md. Known incident 2026-07-05: NOAA silently
+        dropped two SNS subscriptions -- SQS goes quiet, lanes go "starved"
+        (delivery-silence gate), fix = re-run
+        infra/s1_create_source.sh <source> from the codespace.)
       - tat-overlays (mrms/recon pollers)
 
   - name: box2

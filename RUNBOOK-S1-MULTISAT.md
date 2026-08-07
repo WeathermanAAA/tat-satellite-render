@@ -6,21 +6,41 @@ SHADOW ONLY (R2 `shadow/sat/{sat}/{sector}/ir/`); no viewer/floater/meso change.
 Per-source isolation: each sat is its OWN worker + queue, so a new-sat failure
 can never stale GOES-19 S1 / meso / the floater / ACE.
 
-## AWS resources -- ALREADY CREATED (idempotent; re-run safe)
+## AWS resources -- created by the idempotent IaC (re-run safe)
 Created from the codespace with the tat-sat-ingest creds (acct 532918216657):
 ```
-./infra/s1_create_source.sh goes18       # -> tat-sat-goes18-cmip (+ -dlq), sub NewGOES18Object,     filter ABI-L2-CMIPM/
-./infra/s1_create_source.sh himawari9    # -> tat-sat-himawari9-fldk (+ -dlq), sub NewHimawariNineObject, filter AHI-L1b-FLDK/
+./infra/s1_create_source.sh goes19       # -> tat-sat-goes19-cmip (+ -dlq), sub NewGOES19Object
+./infra/s1_create_source.sh goes18       # -> tat-sat-goes18-cmip (+ -dlq), sub NewGOES18Object
+./infra/s1_create_source.sh himawari9    # -> tat-sat-himawari9-fldk (+ -dlq), sub NewHimawariNineObject
 ```
-Both subscribe with `FilterPolicyScope=MessageBody` (the INGEST-1 catch) and were
-verified RECEIVING within a minute (queues accumulate until the box workers
-drain them; SQS holds 14 days). The worker re-filters by PARSED key, so the
-broad AHI-L1b-FLDK/ prefix (all bands) is trimmed to B13 by the worker.
+All subscribe with `FilterPolicyScope=MessageBody` (the INGEST-1 catch) and a
+BAND-TIGHT wildcard FilterPolicy from `s1_sources.filter_policy` (since
+2026-08-07; the old prefix-only policy delivered every band x sector and the
+worker discarded 95.5% as not_ours -- ~94 SQS requests per published frame).
+The worker still re-filters by PARSED key, so an over-broad filter is only
+wasteful, never wrong; an over-NARROW one degrades to backfill latency, never
+data loss. SNS applies filter edits eventually (~15 min) -- judge after.
+
+## KNOWN INCIDENT (2026-07-05): NOAA silently drops subscriptions
+The goes18 and himawari9 subscriptions died upstream in the same 5-min window
+(02:30-02:35Z) after 16 healthy days; goes19 untouched; nothing on our side
+changed (queue LastModified == Created). The lanes ran 100% on backfill for
+34 days while reporting healthy -- which is why the delivery-silence gate now
+exists: fresh polls + zero deliveries for S1_SQS_SILENT_H (6 h) flips the
+lane to `"state": "starved"` -> `healthy: false` -> /health 503 -> container
+visibly unhealthy. The watchdog does NOT restart on starvation (poll success
+is still liveness -- NOTE-3), so a quiet upstream can never restart-loop the
+worker. **Fix**: re-run `./infra/s1_create_source.sh <source>` from the
+codespace, then `S1_SOURCE=<source> ./infra/s1_acceptance_check.sh`, and
+confirm the box worker's `stats.received` climbs + `src=sqs` publishes resume
+within minutes (ABI) / one 10-min scan (AHI).
 
 ## Box deploy (paste-back; the S1 stack is `-p tat-s1`)
-On the box's S1 checkout (`~/tat-sat-s1` or a fresh clone of this branch):
+On the box's S1 checkout (`/root/tat-sat-s1` -- tracks MAIN since 2026-08-07;
+s1-multisat-copyplots is merged and retired; fleet.yml box1 `services` is the
+map entry, and why this is not a fleet.sh lane is documented there):
 ```bash
-cd ~/tat-sat-s1 && git fetch && git checkout s1-multisat-copyplots && git pull
+cd ~/tat-sat-s1 && git fetch origin main && git checkout main && git reset --hard origin/main
 # .env: add the two new queue URLs (S1_SOURCE is set per-service by compose):
 grep -q S1_QUEUE_URL_GOES18 .env || cat >> .env <<'EOF'
 S1_QUEUE_URL_GOES18=https://queue.amazonaws.com/532918216657/tat-sat-goes18-cmip
