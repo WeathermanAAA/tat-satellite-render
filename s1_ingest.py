@@ -101,8 +101,11 @@ RECEIVE_COUNT_WARN = _env_int("S1_RECEIVE_COUNT_WARN", 3)  # log slot nearing DL
 # R2 (same bucket as the meso/floater workers; SHADOW prefix only).
 R2_ENDPOINT = _env("R2_ENDPOINT")
 R2_BUCKET = _env("R2_BUCKET", "triple-a-tropics-media")
-R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY") or _env("AWS_SECRET_ACCESS_KEY")
+# R2-only on purpose — no AWS_* fallback. This worker legitimately carries the
+# real tat-sat-ingest AWS key for SQS, so a fallback here silently signs R2
+# PUTs with it (and passes the preflight, which checks the resolved value).
+R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY")
 R2_PREFIX = (_env("S1_R2_PREFIX", "shadow") or "shadow").strip("/")
 
 # Render service (dedicated s1-render container, byte-identical to the box's meso

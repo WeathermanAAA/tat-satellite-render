@@ -100,9 +100,11 @@ def list_noaa_ground_truth(start: dt.datetime, end: dt.datetime) -> list[str]:
 # Shipped set (R2 ListObjectsV2 with creds, OR public CDN latest_times.json)
 # ---------------------------------------------------------------------------
 def _r2_creds_present() -> bool:
+    # R2-only on purpose: with ambient real-AWS creds (e.g. the codespace), an
+    # AWS_* fallback made this return True and routed the audit at real AWS.
     return bool(os.environ.get("R2_ENDPOINT")
-                and (os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID"))
-                and (os.environ.get("R2_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")))
+                and os.environ.get("R2_ACCESS_KEY_ID")
+                and os.environ.get("R2_SECRET_ACCESS_KEY"))
 
 
 def _cdn_get(url: str) -> bytes:
@@ -129,8 +131,8 @@ def list_shadow_r2(prefix: str):
     """R2 ListObjectsV2 of the shadow product -> {stamp: put_time}."""
     s3 = boto3.client(
         "s3", endpoint_url=os.environ.get("R2_ENDPOINT"),
-        aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"))
+        aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"))
     bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
     key_prefix = f"{prefix.strip('/')}/{S.S1_PRODUCT_PATH}/"
     out: dict[str, dt.datetime] = {}

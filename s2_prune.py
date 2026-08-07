@@ -156,13 +156,17 @@ def rewrite_manifest(manifest: dict, condemned: set):
 def make_client():
     import boto3
     from botocore.config import Config as BotoConfig
-    ep = os.environ.get("R2_ENDPOINT")
-    if not ep:
-        sys.exit("ERROR: R2_ENDPOINT not set. Run on the box (or export the R2 env).")
+    # R2-only, hard-required: an AWS_* cred fallback (explicit OR via boto3's
+    # default chain) would ship the real tat-sat-ingest key to Cloudflare.
+    missing = [n for n in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID",
+                           "R2_SECRET_ACCESS_KEY") if not os.environ.get(n)]
+    if missing:
+        sys.exit(f"ERROR: {', '.join(missing)} not set. "
+                 "Run on the box (or export the R2 env).")
     return boto3.client(
-        "s3", endpoint_url=ep,
-        aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        "s3", endpoint_url=os.environ.get("R2_ENDPOINT"),
+        aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
         config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
 
 

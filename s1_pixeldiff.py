@@ -43,10 +43,11 @@ def _cdn_get(url: str) -> bytes:
 
 
 def _r2():
+    # R2-only on purpose (call sites gate on s1_audit._r2_creds_present).
     return boto3.client(
         "s3", endpoint_url=os.environ.get("R2_ENDPOINT"),
-        aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"))
+        aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"))
 
 
 def _list_stamps(s3, bucket, key_prefix):

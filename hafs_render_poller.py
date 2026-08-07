@@ -67,8 +67,10 @@ def _env(n: str, d: Optional[str] = None) -> Optional[str]:
 
 R2_ENDPOINT = _env("R2_ENDPOINT")
 R2_BUCKET = _env("R2_BUCKET", "triple-a-tropics-media")
-R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY") or _env("AWS_SECRET_ACCESS_KEY")
+# R2-only on purpose — an AWS_* fallback would let ambient real-AWS creds
+# satisfy the preflight and get shipped to Cloudflare. Fail loudly instead.
+R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY")
 
 # SHADOW by default. Cutover flips this to "models/hafs" (the live cron keys).
 HAFS_R2_PREFIX = _env("HAFS_R2_PREFIX", "shadow/models/hafs").strip("/")
@@ -692,9 +694,9 @@ def main() -> None:  # pragma: no cover - Railway worker entrypoint
     if not R2_ENDPOINT:
         missing.append("R2_ENDPOINT")
     if not R2_ACCESS_KEY_ID:
-        missing.append("R2_ACCESS_KEY_ID/AWS_ACCESS_KEY_ID")
+        missing.append("R2_ACCESS_KEY_ID")
     if not R2_SECRET_ACCESS_KEY:
-        missing.append("R2_SECRET_ACCESS_KEY/AWS_SECRET_ACCESS_KEY")
+        missing.append("R2_SECRET_ACCESS_KEY")
     if missing:
         raise SystemExit("hafs_render_poller: missing required env: "
                          + ", ".join(missing))

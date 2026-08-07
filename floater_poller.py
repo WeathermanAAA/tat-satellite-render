@@ -79,8 +79,10 @@ RENDER_URL = RENDER_BASE_URL + "/render"
 # R2 / S3
 R2_ENDPOINT = _env("R2_ENDPOINT")
 R2_BUCKET = _env("R2_BUCKET", "triple-a-tropics-media")
-R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY") or _env("AWS_SECRET_ACCESS_KEY")
+# R2-only on purpose — an AWS_* fallback would let ambient real-AWS creds
+# satisfy _validate_env and get shipped to Cloudflare. Fail loudly instead.
+R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY")
 R2_PREFIX = _env("R2_PREFIX", "floaters").strip("/")
 
 # Where the hardened active-storm list lives. Use the LIVE R2 feed (poller-

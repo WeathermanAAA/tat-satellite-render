@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from typing import Optional
 
@@ -106,13 +107,20 @@ class _R2Png:
     def __init__(self) -> None:
         import boto3
         from botocore.config import Config as BotoConfig
+        # R2-only, hard-required (s2_prune pattern). endpoint=None would sign
+        # real-AWS calls; an AWS_* cred fallback (explicit OR via boto3's
+        # default chain) would ship the real tat-sat-ingest key to Cloudflare.
+        missing = [n for n in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID",
+                               "R2_SECRET_ACCESS_KEY")
+                   if not os.environ.get(n)]
+        if missing:
+            sys.exit(f"ERROR: {', '.join(missing)} not set. "
+                     "Run on the box (or export the R2 env).")
         self.bucket = os.environ.get("R2_BUCKET", "triple-a-tropics-media")
         self.s3 = boto3.client(
             "s3", endpoint_url=os.environ.get("R2_ENDPOINT"),
-            aws_access_key_id=(os.environ.get("R2_ACCESS_KEY_ID")
-                               or os.environ.get("AWS_ACCESS_KEY_ID")),
-            aws_secret_access_key=(os.environ.get("R2_SECRET_ACCESS_KEY")
-                                   or os.environ.get("AWS_SECRET_ACCESS_KEY")),
+            aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
             config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
 
     def write_png(self, key: str, data: bytes) -> None:

@@ -874,11 +874,19 @@ class R2Sink(pf.Sink):
     def __init__(self) -> None:
         import boto3
         from botocore.config import Config as BotoConfig
+        # R2-only, hard-required (s2_prune pattern). endpoint=None would sign
+        # real-AWS calls; an AWS_* cred fallback (explicit OR via boto3's
+        # default chain) would ship the real tat-sat-ingest key to Cloudflare.
+        missing = [n for n in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID",
+                               "R2_SECRET_ACCESS_KEY") if not _env(n)]
+        if missing:
+            raise SystemExit(f"ERROR: {', '.join(missing)} not set. "
+                             "Run on the box (or export the R2 env).")
         self.bucket = _env("R2_BUCKET", "triple-a-tropics-media")
         self.s3 = boto3.client(
             "s3", endpoint_url=_env("R2_ENDPOINT"),
-            aws_access_key_id=_env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=_env("R2_SECRET_ACCESS_KEY") or _env("AWS_SECRET_ACCESS_KEY"),
+            aws_access_key_id=_env("R2_ACCESS_KEY_ID"),
+            aws_secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
             config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
 
     def write(self, key: str, payload: dict) -> None:
@@ -908,9 +916,8 @@ class R2Sink(pf.Sink):
 def main() -> None:   # pragma: no cover - Railway worker entrypoint
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
-    missing = [n for n in ("R2_ENDPOINT",) if not _env(n)]
-    if not (_env("R2_ACCESS_KEY_ID") or _env("AWS_ACCESS_KEY_ID")):
-        missing.append("R2_ACCESS_KEY_ID/AWS_ACCESS_KEY_ID")
+    missing = [n for n in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID",
+                           "R2_SECRET_ACCESS_KEY") if not _env(n)]
     if missing:
         raise SystemExit("intensity_poller: missing required env: " + ", ".join(missing))
     sink = R2Sink()
