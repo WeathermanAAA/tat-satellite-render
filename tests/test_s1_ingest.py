@@ -26,6 +26,13 @@ import s1_ingest as W  # noqa: E402
 
 UTC = dt.timezone.utc
 
+# Frozen "now" beside the frozen fixtures. The worker's stale-slot guard acks
+# (without rendering) anything older than RETAIN_H=72h, so tests defaulting to
+# the REAL clock pass only within ~3 days of the fixture dates (2026-06-18/19)
+# and then rot: 12 of them failed exactly this way 50 days on. Every _worker()
+# defaults to this clock; tests that need a different now still inject one.
+FROZEN_NOW = dt.datetime(2026, 6, 19, 21, 0, tzinfo=UTC)
+
 C13_A = ("ABI-L2-CMIPM/2026/169/21/"
          "OR_ABI-L2-CMIPM2-M6C13_G19_s20261692100572_e20261692101042_c20261692101089.nc")
 C13_B = ("ABI-L2-CMIPM/2026/169/21/"
@@ -38,6 +45,16 @@ RADC = ("ABI-L1b-RadC/2026/169/21/"
         "OR_ABI-L1b-RadC-M6C08_G19_s20261692106194_e20261692108567_c20261692109023.nc")
 
 BBOX = [100.0, 20.0, 112.0, 32.0]
+
+# GOES-18 CMIPM2 C13 (same s-token as C13_A -> stamp 20260618T210057Z, sat 18).
+G18_C13 = ("ABI-L2-CMIPM/2026/169/21/"
+           "OR_ABI-L2-CMIPM2-M6C13_G18_s20261692100572_e20261692101042_c20261692101089.nc")
+
+
+def ahi_key(seg, band=13, time="1850"):
+    """Himawari-9 AHI FLDK HSD segment key (10 segments make a complete scan)."""
+    return (f"AHI-L1b-FLDK/2026/06/19/{time}/"
+            f"HS_H09_20260619_{time}_B{band:02d}_FLDK_R20_S{seg:02d}10.DAT.bz2")
 
 
 def raw_event(key):
@@ -131,7 +148,8 @@ class S1IngestTest(unittest.TestCase):
         return int(a["Attributes"]["ApproximateNumberOfMessages"])
 
     def _worker(self, render=None, r2=None, ground_truth=None, extent=None,
-                clock=None):
+                clock=None, source=None):
+        import s1_sources as SRC
         return W.S1Ingest(
             r2=r2 or FakeR2(),
             sqs=W.SQS(self.q_url),
@@ -139,7 +157,8 @@ class S1IngestTest(unittest.TestCase):
             extent_fn=extent or (lambda k: list(BBOX)),
             ground_truth_fn=ground_truth or (lambda lookback: []),
             prefix="shadow",
-            clock=clock or W.utcnow,
+            clock=clock or (lambda: FROZEN_NOW),
+            source=source or SRC.get_source("goes19"),
         )
 
     # -- happy path: render + publish + delete -------------------------------
@@ -335,6 +354,64 @@ class S1IngestTest(unittest.TestCase):
         w.consume_once(wait_s=1)
         self.assertEqual(render.calls, [])               # idempotent post-cold-start
         self.assertEqual(w.stats.duplicates, 1)
+
+    # -- STAGE A multi-sat: GOES-18 (ABI twin) + Himawari-9 (AHI segments) -----
+    def test_goes18_publishes_to_goes18_path_only(self):
+        import s1_sources as SRC
+        src = SRC.get_source("goes18")
+        r2 = FakeR2()
+        w = self._worker(r2=r2, source=src)
+        self._send(raw_event(G18_C13))
+        w.consume_once(wait_s=1)
+        self.assertEqual(w.stats.rendered, 1)
+        key = S.shadow_frame_key("shadow", "20260618T210057Z", src.product_path)
+        self.assertEqual(key, "shadow/sat/goes18/meso2/ir/20260618T210057Z.webp")
+        self.assertIn(key, r2.store)
+        # isolation: must NOT touch the GOES-19 product path
+        self.assertNotIn(S.shadow_frame_key("shadow", "20260618T210057Z"), r2.store)
+
+    def test_goes19_worker_drops_goes18_object(self):
+        # per-sat isolation: a GOES-18 event on a GOES-19 worker is not-ours.
+        w = self._worker()   # default goes19
+        self._send(raw_event(G18_C13))
+        w.consume_once(wait_s=1)
+        self.assertEqual(w.stats.rendered, 0)
+        self.assertEqual(w.stats.not_ours, 1)
+
+    def test_himawari_segment_gate_waits_for_all_10(self):
+        import s1_sources as SRC
+        src = SRC.get_source("himawari9")
+        r2 = FakeR2()
+        render = RenderStub()
+        w = self._worker(render=render, r2=r2, source=src,
+                         extent=lambda k: [115.0, -5.0, 165.0, 35.0])
+        # 9 of 10 segments -> NEVER render (the southern-segment lesson)
+        for s in range(1, 10):
+            self._send(raw_event(ahi_key(s)))
+        while w.consume_once(wait_s=0):
+            pass
+        self.assertEqual(w.stats.rendered, 0)
+        self.assertEqual(render.calls, [])
+        self.assertEqual(self._q_count(self.q_url), 0)   # incomplete segments acked
+        # the 10th segment completes the scan -> render ONCE
+        self._send(raw_event(ahi_key(10)))
+        w.consume_once(wait_s=1)
+        self.assertEqual(w.stats.rendered, 1)
+        self.assertEqual(len(render.calls), 1)
+        key = S.shadow_frame_key("shadow", "20260619T185000Z", src.product_path)
+        self.assertEqual(key, "shadow/sat/himawari9/fldk/ir/20260619T185000Z.webp")
+        self.assertIn(key, r2.store)
+
+    def test_himawari_other_band_segments_not_ours(self):
+        import s1_sources as SRC
+        render = RenderStub()
+        w = self._worker(render=render, source=SRC.get_source("himawari9"))
+        for s in range(1, 11):
+            self._send(raw_event(ahi_key(s, band=7)))   # B07, not our clean-IR
+        while w.consume_once(wait_s=0):
+            pass
+        self.assertEqual(w.stats.rendered, 0)
+        self.assertEqual(w.stats.not_ours, 10)
 
     # -- stale-slot guard: ancient backlog acked, not rendered ----------------
     def test_stale_slot_acked_not_rendered(self):
