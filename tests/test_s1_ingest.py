@@ -424,6 +424,63 @@ class S1IngestTest(unittest.TestCase):
         self.assertEqual(render.calls, [])               # not rendered
         self.assertEqual(self._q_count(self.q_url), 0)   # acked
 
+    # -- delivery-silence gate (the 34-day lesson) ----------------------------
+    # goes18 + himawari9 reported healthy for 34 days of empty polls after
+    # NOAA's SNS stopped delivering: poll success counted as health. The gate
+    # flips a lane whose polls succeed but deliver NOTHING for S1_SQS_SILENT_H
+    # to "starved" (healthy: false). Liveness (the watchdog) is untouched.
+
+    def test_empty_polls_within_window_stay_healthy(self):
+        clock = [FROZEN_NOW]
+        w = self._worker(clock=lambda: clock[0])
+        clock[0] += dt.timedelta(hours=1)                # 1h of empty polls
+        w.consume_once(wait_s=0)
+        w.backfill_once()          # both loops run in production; keep backfill
+        snap = w.health_snapshot()  # fresh so `healthy` isolates the sqs gate
+        self.assertEqual(snap["sources"]["sqs"]["state"], "fresh")
+        self.assertTrue(snap["healthy"])
+
+    def test_silent_queue_goes_starved_despite_fresh_polls(self):
+        clock = [FROZEN_NOW]
+        w = self._worker(clock=lambda: clock[0])
+        clock[0] += dt.timedelta(hours=7)                # > SQS_SILENT_H=6
+        w.consume_once(wait_s=0)                         # succeeds, empty
+        snap = w.health_snapshot()
+        sq = snap["sources"]["sqs"]
+        self.assertEqual(sq["state"], "starved")
+        self.assertFalse(snap["healthy"])                # -> /health 503
+        self.assertIn("no SQS delivery", sq["last_error"])
+        self.assertIsNone(sq["last_delivery_utc"])       # never delivered
+
+    def test_delivery_re_anchors_the_silence_window(self):
+        clock = [FROZEN_NOW]
+        w = self._worker(clock=lambda: clock[0])
+        clock[0] += dt.timedelta(hours=5)                # quiet boot, then...
+        self._send(raw_event(C13_A))
+        w.consume_once(wait_s=0)                         # ...a real delivery
+        clock[0] += dt.timedelta(hours=5)                # 5h later: inside the
+        w.consume_once(wait_s=0)                         # window again (empty)
+        w.backfill_once()
+        snap = w.health_snapshot()
+        self.assertEqual(snap["sources"]["sqs"]["state"], "fresh")
+        self.assertTrue(snap["healthy"])
+        clock[0] += dt.timedelta(hours=2)                # now 7h since delivery
+        w.consume_once(wait_s=0)
+        snap = w.health_snapshot()
+        self.assertEqual(snap["sources"]["sqs"]["state"], "starved")
+
+    def test_starved_does_not_mask_failing(self):
+        # An actively-erroring receive stays "failing" — the louder signal.
+        clock = [FROZEN_NOW]
+        w = self._worker(clock=lambda: clock[0])
+        w.sqs.url = "https://sqs.us-east-1.amazonaws.com/000000000000/nope"
+        clock[0] += dt.timedelta(hours=7)
+        for _ in range(3):                               # FAIL_THRESHOLD=3
+            w.consume_once(wait_s=0)
+        snap = w.health_snapshot()
+        self.assertEqual(snap["sources"]["sqs"]["state"], "failing")
+        self.assertFalse(snap["healthy"])
+
 
 if __name__ == "__main__":
     unittest.main()

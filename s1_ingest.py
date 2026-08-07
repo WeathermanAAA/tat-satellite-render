@@ -137,6 +137,17 @@ WATCHDOG_S = _env_float("S1_WATCHDOG_S", 600.0)
 # Health classification + tiny health HTTP server (a compose healthcheck curls it).
 STALE_AFTER_S = _env_float("S1_STALE_AFTER_S", 600.0)
 FAIL_THRESHOLD = _env_int("S1_FAIL_THRESHOLD", 3)
+# Delivery-silence gate (the 34-day lesson): a successful EMPTY long-poll proves
+# the CONSUMER is alive, not that the SUBSCRIPTION is. goes18 + himawari9 sat
+# "healthy: true" for 34 days on empty polls after NOAA's SNS stopped delivering
+# (2026-07-05). If SQS delivers NOTHING for this long, the lane reports
+# "starved" (-> healthy:false -> /health 503) even though every poll succeeds.
+# All three feeds are continuous firehoses (ABI meso ~1/min, AHI FLDK 10/10min)
+# so hours of silence is a dead subscription, not a quiet day. REPORTING ONLY:
+# the liveness watchdog still runs on poll progress (NOTE-3 below), so a quiet
+# upstream can flip the healthcheck red but can never restart-loop the worker.
+SQS_SILENT_H = _env_float("S1_SQS_SILENT_H", 6.0)
+STARVED = "starved"
 HEALTH_PORT = _env_int("S1_HEALTH_PORT", 8091)
 HEALTH_FILE = _env("S1_HEALTH_FILE", "/tmp/s1_health.json")
 
@@ -452,6 +463,11 @@ class S1Ingest:
         }
         self._last_progress = time.monotonic()
         self._dlq_visible: Optional[int] = None
+        # Anchor for the delivery-silence gate: last time SQS delivered ANY
+        # message (ours or not — either proves the subscription is alive).
+        # Starts at boot so a fresh worker gets the full window before alarming.
+        self._sqs_last_delivery: Optional[dt.datetime] = None
+        self._started_utc: dt.datetime = self._now()
 
     # -- cold start (§3.6) ----------------------------------------------------
     def cold_start(self) -> None:
@@ -581,8 +597,11 @@ class S1Ingest:
         h.last_error = None
         # A successful poll IS liveness, even when empty -- otherwise a
         # legitimately quiet firehose (upstream maintenance) would trip the
-        # watchdog and restart-loop the worker (NOTE-3).
+        # watchdog and restart-loop the worker (NOTE-3). But liveness is NOT
+        # health: only an actual delivery feeds the silence gate below.
         self._last_progress = time.monotonic()
+        if msgs:
+            self._sqs_last_delivery = self._now()
         for m in msgs:
             self.stats.received += 1
             try:
@@ -728,6 +747,22 @@ class S1Ingest:
         now = self._now()
         sources = {n: hh.snapshot(now, STALE_AFTER_S, FAIL_THRESHOLD)
                    for n, hh in self.health.items()}
+        # Delivery-silence gate: fresh polls + no deliveries for SQS_SILENT_H
+        # = a starved lane (dead subscription upstream), NOT a healthy one.
+        # Overrides only the fresh state — failing/stale/never stay the louder
+        # signal. Anchored on last delivery, or process start on a fresh boot.
+        sq = sources["sqs"]
+        anchor = self._sqs_last_delivery or self._started_utc
+        silence_s = (now - anchor).total_seconds()
+        sq["last_delivery_utc"] = (iso_z(self._sqs_last_delivery)
+                                   if self._sqs_last_delivery else None)
+        sq["delivery_silence_seconds"] = round(silence_s, 1)
+        sq["silent_after_s"] = SQS_SILENT_H * 3600.0
+        if sq["state"] == FRESH and silence_s > SQS_SILENT_H * 3600.0:
+            sq["state"] = STARVED
+            sq["last_error"] = (
+                f"no SQS delivery in {silence_s / 3600.0:.1f}h (polls succeed "
+                f"but return nothing — subscription dead upstream?)")
         healthy = all(s["state"] == FRESH for s in sources.values())
         return {
             "poller": "s1-ingest",
