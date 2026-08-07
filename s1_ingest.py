@@ -148,6 +148,8 @@ FAIL_THRESHOLD = _env_int("S1_FAIL_THRESHOLD", 3)
 # upstream can flip the healthcheck red but can never restart-loop the worker.
 SQS_SILENT_H = _env_float("S1_SQS_SILENT_H", 6.0)
 STARVED = "starved"
+# DLQ-depth probe cadence. The health emit itself stays at 30 s.
+DLQ_PROBE_S = _env_float("S1_DLQ_PROBE_S", 300.0)
 HEALTH_PORT = _env_int("S1_HEALTH_PORT", 8091)
 HEALTH_FILE = _env("S1_HEALTH_FILE", "/tmp/s1_health.json")
 
@@ -463,6 +465,7 @@ class S1Ingest:
         }
         self._last_progress = time.monotonic()
         self._dlq_visible: Optional[int] = None
+        self._dlq_probed_mono: Optional[float] = None
         # Anchor for the delivery-silence gate: last time SQS delivered ANY
         # message (ours or not — either proves the subscription is alive).
         # Starts at boot so a fresh worker gets the full window before alarming.
@@ -740,8 +743,19 @@ class S1Ingest:
 
     # -- health (§3.5) --------------------------------------------------------
     def refresh_dlq_depth(self) -> None:
-        if S1_DLQ_URL:
-            self._dlq_visible = self.sqs.visible_count(S1_DLQ_URL)
+        """Rate-limited to DLQ_PROBE_S: the 30 s health emit was issuing a
+        GetQueueAttributes per lane per emit (~8.6k requests/day across three
+        lanes) to re-read a depth that is 0 for months at a time. Between
+        probes the cached depth serves; a poison burst still shows within
+        DLQ_PROBE_S, which is plenty for a 14-day-retention queue."""
+        if not S1_DLQ_URL:
+            return
+        mono = time.monotonic()
+        if (self._dlq_probed_mono is not None
+                and mono - self._dlq_probed_mono < DLQ_PROBE_S):
+            return
+        self._dlq_probed_mono = mono
+        self._dlq_visible = self.sqs.visible_count(S1_DLQ_URL)
 
     def health_snapshot(self) -> dict:
         now = self._now()
