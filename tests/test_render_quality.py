@@ -104,7 +104,7 @@ class CacheKeyTests(unittest.TestCase):
     def _key(self, **kw):
         body = app.RenderRequest(bbox=BBOX, channel="clean_ir", **kw)
         return app._request_key(body, "clean_ir", "2026-06-20T12:00:00", "noaa-goes19",
-                                body.quality)
+                                body.quality, policy=app.PROCESS_RENDER_POLICY)
 
     def test_tiers_cache_separately(self):
         keys = {self._key(quality=q) for q in ("low", "default", "high")}
@@ -122,7 +122,8 @@ class CacheKeyTests(unittest.TestCase):
         def wkey(q):
             body = app.RenderRequest(bbox=BBOX, channel="clean_ir", format="webp", quality=q)
             return app._request_key(body, "clean_ir", "2026-06-20T12:00:00",
-                                    "noaa-goes19", body.quality)
+                                    "noaa-goes19", body.quality,
+                                    policy=app.PROCESS_RENDER_POLICY)
         self.assertEqual(wkey("low"), wkey("high"))
         self.assertEqual(wkey("default"), wkey("low"))
 
@@ -201,7 +202,7 @@ class RenderPngDpiTests(unittest.TestCase):
         import render
         data, bbox = _synthetic_ir()
         png = render.render_png(data, bbox, 13, "2026-06-20 12:00", "rainbow_ir",
-                                1, dpi=dpi)
+                                1, dpi=dpi, policy=app.PROCESS_RENDER_POLICY)
         return Image.open(io.BytesIO(png)).size
 
     def test_dpi_scales_output_resolution(self):
@@ -223,8 +224,14 @@ class RenderPngDpiTests(unittest.TestCase):
         from PIL import Image
         import render
         data, bbox = _synthetic_ir()
-        a = render.render_png(data, bbox, 13, "t", "rainbow_ir", 1)
-        b = render.render_png(data, bbox, 13, "t", "rainbow_ir", 1, dpi=110)
+        a = render.render_png(
+            data, bbox, 13, "t", "rainbow_ir", 1,
+            policy=app.PROCESS_RENDER_POLICY,
+        )
+        b = render.render_png(
+            data, bbox, 13, "t", "rainbow_ir", 1, dpi=110,
+            policy=app.PROCESS_RENDER_POLICY,
+        )
         self.assertEqual(a, b)
 
 

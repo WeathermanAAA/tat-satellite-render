@@ -30,6 +30,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import render                                  # noqa: E402
+from render_policy import M1_POLICY            # noqa: E402
 from satellites import FetchResult             # noqa: E402
 
 
@@ -121,7 +122,8 @@ class RenderedHeaderTests(unittest.TestCase):
         return render.render_png(
             _frame(generic, chan, units=units), bbox=self.BBOX, channel=chan,
             time_str="2026-07-28 12:00", enhancement="tat_neon",
-            storm=storm, coastlines=False, gridlines=False, dpi=60)
+            storm=storm, coastlines=False, gridlines=False, dpi=60,
+            policy=M1_POLICY)
 
     def test_ir_frame_renders_with_a_header_readout(self):
         png = self._png("clean_ir", 13,

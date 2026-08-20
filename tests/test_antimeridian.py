@@ -47,6 +47,7 @@ from app import (  # noqa: E402
     compute_downsample_factor,
     rate_limit_for,
 )
+from render_policy import M1_POLICY  # noqa: E402
 import floater_poller as fp  # noqa: E402
 from render import render_backdrop_webp, render_png  # noqa: E402
 
@@ -215,6 +216,7 @@ def test_render_png_crossing():
     png = render_png(
         _synthetic_crossing_fetch(cold_east=True), bbox,
         channel=13, time_str="2026-07-14T04:00Z", enhancement="rainbow_ir",
+        policy=M1_POLICY,
     )
     assert len(png) > 10_000 and png[:8] == b"\x89PNG\r\n\x1a\n"
     print("render_png crossing ok")
@@ -233,7 +235,8 @@ def test_render_png_plain_unchanged():
         sat_name="GOES-19", sub_sat_lon=-75.2, units="K",
     )
     png = render_png(fr, [-100, 5, -80, 25], channel=13,
-                     time_str="2026-07-14T04:00Z", enhancement="rainbow_ir")
+                     time_str="2026-07-14T04:00Z", enhancement="rainbow_ir",
+                     policy=M1_POLICY)
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     print("render_png plain control ok")
 

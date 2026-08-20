@@ -70,26 +70,78 @@ class ImshowCall:
     branch: str
 
 
-def imshow_calls() -> tuple[ImshowCall, ...]:
-    """Return literal interpolation policy at production ``imshow`` calls."""
+def imshow_calls(policy_version: str | None = None) -> tuple[ImshowCall, ...]:
+    """Return the effective literal kernel at both regular-grid render sites.
 
+    M1 keeps literal ``nearest`` and ``hanning`` calls in a shared dispatcher
+    so the previous M0 generation remains selectable for rollback.  Merely
+    enumerating every ``Axes.imshow`` node would therefore report dispatcher
+    alternatives instead of the policy used at the RGB and scalar production
+    sites.  Resolve the requested immutable policy, prove its dispatcher arm
+    contains the matching literal, then report that effective value at each
+    call site.  The default stays M0 for the M0 baseline adapter; later-stage
+    validators must name their policy explicitly.
+    """
+
+    render_policy = importlib.import_module("render_policy")
+    selected_name = (
+        render_policy.M0_POLICY.algo_version
+        if policy_version is None
+        else policy_version
+    )
+    policy = render_policy.resolve_render_policy(selected_name)
     path = REPO_ROOT / "render.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    dispatcher_literals: dict[str, str | None] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and isinstance(test.comparators[0].value, str)
+            and isinstance(test.left, ast.Attribute)
+            and test.left.attr == "resample_kernel"
+        ):
+            continue
+        declared = test.comparators[0].value
+        literal: str | None = None
+        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if not (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "imshow"
+            ):
+                continue
+            interpolation = next(
+                (keyword.value for keyword in child.keywords if keyword.arg == "interpolation"),
+                None,
+            )
+            if isinstance(interpolation, ast.Constant) and isinstance(
+                interpolation.value, str
+            ):
+                literal = interpolation.value
+        dispatcher_literals[declared] = literal
+
+    effective = dispatcher_literals.get(policy.resample_kernel)
+    if effective != policy.resample_kernel:
+        effective = None
+
     calls: list[ImshowCall] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_imshow_with_render_policy"
+        ):
             continue
-        if not isinstance(node.func, ast.Attribute) or node.func.attr != "imshow":
-            continue
-        value = None
-        for keyword in node.keywords:
-            if keyword.arg == "interpolation" and isinstance(keyword.value, ast.Constant):
-                if isinstance(keyword.value.value, str):
-                    value = keyword.value.value
-        # The two production sites are distinguishable from their array/cmap
-        # arguments.  Extra sites are reported rather than ignored.
         branch = "scalar" if any(k.arg == "cmap" for k in node.keywords) else "rgb"
-        calls.append(ImshowCall(node.lineno, value, branch))
+        calls.append(ImshowCall(node.lineno, effective, branch))
     return tuple(sorted(calls, key=lambda item: item.line))
 
 
@@ -429,6 +481,7 @@ def port_fidelity_probe(case_id: str) -> PortFidelityResult:
             coastlines=False,
             gridlines=False,
             dpi=110,
+            policy=importlib.import_module("render_policy").M0_POLICY,
         )
     try:
         with Image.open(io.BytesIO(png)) as image:

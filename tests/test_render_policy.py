@@ -6,7 +6,7 @@ import render_policy as rp
 
 
 def test_m0_policy_is_an_exact_legacy_behavior_declaration():
-    policy = rp.resolve_render_policy()
+    policy = rp.resolve_render_policy(rp.M0_POLICY.algo_version)
     assert policy is rp.M0_POLICY
     assert policy.stage == "M0"
     assert policy.algo_version == "tat-truecolor-m0-baseline-v1"
@@ -21,6 +21,21 @@ def test_m0_policy_is_an_exact_legacy_behavior_declaration():
     assert policy.operational_integrity is False
     assert policy.glint_in_reflectance is False
     assert policy.quantizer == "production_floor"
+
+
+def test_m1_is_the_default_and_changes_only_the_explicit_kernel():
+    policy = rp.resolve_render_policy()
+    assert policy is rp.M1_POLICY
+    assert rp.ALGO_VERSION == "tat-truecolor-m1-hanning-v1"
+    assert policy.stage == "M1"
+    assert policy.resample_kernel == "hanning"
+
+    m0_behavior = rp.M0_POLICY.canonical_dict()
+    m1_behavior = rp.M1_POLICY.canonical_dict()
+    for identity_field in ("stage", "algo_version", "resample_kernel"):
+        m0_behavior.pop(identity_field)
+        m1_behavior.pop(identity_field)
+    assert m1_behavior == m0_behavior
 
 
 def test_policy_is_immutable_and_fingerprint_is_deterministic():
@@ -51,6 +66,14 @@ def test_unknown_policy_fails_loudly(monkeypatch):
     monkeypatch.setenv(rp.POLICY_ENV, "tat-truecolor-m7-not-implemented-v1")
     with pytest.raises(RuntimeError, match="unknown TAT_TRUECOLOR_RENDER_POLICY"):
         rp.resolve_render_policy()
+
+
+def test_production_boundaries_reject_an_unregistered_policy_lookalike():
+    lookalike = dataclasses.replace(rp.M0_POLICY)
+    assert lookalike == rp.M0_POLICY
+    assert lookalike is not rp.M0_POLICY
+    with pytest.raises(RuntimeError, match="unregistered render policy object"):
+        rp.require_registered_policy(lookalike)
 
 
 def test_m8_glint_switch_exists_but_is_parked():

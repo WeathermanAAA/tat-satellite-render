@@ -1,4 +1,4 @@
-"""Stable JSON reporting and external-artifact safety for the M0 harness."""
+"""Stable JSON reporting and external-artifact safety for validation stages."""
 
 from __future__ import annotations
 
@@ -8,11 +8,13 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from . import production_adapter
 from .gates import BaselineRun
@@ -29,6 +31,27 @@ DEPENDENCIES = (
     "pyspectral",
     "scikit-image",
     "tat-palettes",
+)
+
+_SECRET_METADATA_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "client_secret",
+        "credential",
+        "credentials",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+    }
+)
+_TOKEN_VALUE_PATTERN = re.compile(
+    r"(?i)(?:bearer\s+\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|"
+    r"sk-[A-Za-z0-9_-]{8,})"
 )
 
 
@@ -49,6 +72,66 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _sha256_file(path: Path) -> str:
     return _sha256_bytes(path.read_bytes())
+
+
+def _sanitize_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if not parsed.scheme:
+        return value
+    hostname = parsed.hostname
+    if hostname is None:
+        sanitized_netloc = parsed.netloc
+    else:
+        sanitized_host = f"[{hostname}]" if ":" in hostname else hostname
+        sanitized_netloc = sanitized_host
+        try:
+            if parsed.port is not None:
+                sanitized_netloc += f":{parsed.port}"
+        except ValueError:
+            return "<redacted-invalid-url>"
+    return urlunsplit(
+        SplitResult(
+            parsed.scheme,
+            sanitized_netloc,
+            parsed.path,
+            "",
+            "",
+        )
+    )
+
+
+def sanitize_direct_url_metadata(value: Any, *, key: str | None = None) -> Any:
+    """Remove credentials and token-bearing fields from PEP-610 metadata."""
+
+    if key is not None:
+        normalized_key = key.strip().lower().replace("-", "_")
+        if (
+            normalized_key in _SECRET_METADATA_KEYS
+            or normalized_key.endswith("_token")
+            or normalized_key.endswith("_secret")
+            or normalized_key.endswith("_password")
+            or normalized_key.endswith("_credential")
+        ):
+            return "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(child_key): sanitize_direct_url_metadata(
+                child_value,
+                key=str(child_key),
+            )
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_direct_url_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_direct_url_metadata(item) for item in value]
+    if isinstance(value, str):
+        if urlsplit(value).scheme:
+            return _sanitize_url(value)
+        if _TOKEN_VALUE_PATTERN.search(value):
+            return "<redacted>"
+        return value
+    return value
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -97,7 +180,9 @@ def collect_dependency_metadata() -> dict[str, Any]:
             versions[distribution] = metadata.version
             raw_direct_url = metadata.read_text("direct_url.json")
             direct_urls[distribution] = (
-                json.loads(raw_direct_url) if raw_direct_url else None
+                sanitize_direct_url_metadata(json.loads(raw_direct_url))
+                if raw_direct_url
+                else None
             )
         except importlib.metadata.PackageNotFoundError:
             versions[distribution] = None

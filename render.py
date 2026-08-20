@@ -28,6 +28,7 @@ from matplotlib.colors import Normalize
 from shapely.geometry import shape
 
 from colormaps import get_enhancement, enhancement_norm, normalize_visible
+from render_policy import RenderPolicy, require_registered_policy
 from satellites import FetchResult
 
 log = logging.getLogger("tat-satellite.render")
@@ -75,6 +76,33 @@ LINE_HALO = "#000000"     # black halo under both (thin: +~1.2 px)
 TEXT_COLOR = "#e8eef5"
 ACCENT_COLOR = "#79f0d6"
 MUTED_COLOR = "#9199a4"
+
+
+def _imshow_with_render_policy(
+    ax,
+    image,
+    *,
+    policy: RenderPolicy,
+    **kwargs,
+):
+    """Draw a regular raster with the policy's explicit Matplotlib kernel.
+
+    Keep both literals in this dispatcher.  Matplotlib's ``"auto"`` and
+    ``"antialiased"`` modes can silently choose nearest-neighbour sampling at
+    the resize ratios used by TAT, so the production call must never delegate
+    this decision back to Matplotlib.  M0 remains available as an exact
+    nearest-neighbour rollback; M1 is the explicit Hanning stopgap only.
+    """
+
+    require_registered_policy(policy)
+    if policy.resample_kernel == "nearest":
+        return ax.imshow(image, interpolation="nearest", **kwargs)
+    if policy.resample_kernel == "hanning":
+        return ax.imshow(image, interpolation="hanning", **kwargs)
+    raise RuntimeError(
+        f"render policy {policy.algo_version!r} cannot use "
+        f"{policy.resample_kernel!r} through Matplotlib imshow"
+    )
 
 
 def _fill_coord_nan(a: np.ndarray) -> np.ndarray:
@@ -298,7 +326,10 @@ def render_png(
     coastlines: bool = True,
     gridlines: bool = True,
     dpi: int = 110,
+    *,
+    policy: RenderPolicy,
 ) -> bytes:
+    require_registered_policy(policy)
     # ``coastlines`` draws coastlines + political borders; ``gridlines`` draws the
     # labeled lat/lon graticule. Both default True (the standard look); the custom-
     # zoom page can switch either off for clean imagery. (The floater/meso loop
@@ -531,12 +562,13 @@ def render_png(
         # re-centered crossing frame is exactly [-span/2, +span/2] — identity
         # transform either way, so imshow stays a fast non-warping draw.
         rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
-        ax.imshow(
+        _imshow_with_render_policy(
+            ax,
             rgb,
+            policy=policy,
             origin="upper",
             extent=img_extent,
             transform=map_crs,
-            interpolation="nearest",
             zorder=1,
         )
     else:
@@ -571,14 +603,15 @@ def render_png(
                 min(lat1[0], lat1[-1]) - abs(dlat) / 2.0,
                 max(lat1[0], lat1[-1]) + abs(dlat) / 2.0,
             ]
-            mesh = ax.imshow(
+            mesh = _imshow_with_render_policy(
+                ax,
                 np.ma.masked_invalid(plot_field),
+                policy=policy,
                 origin="lower" if dlat > 0 else "upper",
                 extent=ext_img,
                 cmap=plot_cmap,
                 norm=plot_cnorm,
                 transform=ccrs.PlateCarree(),
-                interpolation="nearest",
                 zorder=1,
             )
         else:

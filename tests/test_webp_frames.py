@@ -7,11 +7,9 @@ The contract under test, end to end:
   REQUEST    - RenderRequest accepts format png|webp, defaults png, rejects
                anything else (the draw-a-box panel and legacy callers are
                untouched by construction).
-  CACHE      - _request_key for the WEBP LOOP path is byte-identical to its
-               pre-resolution-tier key (poller frame-cache continuity); the png
-               /custom-zoom path keys on the resolution tier so the tiers cache
-               separately (the default tier's size changed, so it must NOT reuse
-               the old tier-less key).
+  CACHE      - _request_key preserves the WEBP LOOP path's pre-resolution-tier
+               request string, then appends the independently reversible
+               algorithm version. The png/custom-zoom path still keys on tier.
   POLLER     - floater_poller derives the uploaded extension + content-type
                from the /render RESPONSE, case-insensitively, falling back to
                .png for an old service that ignored the format param.
@@ -115,16 +113,23 @@ class TestRenderRequestFormat(unittest.TestCase):
         with self.assertRaises(Exception):
             self._req(format="gif")
 
-    def test_webp_loop_cache_key_is_byte_identical_to_legacy(self):
-        # The WEBP loop path (the floater/meso poller frames) MUST keep its
-        # pre-resolution-tier key so the durable frame cache stays continuous
-        # across this deploy. quality is irrelevant there (no q-part).
+    def test_webp_loop_cache_key_preserves_legacy_request_then_appends_algo(self):
+        # The WEBP loop path preserves its pre-resolution-tier request string;
+        # M1 appends only the reversible algorithm generation. Quality remains
+        # irrelevant there (no q-part).
         body = self._req(format="webp")
-        key = self.app._request_key(body, "clean_ir", "2026-06-12T06:00:00", "noaa-goes19")
+        key = self.app._request_key(
+            body,
+            "clean_ir",
+            "2026-06-12T06:00:00",
+            "noaa-goes19",
+            policy=self.app.PROCESS_RENDER_POLICY,
+        )
         legacy_raw = (
             f"{body.bbox}|2026-06-12T06:00:00|clean_ir|{body.enhancement}|noaa-goes19|fmt=webp"
         )
-        self.assertEqual(key, hashlib.sha256(legacy_raw.encode()).hexdigest())
+        versioned_raw = legacy_raw + f"|algo={self.app.PROCESS_RENDER_POLICY.algo_version}"
+        self.assertEqual(key, hashlib.sha256(versioned_raw.encode()).hexdigest())
 
     def test_png_cache_key_carries_resolution_tier(self):
         # The png/custom-zoom path now keys on the resolution tier so the three
@@ -133,19 +138,32 @@ class TestRenderRequestFormat(unittest.TestCase):
         # tier-less key -- the in-memory cache must not serve a stale full-res
         # frame as the new default.
         body = self._req()  # default png
-        key = self.app._request_key(body, "clean_ir", "2026-06-12T06:00:00", "noaa-goes19")
+        key = self.app._request_key(
+            body,
+            "clean_ir",
+            "2026-06-12T06:00:00",
+            "noaa-goes19",
+            policy=self.app.PROCESS_RENDER_POLICY,
+        )
         legacy_raw = (
             f"{body.bbox}|2026-06-12T06:00:00|clean_ir|{body.enhancement}|noaa-goes19"
         )
         self.assertNotEqual(key, hashlib.sha256(legacy_raw.encode()).hexdigest())
-        self.assertEqual(key, hashlib.sha256((legacy_raw + "|q=default").encode()).hexdigest())
+        versioned_raw = (
+            legacy_raw
+            + "|q=default"
+            + f"|algo={self.app.PROCESS_RENDER_POLICY.algo_version}"
+        )
+        self.assertEqual(key, hashlib.sha256(versioned_raw.encode()).hexdigest())
 
     def test_webp_keys_separately_from_png(self):
         png_key = self.app._request_key(
-            self._req(), "clean_ir", "2026-06-12T06:00:00", "noaa-goes19"
+            self._req(), "clean_ir", "2026-06-12T06:00:00", "noaa-goes19",
+            policy=self.app.PROCESS_RENDER_POLICY,
         )
         webp_key = self.app._request_key(
-            self._req(format="webp"), "clean_ir", "2026-06-12T06:00:00", "noaa-goes19"
+            self._req(format="webp"), "clean_ir", "2026-06-12T06:00:00", "noaa-goes19",
+            policy=self.app.PROCESS_RENDER_POLICY,
         )
         self.assertNotEqual(png_key, webp_key)
 

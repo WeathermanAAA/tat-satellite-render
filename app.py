@@ -43,6 +43,12 @@ from cache import RenderCache
 from poller_framework import process_mem_mb
 from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
+from render_policy import (
+    M0_POLICY,
+    RenderPolicy,
+    require_registered_policy,
+    resolve_render_policy,
+)
 import gridsat
 import gridsat_goes
 import mergir
@@ -114,6 +120,11 @@ LATEST_CACHE_TTL = float(os.getenv("LATEST_CACHE_TTL", "300"))  # 5 min
 # IR/IRBD enhancements -- the banding/chroma worst cases).
 WEBP_FRAME_WIDTH = int(os.getenv("WEBP_FRAME_WIDTH", "1056"))
 WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "90"))
+
+# Resolve once when the worker imports.  A request cannot observe an
+# environment change halfway through a process, and its cache identity and
+# raster path therefore always carry the same immutable policy object.
+PROCESS_RENDER_POLICY = resolve_render_policy()
 
 render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
 cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
@@ -675,6 +686,7 @@ async def health():
         "satellites": [
             {"family": s.family, "sensor": s.sensor} for s in ALL_SATELLITES
         ],
+        "algorithm_version": PROCESS_RENDER_POLICY.algo_version,
         "cache_entries": len(cache),
         "cache_bytes": cache.size_bytes,
         # Parent residency (MB), same shape as the pollers' heartbeat
@@ -685,8 +697,16 @@ async def health():
     }
 
 
-def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bucket: str,
-                 quality: str = DEFAULT_QUALITY) -> str:
+def _request_key(
+    body: RenderRequest,
+    generic_channel: str,
+    snapped_iso: str,
+    bucket: str,
+    quality: str = DEFAULT_QUALITY,
+    *,
+    policy: RenderPolicy,
+) -> str:
+    require_registered_policy(policy)
     # Bucket included so an algorithm tweak (e.g. moving the goes19/goes16
     # boundary date) cleanly invalidates entries that would now resolve
     # differently. Same scan_start in goes19 and goes16 still produces
@@ -722,8 +742,18 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     # PART 4: the bare grayscale backdrop is a DISTINCT artifact from the chromed
     # render at the same bbox/channel -> its own cache slot (never clobbers it).
     backdrop_part = "|bd" if body.backdrop else ""
+    # Open a new key space for each independently reversible algorithm while
+    # retaining every previous generation for rollback. M0 deliberately has
+    # no suffix: selecting it addresses the exact legacy keys that already
+    # exist. M1+ append their canonical identity and never overwrite M0.
+    algo_part = (
+        ""
+        if policy is M0_POLICY
+        else f"|algo={policy.algo_version}"
+    )
     raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
-           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}")
+           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}"
+           f"{algo_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -868,7 +898,14 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     else:
         snapped = resolved.scan_start.isoformat()
 
-    cache_key = _request_key(body, generic_channel, snapped, resolved.bucket, body.quality)
+    cache_key = _request_key(
+        body,
+        generic_channel,
+        snapped,
+        resolved.bucket,
+        body.quality,
+        policy=PROCESS_RENDER_POLICY,
+    )
     native_band = (
         satellite.truecolor_bands["red"] if is_true_color
         else satellite.generic_to_band[generic_channel]
@@ -885,6 +922,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             "X-Satellite": resolved.sat_name,
             "X-Satellite-Family": satellite.family,
             "X-Sensor": satellite.sensor,
+            "X-Algorithm-Version": PROCESS_RENDER_POLICY.algo_version,
             "X-Sub-Sat-Lon": f"{resolved.sub_sat_lon:g}",
             "X-Generic-Channel": generic_channel,
             "X-Native-Band": str(native_band),
@@ -970,6 +1008,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     coastlines=body.coastlines,
                     gridlines=body.gridlines,
                     dpi=tier_dpi,
+                    policy=PROCESS_RENDER_POLICY,
                 )
                 # webp LOOP frames (floater/meso pollers): downscale the 1320 px
                 # render to the fixed frame width -- UNCHANGED. The custom-zoom

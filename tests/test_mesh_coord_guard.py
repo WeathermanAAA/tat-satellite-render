@@ -17,6 +17,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import render  # noqa: E402
+from render_policy import M1_POLICY  # noqa: E402
 from satellites import FetchResult  # noqa: E402
 
 BBOX = [-80.0, 20.0, -60.0, 40.0]
@@ -94,6 +95,7 @@ class RenderEndToEndTests(unittest.TestCase):
         return render.render_png(
             _fetch_result(cmi, lats, lons), BBOX, 13,
             "2017-09-05T10:15Z", "rainbow_ir", dpi=60,
+            policy=M1_POLICY,
         )
 
     def test_scalar_render_survives_masked_geolocation(self):

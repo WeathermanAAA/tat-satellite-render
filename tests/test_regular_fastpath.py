@@ -25,6 +25,7 @@ import unittest
 import numpy as np
 
 import render
+from render_policy import M1_POLICY
 from satellites import FetchResult
 
 
@@ -102,7 +103,7 @@ class TestFastPathRenderParity(unittest.TestCase):
         fetch = self._fetch(ascending_lat=ascending_lat)
         bbox = [-99.0, 6.0, -62.0, 31.0]
         kw = dict(bbox=bbox, channel=13, time_str="2005-07-01 18:00 UTC",
-                  enhancement="rainbow_ir", dpi=70)
+                  enhancement="rainbow_ir", dpi=70, policy=M1_POLICY)
         fast = render.render_png(fetch, **kw)
         orig = render._regular_grid_axes
         render._regular_grid_axes = lambda *a: None   # force pcolormesh
@@ -149,7 +150,7 @@ class TestFastPathRenderParity(unittest.TestCase):
             png = render.render_png(
                 fetch, bbox=[-99.0, 6.0, -62.0, 31.0], channel=13,
                 time_str="2005-07-01 18:00 UTC", enhancement="rainbow_ir",
-                dpi=70)
+                dpi=70, policy=M1_POLICY)
         finally:
             render._regular_grid_axes = orig
         self.assertEqual(calls["imshow"], 1, "fast path not taken for a regular grid")

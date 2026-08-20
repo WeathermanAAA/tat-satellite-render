@@ -91,18 +91,43 @@ M0_POLICY = RenderPolicy(
     algo_version="tat-truecolor-m0-baseline-v1",
 )
 
+M1_POLICY = RenderPolicy(
+    stage="M1",
+    algo_version="tat-truecolor-m1-hanning-v1",
+    resample_kernel="hanning",
+)
+
 
 # MappingProxyType prevents a long-running worker (or a test mutation) from
 # changing the stage registry in place.
 POLICIES: Mapping[str, RenderPolicy] = MappingProxyType(
-    {M0_POLICY.algo_version: M0_POLICY}
+    {
+        M0_POLICY.algo_version: M0_POLICY,
+        M1_POLICY.algo_version: M1_POLICY,
+    }
 )
-DEFAULT_POLICY_VERSION = M0_POLICY.algo_version
+DEFAULT_POLICY_VERSION = M1_POLICY.algo_version
 ALGO_VERSION = DEFAULT_POLICY_VERSION
 
 
+def require_registered_policy(policy: RenderPolicy) -> RenderPolicy:
+    """Reject policy lookalikes whose version does not name this exact object.
+
+    Production cache and raster boundaries accept only the immutable singleton
+    registered for an algorithm version.  Otherwise a reconstructed or
+    modified policy could reuse a canonical version while producing different
+    pixels (or addressing a second cache namespace), making provenance false.
+    """
+
+    if POLICIES.get(policy.algo_version) is not policy:
+        raise RuntimeError(
+            f"unregistered render policy object for {policy.algo_version!r}"
+        )
+    return policy
+
+
 def resolve_render_policy(name: str | None = None) -> RenderPolicy:
-    """Resolve an explicitly registered policy, defaulting to M0.
+    """Resolve an explicitly registered policy, defaulting to M1.
 
     Unknown versions fail at startup rather than silently falling back to a
     different algorithm whose cache/provenance identity would be false.
