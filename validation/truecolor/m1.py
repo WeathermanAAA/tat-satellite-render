@@ -51,6 +51,9 @@ M1_BBOX: Final = (-84.1, 10.3, -72.1, 22.3)
 M1_REQUIRED_ROLES: Final = ("red", "blue", "veggie", "ir")
 M1_SOURCE_LONG_AXIS_PX: Final = 1600
 M1_DELIVERED_PX: Final = 1188
+V16_CAPTURED_GEOMETRY_PROVENANCE: Final = (
+    "captured_canonical_production_agg_x_transform"
+)
 M1_REQUIRED_GATE_IDS: Final[frozenset[str]] = frozenset(
     {"V01", "V02", "V03", "V04", "V15", "V16", "V18", "V25"}
 )
@@ -151,6 +154,26 @@ class KernelCoverage:
 
 
 @dataclass(frozen=True, slots=True)
+class V16EdgeSamplingGeometry:
+    """Exact horizontal Agg geometry used by the V16 edge discriminator."""
+
+    provenance: str
+    axis: str
+    source_pixels: int
+    internal_destination_pixels: int
+    delivered_internal_start: int
+    delivered_internal_stop: int
+    scale: float
+    translation: float
+    baseline_interpolation: str
+    candidate_interpolation: str
+
+    @property
+    def delivered_pixels(self) -> int:
+        return self.delivered_internal_stop - self.delivered_internal_start
+
+
+@dataclass(frozen=True, slots=True)
 class SyntheticM1Evidence:
     evidence_kind: str
     source_width: int
@@ -165,6 +188,7 @@ class SyntheticM1Evidence:
     edge_fixture_left_plateau_sigma_dn: float
     edge_fixture_right_plateau_sigma_dn: float
     edge_fixture_edge_index: int
+    edge_sampling_geometry: V16EdgeSamplingGeometry
     nearest_edge_step_dn: float
     nearest_edge_overshoot_dn: float
     nearest_edge_undershoot_dn: float
@@ -249,6 +273,98 @@ class CanonicalM1Evidence:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def v16_edge_sampling_geometry_from_canonical(
+    canonical: CanonicalM1Evidence,
+) -> V16EdgeSamplingGeometry:
+    """Extract the fail-closed horizontal V16 binding from canonical evidence."""
+
+    if canonical.evidence_kind != "canonical_real_pinned_scene":
+        raise ValueError("V16 requires canonical real pinned-scene evidence")
+    matrix = np.asarray(canonical.agg_transform_matrix, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("V16 canonical Agg transform must be a finite 3x3 affine")
+    if matrix[0, 1] != 0.0 or matrix[1, 0] != 0.0:
+        raise ValueError("V16 horizontal replay rejects cross-axis Agg transforms")
+    if not np.array_equal(matrix[2], np.asarray([0.0, 0.0, 1.0])):
+        raise ValueError("V16 canonical Agg transform has an invalid affine tail")
+    if matrix[0, 0] == 0.0:
+        raise ValueError("V16 canonical horizontal Agg scale is zero")
+
+    if len(canonical.source_shape) != 3 or len(canonical.agg_internal_shape) != 3:
+        raise ValueError("V16 canonical source/internal shapes must be HxWxC")
+    source_pixels = int(canonical.source_shape[1])
+    internal_destination_pixels = int(canonical.agg_internal_shape[1])
+    delivered_start = int(canonical.delivered_internal_pixel_bounds[2])
+    delivered_stop = int(canonical.delivered_internal_pixel_bounds[3])
+    if source_pixels <= 0 or internal_destination_pixels <= 0:
+        raise ValueError("V16 canonical horizontal dimensions must be positive")
+    if not 0 <= delivered_start < delivered_stop <= internal_destination_pixels:
+        raise ValueError("V16 canonical delivered column slice is invalid")
+    if delivered_stop - delivered_start != int(canonical.delivered_shape[1]):
+        raise ValueError("V16 canonical delivered column slice/shape disagree")
+
+    nearest_interpolations = tuple(
+        canonical.runtime_interpolations.get("production_nearest", ())
+    )
+    hanning_interpolations = tuple(
+        canonical.runtime_interpolations.get("explicit_hanning", ())
+    )
+    if nearest_interpolations != ("nearest",):
+        raise ValueError("V16 canonical baseline is not one nearest Agg draw")
+    if hanning_interpolations != ("hanning",):
+        raise ValueError("V16 canonical candidate is not one Hanning Agg draw")
+
+    return V16EdgeSamplingGeometry(
+        provenance=V16_CAPTURED_GEOMETRY_PROVENANCE,
+        axis="x",
+        source_pixels=source_pixels,
+        internal_destination_pixels=internal_destination_pixels,
+        delivered_internal_start=delivered_start,
+        delivered_internal_stop=delivered_stop,
+        scale=float(matrix[0, 0]),
+        translation=float(matrix[0, 2]),
+        baseline_interpolation="nearest",
+        candidate_interpolation="hanning",
+    )
+
+
+def v16_edge_geometry_matches_canonical(
+    synthetic: SyntheticM1Evidence,
+    canonical: CanonicalM1Evidence | None,
+) -> bool:
+    """Require exact identity with geometry captured by the canonical render."""
+
+    if canonical is None:
+        return False
+    try:
+        expected = v16_edge_sampling_geometry_from_canonical(canonical)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return False
+    return synthetic.edge_sampling_geometry == expected
+
+
+def v16_edge_discriminator_passes(
+    synthetic: SyntheticM1Evidence,
+    canonical: CanonicalM1Evidence | None,
+) -> bool:
+    """Evaluate V16's transform binding and no-increased-ringing contract."""
+
+    ringing = np.asarray(
+        [
+            synthetic.nearest_edge_ringing_dn,
+            synthetic.hanning_edge_ringing_dn,
+        ],
+        dtype=np.float64,
+    )
+    return bool(
+        v16_edge_geometry_matches_canonical(synthetic, canonical)
+        and np.all(np.isfinite(ringing))
+        and np.all(ringing >= 0.0)
+        and synthetic.hanning_edge_ringing_dn
+        <= synthetic.nearest_edge_ringing_dn + 1e-7
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1228,6 +1344,118 @@ def _float_rgb_resample_columns(
     return np.asarray(result[height // 2, :, 0], dtype=np.float64)
 
 
+def _idealized_v16_edge_sampling_geometry() -> V16EdgeSamplingGeometry:
+    return V16EdgeSamplingGeometry(
+        provenance="idealized_synthetic_x_transform_unbound",
+        axis="x",
+        source_pixels=M1_SOURCE_LONG_AXIS_PX,
+        internal_destination_pixels=M1_DELIVERED_PX,
+        delivered_internal_start=0,
+        delivered_internal_stop=M1_DELIVERED_PX,
+        scale=M1_DELIVERED_PX / M1_SOURCE_LONG_AXIS_PX,
+        translation=0.0,
+        baseline_interpolation="nearest",
+        candidate_interpolation="hanning",
+    )
+
+
+def _float_rgb_resample_columns_at_v16_geometry(
+    values: np.ndarray,
+    kernel: str,
+    geometry: V16EdgeSamplingGeometry,
+    *,
+    height: int = 32,
+) -> np.ndarray:
+    """Replay and slice a 1-D fixture with captured production x geometry."""
+
+    import matplotlib.image as mpl_image
+    from matplotlib.figure import Figure
+    from matplotlib.transforms import Affine2D
+
+    source = np.asarray(values, dtype=np.float32)
+    if source.ndim != 1 or source.size != geometry.source_pixels:
+        raise ValueError("V16 source does not match the bound horizontal geometry")
+    if geometry.axis != "x":
+        raise ValueError("V16 edge discriminator only supports the x axis")
+    if geometry.internal_destination_pixels <= 0:
+        raise ValueError("V16 internal destination width must be positive")
+    if not (
+        0
+        <= geometry.delivered_internal_start
+        < geometry.delivered_internal_stop
+        <= geometry.internal_destination_pixels
+    ):
+        raise ValueError("V16 delivered internal column slice is invalid")
+    if not np.isfinite(geometry.scale) or geometry.scale == 0.0:
+        raise ValueError("V16 horizontal scale must be finite and nonzero")
+    if not np.isfinite(geometry.translation):
+        raise ValueError("V16 horizontal translation must be finite")
+    expected_kernel = {
+        "nearest": geometry.baseline_interpolation,
+        "hanning": geometry.candidate_interpolation,
+    }.get(kernel)
+    if expected_kernel != kernel:
+        raise ValueError(f"V16 interpolation is not bound for {kernel!r}")
+
+    rgb = np.broadcast_to(source[None, :, None], (height, source.size, 3)).copy()
+    rgba = np.concatenate(
+        [rgb, np.ones((*rgb.shape[:2], 1), dtype=np.float32)], axis=-1
+    )
+    figure = Figure(figsize=(1.0, 1.0))
+    axes = figure.add_axes([0.0, 0.0, 1.0, 1.0])
+    image = axes.imshow(rgba, interpolation=kernel, origin="upper")
+    transform = Affine2D.from_values(
+        geometry.scale,
+        0.0,
+        0.0,
+        1.0,
+        geometry.translation,
+        0.0,
+    )
+    result = mpl_image._resample(  # noqa: SLF001 - captured production engine
+        image,
+        rgba,
+        (height, geometry.internal_destination_pixels),
+        transform,
+    )
+    profile = np.asarray(result[height // 2, :, 0], dtype=np.float64)
+    if profile.shape != (geometry.internal_destination_pixels,):
+        raise RuntimeError(f"unexpected V16 Agg profile shape: {profile.shape}")
+    if geometry.scale < 0.0:
+        profile = profile[::-1]
+    delivered = profile[
+        geometry.delivered_internal_start : geometry.delivered_internal_stop
+    ]
+    if delivered.size != geometry.delivered_pixels:
+        raise RuntimeError("V16 delivered profile does not match its bound slice")
+    return delivered
+
+
+def _v16_edge_index_from_delivered_geometry(
+    geometry: V16EdgeSamplingGeometry,
+) -> int:
+    """Locate the source fixture's edge after actual orientation and slicing."""
+
+    source = np.full(geometry.source_pixels, 100.0, dtype=np.float64)
+    source[geometry.source_pixels // 2 :] = 146.1
+    delivered = 255.0 * _float_rgb_resample_columns_at_v16_geometry(
+        source / 255.0,
+        geometry.baseline_interpolation,
+        geometry,
+    )
+    midpoint = 0.5 * (100.0 + 146.1)
+    high = delivered > midpoint
+    rising = np.flatnonzero((~high[:-1]) & high[1:]) + 1
+    if rising.size != 1:
+        raise ValueError(
+            "V16 fixture edge is absent or ambiguous in the delivered column slice"
+        )
+    edge_index = int(rising[0])
+    # Exercise the same window preconditions before measuring the noisy fixture.
+    local_edge_overshoot(delivered, edge_index)
+    return edge_index
+
+
 def canonical_radial_power_profile(
     values: np.ndarray,
     *,
@@ -1393,7 +1621,20 @@ def isolated_edge_fixture() -> tuple[np.ndarray, int]:
     return source, edge_index
 
 
-def run_synthetic_m1_discriminator() -> SyntheticM1Evidence:
+def run_synthetic_m1_discriminator(
+    *,
+    edge_sampling_geometry: V16EdgeSamplingGeometry | None = None,
+) -> SyntheticM1Evidence:
+    geometry = (
+        _idealized_v16_edge_sampling_geometry()
+        if edge_sampling_geometry is None
+        else edge_sampling_geometry
+    )
+    if geometry.source_pixels != M1_SOURCE_LONG_AXIS_PX:
+        raise ValueError("V16 geometry does not match the declared source fixture")
+    if geometry.delivered_pixels != M1_DELIVERED_PX:
+        raise ValueError("V16 geometry does not match the declared delivered width")
+
     source = alias_stress_columns(M1_SOURCE_LONG_AXIS_PX)
     reference = fractional_area_resample_axis(
         source,
@@ -1403,16 +1644,17 @@ def run_synthetic_m1_discriminator() -> SyntheticM1Evidence:
     nearest = _agg_canvas_resample_columns(source, M1_DELIVERED_PX, "nearest")
     hanning = _agg_canvas_resample_columns(source, M1_DELIVERED_PX, "hanning")
 
-    edge_source_dn, edge_index = isolated_edge_fixture()
-    nearest_step_dn = 255.0 * _float_rgb_resample_columns(
+    edge_source_dn, _ = isolated_edge_fixture()
+    edge_index = _v16_edge_index_from_delivered_geometry(geometry)
+    nearest_step_dn = 255.0 * _float_rgb_resample_columns_at_v16_geometry(
         edge_source_dn / 255.0,
-        M1_DELIVERED_PX,
         "nearest",
+        geometry,
     )
-    hanning_step_dn = 255.0 * _float_rgb_resample_columns(
+    hanning_step_dn = 255.0 * _float_rgb_resample_columns_at_v16_geometry(
         edge_source_dn / 255.0,
-        M1_DELIVERED_PX,
         "hanning",
+        geometry,
     )
     nearest_ring = local_edge_overshoot(nearest_step_dn, edge_index)
     hanning_ring = local_edge_overshoot(hanning_step_dn, edge_index)
@@ -1445,6 +1687,7 @@ def run_synthetic_m1_discriminator() -> SyntheticM1Evidence:
             np.std(edge_source_dn[edge_midpoint:])
         ),
         edge_fixture_edge_index=edge_index,
+        edge_sampling_geometry=geometry,
         nearest_edge_step_dn=nearest_ring.step_dn,
         nearest_edge_overshoot_dn=nearest_ring.overshoot_dn,
         nearest_edge_undershoot_dn=nearest_ring.undershoot_dn,
@@ -2310,11 +2553,11 @@ def evaluate_m1_gates(
         and canonical.hanning_actual_transform_maximum_dc_error <= 2e-6
         and canonical.hanning_float_to_rendered_identity_scored >= 0.998
     )
+    v16_geometry_bound = v16_edge_geometry_matches_canonical(synthetic, canonical)
     v16_pass = (
         horizontal_coverage.is_convex_full_coverage
         and vertical_coverage.is_convex_full_coverage
-        and synthetic.hanning_edge_ringing_dn
-        <= synthetic.nearest_edge_ringing_dn + 1e-7
+        and v16_edge_discriminator_passes(synthetic, canonical)
     )
     forbidden = production_adapter.forbidden_operator_findings()
     v18_pass = not forbidden and synthetic.flat_noise_variance_ratio <= 1.0
@@ -2442,14 +2685,43 @@ def evaluate_m1_gates(
         _m1_gate(
             "V16",
             v16_pass,
-            evidence_kind="fresh_deterministic_local_plateau_edge_plus_kernel_convexity",
+            evidence_kind=(
+                "captured_production_agg_x_transform_local_plateau_edge"
+                if v16_geometry_bound
+                else "unbound_edge_geometry_rejected"
+            ),
             detail=(
                 "fresh fixed-seed 46.1-DN isolated step with 1.76-DN source "
-                "plateau sigma; medians exclude three transition samples and "
+                "plateau sigma replayed with the canonical captured Agg x "
+                "affine, oriented and sliced by the actual internal-to-delivered "
+                "column mapping; medians exclude three transition samples and "
                 "local extrema are measured in DN (not a reproduction of the "
-                "unavailable research edge pixels)"
+                "unavailable research edge pixels); proxy geometry fails closed"
             ),
             measurements={
+                "captured_binding_matches_canonical": v16_geometry_bound,
+                "geometry_provenance": (
+                    synthetic.edge_sampling_geometry.provenance
+                ),
+                "axis": synthetic.edge_sampling_geometry.axis,
+                "source_pixels": synthetic.edge_sampling_geometry.source_pixels,
+                "internal_destination_pixels": (
+                    synthetic.edge_sampling_geometry.internal_destination_pixels
+                ),
+                "delivered_internal_start": (
+                    synthetic.edge_sampling_geometry.delivered_internal_start
+                ),
+                "delivered_internal_stop": (
+                    synthetic.edge_sampling_geometry.delivered_internal_stop
+                ),
+                "scale": synthetic.edge_sampling_geometry.scale,
+                "translation": synthetic.edge_sampling_geometry.translation,
+                "baseline_interpolation": (
+                    synthetic.edge_sampling_geometry.baseline_interpolation
+                ),
+                "candidate_interpolation": (
+                    synthetic.edge_sampling_geometry.candidate_interpolation
+                ),
                 "nominal_step_dn": synthetic.edge_fixture_nominal_step_dn,
                 "noise_seed": synthetic.edge_fixture_noise_seed,
                 "left_plateau_sigma_dn": (
@@ -2514,10 +2786,12 @@ def run_m1(
         raise RuntimeError("M1 refuses to run without the eight-sensor Rayleigh contract")
     static_policy = audit_production_policy()
     runtime_traces = trace_all_runtime_kernels()
-    synthetic = run_synthetic_m1_discriminator()
     canonical, rendered, horizontal, vertical = measure_canonical_m1(
         research,
         corpus_root,
+    )
+    synthetic = run_synthetic_m1_discriminator(
+        edge_sampling_geometry=v16_edge_sampling_geometry_from_canonical(canonical)
     )
     gates = evaluate_m1_gates(
         static_policy=static_policy,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,6 +15,8 @@ from validation.truecolor.m1 import (
     M1Run,
     M1_REQUIRED_GATE_IDS,
     StaticPolicyAudit,
+    V16EdgeSamplingGeometry,
+    V16_CAPTURED_GEOMETRY_PROVENANCE,
     canonical_radial_power_profile,
     evaluate_m1_gates,
     find_internal_canvas_mapping,
@@ -27,6 +30,8 @@ from validation.truecolor.m1 import (
     m1_harness_source_hashes,
     radial_high_frequency_power,
     run_synthetic_m1_discriminator,
+    v16_edge_discriminator_passes,
+    v16_edge_geometry_matches_canonical,
 )
 
 
@@ -68,6 +73,30 @@ def _spectral_fixture() -> np.ndarray:
     green = 60 + 0.2 * y + 13 * np.cos(x / 8) + 3 * ((2 * x + y) % 3)
     blue = 40 + 0.4 * x + 0.3 * y + 17 * (x % 5 == 0) - 11 * (y % 7 == 0)
     return np.stack([red, green, blue], axis=-1)
+
+
+def _v16_canonical_stub(geometry: V16EdgeSamplingGeometry) -> SimpleNamespace:
+    return SimpleNamespace(
+        evidence_kind="canonical_real_pinned_scene",
+        source_shape=(1527, geometry.source_pixels, 3),
+        agg_internal_shape=(1189, geometry.internal_destination_pixels, 4),
+        delivered_shape=(1188, geometry.delivered_pixels, 3),
+        delivered_internal_pixel_bounds=(
+            1,
+            1189,
+            geometry.delivered_internal_start,
+            geometry.delivered_internal_stop,
+        ),
+        agg_transform_matrix=(
+            (geometry.scale, 0.0, geometry.translation),
+            (0.0, -0.7786510114559513, 1189.00007559459),
+            (0.0, 0.0, 1.0),
+        ),
+        runtime_interpolations={
+            "production_nearest": ("nearest",),
+            "explicit_hanning": ("hanning",),
+        },
+    )
 
 
 def test_canonical_v03_profile_is_pinned_to_research_conventions() -> None:
@@ -261,6 +290,7 @@ def test_v15_local_range_catches_negative_lobe_mutant_inside_global_range() -> N
 
 def test_v16_uses_local_plateaus_and_fresh_deterministic_dn_fixture() -> None:
     evidence = run_synthetic_m1_discriminator()
+    assert evidence.edge_sampling_geometry.provenance.endswith("_unbound")
     assert evidence.edge_fixture_nominal_step_dn == 46.1
     assert evidence.edge_fixture_noise_seed == 20251027
     assert evidence.edge_fixture_left_plateau_sigma_dn == pytest.approx(1.76)
@@ -271,6 +301,84 @@ def test_v16_uses_local_plateaus_and_fresh_deterministic_dn_fixture() -> None:
     # research profile's 3.66 and 2.60 DN values.
     assert evidence.nearest_edge_ringing_dn != pytest.approx(3.66, abs=0.01)
     assert evidence.hanning_edge_ringing_dn != pytest.approx(2.60, abs=0.01)
+
+
+def test_v16_replays_nonzero_translation_and_delivered_column_offset() -> None:
+    geometry = V16EdgeSamplingGeometry(
+        provenance=V16_CAPTURED_GEOMETRY_PROVENANCE,
+        axis="x",
+        source_pixels=1600,
+        internal_destination_pixels=1189,
+        delivered_internal_start=1,
+        delivered_internal_stop=1189,
+        scale=1189 / 1600,
+        translation=-0.125,
+        baseline_interpolation="nearest",
+        candidate_interpolation="hanning",
+    )
+    captured = run_synthetic_m1_discriminator(edge_sampling_geometry=geometry)
+    ideal = run_synthetic_m1_discriminator()
+
+    assert captured.edge_sampling_geometry == geometry
+    assert captured.edge_fixture_edge_index == 593
+    assert captured.edge_fixture_edge_index != ideal.edge_fixture_edge_index
+    assert captured.hanning_edge_ringing_dn != pytest.approx(
+        ideal.hanning_edge_ringing_dn,
+        abs=1e-6,
+    )
+
+
+def test_v16_binding_rejects_ideal_affine_slice_and_cross_axis_mutants() -> None:
+    geometry = V16EdgeSamplingGeometry(
+        provenance=V16_CAPTURED_GEOMETRY_PROVENANCE,
+        axis="x",
+        source_pixels=1600,
+        internal_destination_pixels=1189,
+        delivered_internal_start=1,
+        delivered_internal_stop=1189,
+        scale=1189 / 1600,
+        translation=-0.125,
+        baseline_interpolation="nearest",
+        candidate_interpolation="hanning",
+    )
+    canonical = _v16_canonical_stub(geometry)
+    captured = run_synthetic_m1_discriminator(edge_sampling_geometry=geometry)
+    ideal = run_synthetic_m1_discriminator()
+    assert v16_edge_geometry_matches_canonical(captured, canonical)
+    assert not v16_edge_geometry_matches_canonical(ideal, canonical)
+
+    slice_mutant = dataclasses.replace(
+        captured,
+        edge_sampling_geometry=dataclasses.replace(
+            geometry,
+            delivered_internal_start=0,
+            delivered_internal_stop=1188,
+        ),
+    )
+    assert not v16_edge_geometry_matches_canonical(slice_mutant, canonical)
+
+    translation_mutant = dataclasses.replace(
+        captured,
+        edge_sampling_geometry=dataclasses.replace(geometry, translation=0.0),
+    )
+    assert not v16_edge_geometry_matches_canonical(translation_mutant, canonical)
+
+    scale_mutant = dataclasses.replace(
+        captured,
+        edge_sampling_geometry=dataclasses.replace(
+            geometry,
+            scale=geometry.delivered_pixels / geometry.source_pixels,
+        ),
+    )
+    assert not v16_edge_geometry_matches_canonical(scale_mutant, canonical)
+
+    cross_axis_mutant = _v16_canonical_stub(geometry)
+    cross_axis_mutant.agg_transform_matrix = (
+        (geometry.scale, 1e-12, geometry.translation),
+        (0.0, -0.7786510114559513, 1189.00007559459),
+        (0.0, 0.0, 1.0),
+    )
+    assert not v16_edge_geometry_matches_canonical(captured, cross_axis_mutant)
 
 
 def test_v16_detects_local_ringing_that_stays_inside_unrelated_global_range() -> None:
@@ -286,12 +394,32 @@ def test_v16_detects_local_ringing_that_stays_inside_unrelated_global_range() ->
     assert measured.ringing_dn == pytest.approx(1.9)
 
 
-def test_v16_gate_rejects_candidate_ringing_above_measured_m0() -> None:
-    synthetic = run_synthetic_m1_discriminator()
+def test_v16_discriminator_rejects_candidate_ringing_above_measured_m0() -> None:
+    geometry = V16EdgeSamplingGeometry(
+        provenance=V16_CAPTURED_GEOMETRY_PROVENANCE,
+        axis="x",
+        source_pixels=1600,
+        internal_destination_pixels=1188,
+        delivered_internal_start=0,
+        delivered_internal_stop=1188,
+        scale=0.742500094413769,
+        translation=-0.00015106202963011128,
+        baseline_interpolation="nearest",
+        candidate_interpolation="hanning",
+    )
+    synthetic = run_synthetic_m1_discriminator(edge_sampling_geometry=geometry)
+    canonical = _v16_canonical_stub(geometry)
+    assert v16_edge_discriminator_passes(synthetic, canonical)
     mutant = dataclasses.replace(
         synthetic,
         hanning_edge_ringing_dn=synthetic.nearest_edge_ringing_dn + 0.01,
     )
+    assert not v16_edge_discriminator_passes(mutant, canonical)
+
+
+def test_v16_gate_fails_closed_without_canonical_geometry() -> None:
+    synthetic = run_synthetic_m1_discriminator()
+    assert synthetic.hanning_edge_ringing_dn <= synthetic.nearest_edge_ringing_dn
     coverage = KernelCoverage(
         kernel="hanning",
         source_pixels=1600,
@@ -308,12 +436,13 @@ def test_v16_gate_rejects_candidate_ringing_above_measured_m0() -> None:
         runtime_traces=(),
         horizontal_coverage=coverage,
         vertical_coverage=coverage,
-        synthetic=mutant,
+        synthetic=synthetic,
         canonical=None,
     )
     v16 = next(gate for gate in gates if gate.gate_id == "V16")
     assert v16.outcome == "FAIL"
     assert v16.blocking
+    assert not v16.measurements["captured_binding_matches_canonical"]
 
 
 def test_synthetic_discriminator_cannot_bless_canonical_v01_v02_v03() -> None:
