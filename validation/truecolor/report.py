@@ -22,6 +22,9 @@ from .gates import BaselineRun
 
 REPORT_SCHEMA = "tat_truecolor_validation_report/v1"
 DEPENDENCIES = (
+    "fastapi",
+    "uvicorn",
+    "pydantic",
     "numpy",
     "scipy",
     "matplotlib",
@@ -29,6 +32,16 @@ DEPENDENCIES = (
     "Pillow",
     "satpy",
     "pyspectral",
+    "pyorbital",
+    "shapely",
+    "PyYAML",
+    "xarray",
+    "h5netcdf",
+    "h5py",
+    "netCDF4",
+    "s3fs",
+    "aiobotocore",
+    "python-dateutil",
     "scikit-image",
     "tat-palettes",
 )

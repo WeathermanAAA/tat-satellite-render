@@ -325,6 +325,7 @@ class GridSatGoesSatellite(Satellite):
             sat_name=resolved.sat_name,
             sub_sat_lon=resolved.sub_sat_lon,
             units=("1" if var == "ch1" else "K"),
+            source_s3_key=resolved.s3_key,
         )
 
 

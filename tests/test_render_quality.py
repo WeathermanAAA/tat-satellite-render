@@ -104,7 +104,9 @@ class CacheKeyTests(unittest.TestCase):
     def _key(self, **kw):
         body = app.RenderRequest(bbox=BBOX, channel="clean_ir", **kw)
         return app._request_key(body, "clean_ir", "2026-06-20T12:00:00", "noaa-goes19",
-                                body.quality, policy=app.PROCESS_RENDER_POLICY)
+                                body.quality, policy=app.PROCESS_RENDER_POLICY,
+                                resolved_product="GridSat-B1",
+                                resolved_s3_key="fixture/archive-grid.nc")
 
     def test_tiers_cache_separately(self):
         keys = {self._key(quality=q) for q in ("low", "default", "high")}
@@ -123,7 +125,9 @@ class CacheKeyTests(unittest.TestCase):
             body = app.RenderRequest(bbox=BBOX, channel="clean_ir", format="webp", quality=q)
             return app._request_key(body, "clean_ir", "2026-06-20T12:00:00",
                                     "noaa-goes19", body.quality,
-                                    policy=app.PROCESS_RENDER_POLICY)
+                                    policy=app.PROCESS_RENDER_POLICY,
+                                    resolved_product="GridSat-B1",
+                                    resolved_s3_key="fixture/archive-grid.nc")
         self.assertEqual(wkey("low"), wkey("high"))
         self.assertEqual(wkey("default"), wkey("low"))
 
@@ -202,7 +206,7 @@ class RenderPngDpiTests(unittest.TestCase):
         import render
         data, bbox = _synthetic_ir()
         png = render.render_png(data, bbox, 13, "2026-06-20 12:00", "rainbow_ir",
-                                1, dpi=dpi, policy=app.PROCESS_RENDER_POLICY)
+                                1, dpi=dpi, policy=app.M1_POLICY)
         return Image.open(io.BytesIO(png)).size
 
     def test_dpi_scales_output_resolution(self):
@@ -226,11 +230,11 @@ class RenderPngDpiTests(unittest.TestCase):
         data, bbox = _synthetic_ir()
         a = render.render_png(
             data, bbox, 13, "t", "rainbow_ir", 1,
-            policy=app.PROCESS_RENDER_POLICY,
+            policy=app.M1_POLICY,
         )
         b = render.render_png(
             data, bbox, 13, "t", "rainbow_ir", 1, dpi=110,
-            policy=app.PROCESS_RENDER_POLICY,
+            policy=app.M1_POLICY,
         )
         self.assertEqual(a, b)
 

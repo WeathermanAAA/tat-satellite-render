@@ -45,6 +45,7 @@ from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
 from render_policy import (
     M0_POLICY,
+    M1_POLICY,
     RenderPolicy,
     require_registered_policy,
     resolve_render_policy,
@@ -59,10 +60,14 @@ from satellites import (
     GOES_BUCKET_OVERRIDE,
     GOES_EAST,
     PRIMARY_LIVE_BUCKET,
+    FetchResult,
+    ResolvedFile,
     Satellite,
+    TrueColorPhysicalSourceManifest,
     UnsupportedTimeError,
     bucket_reachable,
     goes_band_to_generic,
+    m2_truecolor_bbox_preflight,
     parse_request_time,
     pick_buckets_for_time,
     pick_satellite,
@@ -705,6 +710,9 @@ def _request_key(
     quality: str = DEFAULT_QUALITY,
     *,
     policy: RenderPolicy,
+    resolved_product: str | None = None,
+    resolved_s3_key: str | None = None,
+    resolved_source_manifest: TrueColorPhysicalSourceManifest | None = None,
 ) -> str:
     require_registered_policy(policy)
     # Bucket included so an algorithm tweak (e.g. moving the goes19/goes16
@@ -751,10 +759,278 @@ def _request_key(
         if policy is M0_POLICY
         else f"|algo={policy.algo_version}"
     )
+    # M2 binds every object consumed by a true-colour composite (or the one
+    # object consumed by a scalar) into its new cache generation. Bucket +
+    # scan time alone are ambiguous: product variants and reprocessed sibling
+    # bands can share both. M0/M1 deliberately omit this suffix so every
+    # established rollback key remains byte-identical.
+    resolved_part = ""
+    if policy.resample_in_reflectance:
+        if (
+            type(resolved_product) is not str
+            or not resolved_product
+            or type(resolved_s3_key) is not str
+            or not resolved_s3_key
+        ):
+            raise RuntimeError(
+                "M2 cache identity requires the resolved product and source object"
+            )
+        if generic_channel == "true_color":
+            if type(resolved_source_manifest) is not TrueColorPhysicalSourceManifest:
+                raise RuntimeError(
+                    "M2 true-color cache identity requires the exact physical "
+                    "source manifest"
+                )
+            source_payload = resolved_source_manifest.as_dict()
+            if (
+                source_payload.get("product") != resolved_product
+                or source_payload.get("bucket") != bucket
+                or source_payload.get("resolved_anchor_s3_key")
+                != resolved_s3_key
+                or not source_payload.get("sources")
+                or source_payload["sources"][0].get("role") != "red"
+            ):
+                raise RuntimeError(
+                    "M2 true-color source manifest is not bound to the resolved red object"
+                )
+            resolved_bytes = json.dumps(
+                source_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        else:
+            if resolved_source_manifest is not None:
+                raise RuntimeError("M2 scalar cache identity rejects a composite manifest")
+            resolved_bytes = (
+                resolved_product + "\0" + resolved_s3_key
+            ).encode("utf-8")
+        resolved_identity = hashlib.sha256(resolved_bytes).hexdigest()
+        resolved_part = f"|resolved={resolved_identity}"
     raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
            f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}"
-           f"{algo_part}")
+           f"{algo_part}{resolved_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def _fetch_true_color_for_policy(
+    satellite: Satellite,
+    bbox: list[float],
+    resolved,
+    downsample: int,
+    *,
+    policy: RenderPolicy,
+    source_manifest: TrueColorPhysicalSourceManifest | None = None,
+):
+    """Select the exact registered legacy or M2 physical fetch boundary."""
+
+    require_registered_policy(policy)
+    if policy.resample_in_reflectance:
+        fetch_physical = getattr(satellite, "fetch_true_color_physical", None)
+        if fetch_physical is None:
+            raise RuntimeError(
+                f"{satellite.family} has no registered M2 physical "
+                "true-color fetch boundary"
+            )
+        if type(source_manifest) is not TrueColorPhysicalSourceManifest:
+            raise RuntimeError("M2 physical fetch requires the pre-cache source manifest")
+        return await fetch_physical(
+            bbox,
+            resolved,
+            source_manifest=source_manifest,
+        )
+    if source_manifest is not None:
+        raise RuntimeError("legacy true-color fetch rejects an M2 source manifest")
+    return await satellite.fetch_true_color(bbox, resolved, downsample)
+
+
+def _require_m2_fetch_sensor_binding(
+    data,
+    satellite: Satellite,
+    *,
+    policy,
+    source_manifest: TrueColorPhysicalSourceManifest | None = None,
+    resolved: ResolvedFile | None = None,
+) -> None:
+    """Bind the returned payload to producer, scan, and pre-cache objects."""
+
+    require_registered_policy(policy)
+    if not policy.resample_in_reflectance:
+        if source_manifest is not None:
+            raise RuntimeError("legacy fetch returned with an M2 source manifest")
+        return
+    import truecolor
+
+    producer_sensor = getattr(satellite, "sensor", None)
+    sensor_map = {"ABI": "abi", "AHI": "ahi"}
+    if type(producer_sensor) is not str or producer_sensor not in sensor_map:
+        raise RuntimeError("M2 primary fetch requires an exact ABI/AHI producer sensor")
+    expected = sensor_map[producer_sensor]
+    if (
+        type(source_manifest) is not TrueColorPhysicalSourceManifest
+        or type(resolved) is not ResolvedFile
+    ):
+        raise RuntimeError("M2 fetch provenance requires exact source/scan bindings")
+    manifest_dict = source_manifest.as_dict()
+    if (
+        source_manifest.sensor != expected
+        or source_manifest.bucket != resolved.bucket
+        or source_manifest.product != resolved.product
+        or source_manifest.scan_start != resolved.scan_start
+        or source_manifest.sat_name != resolved.sat_name
+        or source_manifest.resolved_anchor_s3_key != resolved.s3_key
+    ):
+        raise RuntimeError("M2 source manifest differs from the resolved producer scan")
+    if type(data) is not FetchResult:
+        raise RuntimeError("M2 fetch did not return the exact FetchResult type")
+    state = getattr(data, "truecolor_physical", None)
+    if type(state) is not truecolor.TrueColorPhysicalState:
+        raise RuntimeError("M2 fetch did not return a registered physical state")
+    metadata = state.grid_metadata
+    if (
+        state.sensor != expected
+        or type(metadata) is not dict
+        or metadata.get("sensor") != expected
+        or metadata.get("physical_source_manifest") != manifest_dict
+    ):
+        raise RuntimeError(
+            "M2 physical-state sensor is not bound to the selected satellite"
+        )
+    red_source = source_manifest.sources[0]
+    if (
+        data.product != resolved.product
+        or data.bucket != resolved.bucket
+        or data.scan_start != resolved.scan_start
+        or data.sat_name != resolved.sat_name
+        or float(data.sub_sat_lon) != float(resolved.sub_sat_lon)
+        or data.generic_channel != "true_color"
+        or data.units != "truecolor_physical"
+        or data.channel != red_source.band
+    ):
+        raise RuntimeError(
+            "M2 FetchResult provenance differs from the resolved source manifest"
+        )
+
+
+def _require_m2_scalar_fetch_binding(
+    data,
+    satellite: Satellite,
+    resolved: ResolvedFile,
+    generic_channel: str,
+    *,
+    policy: RenderPolicy,
+) -> None:
+    """Bind an M2 archive scalar payload to its pre-cache resolved object."""
+
+    require_registered_policy(policy)
+    if not policy.resample_in_reflectance:
+        return
+    if (
+        not _m2_archive_scalar_source_supported(satellite, resolved)
+        or type(data) is not FetchResult
+    ):
+        raise RuntimeError("M2 scalar fetch has an unregistered producer boundary")
+    expected_channel = satellite.generic_to_band.get(generic_channel)
+    if (
+        type(generic_channel) is not str
+        or type(expected_channel) is not int
+        or data.generic_channel != generic_channel
+        or data.channel != expected_channel
+        or data.product != resolved.product
+        or data.bucket != resolved.bucket
+        or data.scan_start != resolved.scan_start
+        or data.sat_name != resolved.sat_name
+        or float(data.sub_sat_lon) != float(resolved.sub_sat_lon)
+        or data.source_s3_key != resolved.s3_key
+    ):
+        raise RuntimeError(
+            "M2 scalar FetchResult provenance differs from the pre-cache object"
+        )
+
+
+def _reported_point_stride(
+    computed_downsample: int,
+    *,
+    is_true_color: bool,
+    policy: RenderPolicy,
+) -> int:
+    """Return the point stride actually applied before imagery delivery.
+
+    Every path inside M2's bounded authority applies no point stride.  True
+    colour may first use the separately recorded physical Hanning source cap;
+    true colour and regular archive scalars then use the captured Hanning
+    delivery transform.  None of those operations is the request-budget point
+    stride carried by this legacy header, so cache hits and misses both report
+    ``1``.  Dynamic cap/delivery ratios remain bound provenance, not guessed
+    headers.
+    """
+
+    require_registered_policy(policy)
+    value = int(computed_downsample)
+    if value < 1:
+        raise ValueError("computed downsample must be a positive integer")
+    if policy.resample_in_reflectance:
+        return 1
+    return value
+
+
+def _effective_render_policy(
+    *,
+    process_policy: RenderPolicy,
+    is_true_color: bool,
+    use_archive: bool,
+    crosses_antimeridian: bool,
+    is_backdrop: bool,
+    output_format: str,
+    m2_truecolor_supported: bool,
+    m2_archive_scalar_supported: bool,
+) -> RenderPolicy:
+    """Select only paths for which the active stage has an honest authority.
+
+    M2 owns primary typed true colour and non-crossing regular GridSat-B1 /
+    GridSat-GOES scalar imagery. Native curvilinear/crossing scalar, MergIR,
+    backdrop, and calibrated-BT payloads retain the registered M1 path until
+    their assigned milestones; they must never enter an M2 policy and silently
+    ignore its physical-domain contract.
+    """
+
+    require_registered_policy(process_policy)
+    if not process_policy.resample_in_reflectance:
+        return process_policy
+    if is_backdrop or crosses_antimeridian:
+        return M1_POLICY
+    if is_true_color:
+        return process_policy if m2_truecolor_supported else M1_POLICY
+    if (
+        use_archive
+        and m2_archive_scalar_supported
+        and not is_backdrop
+        and output_format != "btpng"
+    ):
+        return process_policy
+    return M1_POLICY
+
+
+def _m2_archive_scalar_source_supported(
+    satellite: Satellite, resolved: ResolvedFile
+) -> bool:
+    """Admit only archive sources with exact pre-fetch object identity.
+
+    MergIR's legacy fetch may move to an adjacent half-hour after resolution,
+    so it remains on registered M1 until a later milestone can bind the actual
+    consumed granule before cache lookup.  The two GridSat producers resolve
+    the exact object consumed and are the bounded M2 scalar authority.
+    """
+
+    if type(resolved) is not ResolvedFile:
+        return False
+    return (
+        satellite is gridsat.GRIDSAT and resolved.product == "GRIDSAT-B1"
+    ) or (
+        satellite is gridsat_goes.GRIDSAT_GOES
+        and resolved.product == "GridSat-GOES"
+    )
 
 
 @app.post("/render")
@@ -775,6 +1051,11 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     # deprecation header on the response when numeric was used.
     generic_channel, channel_was_numeric = normalize_channel(body.channel)
     is_true_color = generic_channel == "true_color"
+    if is_true_color and body.backdrop:
+        raise HTTPException(
+            status_code=422,
+            detail="backdrop output is a single-band Clean-IR product, not true color",
+        )
     # True color composes onto a REGULAR lat/lon grid built with plain
     # linspace(lon_min, lon_max) in every family and renders via imshow —
     # neither leg is antimeridian-aware yet. Refuse crossing bboxes honestly
@@ -898,13 +1179,60 @@ async def render(request: Request, body: RenderRequest = Body(...)):
     else:
         snapped = resolved.scan_start.isoformat()
 
+    m2_truecolor_preflight = None
+    m2_truecolor_supported = True
+    if is_true_color and PROCESS_RENDER_POLICY.resample_in_reflectance:
+        m2_truecolor_preflight = m2_truecolor_bbox_preflight(
+            body.bbox, sensor=satellite.sensor
+        )
+        # The default/loop delivery has a measured bounded workspace.  The
+        # high-DPI M2 true-colour path remains on registered M1 until M3's
+        # native-resolution governor removes its >1 GiB delivery peak.
+        m2_truecolor_supported = bool(m2_truecolor_preflight["supported"])
+        if body.quality == "high":
+            m2_truecolor_supported = False
+
+    m2_archive_scalar_supported = (
+        use_archive
+        and not is_true_color
+        and _m2_archive_scalar_source_supported(satellite, resolved)
+    )
+    request_policy = _effective_render_policy(
+        process_policy=PROCESS_RENDER_POLICY,
+        is_true_color=is_true_color,
+        use_archive=use_archive,
+        crosses_antimeridian=body.bbox[2] < body.bbox[0],
+        is_backdrop=body.backdrop,
+        output_format=body.format,
+        m2_truecolor_supported=m2_truecolor_supported,
+        m2_archive_scalar_supported=m2_archive_scalar_supported,
+    )
+
+    physical_source_manifest = None
+    if is_true_color and request_policy.resample_in_reflectance:
+        try:
+            physical_source_manifest = (
+                await satellite.resolve_true_color_physical_sources(
+                    body.bbox, resolved
+                )
+            )
+        except Exception as e:
+            log.exception("M2 physical source resolution failed: %s", e)
+            raise HTTPException(
+                status_code=502,
+                detail=f"could not resolve exact true-color source objects: {e}",
+            ) from e
+
     cache_key = _request_key(
         body,
         generic_channel,
         snapped,
         resolved.bucket,
         body.quality,
-        policy=PROCESS_RENDER_POLICY,
+        policy=request_policy,
+        resolved_product=resolved.product,
+        resolved_s3_key=resolved.s3_key,
+        resolved_source_manifest=physical_source_manifest,
     )
     native_band = (
         satellite.truecolor_bands["red"] if is_true_color
@@ -918,11 +1246,17 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             "X-Product": resolved.product,
             "X-Scan-Time": resolved.scan_start.isoformat(),
             "X-Bucket": resolved.bucket,
-            "X-Downsample": str(downsample),
+            "X-Downsample": str(
+                _reported_point_stride(
+                    downsample,
+                    is_true_color=is_true_color,
+                    policy=request_policy,
+                )
+            ),
             "X-Satellite": resolved.sat_name,
             "X-Satellite-Family": satellite.family,
             "X-Sensor": satellite.sensor,
-            "X-Algorithm-Version": PROCESS_RENDER_POLICY.algo_version,
+            "X-Algorithm-Version": request_policy.algo_version,
             "X-Sub-Sat-Lon": f"{resolved.sub_sat_lon:g}",
             "X-Generic-Channel": generic_channel,
             "X-Native-Band": str(native_band),
@@ -935,6 +1269,17 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         }
         if channel_was_numeric:
             headers["X-Deprecated-Channel-API"] = "numeric"
+        if physical_source_manifest is not None:
+            source_identity = hashlib.sha256(
+                json.dumps(
+                    physical_source_manifest.as_dict(),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            headers["X-Source-Manifest-SHA256"] = source_identity
         # Archive pacing hint: the Time Machine client paces its window fill
         # to the PUBLIC rate limit (6.5 s default, sized to 10/min). With the
         # regular-grid imshow fast path the per-frame cost dropped ~3x, so
@@ -967,10 +1312,26 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         tier_dpi = pick_tier_dpi(body.format, body.quality)
         try:
             if is_true_color:
-                # Stride the bands BEFORE the per-pixel recipe (Rayleigh) inside
-                # the fetch -- byte-identical to striding after, but far cheaper
-                # (what makes low fast). render_png must then NOT stride again.
-                data = await satellite.fetch_true_color(body.bbox, resolved, downsample)
+                # M2 keeps the post-fetch physical payload intact for the
+                # final geometry's band-limited delivery.  Larger supported
+                # requests may already carry the explicit upstream physical
+                # Hanning-cap trace; no point stride is introduced here.
+                # M0/M1 retain their established pre-recipe point stride.
+                data = await _fetch_true_color_for_policy(
+                    satellite,
+                    body.bbox,
+                    resolved,
+                    downsample,
+                    policy=request_policy,
+                    source_manifest=physical_source_manifest,
+                )
+                _require_m2_fetch_sensor_binding(
+                    data,
+                    satellite,
+                    policy=request_policy,
+                    source_manifest=physical_source_manifest,
+                    resolved=resolved,
+                )
                 render_downsample = 1
             elif body.format == "btpng" and hasattr(satellite, "fetch_regular"):
                 # native-era btpng: regular-grid single band (the archive
@@ -980,6 +1341,13 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                 render_downsample = 1
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
+                _require_m2_scalar_fetch_binding(
+                    data,
+                    satellite,
+                    resolved,
+                    generic_channel,
+                    policy=request_policy,
+                )
                 render_downsample = downsample
             def _render_job() -> bytes:
                 if body.format == "btpng":
@@ -1008,7 +1376,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                     coastlines=body.coastlines,
                     gridlines=body.gridlines,
                     dpi=tier_dpi,
-                    policy=PROCESS_RENDER_POLICY,
+                    policy=request_policy,
                 )
                 # webp LOOP frames (floater/meso pollers): downscale the 1320 px
                 # render to the fixed frame width -- UNCHANGED. The custom-zoom

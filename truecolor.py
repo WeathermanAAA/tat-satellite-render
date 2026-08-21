@@ -97,7 +97,9 @@ from __future__ import annotations
 import logging
 import datetime as dt
 import threading
-from typing import Optional
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Optional
 
 import numpy as np
 
@@ -182,6 +184,243 @@ IR_T_COLD = 183.0
 # Geostationary satellite height above the surface (km) for pyorbital's
 # observer-look geometry. 42164 km geocentric - 6378 km mean Earth radius.
 GEO_SAT_ALT_KM = 35786.0
+
+
+# ---------------------------------------------------------------------------
+# M2 typed physical/delivery boundaries
+# ---------------------------------------------------------------------------
+class TrueColorArrayDomain(Enum):
+    """Registered numeric domains accepted by the M2 true-color boundary.
+
+    An enum is intentional: a string or a lookalike object cannot silently
+    relabel display-encoded RGB as corrected reflectance.
+    """
+
+    CORRECTED_TOA_REFLECTANCE = "corrected_toa_reflectance"
+
+
+class TrueColorTemperatureUnit(Enum):
+    """Registered temperature units accepted by the M2 physical payload."""
+
+    KELVIN = "kelvin"
+
+
+class TrueColorDisplayEncoding(Enum):
+    """Registered encoding of a completed M2 delivery raster."""
+
+    CIRA_STRETCHED_FLOAT32 = "cira_stretched_float32"
+
+
+class TrueColorBackgroundContract(Enum):
+    """How uncovered pixels are represented by an M2 delivery."""
+
+    ALPHA_NAN = "alpha_nan"
+    OPAQUE_PRE_CIRA = "opaque_pre_cira"
+
+
+M2_NIGHT_MAPPING_ID = "inverse_cira_continuous_preimage_v1"
+M2_NIGHT_OUTPUT_SEMANTICS = "cira_preimage_compatibility_coordinate"
+M2_DAY_WEIGHT_POLICY_ID = "legacy_88_to_95_no_survival_gate"
+M2_GLINT_COMPATIBILITY_ID = "post_cira_surviving_day_fraction_v1"
+M2_COVERAGE_EPSILON = np.float32(1.0e-6)
+
+
+def _require_exact_array(
+    name: str,
+    value: np.ndarray,
+    *,
+    dtype: np.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    """Reject implicit dtype conversion or broadcasting at a typed boundary."""
+
+    # ``MaskedArray`` is an ``ndarray`` subclass, but accepting it here would
+    # make missingness implicit: downstream ``np.asarray`` calls discard the
+    # mask and expose its backing values.  M2 carries all missingness through
+    # explicit coverage, so this boundary accepts only a plain ndarray.
+    if type(value) is not np.ndarray:
+        raise TypeError(f"{name} must be a plain numpy.ndarray")
+    if value.dtype != np.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {np.dtype(dtype)}, got {value.dtype}")
+    if value.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {value.shape}")
+
+
+@dataclass(frozen=True)
+class TrueColorPhysicalState:
+    """Strict M2 state before the sole final CIRA display transform.
+
+    All numeric arrays are float32 and share one exact ``(H, W)`` grid.
+    ``day_rgb_reflectance`` is corrected TOA reflectance, never CIRA/display
+    RGB.  ``ir_bt_kelvin`` remains calibrated brightness temperature until
+    after the spatial operation owned by the caller.  Missingness is carried
+    only by coverage (and optional NaNs), never by a numeric black sentinel.
+    ``day_weight`` is the current 88-to-95-degree taper evaluated on the
+    source grid; the renderer must spatially deliver that scalar rather than
+    reapplying its nonlinear curve to averaged ``cos_sza``.
+
+    ``grid_metadata``, ``extent`` and ``projection`` are opaque transport
+    metadata for the renderer; they are not interpreted by this pointwise
+    module.
+    """
+
+    day_rgb_reflectance: np.ndarray
+    day_coverage: np.ndarray
+    ir_bt_kelvin: Optional[np.ndarray]
+    ir_coverage: Optional[np.ndarray]
+    cos_sza: np.ndarray
+    day_weight: np.ndarray
+    geom_valid: np.ndarray
+    red_corrected: np.ndarray
+    veggie_corrected: Optional[np.ndarray]
+    glint_deg: np.ndarray
+    sensor: str
+    array_domain: TrueColorArrayDomain = TrueColorArrayDomain.CORRECTED_TOA_REFLECTANCE
+    ir_temperature_unit: TrueColorTemperatureUnit = TrueColorTemperatureUnit.KELVIN
+    grid_metadata: Any = None
+    extent: Optional[tuple[float, float, float, float]] = None
+    projection: Any = None
+
+    def __post_init__(self) -> None:
+        if self.array_domain is not TrueColorArrayDomain.CORRECTED_TOA_REFLECTANCE:
+            raise ValueError(
+                "M2 physical RGB must be tagged as corrected TOA reflectance; "
+                "encoded/display RGB is forbidden"
+            )
+        if self.ir_temperature_unit is not TrueColorTemperatureUnit.KELVIN:
+            raise ValueError("M2 infrared input must be calibrated kelvin")
+        if self.sensor not in SENSOR_BANDS:
+            raise ValueError(
+                f"unknown physical-state sensor {self.sensor!r} "
+                f"(expected one of {sorted(SENSOR_BANDS)})"
+            )
+
+        rgb = self.day_rgb_reflectance
+        if type(rgb) is not np.ndarray:
+            raise TypeError("day_rgb_reflectance must be a plain numpy.ndarray")
+        if rgb.dtype != np.dtype(np.float32):
+            raise TypeError(
+                "day_rgb_reflectance must be float32 corrected reflectance; "
+                f"got {rgb.dtype} (encoded RGB is not accepted)"
+            )
+        if rgb.ndim != 3 or rgb.shape[-1] != 3:
+            raise ValueError(
+                "day_rgb_reflectance must have exact shape (H, W, 3), "
+                f"got {rgb.shape}"
+            )
+        shape = rgb.shape[:2]
+        _require_exact_array("day_coverage", self.day_coverage,
+                             dtype=np.float32, shape=shape)
+        _require_exact_array("cos_sza", self.cos_sza,
+                             dtype=np.float32, shape=shape)
+        _require_exact_array("day_weight", self.day_weight,
+                             dtype=np.float32, shape=shape)
+        _require_exact_array("geom_valid", self.geom_valid,
+                             dtype=np.bool_, shape=shape)
+        _require_exact_array("red_corrected", self.red_corrected,
+                             dtype=np.float32, shape=shape)
+        _require_exact_array("glint_deg", self.glint_deg,
+                             dtype=np.float32, shape=shape)
+        if self.veggie_corrected is not None:
+            _require_exact_array("veggie_corrected", self.veggie_corrected,
+                                 dtype=np.float32, shape=shape)
+
+        if (self.ir_bt_kelvin is None) != (self.ir_coverage is None):
+            raise ValueError(
+                "ir_bt_kelvin and ir_coverage must either both be present or both be None"
+            )
+        if self.ir_bt_kelvin is not None:
+            _require_exact_array("ir_bt_kelvin", self.ir_bt_kelvin,
+                                 dtype=np.float32, shape=shape)
+            _require_exact_array("ir_coverage", self.ir_coverage,
+                                 dtype=np.float32, shape=shape)
+
+        for name, coverage in (
+            ("day_coverage", self.day_coverage),
+            ("ir_coverage", self.ir_coverage),
+        ):
+            if coverage is None:
+                continue
+            if not np.all(np.isfinite(coverage)):
+                raise ValueError(f"{name} must be finite")
+            if np.any((coverage < 0.0) | (coverage > 1.0)):
+                raise ValueError(f"{name} must lie in [0, 1]")
+            if np.any(coverage[~self.geom_valid] != 0.0):
+                raise ValueError(f"{name} must be zero outside geom_valid")
+
+        if not np.all(np.isfinite(self.day_weight)) or np.any(
+            (self.day_weight < 0.0) | (self.day_weight > 1.0)
+        ):
+            raise ValueError("day_weight must be finite and lie in [0, 1]")
+        if np.any(self.day_weight[~self.geom_valid] != 0.0):
+            raise ValueError("day_weight must be zero outside geom_valid")
+
+        day_used = self.day_coverage > M2_COVERAGE_EPSILON
+        if np.any(~np.isfinite(rgb[day_used])):
+            raise ValueError("day_rgb_reflectance must be finite where day coverage survives")
+        if np.any(~np.isfinite(self.red_corrected[day_used])):
+            raise ValueError("red_corrected must be finite where day coverage survives")
+        if self.veggie_corrected is not None and np.any(
+            ~np.isfinite(self.veggie_corrected[day_used])
+        ):
+            raise ValueError("veggie_corrected must be finite where day coverage survives")
+        if np.any(~np.isfinite(self.glint_deg[day_used])):
+            raise ValueError("glint_deg must be finite where day coverage survives")
+
+        any_used = day_used.copy()
+        if self.ir_bt_kelvin is not None:
+            ir_used = self.ir_coverage > M2_COVERAGE_EPSILON
+            if np.any(~np.isfinite(self.ir_bt_kelvin[ir_used])):
+                raise ValueError("ir_bt_kelvin must be finite where IR coverage survives")
+            any_used |= ir_used
+        if np.any(~np.isfinite(self.cos_sza[any_used])):
+            raise ValueError("cos_sza must be finite wherever either modality survives")
+
+        if self.extent is not None:
+            if len(self.extent) != 4 or not np.all(np.isfinite(self.extent)):
+                raise ValueError("extent must contain four finite coordinates")
+
+
+@dataclass(frozen=True)
+class TrueColorDelivery:
+    """Pointwise M2 display result plus retained effective coverage ``A``."""
+
+    rgb: np.ndarray
+    coverage: np.ndarray
+    surviving_day_fraction: np.ndarray
+    display_encoding: TrueColorDisplayEncoding = (
+        TrueColorDisplayEncoding.CIRA_STRETCHED_FLOAT32
+    )
+    background_contract: TrueColorBackgroundContract = (
+        TrueColorBackgroundContract.ALPHA_NAN
+    )
+
+    def __post_init__(self) -> None:
+        if self.display_encoding is not TrueColorDisplayEncoding.CIRA_STRETCHED_FLOAT32:
+            raise ValueError("unsupported or unregistered true-color display encoding")
+        if self.background_contract not in (
+            TrueColorBackgroundContract.ALPHA_NAN,
+            TrueColorBackgroundContract.OPAQUE_PRE_CIRA,
+        ):
+            raise ValueError("unsupported or unregistered background contract")
+        if type(self.rgb) is not np.ndarray or self.rgb.dtype != np.dtype(np.float32):
+            raise TypeError("delivery rgb must be float32")
+        if self.rgb.ndim != 3 or self.rgb.shape[-1] != 3:
+            raise ValueError("delivery rgb must have shape (H, W, 3)")
+        shape = self.rgb.shape[:2]
+        _require_exact_array("coverage", self.coverage,
+                             dtype=np.float32, shape=shape)
+        _require_exact_array("surviving_day_fraction", self.surviving_day_fraction,
+                             dtype=np.float32, shape=shape)
+        if not np.all(np.isfinite(self.coverage)):
+            raise ValueError("delivery coverage must be finite")
+        if np.any((self.coverage < 0.0) | (self.coverage > 1.0)):
+            raise ValueError("delivery coverage must lie in [0, 1]")
+        if not np.all(np.isfinite(self.surviving_day_fraction)):
+            raise ValueError("surviving_day_fraction must be finite")
+        if np.any((self.surviving_day_fraction < 0.0)
+                  | (self.surviving_day_fraction > 1.0)):
+            raise ValueError("surviving_day_fraction must lie in [0, 1]")
 
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
@@ -472,6 +711,73 @@ def cira_stretch(rgb: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
 
+def cira_preimage_compatibility(
+    gray: np.ndarray,
+    *,
+    coverage: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Embed display gray in the continuous preimage of ``cira_stretch``.
+
+    This is a *CIRA preimage compatibility coordinate*, not infrared
+    reflectance.  It is derived only from the existing CIRA expressions:
+
+    ``J(g) = 10 ** (_CIRA_LOG_ROOT + _CIRA_DENOM * clip(g, 0, 1))``.
+
+    The continuous endpoints are therefore ``J(0) == 0.0223`` and
+    ``J(1) == 2.1730825...``.  Numeric zero is valid data.  Non-finite or
+    uncovered inputs remain NaN; this helper never fills missing data with
+    either endpoint and never calls ``nan_to_num``.
+    """
+
+    if type(gray) is not np.ndarray:
+        raise TypeError("gray must be a plain numpy.ndarray")
+    value = gray
+    if not np.issubdtype(value.dtype, np.number):
+        raise TypeError("gray must be a numeric numpy array")
+    valid = np.isfinite(value)
+    if coverage is not None:
+        if type(coverage) is not np.ndarray:
+            raise TypeError("coverage must be a plain numpy.ndarray")
+        cov = coverage
+        if cov.shape != value.shape:
+            raise ValueError(
+                f"coverage shape {cov.shape} does not match gray shape {value.shape}"
+            )
+        if not np.issubdtype(cov.dtype, np.floating):
+            raise TypeError("coverage must be floating point")
+        if not np.all(np.isfinite(cov)) or np.any((cov < 0.0) | (cov > 1.0)):
+            raise ValueError("coverage must be finite and lie in [0, 1]")
+        valid &= cov > M2_COVERAGE_EPSILON
+
+    out = np.full(value.shape, np.nan, dtype=np.float32)
+    if np.any(valid):
+        clipped = np.clip(value[valid], 0.0, 1.0)
+        out[valid] = np.power(
+            10.0,
+            _CIRA_LOG_ROOT + _CIRA_DENOM * clipped,
+        ).astype(np.float32, copy=False)
+    return out
+
+
+def clean_ir_cira_preimage(
+    bt_kelvin: np.ndarray,
+    *,
+    coverage: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Map already-delivered clean-IR BT (K) to the CIRA preimage domain.
+
+    Spatial sampling belongs upstream and must occur while the field is
+    calibrated brightness temperature in kelvin.  Applying this nonlinear
+    helper before that operation violates the M2 domain contract.
+    """
+
+    if type(bt_kelvin) is not np.ndarray:
+        raise TypeError("bt_kelvin must be a plain numpy.ndarray")
+    bt = bt_kelvin
+    gray = _clean_ir_gray(bt)
+    return cira_preimage_compatibility(gray, coverage=coverage)
+
+
 # ---------------------------------------------------------------------------
 # Step 7: day/night cross-fade to clean IR (GeoColor-lite)
 # ---------------------------------------------------------------------------
@@ -538,10 +844,244 @@ def glint_tame(rgb: np.ndarray, glint_deg: np.ndarray,
     return np.clip(out, 0.0, 1.0).astype(rgb.dtype, copy=False)
 
 
+def apply_display_glint_compat(
+    rgb: np.ndarray,
+    glint_deg: np.ndarray,
+    red_corrected: np.ndarray,
+    veggie_corrected: Optional[np.ndarray],
+    surviving_day_fraction: np.ndarray,
+) -> np.ndarray:
+    """Apply the parked-M8 glint appearance to only the surviving day part.
+
+    This is deliberately a pointwise, post-CIRA compatibility operation.  It
+    performs no spatial work and changes no constant, cone, land gate or
+    strength.  Full day is exactly ``glint_tame``; pure night is an exact
+    no-op; mixed pixels scale only the legacy glint delta by ``a_d / A``.
+    """
+
+    if type(rgb) is not np.ndarray:
+        raise TypeError("rgb must be a plain numpy.ndarray")
+    value = rgb
+    if value.dtype != np.dtype(np.float32):
+        raise TypeError(f"rgb must be float32, got {value.dtype}")
+    shape = value.shape[:2]
+    if value.ndim != 3 or value.shape[-1] != 3:
+        raise ValueError("rgb must have shape (H, W, 3)")
+    for name, field in (
+        ("glint_deg", glint_deg),
+        ("red_corrected", red_corrected),
+        ("surviving_day_fraction", surviving_day_fraction),
+    ):
+        if type(field) is not np.ndarray:
+            raise TypeError(f"{name} must be a plain numpy.ndarray")
+        if field.dtype != np.dtype(np.float32):
+            raise TypeError(f"{name} must be float32, got {field.dtype}")
+        if field.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+    if veggie_corrected is not None and type(veggie_corrected) is not np.ndarray:
+        raise TypeError("veggie_corrected must be a plain numpy.ndarray")
+    if (
+        veggie_corrected is not None
+        and veggie_corrected.dtype != np.dtype(np.float32)
+    ):
+        raise TypeError(
+            f"veggie_corrected must be float32, got {veggie_corrected.dtype}"
+        )
+    if veggie_corrected is not None and veggie_corrected.shape != shape:
+        raise ValueError(f"veggie_corrected must have shape {shape}")
+    fraction = surviving_day_fraction
+    if not np.all(np.isfinite(fraction)) or np.any(
+        (fraction < 0.0) | (fraction > 1.0)
+    ):
+        raise ValueError("surviving_day_fraction must be finite and lie in [0, 1]")
+    if not np.any(fraction > 0.0):
+        return rgb
+
+    active = fraction > 0.0
+    if (
+        not np.all(np.isfinite(value[active]))
+        or not np.all(np.isfinite(glint_deg[active]))
+        or not np.all(np.isfinite(red_corrected[active]))
+        or (
+            veggie_corrected is not None
+            and not np.all(np.isfinite(veggie_corrected[active]))
+        )
+    ):
+        raise ValueError("active display-glint inputs must be finite")
+
+    full_day = glint_tame(
+        rgb,
+        glint_deg,
+        red_corrected,
+        veggie_corrected,
+    )
+    if np.all(fraction == 1.0):
+        return full_day
+    frac3 = fraction[..., None].astype(value.dtype, copy=False)
+    mixed = value + (full_day - value) * frac3
+    return np.where(frac3 > 0.0, mixed, value).astype(value.dtype, copy=False)
+
+
+def finalize_truecolor_m2(
+    state: TrueColorPhysicalState,
+    *,
+    coverage_epsilon: float = float(M2_COVERAGE_EPSILON),
+    background_display_rgb: Optional[tuple[float, float, float]] = None,
+) -> TrueColorDelivery:
+    """Finalize already-delivered M2 fields with one unchanged CIRA call.
+
+    No resampling occurs here.  The caller must first deliver reflectance,
+    calibrated IR BT (K), the already-evaluated day-weight scalar, auxiliary
+    geometry, and their coverages to one exact raster geometry.  Pointwise
+    modality weights are
+
+    ``a_d = legacy_day_weight * day_coverage`` and
+    ``a_n = (1 - legacy_day_weight) * ir_coverage``.
+
+    Without ``background_display_rgb``, values are coverage-normalized and
+    uncovered pixels remain NaN for an alpha consumer.  With a finite RGB
+    tuple in display coordinates, missing ``1-A`` is precomposed through
+    ``J(background)`` before the sole CIRA call; the scientific coverage A
+    is retained either way.
+    """
+
+    if type(state) is not TrueColorPhysicalState:
+        raise TypeError("state must be a registered TrueColorPhysicalState")
+    eps = float(coverage_epsilon)
+    if not np.isfinite(eps) or eps < 0.0 or eps >= 1.0:
+        raise ValueError("coverage_epsilon must be finite and lie in [0, 1)")
+
+    shape = state.day_coverage.shape
+    # ``day_weight`` was computed from the current 88->95 policy on the
+    # source grid and spatially delivered as a scalar field.  Reapplying the
+    # nonlinear taper to averaged cos(SZA) here would bias mixed terminator
+    # footprints and contradict the captured physical operation order.
+    w_day = state.day_weight
+    a_day = (w_day * state.day_coverage).astype(np.float32, copy=False)
+    a_day[a_day <= eps] = np.float32(0.0)
+    if state.ir_bt_kelvin is None:
+        a_night = np.zeros(shape, dtype=np.float32)
+        night_gray = np.full(shape, np.nan, dtype=np.float32)
+        night_preimage = np.full(shape, np.nan, dtype=np.float32)
+    else:
+        a_night = ((1.0 - w_day) * state.ir_coverage).astype(np.float32, copy=False)
+        a_night[a_night <= eps] = np.float32(0.0)
+        night_gray = _clean_ir_gray(state.ir_bt_kelvin).astype(
+            np.float32, copy=False
+        )
+        night_preimage = cira_preimage_compatibility(
+            night_gray,
+            coverage=state.ir_coverage,
+        )
+
+    coverage = a_day.copy()
+    coverage += a_night
+    np.clip(coverage, 0.0, 1.0, out=coverage)
+    premultiplied = np.zeros((*shape, 3), dtype=np.float32)
+    np.multiply(
+        state.day_rgb_reflectance,
+        a_day[..., None],
+        out=premultiplied,
+        where=(a_day > eps)[..., None],
+    )
+    if state.ir_bt_kelvin is not None:
+        night_preimage[a_night <= eps] = np.float32(0.0)
+        np.multiply(
+            night_preimage,
+            a_night,
+            out=night_preimage,
+            where=a_night > eps,
+        )
+        premultiplied += night_preimage[..., None]
+
+    if background_display_rgb is None:
+        compatibility = premultiplied
+        np.divide(
+            compatibility,
+            coverage[..., None],
+            out=compatibility,
+            where=(coverage > eps)[..., None],
+        )
+        compatibility[coverage <= eps] = np.float32(np.nan)
+        background_contract = TrueColorBackgroundContract.ALPHA_NAN
+    else:
+        background = np.asarray(background_display_rgb, dtype=np.float32)
+        if background.shape != (3,) or not np.all(np.isfinite(background)):
+            raise ValueError("background_display_rgb must contain three finite values")
+        if np.any((background < 0.0) | (background > 1.0)):
+            raise ValueError("background_display_rgb must lie in [0, 1]")
+        background_preimage = cira_preimage_compatibility(background)
+        compatibility = premultiplied
+        missing = np.float32(1.0) - coverage
+        for channel in range(3):
+            compatibility[..., channel] += missing * background_preimage[channel]
+        background_contract = TrueColorBackgroundContract.OPAQUE_PRE_CIRA
+
+    # The sole final tone-curve call for the M2 pointwise delivery.
+    rgb = cira_stretch(compatibility)
+
+    surviving_day_fraction = np.zeros(shape, dtype=np.float32)
+    np.divide(
+        a_day,
+        coverage,
+        out=surviving_day_fraction,
+        where=coverage > eps,
+    )
+    surviving_day_fraction = np.clip(
+        surviving_day_fraction, 0.0, 1.0
+    ).astype(np.float32, copy=False)
+    rgb = apply_display_glint_compat(
+        rgb,
+        state.glint_deg,
+        state.red_corrected,
+        state.veggie_corrected,
+        surviving_day_fraction,
+    ).astype(np.float32, copy=False)
+    if state.ir_bt_kelvin is not None:
+        pure_night = (a_day == 0.0) & (a_night > 0.0)
+        if background_display_rgb is not None:
+            # Fractional opaque coverage intentionally mixes J(night) with
+            # J(background) before CIRA; only a fully covered endpoint is the
+            # exact unchanged Clean-IR gray.
+            pure_night &= coverage == 1.0
+        if np.any(pure_night):
+            # J(gray)->CIRA is analytically the identity, but its float32
+            # round trip can land just below an 8-bit code and floor one DN
+            # dark. Preserve the unchanged Clean-IR appearance exactly at
+            # this pure-modality endpoint; mixed pixels retain the canonical
+            # one-CIRA preimage composite.
+            rgb[pure_night] = night_gray[pure_night, None]
+    if background_display_rgb is not None:
+        # Float32 J(g)->CIRA(g) round-trip error can fall just below an exact
+        # 8-bit background code and therefore floor one DN darker in Agg.
+        # Preserve the mathematically identical A==0 endpoint exactly; only
+        # fractional coverage remains precomposed in the CIRA preimage.
+        rgb[coverage == 0.0] = background
+    return TrueColorDelivery(
+        rgb=rgb,
+        coverage=coverage,
+        surviving_day_fraction=surviving_day_fraction,
+        background_contract=background_contract,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level assembly
 # ---------------------------------------------------------------------------
-def assemble_truecolor(
+@dataclass(frozen=True)
+class _TrueColorPhysicalComponents:
+    """Internal uncast fields shared by exact legacy and strict M2 paths."""
+
+    day_rgb_reflectance: np.ndarray
+    cos_sza: np.ndarray
+    glint_deg: np.ndarray
+    red_corrected: np.ndarray
+    veggie_corrected: Optional[np.ndarray]
+    ir_bt_kelvin: Optional[np.ndarray]
+    sensor: str
+
+
+def _assemble_truecolor_physical_components(
     red: np.ndarray,
     green: Optional[np.ndarray],
     blue: np.ndarray,
@@ -555,17 +1095,9 @@ def assemble_truecolor(
     ir_bt: Optional[np.ndarray] = None,
     do_rayleigh: bool = True,
     do_ratio_sharpen: bool = True,
-):
-    """Build a display RGB (H,W,3 float32 0..1) + the cos(SZA) field.
+) -> _TrueColorPhysicalComponents:
+    """Run the existing physical recipe through ratio sharpening, no CIRA."""
 
-    ``green`` is None for ABI (synthesized); the sensor's REAL ~0.51 um green
-    for AHI/AMI/FCI -- never the 0.86 um NIR, which rides in ``veggie``.
-    ``ir_bt`` (clean-IR brightness temp, K, co-registered) enables the
-    terminator IR cross-fade. All inputs are co-registered TOA reflectance
-    (0..1, not sun-normalized) on the same (red-res) grid. Returns
-    (rgb, cos_sza). The pipeline and every constant are shared across ALL
-    ring sensors -- see the module docstring for the order and provenance.
-    """
     sensor_l = sensor.lower()
     band_names = SENSOR_BANDS.get(sensor_l)
     if band_names is None:
@@ -609,15 +1141,222 @@ def assemble_truecolor(
     if do_ratio_sharpen:
         rgb = self_sharpen(rgb, sensor_l)
 
+    return _TrueColorPhysicalComponents(
+        day_rgb_reflectance=rgb,
+        cos_sza=cos_sza,
+        glint_deg=glint_angle_field(sun_zen, sat_zen, azidiff),
+        red_corrected=red_c,
+        veggie_corrected=veggie_c,
+        ir_bt_kelvin=ir_bt,
+        sensor=sensor_l,
+    )
+
+
+def finalize_truecolor_legacy(
+    day_rgb_reflectance: np.ndarray,
+    cos_sza: np.ndarray,
+    glint_deg: np.ndarray,
+    red_corrected: np.ndarray,
+    veggie_corrected: Optional[np.ndarray],
+    ir_bt_kelvin: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unchanged M0/M1 display finalizer, isolated from the M2 contract."""
+
     # 6) The ONE shared tone curve.
-    rgb = cira_stretch(rgb)
+    rgb = cira_stretch(day_rgb_reflectance)
 
     # 8) Sun-glint tame (before the IR fade so night is untouched).
-    rgb = glint_tame(rgb, glint_angle_field(sun_zen, sat_zen, azidiff),
-                     red_c, veggie_c)
+    rgb = glint_tame(rgb, glint_deg, red_corrected, veggie_corrected)
 
     # 7) Terminator cross-fade to clean IR (the taper's exact complement).
-    if ir_bt is not None:
-        rgb = night_blend(rgb, ir_bt, cos_sza)
+    if ir_bt_kelvin is not None:
+        rgb = night_blend(rgb, ir_bt_kelvin, cos_sza)
 
     return rgb.astype(np.float32), cos_sza.astype(np.float32)
+
+
+def assemble_truecolor_physical(
+    red: np.ndarray,
+    green: Optional[np.ndarray],
+    blue: np.ndarray,
+    veggie: Optional[np.ndarray],
+    lats: np.ndarray,
+    lons: np.ndarray,
+    when: dt.datetime,
+    sub_sat_lon: float,
+    platform_name: str,
+    sensor: str,
+    ir_bt: Optional[np.ndarray] = None,
+    *,
+    geom_valid: Optional[np.ndarray] = None,
+    day_coverage: Optional[np.ndarray] = None,
+    ir_coverage: Optional[np.ndarray] = None,
+    do_rayleigh: bool = True,
+    do_ratio_sharpen: bool = True,
+    grid_metadata: Any = None,
+    extent: Optional[tuple[float, float, float, float]] = None,
+    projection: Any = None,
+) -> TrueColorPhysicalState:
+    """Assemble strict float32 physical state for a later M2 delivery.
+
+    Every source band, coordinate, mask and coverage must have the red-band
+    ``(H, W)`` shape.  Omitted coverages are derived from joint finite support
+    and ``geom_valid``; supplied fractional coverage is preserved exactly.
+    No tone curve, night mapping, glint display operation or quantization is
+    performed here.
+    """
+
+    if type(red) is not np.ndarray or red.ndim != 2:
+        raise ValueError("red must be a two-dimensional plain numpy array")
+    if red.dtype != np.dtype(np.float32):
+        raise TypeError(f"red must be float32 physical data, got {red.dtype}")
+    shape = red.shape
+    for name, field in (
+        ("blue", blue),
+        ("lats", lats),
+        ("lons", lons),
+    ):
+        if type(field) is not np.ndarray or field.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+        if field.dtype != np.dtype(np.float32):
+            raise TypeError(f"{name} must be float32 physical data, got {field.dtype}")
+    for name, field in (("green", green), ("veggie", veggie), ("ir_bt", ir_bt)):
+        if field is not None and (
+            type(field) is not np.ndarray or field.shape != shape
+        ):
+            raise ValueError(f"{name} must have shape {shape}")
+        if field is not None and field.dtype != np.dtype(np.float32):
+            raise TypeError(f"{name} must be float32 physical data, got {field.dtype}")
+
+    if geom_valid is None:
+        geom = (np.isfinite(lats) & np.isfinite(lons)).astype(np.bool_, copy=False)
+    else:
+        _require_exact_array("geom_valid", geom_valid,
+                             dtype=np.bool_, shape=shape)
+        geom = geom_valid
+
+    components = _assemble_truecolor_physical_components(
+        red,
+        green,
+        blue,
+        veggie,
+        lats,
+        lons,
+        when,
+        sub_sat_lon,
+        platform_name,
+        sensor,
+        ir_bt=ir_bt,
+        do_rayleigh=do_rayleigh,
+        do_ratio_sharpen=do_ratio_sharpen,
+    )
+
+    day_rgb = components.day_rgb_reflectance.astype(np.float32, copy=False)
+    cos_sza = components.cos_sza.astype(np.float32, copy=False)
+    day_weight_field = terminator_day_weight(cos_sza).astype(
+        np.float32, copy=False
+    )
+    day_weight_field = np.where(
+        geom, day_weight_field, np.float32(0.0)
+    ).astype(np.float32, copy=False)
+    glint_deg = components.glint_deg.astype(np.float32, copy=False)
+    red_corrected = components.red_corrected.astype(np.float32, copy=False)
+    veggie_corrected = (
+        None
+        if components.veggie_corrected is None
+        else components.veggie_corrected.astype(np.float32, copy=False)
+    )
+    ir_bt_kelvin = (
+        None
+        if components.ir_bt_kelvin is None
+        else components.ir_bt_kelvin.astype(np.float32, copy=False)
+    )
+
+    if day_coverage is None:
+        day_valid = geom & np.isfinite(cos_sza) & np.isfinite(glint_deg)
+        day_valid &= np.all(np.isfinite(day_rgb), axis=-1)
+        day_valid &= np.isfinite(red_corrected)
+        if veggie_corrected is not None:
+            day_valid &= np.isfinite(veggie_corrected)
+        day_cov = day_valid.astype(np.float32)
+    else:
+        _require_exact_array("day_coverage", day_coverage,
+                             dtype=np.float32, shape=shape)
+        day_cov = day_coverage
+
+    if ir_bt_kelvin is None:
+        if ir_coverage is not None:
+            raise ValueError("ir_coverage cannot be supplied without ir_bt")
+        ir_cov = None
+    elif ir_coverage is None:
+        ir_cov = (
+            geom & np.isfinite(cos_sza) & np.isfinite(ir_bt_kelvin)
+        ).astype(np.float32)
+    else:
+        _require_exact_array("ir_coverage", ir_coverage,
+                             dtype=np.float32, shape=shape)
+        ir_cov = ir_coverage
+
+    return TrueColorPhysicalState(
+        day_rgb_reflectance=day_rgb,
+        day_coverage=day_cov,
+        ir_bt_kelvin=ir_bt_kelvin,
+        ir_coverage=ir_cov,
+        cos_sza=cos_sza,
+        day_weight=day_weight_field,
+        geom_valid=geom,
+        red_corrected=red_corrected,
+        veggie_corrected=veggie_corrected,
+        glint_deg=glint_deg,
+        sensor=components.sensor,
+        grid_metadata=grid_metadata,
+        extent=extent,
+        projection=projection,
+    )
+
+
+def assemble_truecolor(
+    red: np.ndarray,
+    green: Optional[np.ndarray],
+    blue: np.ndarray,
+    veggie: Optional[np.ndarray],
+    lats: np.ndarray,
+    lons: np.ndarray,
+    when: dt.datetime,
+    sub_sat_lon: float,
+    platform_name: str,
+    sensor: str,
+    ir_bt: Optional[np.ndarray] = None,
+    do_rayleigh: bool = True,
+    do_ratio_sharpen: bool = True,
+):
+    """Build the exact legacy M0/M1 display RGB plus cos(SZA) field.
+
+    This public signature and behavior remain unchanged.  M2 callers use
+    ``assemble_truecolor_physical`` and finalize only after physical fields
+    have been delivered to the target raster.
+    """
+
+    components = _assemble_truecolor_physical_components(
+        red,
+        green,
+        blue,
+        veggie,
+        lats,
+        lons,
+        when,
+        sub_sat_lon,
+        platform_name,
+        sensor,
+        ir_bt=ir_bt,
+        do_rayleigh=do_rayleigh,
+        do_ratio_sharpen=do_ratio_sharpen,
+    )
+    return finalize_truecolor_legacy(
+        components.day_rgb_reflectance,
+        components.cos_sza,
+        components.glint_deg,
+        components.red_corrected,
+        components.veggie_corrected,
+        components.ir_bt_kelvin,
+    )

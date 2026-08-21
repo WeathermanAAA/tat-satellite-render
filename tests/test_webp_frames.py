@@ -31,6 +31,13 @@ import floater_poller as fp          # noqa: E402
 from render import transcode_frame   # noqa: E402
 
 
+RESOLVED_PRODUCT = "CMIPF"
+RESOLVED_S3_KEY = "noaa-goes19/ABI-L2-CMIPF/fixture.nc"
+RESOLVED_IDENTITY = hashlib.sha256(
+    (RESOLVED_PRODUCT + "\0" + RESOLVED_S3_KEY).encode("utf-8")
+).hexdigest()
+
+
 def _png_bytes(w: int, h: int) -> bytes:
     from PIL import Image
 
@@ -124,11 +131,17 @@ class TestRenderRequestFormat(unittest.TestCase):
             "2026-06-12T06:00:00",
             "noaa-goes19",
             policy=self.app.PROCESS_RENDER_POLICY,
+            resolved_product=RESOLVED_PRODUCT,
+            resolved_s3_key=RESOLVED_S3_KEY,
         )
         legacy_raw = (
             f"{body.bbox}|2026-06-12T06:00:00|clean_ir|{body.enhancement}|noaa-goes19|fmt=webp"
         )
-        versioned_raw = legacy_raw + f"|algo={self.app.PROCESS_RENDER_POLICY.algo_version}"
+        versioned_raw = (
+            legacy_raw
+            + f"|algo={self.app.PROCESS_RENDER_POLICY.algo_version}"
+            + f"|resolved={RESOLVED_IDENTITY}"
+        )
         self.assertEqual(key, hashlib.sha256(versioned_raw.encode()).hexdigest())
 
     def test_png_cache_key_carries_resolution_tier(self):
@@ -144,6 +157,8 @@ class TestRenderRequestFormat(unittest.TestCase):
             "2026-06-12T06:00:00",
             "noaa-goes19",
             policy=self.app.PROCESS_RENDER_POLICY,
+            resolved_product=RESOLVED_PRODUCT,
+            resolved_s3_key=RESOLVED_S3_KEY,
         )
         legacy_raw = (
             f"{body.bbox}|2026-06-12T06:00:00|clean_ir|{body.enhancement}|noaa-goes19"
@@ -153,6 +168,7 @@ class TestRenderRequestFormat(unittest.TestCase):
             legacy_raw
             + "|q=default"
             + f"|algo={self.app.PROCESS_RENDER_POLICY.algo_version}"
+            + f"|resolved={RESOLVED_IDENTITY}"
         )
         self.assertEqual(key, hashlib.sha256(versioned_raw.encode()).hexdigest())
 
@@ -160,10 +176,14 @@ class TestRenderRequestFormat(unittest.TestCase):
         png_key = self.app._request_key(
             self._req(), "clean_ir", "2026-06-12T06:00:00", "noaa-goes19",
             policy=self.app.PROCESS_RENDER_POLICY,
+            resolved_product=RESOLVED_PRODUCT,
+            resolved_s3_key=RESOLVED_S3_KEY,
         )
         webp_key = self.app._request_key(
             self._req(format="webp"), "clean_ir", "2026-06-12T06:00:00", "noaa-goes19",
             policy=self.app.PROCESS_RENDER_POLICY,
+            resolved_product=RESOLVED_PRODUCT,
+            resolved_s3_key=RESOLVED_S3_KEY,
         )
         self.assertNotEqual(png_key, webp_key)
 

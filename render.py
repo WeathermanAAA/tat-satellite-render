@@ -8,9 +8,11 @@ footer credit.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import logging
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -24,7 +26,7 @@ import numpy as np
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from cartopy.feature import ShapelyFeature
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, to_rgb
 from shapely.geometry import shape
 
 from colormaps import get_enhancement, enhancement_norm, normalize_visible
@@ -103,6 +105,545 @@ def _imshow_with_render_policy(
         f"render policy {policy.algo_version!r} cannot use "
         f"{policy.resample_kernel!r} through Matplotlib imshow"
     )
+
+
+def _axes_device_pixel_bounds(fig, ax) -> tuple[int, int, int, int]:
+    """Return the exact half-open canvas rows/columns covered by ``ax``.
+
+    Agg samples at device-pixel centres.  Deriving the integer bounds from the
+    *resolved* axes bbox (after Cartopy aspect/letterboxing) keeps fractional
+    layout phase dynamic across Matplotlib versions and avoids the historical
+    1189-versus-1188 hard-code.  Rows are measured from the top of the canvas;
+    columns from the left.
+    """
+
+    renderer = fig.canvas.get_renderer()
+    bbox = ax.get_window_extent(renderer)
+    figure_height = int(round(float(fig.bbox.height)))
+    figure_width = int(round(float(fig.bbox.width)))
+    left = int(math.ceil(float(bbox.x0) - 0.5))
+    right = int(math.ceil(float(bbox.x1) - 0.5))
+    top = int(math.ceil(figure_height - float(bbox.y1) - 0.5))
+    bottom = int(math.ceil(figure_height - float(bbox.y0) - 0.5))
+    if not (0 <= top < bottom <= figure_height):
+        raise RuntimeError(
+            f"resolved axes rows {(top, bottom)} exceed canvas height "
+            f"{figure_height}"
+        )
+    if not (0 <= left < right <= figure_width):
+        raise RuntimeError(
+            f"resolved axes columns {(left, right)} exceed canvas width "
+            f"{figure_width}"
+        )
+    return top, bottom, left, right
+
+
+def _place_device_raster(fig, ax, raster: np.ndarray, bounds) -> object:
+    """Place an already-delivered RGB(A) raster onto the canvas exactly 1:1.
+
+    ``Figure.figimage`` is intentionally used instead of ``Axes.imshow``:
+    figimage performs no spatial resampling.  The GeoAxes patch becomes
+    transparent while coastlines, borders and graticules remain above the
+    figure image.  The figure's dark facecolor still supplies the same outer
+    background and any fractional half-pixel edge.
+    """
+
+    top, bottom, left, right = (int(value) for value in bounds)
+    image = np.asarray(raster)
+    expected = (bottom - top, right - left)
+    if image.ndim != 3 or image.shape[2] not in (3, 4):
+        raise ValueError(f"device raster must be HxWxRGB(A), got {image.shape}")
+    if tuple(image.shape[:2]) != expected:
+        raise ValueError(
+            f"device raster shape {image.shape[:2]} does not match bounds "
+            f"{expected}"
+        )
+    if not np.isfinite(image).all():
+        raise ValueError("device raster must be finite before opaque delivery")
+    figure_height = int(round(float(fig.bbox.height)))
+    ax.patch.set_alpha(0.0)
+    return fig.figimage(
+        image,
+        xo=left,
+        yo=figure_height - bottom,
+        origin="upper",
+        interpolation="nearest",
+        resize=False,
+        zorder=-10,
+    )
+
+
+def _validate_m2_truecolor_source_geometry(data: FetchResult, bbox) -> None:
+    """Bind a typed M2 payload to the exact regular request grid.
+
+    Shape agreement alone is not geolocation.  The primary M2 authority is a
+    north-to-south regular Plate Carrée grid, so every coordinate endpoint,
+    metadata tag, and FetchResult alias is checked before raster planning.
+    """
+
+    import truecolor
+
+    state = data.truecolor_physical
+    if type(state) is not truecolor.TrueColorPhysicalState:
+        raise RuntimeError("M2 true-color state has an unregistered type")
+    expected_extent = tuple(float(value) for value in bbox)
+    if state.extent is None or not np.allclose(
+        np.asarray(state.extent, dtype=np.float64),
+        np.asarray(expected_extent, dtype=np.float64),
+        rtol=0.0,
+        atol=2.0e-6,
+    ):
+        raise RuntimeError("M2 physical-state extent is not bound to the request")
+    if type(state.projection) is not str or state.projection != "PlateCarree":
+        raise RuntimeError("M2 physical-state projection is not registered PlateCarree")
+    metadata = state.grid_metadata
+    if type(metadata) is not dict:
+        raise RuntimeError("M2 physical-state grid metadata must be an exact dict")
+    if state.sensor not in ("abi", "ahi"):
+        raise RuntimeError("M2 primary renderer authority is limited to ABI/AHI")
+    required_metadata = {
+        "grid": "regular_latlon",
+        "row_order": "north_to_south",
+        "sensor": state.sensor,
+        "point_stride_applied": False,
+    }
+    if any(metadata.get(key) != value for key, value in required_metadata.items()):
+        raise RuntimeError("M2 physical-state grid metadata is unregistered or inconsistent")
+
+    shape = state.day_coverage.shape
+    # ``np.asarray`` would silently strip a MaskedArray's mask and admit a
+    # lookalike coordinate payload.  M2 binds the exact plain arrays supplied
+    # by the fetcher before any coercion can erase type semantics.
+    if type(data.lats) is not np.ndarray or type(data.lons) is not np.ndarray:
+        raise RuntimeError("M2 FetchResult coordinates must be exact plain ndarrays")
+    lats = data.lats
+    lons = data.lons
+    if (
+        lats.dtype != np.float32
+        or lons.dtype != np.float32
+        or lats.shape != shape
+        or lons.shape != shape
+        or not np.all(np.isfinite(lats))
+        or not np.all(np.isfinite(lons))
+    ):
+        raise RuntimeError("M2 FetchResult coordinates do not match the physical grid")
+    if data.cos_sza is not state.cos_sza or data.geom_valid is not state.geom_valid:
+        raise RuntimeError("M2 FetchResult geometry aliases are not bound to the typed state")
+    expected_source_day_weight = truecolor.terminator_day_weight(
+        state.cos_sza
+    ).astype(np.float32, copy=False)
+    if not np.array_equal(
+        state.day_weight[state.geom_valid],
+        expected_source_day_weight[state.geom_valid],
+    ):
+        raise RuntimeError(
+            "M2 source day weight is not bound to the 88-to-95-degree taper"
+        )
+    if not np.array_equal(lats, np.broadcast_to(lats[:, :1], shape)):
+        raise RuntimeError("M2 latitude grid is not separable regular latitude")
+    if not np.array_equal(lons, np.broadcast_to(lons[:1, :], shape)):
+        raise RuntimeError("M2 longitude grid is not separable regular longitude")
+
+    lat_axis = lats[:, 0].astype(np.float64, copy=False)
+    lon_axis = lons[0, :].astype(np.float64, copy=False)
+    if lat_axis.size < 2 or lon_axis.size < 2:
+        raise RuntimeError("M2 regular grid must have at least two pixels per axis")
+    if not np.all(np.diff(lat_axis) < 0.0):
+        raise RuntimeError("M2 latitude rows are not strictly north-to-south")
+    if not np.all(np.diff(lon_axis) > 0.0):
+        raise RuntimeError("M2 longitude columns are not strictly west-to-east")
+    lon_min, lat_min, lon_max, lat_max = expected_extent
+    expected_lon_axis = np.linspace(
+        lon_min, lon_max, lon_axis.size
+    ).astype(np.float32)
+    expected_lat_axis = np.linspace(
+        lat_max, lat_min, lat_axis.size
+    ).astype(np.float32)
+    if not np.array_equal(lons[0], expected_lon_axis) or not np.array_equal(
+        lats[:, 0], expected_lat_axis
+    ):
+        raise RuntimeError("M2 regular-grid pixel centres are not request-bound linspace")
+    endpoints = np.array(
+        (lon_axis[0], lon_axis[-1], lat_axis[0], lat_axis[-1]),
+        dtype=np.float64,
+    )
+    expected_endpoints = np.array(
+        (lon_min, lon_max, lat_max, lat_min), dtype=np.float64
+    )
+    if not np.allclose(
+        endpoints, expected_endpoints, rtol=0.0, atol=2.0e-5
+    ):
+        raise RuntimeError("M2 regular-grid endpoints do not match the request extent")
+
+
+def _m2_truecolor_cell_edge_extent(data: FetchResult) -> list[float]:
+    """Return image edges for already-validated regular centre coordinates."""
+
+    lons = data.lons
+    lats = data.lats
+    if type(lons) is not np.ndarray or type(lats) is not np.ndarray:
+        raise RuntimeError("M2 true-color edge extent requires plain coordinate arrays")
+    lon_axis = lons[0, :].astype(np.float64, copy=False)
+    lat_axis = lats[:, 0].astype(np.float64, copy=False)
+    if lon_axis.size < 2 or lat_axis.size < 2:
+        raise RuntimeError("M2 true-color edge extent requires two pixels per axis")
+    dlon = (lon_axis[-1] - lon_axis[0]) / (lon_axis.size - 1)
+    dlat = (lat_axis[-1] - lat_axis[0]) / (lat_axis.size - 1)
+    if not (np.isfinite(dlon) and dlon > 0.0 and np.isfinite(dlat) and dlat < 0.0):
+        raise RuntimeError("M2 true-color centre axes have unsupported orientation")
+    return [
+        float(lon_axis[0] - dlon / 2.0),
+        float(lon_axis[-1] + dlon / 2.0),
+        float(lat_axis[-1] + dlat / 2.0),
+        float(lat_axis[0] - dlat / 2.0),
+    ]
+
+
+def _resample_truecolor_physical_state(state, plan):
+    """Deliver every M2 field/coverage through one exact RasterPlan.
+
+    The same Hanning geometry is replayed for every numerator and coverage.
+    Auxiliary geometry is never inferred from encoded RGB, and no nearest
+    mask resize or missing-to-black fill exists in this boundary.
+    """
+
+    import render_resample
+    import truecolor
+
+    if type(state) is not truecolor.TrueColorPhysicalState:
+        raise TypeError("M2 renderer requires an exact TrueColorPhysicalState")
+
+    day_sources = (
+        state.day_rgb_reflectance,
+        state.red_corrected,
+        state.glint_deg,
+        *((state.veggie_corrected,) if state.veggie_corrected is not None else ()),
+    )
+    day_field_names = [
+        "day_rgb_reflectance",
+        "red_corrected",
+        "glint_deg",
+        *(["veggie_corrected"] if state.veggie_corrected is not None else []),
+    ]
+    day_fields, day_coverage = render_resample.resample_fields_shared_coverage(
+        day_sources, state.day_coverage, plan
+    )
+    day_rgb, red_corrected, glint_deg, *optional_day_fields = day_fields
+    veggie_corrected = (
+        optional_day_fields[0] if optional_day_fields else None
+    )
+    if state.ir_bt_kelvin is None:
+        ir_bt = None
+        ir_coverage = None
+        source_union = state.day_coverage
+    else:
+        ir_bt, ir_coverage = render_resample.resample_field(
+            state.ir_bt_kelvin, state.ir_coverage, plan
+        )
+        source_union = np.maximum(state.day_coverage, state.ir_coverage).astype(
+            np.float32, copy=False
+        )
+
+    (cos_sza, day_weight), union_coverage = (
+        render_resample.resample_fields_shared_coverage(
+            (state.cos_sza, state.day_weight), source_union, plan
+        )
+    )
+    day_weight = np.where(
+        union_coverage > 0.0,
+        np.clip(day_weight, 0.0, 1.0),
+        np.float32(0.0),
+    ).astype(np.float32, copy=False)
+    # A constant value carried by geom_valid yields the exact filtered
+    # geometric coverage without inventing a nearest-resized boolean mask.
+    _, geom_coverage = render_resample.resample_field(
+        np.ones(plan.source_shape, dtype=np.float32), state.geom_valid, plan
+    )
+    # ``resample_field`` has already canonicalised rejected Hanning tails to
+    # exact zero using the same threshold as every modality.  Geometry is
+    # therefore derived from the effective support, not from a second and
+    # potentially divergent comparison.
+    geom_valid = geom_coverage > 0.0
+
+    # The day RGB and every day-only auxiliary were delivered in one shared
+    # coverage call above; a future field cannot silently select another mask,
+    # kernel, phase, or threshold.
+    if state.ir_bt_kelvin is not None and ir_coverage is None:
+        raise RuntimeError("M2 IR coverage was lost during delivery resampling")
+    if np.any(day_coverage[~geom_valid] != 0.0):
+        raise RuntimeError("M2 day coverage escaped delivered geometric support")
+    if ir_coverage is not None and np.any(ir_coverage[~geom_valid] != 0.0):
+        raise RuntimeError("M2 IR coverage escaped delivered geometric support")
+    if np.any(union_coverage[~geom_valid] != 0.0):
+        raise RuntimeError("M2 modality coverage escaped delivered geometry")
+
+    metadata = {
+        "source_geometry_binding": "request_regular_latlon_exact_float32_linspace_v1",
+        "primary_sensor": state.sensor,
+        "source_projection": state.projection,
+        "source_declared_extent": state.extent,
+        "source_grid_metadata": state.grid_metadata,
+        "resample_kernel": plan.kernel,
+        "resample_domain": plan.domain,
+        "physical_domain_transport": render_resample.PHYSICAL_DOMAIN_TRANSPORT,
+        "source_shape": plan.source_shape,
+        "internal_destination_shape": plan.destination_shape,
+        "delivered_shape": plan.delivered_shape,
+        "source_extent": plan.source_extent,
+        "view_extent": plan.view_extent,
+        "device_bounds": plan.device_bounds,
+        "delivered_device_bounds": plan.delivered_device_bounds,
+        "delivered_internal_bounds": plan.delivered_internal_bounds,
+        "internal_to_canvas_flip_y": plan.internal_to_canvas_flip_y,
+        "internal_to_canvas_flip_x": plan.internal_to_canvas_flip_x,
+        "affine_matrix": plan.affine_matrix,
+        "sampling_phase_yx": plan.sampling_phase_yx,
+        "coverage_threshold": render_resample.DEFAULT_COVERAGE_THRESHOLD,
+        "shared_day_fields": day_field_names,
+        "day_coverage_binding": "one_premultiplied_hanning_replay_shared_by_all_day_fields",
+        "terminator_weight_binding": (
+            "source_88_to_95_day_weight_resampled_with_modality_union_v1"
+        ),
+        "terminator_weight_policy": truecolor.M2_DAY_WEIGHT_POLICY_ID,
+    }
+    return dataclasses.replace(
+        state,
+        day_rgb_reflectance=day_rgb,
+        day_coverage=day_coverage,
+        ir_bt_kelvin=ir_bt,
+        ir_coverage=ir_coverage,
+        cos_sza=cos_sza,
+        day_weight=day_weight,
+        geom_valid=geom_valid,
+        red_corrected=red_corrected,
+        veggie_corrected=veggie_corrected,
+        glint_deg=glint_deg,
+        grid_metadata=metadata,
+    )
+
+
+def _m2_plan_axes_raster(
+    fig,
+    ax,
+    source_shape: tuple[int, int],
+    *,
+    origin: str,
+    extent,
+    transform,
+    policy: RenderPolicy,
+):
+    """Capture a real Agg plan with a disposable, value-neutral image."""
+
+    import render_resample
+
+    require_registered_policy(policy)
+    if not policy.resample_in_reflectance:
+        raise RuntimeError("M2 raster planning requires reflectance resampling")
+    if policy.resample_kernel != "hanning":
+        raise RuntimeError("M2 raster planning requires literal Hanning")
+    # A deterministic opaque tag pattern exercises the live image backend and
+    # canvas during planning. Scientific geometry is derived separately from
+    # the resolved image-to-delivered-device transform below, so a private Agg
+    # intermediate row cannot move source support across library versions.
+    probe = np.empty((*source_shape, 3), dtype=np.uint8)
+    # One-dimensional modular terms produce the same collision-resistant tag
+    # as full ``np.indices`` grids while avoiding two source-sized uint32
+    # allocations.  This matters at the bounded high-resolution M2 envelope.
+    x_mod = (np.arange(source_shape[1], dtype=np.uint32) & 0xFF).astype(
+        np.uint8, copy=False
+    )
+    y_mod = (np.arange(source_shape[0], dtype=np.uint32) & 0xFF).astype(
+        np.uint8, copy=False
+    )
+    for channel, (x_factor, y_factor, offset) in enumerate(
+        ((17, 31, 23), (47, 13, 71), (29, 61, 131))
+    ):
+        x_term = np.multiply(x_mod, np.uint8(x_factor), dtype=np.uint8)
+        y_term = np.multiply(y_mod, np.uint8(y_factor), dtype=np.uint8)
+        np.add(
+            y_term[:, None],
+            x_term[None, :],
+            out=probe[..., channel],
+        )
+        np.add(
+            probe[..., channel],
+            np.uint8(offset),
+            out=probe[..., channel],
+        )
+    image = render_resample.make_hanning_planning_image(
+        ax,
+        probe,
+        origin=origin,
+        extent=extent,
+        transform=transform,
+        zorder=1,
+    )
+    spine_visibility = {
+        name: spine.get_visible() for name, spine in ax.spines.items()
+    }
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    try:
+        # Cartopy's equal-aspect adjustment and fractional device bbox do not
+        # become authoritative until a real renderer has completed layout.
+        fig.canvas.draw()
+        top, bottom, left, right = _axes_device_pixel_bounds(fig, ax)
+        figure_height = int(round(float(fig.bbox.height)))
+        delivered_device_bounds = (
+            float(left),
+            float(figure_height - bottom),
+            float(right),
+            float(figure_height - top),
+        )
+        plan = render_resample.RasterPlan.from_axes_image_delivered(
+            image,
+            fig.canvas.get_renderer(),
+            delivered_device_bounds=delivered_device_bounds,
+        )
+    finally:
+        image.remove()
+        for name, visible in spine_visibility.items():
+            ax.spines[name].set_visible(visible)
+    expected = (bottom - top, right - left)
+    if plan.delivered_shape != expected:
+        raise RuntimeError(
+            f"captured delivered shape {plan.delivered_shape} differs from "
+            f"resolved device bounds {expected}"
+        )
+    return plan, (top, bottom, left, right)
+
+
+def _m2_place_verified(fig, ax, raster, plan, bounds):
+    """Place and independently prove a no-resample final imagery draw."""
+
+    import render_resample
+
+    artist = _place_device_raster(fig, ax, raster, bounds)
+    render_resample.verify_identity_draw(
+        artist,
+        fig.canvas.get_renderer(),
+        plan,
+    )
+    return artist
+
+
+_M2_ARCHIVE_SCALAR_CHANNELS = {
+    "GRIDSAT-B1": {"clean_ir": 1, "wv_upper": 2},
+    "GridSat-GOES": {
+        "visible_red": 1,
+        "shortwave_ir": 2,
+        "wv_upper": 3,
+        "clean_ir": 4,
+    },
+}
+_M2_VISIBLE_SOURCE_UNITS = frozenset({"1"})
+_M2_KELVIN_SOURCE_UNITS = frozenset({"K"})
+_M2_CELSIUS_SOURCE_UNITS = frozenset({"C", "celsius", "degC"})
+
+
+def _validate_m2_scalar_source(data: FetchResult, requested_channel: int) -> None:
+    """Fail closed at the bounded archive scalar/calibration boundary."""
+
+    if type(data.cmi) is not np.ndarray or data.cmi.dtype != np.dtype(np.float32):
+        raise RuntimeError("M2 scalar calibrated field must be an exact float32 ndarray")
+    if data.cmi.ndim != 2:
+        raise RuntimeError("M2 scalar calibrated field must be two-dimensional")
+    if type(data.lats) is not np.ndarray or type(data.lons) is not np.ndarray:
+        raise RuntimeError("M2 scalar coordinates must be exact plain ndarrays")
+    if data.lats.shape != data.cmi.shape or data.lons.shape != data.cmi.shape:
+        raise RuntimeError("M2 scalar field and coordinate shapes differ")
+    if type(data.product) is not str or type(data.generic_channel) is not str:
+        raise RuntimeError("M2 scalar archive identity must use exact string tags")
+    supported = _M2_ARCHIVE_SCALAR_CHANNELS.get(data.product)
+    if supported is None:
+        raise RuntimeError(
+            f"M2 scalar source family {data.product!r} is outside archive authority"
+        )
+    expected_channel = supported.get(data.generic_channel)
+    if expected_channel is None:
+        raise RuntimeError(
+            f"M2 scalar channel {data.generic_channel!r} is unsupported for "
+            f"{data.product}"
+        )
+    if data.channel != expected_channel or requested_channel != expected_channel:
+        raise RuntimeError(
+            "M2 scalar native channel is not bound to its archive family"
+        )
+    if type(data.units) is not str:
+        raise RuntimeError("M2 scalar source units must be an explicit string")
+    if data.generic_channel == "visible_red":
+        if data.units not in _M2_VISIBLE_SOURCE_UNITS:
+            raise RuntimeError("M2 scalar visible_red requires source units '1'")
+    elif data.units not in (
+        _M2_KELVIN_SOURCE_UNITS | _M2_CELSIUS_SOURCE_UNITS
+    ):
+        raise RuntimeError(
+            "M2 scalar thermal/WV requires source units K, C, celsius, or degC"
+        )
+
+
+def _m2_scalar_rgba(
+    physical_field: np.ndarray,
+    coverage: np.ndarray,
+    plan,
+    *,
+    is_visible: bool,
+    source_units: str,
+    cmap,
+    norm,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a regular scalar field before unit mapping and its palette."""
+
+    import render_resample
+
+    if (
+        type(physical_field) is not np.ndarray
+        or physical_field.dtype != np.dtype(np.float32)
+        or physical_field.ndim != 2
+    ):
+        raise RuntimeError("M2 scalar finalizer requires an exact float32 field")
+    if is_visible:
+        if source_units not in _M2_VISIBLE_SOURCE_UNITS:
+            raise RuntimeError("M2 visible scalar finalizer requires source units '1'")
+    elif source_units not in (
+        _M2_KELVIN_SOURCE_UNITS | _M2_CELSIUS_SOURCE_UNITS
+    ):
+        raise RuntimeError("M2 thermal scalar finalizer received unsupported units")
+    field = physical_field
+    # Temperature offsets are linear, but normalize to the declared kelvin
+    # domain before the spatial operation so the trace never calls Celsius a
+    # different physical quantity.
+    if not is_visible and source_units in _M2_CELSIUS_SOURCE_UNITS:
+        field = (field + np.float32(273.15)).astype(np.float32, copy=False)
+    delivered_field, delivered_coverage = render_resample.resample_field(
+        field,
+        coverage,
+        plan,
+    )
+    delivered_field = plan.delivered_values(delivered_field)
+    delivered_coverage = plan.delivered_values(delivered_coverage)
+    if not np.all(np.isfinite(delivered_coverage)) or np.any(
+        (delivered_coverage < 0.0) | (delivered_coverage > 1.0)
+    ):
+        raise RuntimeError("M2 delivered scalar coverage escaped [0, 1]")
+
+    if is_visible:
+        mapped_field = normalize_visible(delivered_field)
+    else:
+        mapped_field = delivered_field - np.float32(273.15)
+    finite = np.isfinite(mapped_field)
+    fill = float(norm.vmin if norm.vmin is not None else 0.0)
+    safe = np.where(finite, mapped_field, fill)
+    rgba = np.asarray(cmap(norm(safe)), dtype=np.float32)
+    alpha = np.where(finite, delivered_coverage, 0.0).astype(np.float32)
+    background = np.asarray(to_rgb(DARK_BG), dtype=np.float32)
+    opaque_rgb = (
+        rgba[..., :3] * alpha[..., None]
+        + background[None, None, :] * (1.0 - alpha[..., None])
+    ).astype(np.float32, copy=False)
+    if not np.all(np.isfinite(opaque_rgb)):
+        raise RuntimeError("M2 scalar palette produced a non-finite device raster")
+    return opaque_rgb, mapped_field
 
 
 def _fill_coord_nan(a: np.ndarray) -> np.ndarray:
@@ -334,11 +875,49 @@ def render_png(
     # labeled lat/lon graticule. Both default True (the standard look); the custom-
     # zoom page can switch either off for clean imagery. (The floater/meso loop
     # frames never pass them -> always on, unchanged.)
-    # True-color composites carry an H×W×3 RGB array in ``cmi`` (units="rgb")
-    # and don't go through the scalar normalize/cmap path.
-    is_rgb = data.units == "rgb"
+    # M0/M1 carry display RGB. M2 carries an explicitly tagged physical state;
+    # accepting one through the other's boundary would make the policy/cache
+    # identity lie about the numerical domain used for the delivered pixels.
+    is_m2_truecolor = data.units == "truecolor_physical"
+    is_rgb = data.units == "rgb" or is_m2_truecolor
+    if is_m2_truecolor:
+        if not policy.resample_in_reflectance:
+            raise RuntimeError("physical true color requires the registered M2 policy")
+        if data.truecolor_physical is None:
+            raise RuntimeError("physical true color is missing its typed state")
+        if data.cmi is not data.truecolor_physical.day_rgb_reflectance:
+            raise RuntimeError("physical FetchResult cmi is not bound to its typed state")
+    elif data.generic_channel == "true_color" and policy.resample_in_reflectance:
+        raise RuntimeError("registered M2 policy rejects legacy encoded true-color RGB")
     is_visible = data.units == "1"
     enh = None if is_rgb else get_enhancement(enhancement)
+
+    lon_min, lat_min, lon_max, lat_max = bbox
+    m2_truecolor_edge_extent = None
+    if is_m2_truecolor:
+        _validate_m2_truecolor_source_geometry(data, bbox)
+        m2_truecolor_edge_extent = _m2_truecolor_cell_edge_extent(data)
+    # The bounded M2 authority covers typed true colour and non-crossing
+    # regular scalar grids. Those paths retain the complete post-fetch
+    # physical grid here for the final Agg delivery reduction below. Typed
+    # true colour may already carry an explicitly traced upstream physical
+    # Hanning source cap; this renderer does not claim one total spatial
+    # operation. Curvilinear/crossing scalar paths remain the explicitly
+    # scoped legacy fallback until M5.
+    crosses = lon_max < lon_min
+    m2_scalar_axes = None
+    if policy.resample_in_reflectance and not is_rgb:
+        _validate_m2_scalar_source(data, channel)
+        if not crosses:
+            m2_scalar_axes = _m2_regular_grid_axes(data.lons, data.lats)
+        if m2_scalar_axes is None:
+            raise RuntimeError(
+                "registered M2 policy rejects curvilinear, warped, or "
+                "antimeridian-crossing scalar grids; caller must select the "
+                "registered legacy policy"
+            )
+    m2_regular_scalar = m2_scalar_axes is not None
+    preserve_m2_physical_grid = is_m2_truecolor or m2_regular_scalar
 
     # Pixel-budget stride. App-layer (compute_downsample_factor) sets this
     # based on raw bbox×channel so output_pixels ≤ the tier budget. For SCALAR
@@ -349,7 +928,7 @@ def render_png(
     cmi = data.cmi
     lats = data.lats
     lons = data.lons
-    if downsample > 1:
+    if downsample > 1 and not preserve_m2_physical_grid:
         log.info(
             "downsampled bbox by factor %d to stay within pixel budget "
             "(in shape %s -> out shape %s)",
@@ -376,8 +955,14 @@ def render_png(
     bt_min_c = bt_max_c = None  # IR/WV only -> bottom-left min/max overlay
     if not is_rgb:
         if is_visible:
-            refl = normalize_visible(cmi)
-            plot_field = np.ma.masked_invalid(refl)
+            # The M2 regular path carries raw reflectance through the spatial
+            # operation; this early field exists only for validity/extents.
+            # Legacy rendering retains its established pre-draw sqrt mapping.
+            plot_field = np.ma.masked_invalid(
+                np.asarray(cmi, dtype=np.float32)
+                if m2_regular_scalar
+                else normalize_visible(cmi)
+            )
             plot_cmap = plt.get_cmap("gray")
             plot_cnorm = Normalize(vmin=0.0, vmax=1.0)
             cbar_ticks = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -425,20 +1010,20 @@ def render_png(
             if np.isfinite(bt_c).any():
                 bt_min_c = float(np.nanmin(bt_c))
                 bt_max_c = float(np.nanmax(bt_c))
-            plot_field = np.ma.masked_invalid(bt_c)
+            plot_field = np.ma.masked_invalid(
+                bt if m2_regular_scalar else bt_c
+            )
             plot_cmap = enh["cmap"]
             plot_cnorm = enhancement_norm(enhancement)  # fresh, not shared
             cbar_ticks = list(enh["ticks"])
             cbar_ticklabels = [str(t) for t in enh["ticks"]]
             cbar_label = enh.get("cbar_label", "Brightness Temperature (°C)")
 
-    lon_min, lat_min, lon_max, lat_max = bbox
     # Antimeridian crossing (lon_max < lon_min, e < w convention): draw in a
     # PlateCarree frame re-centered on the bbox so the ±180 seam falls on the
     # far side of the planet. Data keeps transform=PlateCarree(0) — cartopy
     # wraps it into the shifted frame continuously, so a GOES-18 meso sector
     # steered over the Bering Sea renders seamlessly.
-    crosses = lon_max < lon_min
     lon_span_req = (lon_max - lon_min) % 360.0 or 360.0
 
     # ---- per-pixel validity (degenerate guards + extent crop) -------------
@@ -454,13 +1039,30 @@ def render_png(
         # cache aged out) re-renders cleanly. Threshold: >50% NaN or
         # mean-of-valid-channel-max <0.04 (~almost-pure-black even where
         # not NaN) counts as degenerate.
-        finite_mask = np.isfinite(cmi).all(axis=-1)
+        if is_m2_truecolor:
+            import truecolor
+
+            physical_state = data.truecolor_physical
+            day_support = physical_state.day_coverage > truecolor.M2_COVERAGE_EPSILON
+            if physical_state.ir_coverage is None:
+                ir_support = np.zeros(day_support.shape, dtype=bool)
+            else:
+                ir_support = (
+                    physical_state.ir_coverage > truecolor.M2_COVERAGE_EPSILON
+                )
+            finite_mask = day_support | ir_support
+        else:
+            finite_mask = np.isfinite(cmi).all(axis=-1)
         # NaN fraction counted over geometrically-valid (on-disk) pixels
         # only, when the fetch supplied the mask: a disk-limb sector's big
         # off-disk corner is geometry, not a broken fetch (mirrors the
         # scalar guard). The mask strides with the data above.
-        geom = data.geom_valid
-        if geom is not None and downsample > 1:
+        geom = (
+            data.truecolor_physical.geom_valid
+            if is_m2_truecolor
+            else data.geom_valid
+        )
+        if geom is not None and downsample > 1 and not preserve_m2_physical_grid:
             geom = geom[::downsample, ::downsample]
         if geom is not None:
             n_geom = float(geom.sum())
@@ -469,7 +1071,23 @@ def render_png(
             nan_frac = float((~finite_mask & geom).sum() / n_geom)
         else:
             nan_frac = float((~finite_mask).mean())
-        if finite_mask.any():
+        if is_m2_truecolor and finite_mask.any():
+            # Diagnostic only: distinguish a genuinely empty/black partial
+            # fetch without building or spatially sampling a legacy RGB.
+            diagnostic_max = np.zeros(finite_mask.shape, dtype=np.float32)
+            if np.any(day_support):
+                diagnostic_max[day_support] = np.nanmax(
+                    physical_state.day_rgb_reflectance[day_support], axis=-1
+                )
+            if np.any(ir_support):
+                night_gray = truecolor._clean_ir_gray(  # noqa: SLF001
+                    physical_state.ir_bt_kelvin
+                )
+                diagnostic_max[ir_support] = np.maximum(
+                    diagnostic_max[ir_support], night_gray[ir_support]
+                )
+            valid_max = float(diagnostic_max[finite_mask].mean())
+        elif finite_mask.any():
             valid_max = float(
                 np.clip(cmi[finite_mask], 0.0, 1.0).max(axis=-1).mean()
             )
@@ -517,7 +1135,11 @@ def render_png(
     # identical); the webp LOOP path always passes 110 (then transcodes to 1056).
     fig_w = 12.0
     fig_h = max(4.0, fig_w / max(aspect, 0.3))
-    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=DARK_BG)
+    # M2 captures and replays exact device-pixel geometry before savefig.  The
+    # figure must therefore be created at the requested delivery DPI; planning
+    # at Matplotlib's default DPI and changing DPI only in savefig would scale
+    # the canvas after the authoritative raster had already been placed.
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi, facecolor=DARK_BG)
 
     # Layout: title strip on top (~6%), main map fills the rest with a small
     # bottom margin for gridline labels. A labeled vertical colorbar sits in a
@@ -529,9 +1151,10 @@ def render_png(
     show_cbar = not is_rgb
     map_w = 0.84 if show_cbar else 0.92
 
-    # The map frame is the EFFECTIVE (valid-data) extent; the image keeps its
-    # own full-request extent (img_extent) so imshow pixel registration is
-    # untouched and set_extent simply crops the view.
+    # The map frame is the EFFECTIVE (valid-data) extent. Legacy imagery keeps
+    # its historical request-as-outer-edge extent. M2 true colour instead uses
+    # the validated centre-derived cell edges while this view continues to
+    # clip to the requested/effective coordinate range.
     if crosses:
         center_uw = lon_min + lon_span_req / 2.0
         center_lon = ((center_uw + 180.0) % 360.0) - 180.0
@@ -552,32 +1175,59 @@ def render_png(
     mesh = None
     # Plot with the (lats, lons) arrays we computed via inverse projection.
     if is_rgb:
-        # True-color RGB is resampled onto a REGULAR lat/lon grid (see
-        # _compose_true_color_sync), so imshow with a PlateCarree extent is
-        # exact — no curvilinear warp to honor, and it sidesteps cartopy's
-        # GeoQuadMesh.set_array(None) limitation for RGB pcolormesh. NaNs
-        # (off-disk) -> black. origin "upper" because row 0 = lat_max.
-        # ``img_extent`` in map_crs coords: the composite grid is regular over
-        # the UNWRAPPED lon range (see _compose_true_color_sync), which in the
-        # re-centered crossing frame is exactly [-span/2, +span/2] — identity
-        # transform either way, so imshow stays a fast non-warping draw.
-        rgb = np.clip(np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0)
-        _imshow_with_render_policy(
-            ax,
-            rgb,
-            policy=policy,
-            origin="upper",
-            extent=img_extent,
-            transform=map_crs,
-            zorder=1,
-        )
+        if is_m2_truecolor:
+            import truecolor
+
+            plan, device_pixel_bounds = _m2_plan_axes_raster(
+                fig,
+                ax,
+                cmi.shape[:2],
+                origin="upper",
+                extent=m2_truecolor_edge_extent,
+                transform=map_crs,
+                policy=policy,
+            )
+            delivered_state = _resample_truecolor_physical_state(
+                data.truecolor_physical, plan
+            )
+            delivery = truecolor.finalize_truecolor_m2(
+                delivered_state,
+                background_display_rgb=to_rgb(DARK_BG),
+            )
+            rgb = plan.delivered_values(delivery.rgb)
+            _m2_place_verified(
+                fig,
+                ax,
+                rgb,
+                plan,
+                device_pixel_bounds,
+            )
+        else:
+            # Legacy true-color RGB is on a regular lat/lon grid and remains
+            # available as the exact M0/M1 rollback path.
+            rgb = np.clip(
+                np.nan_to_num(cmi, nan=0.0).astype(np.float32), 0.0, 1.0
+            )
+            _imshow_with_render_policy(
+                ax,
+                rgb,
+                policy=policy,
+                origin="upper",
+                extent=img_extent,
+                transform=map_crs,
+                zorder=1,
+            )
     else:
         # Masked / non-finite geolocation (off-disk limb; early-era ABI
         # sectors) would raise inside pcolormesh -- same guard as the
         # backdrop path (one guard, both call sites).
         if crosses:
             lons = _unwrap_lons(lons, lon_min)
-        lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
+        # The strict M2 binder already proved exact plain, finite coordinates.
+        # Avoid the legacy guard's float64 coercion so a second strict bind at
+        # the planning boundary can prove the same source, not a lookalike.
+        if not m2_regular_scalar:
+            lons, lats, plot_field = _guard_mesh_coords(lons, lats, plot_field)
         # ---- REGULAR-GRID FAST PATH (Time Machine archive tiers) --------
         # GridSat-B1 / GridSat-GOES / MergIR (and GOES fetch_regular) are
         # uniform lat/lon grids that the fetchers meshgrid into 2-D coords;
@@ -593,7 +1243,22 @@ def render_png(
         # (axes central_longitude=180 vs a PlateCarree(0) image transform
         # would trigger cartopy's warp -- the same reason the true-color
         # imshow path is 422-gated for crossing).
-        axes1d = None if crosses else _regular_grid_axes(lons, lats)
+        if policy.resample_in_reflectance:
+            axes1d = None if crosses else _m2_regular_grid_axes(lons, lats)
+            if axes1d is None or m2_scalar_axes is None:
+                raise RuntimeError(
+                    "registered M2 policy lost its strict scalar-grid binding "
+                    "before raster planning"
+                )
+            if not (
+                np.array_equal(axes1d[0], m2_scalar_axes[0])
+                and np.array_equal(axes1d[1], m2_scalar_axes[1])
+            ):
+                raise RuntimeError(
+                    "registered M2 scalar-grid binding changed before raster planning"
+                )
+        else:
+            axes1d = None if crosses else _regular_grid_axes(lons, lats)
         if axes1d is not None:
             lon1, lat1 = axes1d
             dlon = (lon1[-1] - lon1[0]) / max(len(lon1) - 1, 1)
@@ -603,18 +1268,65 @@ def render_png(
                 min(lat1[0], lat1[-1]) - abs(dlat) / 2.0,
                 max(lat1[0], lat1[-1]) + abs(dlat) / 2.0,
             ]
-            mesh = _imshow_with_render_policy(
-                ax,
-                np.ma.masked_invalid(plot_field),
-                policy=policy,
-                origin="lower" if dlat > 0 else "upper",
-                extent=ext_img,
-                cmap=plot_cmap,
-                norm=plot_cnorm,
-                transform=ccrs.PlateCarree(),
-                zorder=1,
-            )
+            scalar_origin = "lower" if dlat > 0 else "upper"
+            if policy.resample_in_reflectance:
+                plan, device_pixel_bounds = _m2_plan_axes_raster(
+                    fig,
+                    ax,
+                    cmi.shape[:2],
+                    origin=scalar_origin,
+                    extent=ext_img,
+                    transform=ccrs.PlateCarree(),
+                    policy=policy,
+                )
+                source_coverage = (
+                    np.isfinite(cmi)
+                    & np.isfinite(lats)
+                    & np.isfinite(lons)
+                ).astype(np.float32)
+                rgba, delivered_scalar = _m2_scalar_rgba(
+                    cmi,
+                    source_coverage,
+                    plan,
+                    is_visible=is_visible,
+                    source_units=data.units,
+                    cmap=plot_cmap,
+                    norm=plot_cnorm,
+                )
+                _m2_place_verified(
+                    fig,
+                    ax,
+                    rgba,
+                    plan,
+                    device_pixel_bounds,
+                )
+                # Colorbar semantics are independent of the 1:1 imagery
+                # layer: it maps the same delivered scalar units/cmap without
+                # relying on a pre-colour spatial artist.
+                mesh = matplotlib.cm.ScalarMappable(
+                    norm=plot_cnorm,
+                    cmap=plot_cmap,
+                )
+                mesh.set_array(delivered_scalar[np.isfinite(delivered_scalar)])
+            else:
+                mesh = _imshow_with_render_policy(
+                    ax,
+                    np.ma.masked_invalid(plot_field),
+                    policy=policy,
+                    origin=scalar_origin,
+                    extent=ext_img,
+                    cmap=plot_cmap,
+                    norm=plot_cnorm,
+                    transform=ccrs.PlateCarree(),
+                    zorder=1,
+                )
         else:
+            if policy.resample_in_reflectance:
+                raise RuntimeError(
+                    "registered M2 policy rejects curvilinear or "
+                    "antimeridian-crossing scalar fallback; caller must "
+                    "select the registered legacy policy"
+                )
             mesh = ax.pcolormesh(
                 lons,
                 lats,
@@ -891,6 +1603,95 @@ def _regular_grid_axes(lons, lats):
     if (dlon.max() - dlon.min()) > tol or (np.abs(dlat).max() - np.abs(dlat).min()) > tol:
         return None
     return lon1, lat1
+
+
+def _float32_axes_equal_within_ulps(
+    actual: np.ndarray,
+    expected: np.ndarray,
+    *,
+    max_ulps: int = 4,
+) -> bool:
+    """Compare a float32 archive axis with its endpoint linear fit.
+
+    Archive coordinates originate as uniform float64 netCDF vectors and are
+    cast to float32 only after cropping/mesh construction.  Comparing each
+    value against *its local* ULP is invalid near zero and rejects genuine
+    grids after thousands of accumulated steps.  Bound the residual by four
+    float32 ULPs at the largest coordinate magnitude plus a tiny step-relative
+    term.  This admits only representational quantisation (tens of microdegrees
+    at global longitude), remaining orders of magnitude below the gradual
+    0.125-degree warp mutant.
+    """
+
+    if (
+        actual.dtype != np.dtype(np.float32)
+        or expected.dtype != np.dtype(np.float32)
+        or actual.shape != expected.shape
+        or max_ulps < 0
+    ):
+        return False
+    expected64 = expected.astype(np.float64)
+    scale_value = np.float32(
+        max(float(np.max(np.abs(expected64))), np.finfo(np.float32).tiny)
+    )
+    scale_ulp = float(
+        np.nextafter(scale_value, np.float32(np.inf), dtype=np.float32)
+        - scale_value
+    )
+    nominal_step = abs(
+        float(expected64[-1] - expected64[0]) / (expected64.size - 1)
+    )
+    tolerance = max(
+        float(max_ulps) * scale_ulp,
+        nominal_step * 4.0 * float(np.finfo(np.float32).eps),
+    )
+    difference = np.abs(actual.astype(np.float64) - expected64)
+    return bool(np.all(difference <= tolerance))
+
+
+def _m2_regular_grid_axes(lons, lats):
+    """Strict M2 binder for the two registered archive scalar families.
+
+    Unlike the legacy speed-path detector, this accepts only exact plain
+    float32 meshgrid arrays whose complete axes agree with their endpoint
+    ``linspace`` within the bounded archive-quantisation tolerance above.  A
+    gradually warped axis can have
+    almost-uniform local steps and still move physical pixel centres; it must
+    never acquire M2 authority.
+    """
+
+    if type(lons) is not np.ndarray or type(lats) is not np.ndarray:
+        return None
+    if lons.dtype != np.dtype(np.float32) or lats.dtype != np.dtype(np.float32):
+        return None
+    if lons.ndim != 2 or lats.ndim != 2:
+        return None
+    if lons.shape != lats.shape or min(lons.shape) < 2:
+        return None
+    if not np.all(np.isfinite(lons)) or not np.all(np.isfinite(lats)):
+        return None
+    lon_axis = lons[0, :]
+    lat_axis = lats[:, 0]
+    if not np.array_equal(lons, np.broadcast_to(lon_axis, lons.shape)):
+        return None
+    if not np.array_equal(lats, np.broadcast_to(lat_axis[:, None], lats.shape)):
+        return None
+    if not np.all(np.diff(lon_axis.astype(np.float64)) > 0.0):
+        return None
+    lat_steps = np.diff(lat_axis.astype(np.float64))
+    if not (np.all(lat_steps > 0.0) or np.all(lat_steps < 0.0)):
+        return None
+    expected_lon = np.linspace(
+        lon_axis[0], lon_axis[-1], lon_axis.size, dtype=np.float32
+    )
+    expected_lat = np.linspace(
+        lat_axis[0], lat_axis[-1], lat_axis.size, dtype=np.float32
+    )
+    if not _float32_axes_equal_within_ulps(lon_axis, expected_lon):
+        return None
+    if not _float32_axes_equal_within_ulps(lat_axis, expected_lat):
+        return None
+    return lon_axis.copy(), lat_axis.copy()
 
 
 def _guard_mesh_coords(lons, lats, plot_field):

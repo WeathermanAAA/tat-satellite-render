@@ -23,10 +23,9 @@ def test_m0_policy_is_an_exact_legacy_behavior_declaration():
     assert policy.quantizer == "production_floor"
 
 
-def test_m1_is_the_default_and_changes_only_the_explicit_kernel():
-    policy = rp.resolve_render_policy()
+def test_m1_changes_only_the_explicit_kernel():
+    policy = rp.resolve_render_policy(rp.M1_POLICY.algo_version)
     assert policy is rp.M1_POLICY
-    assert rp.ALGO_VERSION == "tat-truecolor-m1-hanning-v1"
     assert policy.stage == "M1"
     assert policy.resample_kernel == "hanning"
 

@@ -223,6 +223,7 @@ class GridSatB1Satellite(Satellite):
             sat_name="GridSat-B1",
             sub_sat_lon=0.0,
             units="K",
+            source_s3_key=resolved.s3_key,
         )
 
 

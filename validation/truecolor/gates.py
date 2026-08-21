@@ -13,10 +13,11 @@ import hashlib
 import inspect
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Final, Iterable, Mapping, Sequence
@@ -65,6 +66,7 @@ RAYLEIGH_STARTUP_SENSORS = (
     ("GEO-KOMPSAT-2A", "ami"),
     ("Meteosat-12", "fci"),
 )
+RAYLEIGH_DATA_INVENTORY_SCHEMA = "tat_truecolor_rayleigh_data_inventory/v1"
 
 
 class ResearchIntegrityError(RuntimeError):
@@ -85,6 +87,13 @@ class RayleighSensorEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class RayleighDataFileEvidence:
+    relative_path: str
+    bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class RayleighStartupEvidence:
     data_directory: str
     config_file: str
@@ -93,17 +102,63 @@ class RayleighStartupEvidence:
     configured_rayleigh_directory: str
     writable_probe_passed: bool
     sensors: tuple[RayleighSensorEvidence, ...]
+    data_inventory_schema: str
+    data_inventory_file_count: int
+    data_inventory_total_bytes: int
+    data_inventory_file_set_sha256: str
+    data_inventory_sha256: str
+    data_inventory_files: tuple[RayleighDataFileEvidence, ...]
+    factory_binding: str
+    production_cache_session_started_empty: bool | None
+    production_cache_exact_expected_keys: bool | None
+    production_cache_returned_identities_match: bool | None
+    _production_cache_object_ids: tuple[int, ...] = field(repr=False)
 
     @property
     def passed(self) -> bool:
+        try:
+            (
+                file_count,
+                total_bytes,
+                file_set_sha256,
+                inventory_sha256,
+            ) = _rayleigh_inventory_identities(self.data_inventory_files)
+        except (TypeError, ValueError):
+            return False
+        cache_binding_valid = (
+            (
+                self.factory_binding == "production_fresh_cache_session"
+                and self.production_cache_session_started_empty is True
+                and self.production_cache_exact_expected_keys is True
+                and self.production_cache_returned_identities_match is True
+                and len(self._production_cache_object_ids)
+                == len(RAYLEIGH_STARTUP_SENSORS)
+                and len(set(self._production_cache_object_ids))
+                == len(RAYLEIGH_STARTUP_SENSORS)
+            )
+            or (
+                self.factory_binding == "caller_supplied_factory"
+                and self.production_cache_session_started_empty is None
+                and self.production_cache_exact_expected_keys is None
+                and self.production_cache_returned_identities_match is None
+                and self._production_cache_object_ids == ()
+            )
+        )
         return (
             self.writable_probe_passed
             and len(self.sensors) == len(RAYLEIGH_STARTUP_SENSORS)
             and all(item.status == "valid_corrector" for item in self.sensors)
+            and self.data_inventory_schema == RAYLEIGH_DATA_INVENTORY_SCHEMA
+            and self.data_inventory_file_count == file_count
+            and self.data_inventory_total_bytes == total_bytes
+            and self.data_inventory_file_set_sha256 == file_set_sha256
+            and self.data_inventory_sha256 == inventory_sha256
+            and cache_binding_valid
         )
 
     def as_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        result.pop("_production_cache_object_ids")
         result["passed"] = self.passed
         return result
 
@@ -199,6 +254,283 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _inventory_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _valid_inventory_relative_path(value: Any) -> bool:
+    if type(value) is not str or not value or value.startswith("/"):
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    parts = value.split("/")
+    return all(part not in ("", ".", "..") and "\\" not in part for part in parts)
+
+
+def _rayleigh_inventory_identities(
+    files: tuple[RayleighDataFileEvidence, ...],
+) -> tuple[int, int, str, str]:
+    if type(files) is not tuple:
+        raise TypeError("Rayleigh data inventory must be an immutable tuple")
+    rows: list[dict[str, Any]] = []
+    prior_path: str | None = None
+    for item in files:
+        if (
+            type(item) is not RayleighDataFileEvidence
+            or not _valid_inventory_relative_path(item.relative_path)
+            or type(item.bytes) is not int
+            or item.bytes < 0
+            or type(item.sha256) is not str
+            or len(item.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in item.sha256)
+            or (prior_path is not None and item.relative_path <= prior_path)
+        ):
+            raise ValueError("Rayleigh data inventory record is invalid or unsorted")
+        prior_path = item.relative_path
+        rows.append(asdict(item))
+    relative_paths = [row["relative_path"] for row in rows]
+    file_set_sha256 = hashlib.sha256(
+        _inventory_json_bytes(
+            {
+                "schema": RAYLEIGH_DATA_INVENTORY_SCHEMA,
+                "relative_paths": relative_paths,
+            }
+        )
+    ).hexdigest()
+    total_bytes = sum(row["bytes"] for row in rows)
+    inventory_sha256 = hashlib.sha256(
+        _inventory_json_bytes(
+            {
+                "schema": RAYLEIGH_DATA_INVENTORY_SCHEMA,
+                "file_count": len(rows),
+                "total_bytes": total_bytes,
+                "file_set_sha256": file_set_sha256,
+                "files": rows,
+            }
+        )
+    ).hexdigest()
+    return len(rows), total_bytes, file_set_sha256, inventory_sha256
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _hash_open_regular_file(
+    parent_descriptor: int,
+    name: str,
+    listed_stat: os.stat_result,
+    *,
+    relative_path: str,
+) -> RayleighDataFileEvidence:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(opened_stat) != _stat_identity(listed_stat)
+        ):
+            raise RayleighEnvironmentError(
+                f"pyspectral data file changed during inventory: {relative_path}"
+            )
+        digest = hashlib.sha256()
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            byte_count += len(chunk)
+        final_stat = os.fstat(descriptor)
+        if (
+            _stat_identity(final_stat) != _stat_identity(opened_stat)
+            or byte_count != opened_stat.st_size
+        ):
+            raise RayleighEnvironmentError(
+                f"pyspectral data file changed while hashing: {relative_path}"
+            )
+        return RayleighDataFileEvidence(
+            relative_path=relative_path,
+            bytes=byte_count,
+            sha256=digest.hexdigest(),
+        )
+    except OSError as exc:
+        raise RayleighEnvironmentError(
+            f"cannot safely hash pyspectral data file {relative_path}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _inventory_rayleigh_data_root(
+    directory: Path,
+) -> tuple[
+    tuple[RayleighDataFileEvidence, ...],
+    int,
+    int,
+    str,
+    str,
+]:
+    """Hash every regular file without following a symlink or special entry."""
+
+    entries: list[RayleighDataFileEvidence] = []
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+    def visit(descriptor: int, prefix: str) -> None:
+        before = os.fstat(descriptor)
+        try:
+            with os.scandir(descriptor) as iterator:
+                listed = [
+                    (item.name, item.stat(follow_symlinks=False))
+                    for item in iterator
+                ]
+        except OSError as exc:
+            raise RayleighEnvironmentError(
+                f"cannot enumerate pyspectral data directory {prefix or '.'}: {exc}"
+            ) from exc
+        for name, _item_stat in listed:
+            relative_path = f"{prefix}/{name}" if prefix else name
+            if not _valid_inventory_relative_path(relative_path):
+                raise RayleighEnvironmentError(
+                    f"unsafe pyspectral data path in inventory: {relative_path!r}"
+                )
+        for name, item_stat in sorted(
+            listed, key=lambda row: row[0].encode("utf-8", errors="strict")
+        ):
+            relative_path = f"{prefix}/{name}" if prefix else name
+            if stat.S_ISLNK(item_stat.st_mode):
+                raise RayleighEnvironmentError(
+                    f"pyspectral data inventory rejects symlink: {relative_path}"
+                )
+            if stat.S_ISDIR(item_stat.st_mode):
+                child_descriptor = -1
+                try:
+                    child_descriptor = os.open(
+                        name, directory_flags, dir_fd=descriptor
+                    )
+                    if _stat_identity(os.fstat(child_descriptor)) != _stat_identity(
+                        item_stat
+                    ):
+                        raise RayleighEnvironmentError(
+                            "pyspectral data directory changed during inventory: "
+                            f"{relative_path}"
+                        )
+                    visit(child_descriptor, relative_path)
+                except OSError as exc:
+                    raise RayleighEnvironmentError(
+                        "cannot safely traverse pyspectral data directory "
+                        f"{relative_path}: {exc}"
+                    ) from exc
+                finally:
+                    if child_descriptor >= 0:
+                        os.close(child_descriptor)
+            elif stat.S_ISREG(item_stat.st_mode):
+                entries.append(
+                    _hash_open_regular_file(
+                        descriptor,
+                        name,
+                        item_stat,
+                        relative_path=relative_path,
+                    )
+                )
+            else:
+                raise RayleighEnvironmentError(
+                    "pyspectral data inventory rejects non-regular entry: "
+                    f"{relative_path}"
+                )
+            try:
+                current_stat = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except OSError as exc:
+                raise RayleighEnvironmentError(
+                    f"pyspectral data path changed during inventory: {relative_path}"
+                ) from exc
+            if _stat_identity(current_stat) != _stat_identity(item_stat):
+                raise RayleighEnvironmentError(
+                    f"pyspectral data path changed during inventory: {relative_path}"
+                )
+        try:
+            with os.scandir(descriptor) as iterator:
+                after = sorted(
+                    (
+                        item.name,
+                        _stat_identity(item.stat(follow_symlinks=False)),
+                    )
+                    for item in iterator
+                )
+        except OSError as exc:
+            raise RayleighEnvironmentError(
+                f"cannot recheck pyspectral data directory {prefix or '.'}: {exc}"
+            ) from exc
+        expected = sorted((name, _stat_identity(value)) for name, value in listed)
+        if (
+            after != expected
+            or _stat_identity(os.fstat(descriptor)) != _stat_identity(before)
+        ):
+            raise RayleighEnvironmentError(
+                f"pyspectral data directory changed during inventory: {prefix or '.'}"
+            )
+
+    root_descriptor = -1
+    try:
+        root_descriptor = os.open(directory, directory_flags)
+        visit(root_descriptor, "")
+    except OSError as exc:
+        raise RayleighEnvironmentError(
+            f"cannot safely open pyspectral data directory {directory}: {exc}"
+        ) from exc
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+    files = tuple(sorted(entries, key=lambda item: item.relative_path))
+    file_count, total_bytes, file_set_sha256, inventory_sha256 = (
+        _rayleigh_inventory_identities(files)
+    )
+    return files, file_count, total_bytes, file_set_sha256, inventory_sha256
+
+
+def _reject_symlinked_declared_path(
+    value: str | os.PathLike[str] | Path,
+    *,
+    label: str,
+) -> None:
+    candidate = Path(os.path.abspath(Path(value).expanduser()))
+    for component in (candidate, *candidate.parents):
+        if component.is_symlink():
+            raise RayleighEnvironmentError(
+                f"{label} must not use a symlinked path component: {component}"
+            )
+
+
 def _require_external_existing_path(
     value: str | os.PathLike[str] | Path,
     *,
@@ -259,9 +591,24 @@ def run_rayleigh_startup_check(
     *,
     config_file: str | os.PathLike[str] | Path | None = None,
     make_corrector: Callable[[str, str], object | None] | None = None,
+    expected_production_evidence: RayleighStartupEvidence | None = None,
 ) -> RayleighStartupEvidence:
-    """Call the production factory for all eight required sensor/platform pairs."""
+    """Call and bind all eight required Rayleigh correctors.
 
+    A production check starts only from an empty process-local corrector cache.
+    A later pre-publication recheck must pass the evidence returned by that
+    fresh check; it then proves that the exact same eight cached objects remain
+    installed.  A warm cache without that in-process trust chain is rejected.
+    """
+
+    if make_corrector is not None and expected_production_evidence is not None:
+        raise RayleighEnvironmentError(
+            "expected production evidence cannot bind a caller-supplied factory"
+        )
+
+    _reject_symlinked_declared_path(
+        data_directory, label="pyspectral data directory"
+    )
     data_path = _require_external_existing_path(
         data_directory, label="pyspectral data directory", directory=True
     )
@@ -297,6 +644,7 @@ def run_rayleigh_startup_check(
             raise RayleighEnvironmentError(
                 f"pyspectral config lacks a non-empty {key}: {config_path}"
             )
+        _reject_symlinked_declared_path(raw_value, label=f"pyspectral {key}")
         configured_directories[key] = Path(raw_value).expanduser().resolve(
             strict=False
         )
@@ -306,7 +654,17 @@ def run_rayleigh_startup_check(
                 f"not declared data directory {data_path}"
             )
 
-    if make_corrector is None:
+    _prove_directory_writable(data_path)
+    pre_inventory = _inventory_rayleigh_data_root(data_path)
+    if pre_inventory[1] == 0:
+        raise RayleighEnvironmentError(
+            "pyspectral data inventory must contain at least one regular file"
+        )
+
+    production_factory = make_corrector is None
+    truecolor = None
+    cached_correctors: dict[tuple[str, str], object] = {}
+    if production_factory:
         environment_config = os.environ.get("PSP_CONFIG_FILE")
         if not environment_config:
             raise RayleighEnvironmentError(
@@ -319,10 +677,36 @@ def run_rayleigh_startup_check(
                 f"not validated config {config_path}"
             )
         truecolor = production_adapter.production_modules()["truecolor"]
+        cache = truecolor._RAYLEIGH_CACHE
+        if type(cache) is not dict:
+            raise RayleighEnvironmentError(
+                "production Rayleigh cache is not the exact registered dict"
+            )
+        expected_keys = set(RAYLEIGH_STARTUP_SENSORS)
+        if expected_production_evidence is None:
+            if cache:
+                raise RayleighEnvironmentError(
+                    "production Rayleigh cache must be empty at the start of "
+                    "the canonical startup session"
+                )
+        else:
+            if not expected_production_evidence.passed or (
+                expected_production_evidence.factory_binding
+                != "production_fresh_cache_session"
+            ):
+                raise RayleighEnvironmentError(
+                    "pre-publication Rayleigh recheck requires passing evidence "
+                    "from a fresh production-cache startup session"
+                )
+            if set(cache) != expected_keys:
+                raise RayleighEnvironmentError(
+                    "production Rayleigh cache keys changed after startup"
+                )
+            cached_correctors = dict(cache)
         make_corrector = truecolor._make_rayleigh
 
-    _prove_directory_writable(data_path)
     sensor_evidence: list[RayleighSensorEvidence] = []
+    returned_correctors: dict[tuple[str, str], object] = {}
     for platform_name, sensor in RAYLEIGH_STARTUP_SENSORS:
         try:
             corrector = make_corrector(platform_name, sensor)
@@ -348,6 +732,7 @@ def run_rayleigh_startup_check(
                 )
             )
             continue
+        returned_correctors[(platform_name, sensor)] = corrector
         corrector_type = type(corrector)
         sensor_evidence.append(
             RayleighSensorEvidence(
@@ -360,7 +745,42 @@ def run_rayleigh_startup_check(
             )
         )
 
-    return RayleighStartupEvidence(
+    if production_factory:
+        assert truecolor is not None
+        cache = truecolor._RAYLEIGH_CACHE
+        expected_keys = set(RAYLEIGH_STARTUP_SENSORS)
+        if set(cache) != expected_keys:
+            raise RayleighEnvironmentError(
+                "production Rayleigh factory did not populate exactly the eight "
+                "registered cache keys"
+            )
+        if set(returned_correctors) != expected_keys or any(
+            returned_correctors[key] is not cache[key] for key in expected_keys
+        ):
+            raise RayleighEnvironmentError(
+                "production Rayleigh factory returns do not match cached objects"
+            )
+        if cached_correctors and any(
+            cache[key] is not cached_correctors[key] for key in expected_keys
+        ):
+            raise RayleighEnvironmentError(
+                "production Rayleigh cached object identity changed after startup"
+            )
+
+    post_inventory = _inventory_rayleigh_data_root(data_path)
+    if post_inventory != pre_inventory:
+        raise RayleighEnvironmentError(
+            "pyspectral data inventory changed while constructing Rayleigh "
+            "correctors"
+        )
+    (
+        inventory_files,
+        inventory_file_count,
+        inventory_total_bytes,
+        inventory_file_set_sha256,
+        inventory_sha256,
+    ) = pre_inventory
+    evidence = RayleighStartupEvidence(
         data_directory=str(data_path),
         config_file=str(config_path),
         config_sha256=_sha256(config_path),
@@ -368,7 +788,36 @@ def run_rayleigh_startup_check(
         configured_rayleigh_directory=str(configured_directories["rayleigh_dir"]),
         writable_probe_passed=True,
         sensors=tuple(sensor_evidence),
+        data_inventory_schema=RAYLEIGH_DATA_INVENTORY_SCHEMA,
+        data_inventory_file_count=inventory_file_count,
+        data_inventory_total_bytes=inventory_total_bytes,
+        data_inventory_file_set_sha256=inventory_file_set_sha256,
+        data_inventory_sha256=inventory_sha256,
+        data_inventory_files=inventory_files,
+        factory_binding=(
+            "production_fresh_cache_session"
+            if production_factory
+            else "caller_supplied_factory"
+        ),
+        production_cache_session_started_empty=(True if production_factory else None),
+        production_cache_exact_expected_keys=(True if production_factory else None),
+        production_cache_returned_identities_match=(
+            True if production_factory else None
+        ),
+        _production_cache_object_ids=(
+            tuple(
+                id(returned_correctors[key])
+                for key in RAYLEIGH_STARTUP_SENSORS
+            )
+            if production_factory
+            else ()
+        ),
     )
+    if expected_production_evidence is not None and evidence != expected_production_evidence:
+        raise RayleighEnvironmentError(
+            "production Rayleigh startup evidence changed before publication"
+        )
+    return evidence
 
 
 def _fixture_projection_from_json(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -677,10 +1126,37 @@ def _check_v08() -> _Check:
     )
 
 
+def delivery_encoding_path_issues(
+    paths: Sequence[production_adapter.DeliveryEncodingPath],
+    *,
+    required_stages: Sequence[str] = tuple(
+        production_adapter.TRUECOLOR_DELIVERY_ENTRYPOINTS
+    ),
+) -> tuple[str, ...]:
+    """Require one registered transfer on every successful delivery path."""
+
+    issues: list[str] = []
+    stages = {path.stage for path in paths}
+    for stage in required_stages:
+        if stage not in stages:
+            issues.append(f"missing delivery-path evidence for {stage}")
+    for index, path in enumerate(paths):
+        if len(path.transfer_calls) != 1:
+            issues.append(
+                f"{path.stage} path {index} has {len(path.transfer_calls)} "
+                "display-transfer applications"
+            )
+        for proxy in path.unresolved_transfer_proxies:
+            issues.append(f"{path.stage} path {index} has {proxy}")
+    return tuple(issues)
+
+
 def _check_v10(
     port_results: Sequence[production_adapter.PortFidelityResult],
 ) -> _Check:
     order = production_adapter.assemble_call_order()
+    delivery_paths = production_adapter.delivery_encoding_paths()
+    delivery_path_issues = delivery_encoding_path_issues(delivery_paths)
     source_findings: list[str] = []
     for name in ("app.py", "render.py", "satellites.py", "truecolor.py"):
         text = (production_adapter.REPO_ROOT / name).read_text(encoding="utf-8").casefold()
@@ -715,15 +1191,17 @@ def _check_v10(
         for result in port_results
     )
     passed = (
-        order.count("cira_stretch") == 1
+        not delivery_path_issues
         and not source_findings
         and emitted_png_passes
     )
     return _Check(
         passed,
-        "production call order plus emitted-PNG transfer metadata and quantization mutant",
+        "path-specific legacy/M2 transfer proof plus emitted-PNG metadata and quantization mutant",
         {
             "assemble_call_order": list(order),
+            "delivery_encoding_paths": [path.as_dict() for path in delivery_paths],
+            "delivery_encoding_path_issues": list(delivery_path_issues),
             "icc_source_findings": source_findings,
             "emitted_png": png_evidence,
         },

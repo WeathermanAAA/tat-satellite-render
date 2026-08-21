@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Mapping
+from typing import Final, Mapping, Sequence
 from unittest import mock
 
 import numpy as np
@@ -146,22 +146,593 @@ def imshow_calls(policy_version: str | None = None) -> tuple[ImshowCall, ...]:
 
 
 def assemble_call_order() -> tuple[str, ...]:
-    """Pointwise/spatial call order in the real ``assemble_truecolor`` body."""
+    """Pointwise/spatial call order on the legacy assembly path.
 
-    tc = production_modules()["truecolor"]
-    source = inspect.getsource(tc.assemble_truecolor)
-    tree = ast.parse(source)
-    wanted = {"self_sharpen", "cira_stretch", "glint_tame", "night_blend"}
-    found: list[tuple[int, int, str]] = []
-    for node in ast.walk(tree):
+    M2 split the physical assembler from the legacy display finalizer.  Walk
+    the module-local call graph from the public legacy entry point instead of
+    assuming all operations remain textually inside ``assemble_truecolor``.
+    """
+
+    source = (REPO_ROOT / "truecolor.py").read_text(encoding="utf-8")
+    analyzer = _TransferPathAnalyzer(source)
+    return analyzer.ordered_calls(
+        "assemble_truecolor",
+        frozenset({"self_sharpen", "cira_stretch", "glint_tame", "night_blend"}),
+    )
+
+
+@dataclass(frozen=True)
+class DeliveryEncodingPath:
+    """One successful static return path from a production delivery entry."""
+
+    stage: str
+    entrypoint: str
+    branch_trace: tuple[str, ...]
+    transfer_calls: tuple[str, ...]
+    unresolved_transfer_proxies: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+TRUECOLOR_DELIVERY_ENTRYPOINTS: Final[Mapping[str, str]] = MappingProxyType({
+    "legacy_assemble": "assemble_truecolor",
+    "m2_finalize": "finalize_truecolor_m2",
+})
+
+
+@dataclass(frozen=True)
+class _TransferEffect:
+    transfer_calls: tuple[str, ...]
+    unresolved_transfer_proxies: tuple[str, ...]
+    branch_trace: tuple[str, ...]
+
+    def merged(self, other: "_TransferEffect") -> "_TransferEffect":
+        return _TransferEffect(
+            self.transfer_calls + other.transfer_calls,
+            self.unresolved_transfer_proxies + other.unresolved_transfer_proxies,
+            self.branch_trace + other.branch_trace,
+        )
+
+
+@dataclass(frozen=True)
+class _TransferFlow:
+    effect: _TransferEffect
+    status: str = "active"
+
+
+class _TransferPathAnalyzer:
+    """Small path-sensitive call-graph proof for display-transfer calls.
+
+    ``cira_stretch`` is treated as the registered transfer primitive and is
+    not expanded into its logarithm implementation.  Direct aliases,
+    ``getattr``/``globals`` aliases, and module-local wrapper functions are
+    resolved.  Transfer-looking dynamic calls fail closed rather than being
+    silently ignored.
+    """
+
+    _TRANSFER = "cira_stretch"
+    _SUSPICIOUS_CALL_NAMES = frozenset({
+        "apply_gamma",
+        "display_encode",
+        "encode",
+        "encode_srgb",
+        "encoder",
+        "gamma",
+        "gamma_encode",
+        "srgb_encode",
+        "transfer",
+        "transfer_encode",
+        "transfer_function",
+    })
+
+    def __init__(self, source: str) -> None:
+        self._tree = ast.parse(source)
+        self._functions = {
+            node.name: node
+            for node in self._tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self._global_aliases = {name: name for name in self._functions}
+        self._global_aliases[self._TRANSFER] = self._TRANSFER
+        self._collect_assignments(
+            tuple(
+                node
+                for node in self._tree.body
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+            ),
+            self._global_aliases,
+        )
+        self._aliases = {
+            name: self._aliases_for(function)
+            for name, function in self._functions.items()
+        }
+        self._calls = {
+            name: self._scoped_calls(function)
+            for name, function in self._functions.items()
+        }
+        self._edges: dict[str, set[str]] = {}
+        self._direct_transfer: dict[str, bool] = {}
+        self._direct_suspicious: dict[str, bool] = {}
+        self._build_reachability()
+        self._effect_cache: dict[str, tuple[_TransferEffect, ...]] = {}
+
+    @staticmethod
+    def _attribute_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def _resolve_reference(
+        self, node: ast.AST, aliases: Mapping[str, str]
+    ) -> str | None:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            if node.attr == self._TRANSFER:
+                return self._TRANSFER
+            return aliases.get(node.attr, node.attr)
+        if isinstance(node, ast.Subscript):
+            key = node.slice
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                return aliases.get(key.value, key.value)
         if isinstance(node, ast.Call):
-            fn = node.func
-            name = fn.id if isinstance(fn, ast.Name) else (
-                fn.attr if isinstance(fn, ast.Attribute) else None
+            called = self._attribute_name(node.func)
+            if called == "getattr" and len(node.args) >= 2:
+                attribute = node.args[1]
+                if isinstance(attribute, ast.Constant) and isinstance(
+                    attribute.value, str
+                ):
+                    return aliases.get(attribute.value, attribute.value)
+            if called == "partial" and node.args:
+                return self._resolve_reference(node.args[0], aliases)
+        return None
+
+    def _collect_assignments(
+        self, assignments: Sequence[ast.Assign | ast.AnnAssign], aliases: dict[str, str]
+    ) -> None:
+        # A short fixed point resolves alias chains regardless of declaration
+        # order while deliberately ignoring ordinary call results.
+        for _ in range(len(assignments) + 1):
+            changed = False
+            for assignment in assignments:
+                value = assignment.value
+                if value is None:
+                    continue
+                resolved = self._resolve_reference(value, aliases)
+                if resolved is None:
+                    continue
+                targets = (
+                    assignment.targets
+                    if isinstance(assignment, ast.Assign)
+                    else [assignment.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name) and aliases.get(target.id) != resolved:
+                        aliases[target.id] = resolved
+                        changed = True
+            if not changed:
+                break
+
+    @staticmethod
+    def _scope_nodes(nodes: Sequence[ast.AST]) -> tuple[ast.AST, ...]:
+        found: list[ast.AST] = []
+        pending = list(nodes)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            found.append(node)
+            pending.extend(ast.iter_child_nodes(node))
+        return tuple(found)
+
+    def _aliases_for(
+        self, function: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> dict[str, str]:
+        aliases = dict(self._global_aliases)
+        assignments = tuple(
+            node
+            for node in self._scope_nodes(function.body)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+        )
+        self._collect_assignments(assignments, aliases)
+        return aliases
+
+    def _scoped_calls(
+        self, function: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> tuple[ast.Call, ...]:
+        return tuple(sorted(
+            (
+                node
+                for node in self._scope_nodes(function.body)
+                if isinstance(node, ast.Call)
+            ),
+            key=lambda node: (node.lineno, node.col_offset),
+        ))
+
+    def _looks_suspicious(self, target: str) -> bool:
+        lowered = target.casefold()
+        return lowered in self._SUSPICIOUS_CALL_NAMES or (
+            "gamma" in lowered
+            or "srgb" in lowered
+            or "transfer" in lowered
+            or lowered.endswith("_encode")
+            or lowered.endswith("_encoder")
+            or lowered.endswith("_gamma")
+            or lowered.endswith("_gamma_encode")
+            or lowered.endswith("_transfer_function")
+        )
+
+    def _build_reachability(self) -> None:
+        for name in self._functions:
+            edges: set[str] = set()
+            direct_transfer = False
+            direct_suspicious = False
+            for call in self._calls[name]:
+                target = self._resolve_reference(call.func, self._aliases[name])
+                if target == self._TRANSFER:
+                    direct_transfer = True
+                elif target in self._functions:
+                    edges.add(target)
+                    direct_suspicious |= self._looks_suspicious(target)
+                elif target is not None and self._looks_suspicious(target):
+                    direct_suspicious = True
+            self._edges[name] = edges
+            self._direct_transfer[name] = direct_transfer
+            self._direct_suspicious[name] = direct_suspicious
+
+        self._reaches_transfer = {
+            name: self._direct_transfer[name] or self._direct_suspicious[name]
+            for name in self._functions
+        }
+        changed = True
+        while changed:
+            changed = False
+            for name, edges in self._edges.items():
+                if not self._reaches_transfer[name] and any(
+                    self._reaches_transfer.get(edge, False) for edge in edges
+                ):
+                    self._reaches_transfer[name] = True
+                    changed = True
+
+    def _call_effects(
+        self,
+        target: str | None,
+        *,
+        caller: str,
+        line: int,
+        stack: tuple[str, ...],
+    ) -> tuple[_TransferEffect, ...]:
+        if target == self._TRANSFER:
+            return (_TransferEffect(
+                (f"{caller}:{line}:{self._TRANSFER}",), (), ()
+            ),)
+        if target in self._functions and self._reaches_transfer.get(target, False):
+            if target in stack:
+                return (_TransferEffect(
+                    (), (f"{caller}:{line}:recursive-transfer-proxy:{target}",), ()
+                ),)
+            effects = self._function_effects(target, stack)
+            if self._looks_suspicious(target):
+                return tuple(_TransferEffect(
+                    effect.transfer_calls,
+                    effect.unresolved_transfer_proxies
+                    + (f"{caller}:{line}:unregistered-transfer-proxy:{target}",),
+                    effect.branch_trace,
+                ) for effect in effects)
+            return effects
+        if target in self._functions and self._looks_suspicious(target):
+            return (_TransferEffect(
+                (), (f"{caller}:{line}:unregistered-transfer-proxy:{target}",), ()
+            ),)
+        if target is not None and self._looks_suspicious(target):
+            return (_TransferEffect(
+                (), (f"{caller}:{line}:unresolved:{target}",), ()
+            ),)
+        return (_TransferEffect((), (), ()),)
+
+    def _expression(
+        self,
+        expression: ast.AST | None,
+        flows: list[_TransferFlow],
+        *,
+        function_name: str,
+        stack: tuple[str, ...],
+    ) -> list[_TransferFlow]:
+        if expression is None:
+            return flows
+        if isinstance(expression, ast.Call):
+            current = flows
+            current = self._expression(
+                expression.func, current, function_name=function_name, stack=stack
             )
-            if name in wanted:
-                found.append((node.lineno, node.col_offset, name))
-    return tuple(name for _, _, name in sorted(found))
+            for argument in expression.args:
+                current = self._expression(
+                    argument, current, function_name=function_name, stack=stack
+                )
+            for keyword in expression.keywords:
+                current = self._expression(
+                    keyword.value, current, function_name=function_name, stack=stack
+                )
+            expanded: list[_TransferFlow] = []
+            for flow in current:
+                target = self._resolve_reference(
+                    expression.func, self._aliases[function_name]
+                )
+                effects = self._call_effects(
+                    target,
+                    caller=function_name,
+                    line=expression.lineno,
+                    stack=stack,
+                )
+                expanded.extend(
+                    _TransferFlow(flow.effect.merged(effect), flow.status)
+                    for effect in effects
+                )
+            return expanded
+        if isinstance(expression, ast.IfExp):
+            tested = self._expression(
+                expression.test, flows, function_name=function_name, stack=stack
+            )
+            output: list[_TransferFlow] = []
+            for truth, arm in ((True, expression.body), (False, expression.orelse)):
+                branch = _TransferEffect(
+                    (), (), (f"{function_name}:{expression.lineno}:{truth}",)
+                )
+                branched = [
+                    _TransferFlow(flow.effect.merged(branch), flow.status)
+                    for flow in tested
+                ]
+                output.extend(self._expression(
+                    arm, branched, function_name=function_name, stack=stack
+                ))
+            return output
+        if isinstance(expression, ast.BoolOp):
+            # Both short-circuit outcomes are executable.  Prefix variants
+            # model stopping after each operand without summing exclusive
+            # transfer calls into one path.
+            output: list[_TransferFlow] = []
+            current = flows
+            for index, value in enumerate(expression.values):
+                current = self._expression(
+                    value, current, function_name=function_name, stack=stack
+                )
+                output.extend(
+                    _TransferFlow(flow.effect.merged(_TransferEffect(
+                        (), (),
+                        (f"{function_name}:{expression.lineno}:bool-stop-{index}",),
+                    )), flow.status)
+                    for flow in current
+                )
+            return output
+        if isinstance(expression, ast.Lambda):
+            return flows
+        current = flows
+        for child in ast.iter_child_nodes(expression):
+            current = self._expression(
+                child, current, function_name=function_name, stack=stack
+            )
+        return current
+
+    def _statement(
+        self,
+        statement: ast.stmt,
+        flow: _TransferFlow,
+        *,
+        function_name: str,
+        stack: tuple[str, ...],
+    ) -> list[_TransferFlow]:
+        if flow.status != "active":
+            return [flow]
+        if isinstance(statement, ast.If):
+            tested = self._expression(
+                statement.test, [flow], function_name=function_name, stack=stack
+            )
+            output: list[_TransferFlow] = []
+            for truth, body in ((True, statement.body), (False, statement.orelse)):
+                branch = _TransferEffect(
+                    (), (), (f"{function_name}:{statement.lineno}:{truth}",)
+                )
+                branched = [
+                    _TransferFlow(item.effect.merged(branch), item.status)
+                    for item in tested
+                ]
+                output.extend(self._block(
+                    body, branched, function_name=function_name, stack=stack
+                ))
+            return output
+        if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+            seed = [flow]
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                seed = self._expression(
+                    statement.iter, seed, function_name=function_name, stack=stack
+                )
+            else:
+                seed = self._expression(
+                    statement.test, seed, function_name=function_name, stack=stack
+                )
+            if self._nodes_reach_transfer(statement.body, function_name):
+                marker = _TransferEffect(
+                    (),
+                    (f"{function_name}:{statement.lineno}:transfer-in-loop",),
+                    (),
+                )
+                return [
+                    _TransferFlow(item.effect.merged(marker), item.status)
+                    for item in seed
+                ]
+            return seed
+        if isinstance(statement, (ast.Return, ast.Raise)):
+            terminal_value = (
+                statement.value
+                if isinstance(statement, ast.Return)
+                else statement.exc
+            )
+            values = self._expression(
+                terminal_value,
+                [flow],
+                function_name=function_name,
+                stack=stack,
+            )
+            status = "returned" if isinstance(statement, ast.Return) else "raised"
+            return [_TransferFlow(item.effect, status) for item in values]
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            return self._expression(
+                statement.value, [flow], function_name=function_name, stack=stack
+            )
+        if isinstance(statement, ast.Expr):
+            return self._expression(
+                statement.value, [flow], function_name=function_name, stack=stack
+            )
+        if isinstance(statement, ast.Assert):
+            return self._expression(
+                statement.test, [flow], function_name=function_name, stack=stack
+            )
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            values = [flow]
+            for item in statement.items:
+                values = self._expression(
+                    item.context_expr,
+                    values,
+                    function_name=function_name,
+                    stack=stack,
+                )
+            return self._block(
+                statement.body, values, function_name=function_name, stack=stack
+            )
+        # A transfer hidden behind exception dispatch, match, or another
+        # unsupported control-flow construct is not silently blessed.
+        if self._nodes_reach_transfer((statement,), function_name):
+            marker = _TransferEffect(
+                (),
+                (f"{function_name}:{statement.lineno}:unsupported-control-flow",),
+                (),
+            )
+            return [_TransferFlow(flow.effect.merged(marker), flow.status)]
+        return [flow]
+
+    def _nodes_reach_transfer(
+        self, nodes: Sequence[ast.AST], function_name: str
+    ) -> bool:
+        aliases = self._aliases[function_name]
+        return any(
+            target == self._TRANSFER
+            or (target in self._functions and self._reaches_transfer.get(target, False))
+            or (target is not None and self._looks_suspicious(target))
+            for target in (
+                self._resolve_reference(node.func, aliases)
+                for parent in nodes
+                for node in self._scope_nodes((parent,))
+                if isinstance(node, ast.Call)
+            )
+        )
+
+    def _block(
+        self,
+        statements: Sequence[ast.stmt],
+        flows: list[_TransferFlow],
+        *,
+        function_name: str,
+        stack: tuple[str, ...],
+    ) -> list[_TransferFlow]:
+        current = flows
+        for statement in statements:
+            next_states: list[_TransferFlow] = []
+            for flow in current:
+                next_states.extend(self._statement(
+                    statement,
+                    flow,
+                    function_name=function_name,
+                    stack=stack,
+                ))
+            current = next_states
+        return current
+
+    def _function_effects(
+        self, function_name: str, stack: tuple[str, ...] = ()
+    ) -> tuple[_TransferEffect, ...]:
+        if function_name in stack:
+            return (_TransferEffect(
+                (), (f"recursive-transfer-proxy:{function_name}",), ()
+            ),)
+        if function_name in self._effect_cache:
+            return self._effect_cache[function_name]
+        if function_name not in self._functions:
+            return (_TransferEffect((), (f"missing-entrypoint:{function_name}",), ()),)
+        initial = _TransferFlow(_TransferEffect((), (), ()))
+        completed = self._block(
+            self._functions[function_name].body,
+            [initial],
+            function_name=function_name,
+            stack=stack + (function_name,),
+        )
+        effects = tuple(
+            _TransferEffect(
+                flow.effect.transfer_calls,
+                flow.effect.unresolved_transfer_proxies,
+                flow.effect.branch_trace,
+            )
+            for flow in completed
+            if flow.status != "raised"
+        )
+        if not effects:
+            effects = (_TransferEffect(
+                (), (f"no-successful-return:{function_name}",), ()
+            ),)
+        self._effect_cache[function_name] = effects
+        return effects
+
+    def paths(self, entrypoints: Mapping[str, str]) -> tuple[DeliveryEncodingPath, ...]:
+        paths: list[DeliveryEncodingPath] = []
+        for stage, entrypoint in entrypoints.items():
+            effects = self._function_effects(entrypoint)
+            for effect in effects:
+                paths.append(DeliveryEncodingPath(
+                    stage=stage,
+                    entrypoint=entrypoint,
+                    branch_trace=effect.branch_trace,
+                    transfer_calls=effect.transfer_calls,
+                    unresolved_transfer_proxies=effect.unresolved_transfer_proxies,
+                ))
+        return tuple(paths)
+
+    def ordered_calls(
+        self, entrypoint: str, wanted: frozenset[str]
+    ) -> tuple[str, ...]:
+        ordered: list[str] = []
+
+        def visit(function_name: str, stack: tuple[str, ...]) -> None:
+            if function_name not in self._functions or function_name in stack:
+                return
+            for call in self._calls[function_name]:
+                target = self._resolve_reference(
+                    call.func, self._aliases[function_name]
+                )
+                if target in wanted:
+                    ordered.append(target)
+                elif target in self._functions:
+                    visit(target, stack + (function_name,))
+
+        visit(entrypoint, ())
+        return tuple(ordered)
+
+
+def delivery_encoding_paths(
+    *,
+    source: str | None = None,
+    entrypoints: Mapping[str, str] = TRUECOLOR_DELIVERY_ENTRYPOINTS,
+) -> tuple[DeliveryEncodingPath, ...]:
+    """Prove transfer count separately on every successful delivery path.
+
+    ``source`` and ``entrypoints`` are injectable so mutation tests exercise
+    this exact parser rather than a weakened parallel fixture.
+    """
+
+    if source is None:
+        source = (REPO_ROOT / "truecolor.py").read_text(encoding="utf-8")
+    return _TransferPathAnalyzer(source).paths(entrypoints)
 
 
 def forbidden_operator_findings(paths: tuple[Path, ...] | None = None) -> tuple[str, ...]:

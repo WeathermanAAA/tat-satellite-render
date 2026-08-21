@@ -97,6 +97,13 @@ M1_POLICY = RenderPolicy(
     resample_kernel="hanning",
 )
 
+M2_POLICY = RenderPolicy(
+    stage="M2",
+    algo_version="tat-truecolor-m2-reflectance-resample-v1",
+    resample_kernel="hanning",
+    resample_in_reflectance=True,
+)
+
 
 # MappingProxyType prevents a long-running worker (or a test mutation) from
 # changing the stage registry in place.
@@ -104,9 +111,10 @@ POLICIES: Mapping[str, RenderPolicy] = MappingProxyType(
     {
         M0_POLICY.algo_version: M0_POLICY,
         M1_POLICY.algo_version: M1_POLICY,
+        M2_POLICY.algo_version: M2_POLICY,
     }
 )
-DEFAULT_POLICY_VERSION = M1_POLICY.algo_version
+DEFAULT_POLICY_VERSION = M2_POLICY.algo_version
 ALGO_VERSION = DEFAULT_POLICY_VERSION
 
 
@@ -127,7 +135,7 @@ def require_registered_policy(policy: RenderPolicy) -> RenderPolicy:
 
 
 def resolve_render_policy(name: str | None = None) -> RenderPolicy:
-    """Resolve an explicitly registered policy, defaulting to M1.
+    """Resolve an explicitly registered policy, defaulting to M2.
 
     Unknown versions fail at startup rather than silently falling back to a
     different algorithm whose cache/provenance identity would be false.

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -153,7 +154,11 @@ def _segment_seq_from_path(path: str) -> tuple[int, int]:
 
 
 def _filter_segments_for_bbox(
-    paths: list[str], bbox: tuple[float, float, float, float], band: int
+    paths: list[str],
+    bbox: tuple[float, float, float, float],
+    band: int,
+    *,
+    strict: bool = False,
 ) -> list[str]:
     """Drop segments that don't intersect the bbox's line range.
 
@@ -207,6 +212,8 @@ def _filter_segments_for_bbox(
             if np.isfinite(line):
                 lines.append(line)
     if not lines:
+        if strict:
+            raise RuntimeError("M2 AHI bbox has no projection-valid segment rows")
         # bbox doesn't project into any segment's lat band — fall back to all
         # segments (the higher-level fetch will surface a clearer error).
         return paths
@@ -221,7 +228,135 @@ def _filter_segments_for_bbox(
         if not (seg_last < line_lo or seg_first > line_hi):
             keep.append(path)
 
+    if not keep and strict:
+        raise RuntimeError("M2 AHI bbox selected no complete-scan segments")
     return keep if keep else paths
+
+
+def resolve_band_paths_sync(
+    fs: s3fs.S3FileSystem,
+    bucket: str,
+    dt_floor10,
+    band: int,
+    bbox: Optional[tuple[float, float, float, float]] = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the complete scan listing and exact bbox-selected object set."""
+
+    paths = _list_segments(fs, bucket, dt_floor10, band)
+    if not paths:
+        raise FileNotFoundError(
+            f"no AHI segments found at s3://{bucket}/AHI-L1b-FLDK/"
+            f"{dt_floor10:%Y/%m/%d/%H%M}/ for band {band}"
+        )
+    complete = tuple(paths)
+    _require_ahi_segment_layout(
+        complete, bucket, dt_floor10, band, require_complete=True
+    )
+    if bbox is None:
+        selected = complete
+    elif len(paths) > 1:
+        selected = tuple(
+            _filter_segments_for_bbox(paths, bbox, band, strict=True)
+        )
+    else:
+        selected = complete
+    _require_resolved_band_paths(
+        selected,
+        complete,
+        bucket,
+        dt_floor10,
+        band,
+        bbox,
+    )
+    return complete, selected
+
+
+def _require_ahi_segment_layout(
+    paths: tuple[str, ...],
+    bucket: str,
+    dt_floor10,
+    band: int,
+    *,
+    require_complete: bool,
+) -> tuple[tuple[int, int], ...]:
+    if type(paths) is not tuple or not paths:
+        raise RuntimeError("M2 AHI load requires a nonempty exact object tuple")
+    prefix = (
+        f"{bucket}/AHI-L1b-FLDK/"
+        f"{dt_floor10.year:04d}/{dt_floor10.month:02d}/{dt_floor10.day:02d}/"
+        f"{dt_floor10.hour:02d}{dt_floor10.minute:02d}/"
+    )
+    satellite_token = {
+        "noaa-himawari8": "H08",
+        "noaa-himawari9": "H09",
+    }.get(bucket)
+    if satellite_token is None:
+        raise RuntimeError("M2 AHI source bucket is not registered")
+    basename_pattern = re.compile(
+        rf"^HS_{satellite_token}_{dt_floor10:%Y%m%d}_{dt_floor10:%H%M}_"
+        rf"B{band:02d}_FLDK_{BAND_RES_SUFFIX[band]}_S(\d{{2}})(\d{{2}})"
+        rf"\.DAT\.bz2$"
+    )
+    if (
+        paths != tuple(sorted(set(paths)))
+        or any(
+            type(path) is not str
+            or not path.startswith(prefix)
+            or path.rsplit("/", 1)[0] + "/" != prefix
+            for path in paths
+        )
+    ):
+        raise RuntimeError("M2 AHI source objects do not match the bound slot/band")
+    sequence_rows: list[tuple[int, int]] = []
+    for path in paths:
+        match = basename_pattern.fullmatch(path.rsplit("/", 1)[-1])
+        if match is None:
+            raise RuntimeError(
+                "M2 AHI source filename is not bound to platform/date/slot/band"
+            )
+        sequence_rows.append((int(match.group(1)), int(match.group(2))))
+    totals = {total for _, total in sequence_rows}
+    sequences = [sequence for sequence, _ in sequence_rows]
+    if (
+        len(totals) != 1
+        or len(sequences) != len(set(sequences))
+        or any(sequence < 1 or sequence > total for sequence, total in sequence_rows)
+    ):
+        raise RuntimeError("M2 AHI segment sequence layout is incoherent")
+    total = next(iter(totals))
+    if total not in {1, 10}:
+        raise RuntimeError("M2 AHI segment total is not a registered NOAA layout")
+    if require_complete and set(sequences) != set(range(1, total + 1)):
+        raise RuntimeError("M2 AHI complete scan listing is missing segments")
+    return tuple(sequence_rows)
+
+
+def _require_resolved_band_paths(
+    paths: tuple[str, ...],
+    complete_paths: tuple[str, ...],
+    bucket: str,
+    dt_floor10,
+    band: int,
+    bbox: Optional[tuple[float, float, float, float]],
+) -> tuple[str, ...]:
+    _require_ahi_segment_layout(
+        complete_paths, bucket, dt_floor10, band, require_complete=True
+    )
+    _require_ahi_segment_layout(
+        paths, bucket, dt_floor10, band, require_complete=False
+    )
+    if not set(paths).issubset(complete_paths):
+        raise RuntimeError("M2 AHI selected objects escaped the complete scan listing")
+    expected = complete_paths
+    if bbox is not None and len(complete_paths) > 1:
+        expected = tuple(
+            _filter_segments_for_bbox(
+                list(complete_paths), bbox, band, strict=True
+            )
+        )
+    if paths != expected:
+        raise RuntimeError("M2 AHI selected objects do not match the bound bbox")
+    return paths
 
 
 def _forward_for_filter(
@@ -364,6 +499,8 @@ def load_band_sync(
     band: int,
     bbox: Optional[tuple[float, float, float, float]] = None,
     stride: int = 1,
+    resolved_paths: tuple[str, ...] | None = None,
+    complete_resolved_paths: tuple[str, ...] | None = None,
 ) -> CalibratedDisk:
     """Download + parse + stitch + calibrate one (bucket, time slot, band).
 
@@ -379,15 +516,33 @@ def load_band_sync(
 
     Synchronous; call via ``run_in_executor`` from async code.
     """
-    paths = _list_segments(fs, bucket, dt_floor10, band)
-    if not paths:
-        raise FileNotFoundError(
-            f"no AHI segments found at s3://{bucket}/AHI-L1b-FLDK/"
-            f"{dt_floor10:%Y/%m/%d/%H%M}/ for band {band}"
+    if (resolved_paths is None) != (complete_resolved_paths is None):
+        raise RuntimeError(
+            "M2 AHI load requires both selected and complete source-object sets"
         )
-    n_listed = len(paths)
-    if bbox is not None and n_listed > 1:
-        paths = _filter_segments_for_bbox(paths, bbox, band)
+    if resolved_paths is None:
+        listed_paths = _list_segments(fs, bucket, dt_floor10, band)
+        if not listed_paths:
+            raise FileNotFoundError(
+                f"no AHI segments found at s3://{bucket}/AHI-L1b-FLDK/"
+                f"{dt_floor10:%Y/%m/%d/%H%M}/ for band {band}"
+            )
+        n_listed = len(listed_paths)
+        if bbox is not None and n_listed > 1:
+            listed_paths = _filter_segments_for_bbox(listed_paths, bbox, band)
+        paths = listed_paths
+    else:
+        paths = list(
+            _require_resolved_band_paths(
+                resolved_paths,
+                complete_resolved_paths,
+                bucket,
+                dt_floor10,
+                band,
+                bbox,
+            )
+        )
+        n_listed = len(complete_resolved_paths)
     log.info(
         "B%02d at %s: %d segment(s) listed, %d to download",
         band, dt_floor10, n_listed, len(paths),

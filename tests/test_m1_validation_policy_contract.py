@@ -28,7 +28,6 @@ def render_png(ax, rgb, scalar, *, policy):
     _imshow_with_render_policy(ax, scalar, cmap="gray", policy=policy)
 """
 
-
 def _audit(dispatcher: str = DISPATCHER, render: str = RENDER):
     return audit_static_policy_sources(
         dispatcher,
@@ -38,9 +37,14 @@ def _audit(dispatcher: str = DISPATCHER, render: str = RENDER):
     )
 
 
-def test_current_production_policy_passes_static_and_runtime_contracts() -> None:
+def test_historical_m1_auditor_refuses_to_rebless_the_m2_default() -> None:
     audit = audit_production_policy()
-    assert audit.passed, audit.issues
+    assert not audit.passed
+    assert audit.default_policy_is_m1 is False
+    assert any("default render policy" in issue for issue in audit.issues)
+
+
+def test_registered_m0_m1_runtime_kernel_contracts_remain_available() -> None:
     traces = trace_all_runtime_kernels()
     assert len(traces) == 4
     assert all(trace.passed for trace in traces)

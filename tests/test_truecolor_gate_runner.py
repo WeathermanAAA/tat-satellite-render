@@ -27,6 +27,23 @@ RESEARCH_ROOT_ENV = "TAT_TRUECOLOR_RESEARCH_ROOT"
 THREE_IDENTICAL_HASHES = ("d" * 64, "d" * 64, "d" * 64)
 
 
+_TRANSFER_PATH_FIXTURE = """
+def cira_stretch(value):
+    return value
+
+encode = cira_stretch
+
+def legacy_finalize(value):
+    return encode(value)
+
+def assemble_truecolor(value):
+    return legacy_finalize(value)
+
+def finalize_truecolor_m2(value):
+    return cira_stretch(value)
+"""
+
+
 @pytest.fixture(scope="module")
 def research() -> gates.ResearchInputs:
     configured = os.environ.get(RESEARCH_ROOT_ENV)
@@ -43,6 +60,7 @@ def research() -> gates.ResearchInputs:
 def _rayleigh_environment(tmp_path: Path) -> tuple[Path, Path]:
     data_directory = tmp_path / "pyspectral-data"
     data_directory.mkdir()
+    (data_directory / "fixture-rsr.h5").write_bytes(b"fixture RSR bytes\n")
     config_file = tmp_path / "pyspectral.yaml"
     config_file.write_text(
         f"rsr_dir: {data_directory}\nrayleigh_dir: {data_directory}\n",
@@ -186,6 +204,136 @@ def test_port_fidelity_enforcement_cannot_be_reblessed_by_probe_metadata() -> No
     assert "missing canonical port-fidelity case bbox_2x1" in missing
 
 
+def test_v10_proves_legacy_and_m2_transfer_paths_separately() -> None:
+    paths = gates.production_adapter.delivery_encoding_paths()
+    assert {path.stage for path in paths} == {"legacy_assemble", "m2_finalize"}
+    assert all(len(path.transfer_calls) == 1 for path in paths)
+    assert all(not path.unresolved_transfer_proxies for path in paths)
+    assert gates.delivery_encoding_path_issues(paths) == ()
+    assert gates.production_adapter.assemble_call_order() == (
+        "self_sharpen",
+        "cira_stretch",
+        "glint_tame",
+        "night_blend",
+    )
+
+
+def test_v10_does_not_sum_mutually_exclusive_transfer_paths() -> None:
+    source = _TRANSFER_PATH_FIXTURE.replace(
+        "return cira_stretch(value)\n",
+        "if value is None:\n"
+        "        return cira_stretch(value)\n"
+        "    return cira_stretch(value)\n",
+        1,
+    )
+    paths = gates.production_adapter.delivery_encoding_paths(source=source)
+    assert len([path for path in paths if path.stage == "m2_finalize"]) == 2
+    assert gates.delivery_encoding_path_issues(paths) == ()
+
+
+@pytest.mark.parametrize("mutation", ("direct", "alias", "proxy", "missing"))
+def test_v10_rejects_zero_or_double_transfer_on_any_delivery_path(
+    mutation: str,
+) -> None:
+    if mutation == "direct":
+        source = _TRANSFER_PATH_FIXTURE.replace(
+            "return cira_stretch(value)\n",
+            "return cira_stretch(cira_stretch(value))\n",
+            1,
+        )
+    elif mutation == "alias":
+        source = _TRANSFER_PATH_FIXTURE.replace(
+            "return cira_stretch(value)\n",
+            "return encode(cira_stretch(value))\n",
+            1,
+        )
+    elif mutation == "proxy":
+        source = _TRANSFER_PATH_FIXTURE.replace(
+            "def finalize_truecolor_m2(value):\n",
+            "def second_transfer(value):\n"
+            "    return encode(value)\n\n"
+            "def finalize_truecolor_m2(value):\n",
+        ).replace(
+            "return cira_stretch(value)\n",
+            "return second_transfer(cira_stretch(value))\n",
+            1,
+        )
+    else:
+        source = _TRANSFER_PATH_FIXTURE.replace(
+            "return cira_stretch(value)\n", "return value\n", 1
+        )
+    paths = gates.production_adapter.delivery_encoding_paths(source=source)
+    assert gates.delivery_encoding_path_issues(paths)
+
+
+@pytest.mark.parametrize("defined", (False, True))
+def test_v10_fails_closed_on_gamma_proxy(defined: bool) -> None:
+    definition = (
+        "def apply_gamma(value):\n"
+        "    return value ** (1.0 / 2.2)\n\n"
+        if defined
+        else ""
+    )
+    source = definition + _TRANSFER_PATH_FIXTURE.replace(
+        "return cira_stretch(value)\n",
+        "return apply_gamma(cira_stretch(value))\n",
+        1,
+    )
+    paths = gates.production_adapter.delivery_encoding_paths(source=source)
+    issues = gates.delivery_encoding_path_issues(paths)
+    assert any("apply_gamma" in issue for issue in issues)
+
+
+def _valid_v10_port_result() -> gates.production_adapter.PortFidelityResult:
+    return gates.production_adapter.PortFidelityResult(
+        case_id="fixture",
+        matplotlib_version="test",
+        sampling_model="test",
+        bbox_degrees=(4.0, 4.0),
+        geographic_aspect_ratio=1.0,
+        source_shape=(2, 2, 3),
+        figure_shape=(2, 2, 3),
+        delivered_shape=(2, 2, 3),
+        device_origin=(0, 0),
+        sampling_phase=(0.5, 0.5),
+        boundary_exclusion_px=0,
+        minimum_scored_identity=0.998,
+        exact_identity_required=False,
+        full_pixel_identity=1.0,
+        scored_pixel_identity=1.0,
+        numeric_core_exclusion_px=0,
+        noise_variance_ratio=1.0,
+        delivered_sha256="a" * 64,
+        expected_sha256="a" * 64,
+        production_png_sha256="b" * 64,
+        png_mode="RGBA",
+        png_info_keys=(),
+        png_icc_profile_present=False,
+        png_gamma_present=False,
+        png_srgb_present=False,
+        quantization_model="float_nearest_then_floor_u8",
+        floor_quantization_scored_identity=1.0,
+        round_half_up_mutant_scored_identity=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"png_icc_profile_present": True},
+        {"png_gamma_present": True},
+        {"png_srgb_present": True},
+        {"quantization_model": "gamma_then_round_u8"},
+    ),
+)
+def test_v10_rejects_emitted_icc_gamma_srgb_and_transfer_mutations(
+    changes: dict[str, object],
+) -> None:
+    mutant = dataclasses.replace(_valid_v10_port_result(), **changes)
+    result = gates._check_v10((mutant,))
+    assert result.passed is False
+
+
 def test_corpus_browser_and_live_results_are_not_presented_as_current_checks(research) -> None:
     run = gates.run_baseline(research, repeatability_hashes=THREE_IDENTICAL_HASHES)
     actual = {"V02", "V04", "V07", "V08", "V10", "V12", "V14", "V18", "V19", "V25", "V29", "V31", "V36"}
@@ -296,6 +444,251 @@ def test_rayleigh_startup_calls_all_eight_and_aggregates_none_and_exception(
     assert statuses[("Himawari-8", "ahi")] == "exception"
 
 
+def test_rayleigh_startup_inventory_binds_every_relative_file_and_byte(
+    tmp_path: Path,
+) -> None:
+    data_directory, config_file = _rayleigh_environment(tmp_path)
+    (data_directory / "z-last.h5").write_bytes(b"last\x00bytes")
+    (data_directory / "nested").mkdir()
+    (data_directory / "nested" / "a-first.h5").write_bytes(b"first bytes")
+
+    evidence = gates.run_rayleigh_startup_check(
+        data_directory,
+        config_file=config_file,
+        make_corrector=lambda _platform, _sensor: object(),
+    )
+    rows = [dataclasses.asdict(item) for item in evidence.data_inventory_files]
+    assert rows == [
+        {
+            "relative_path": "fixture-rsr.h5",
+            "bytes": len(b"fixture RSR bytes\n"),
+            "sha256": hashlib.sha256(b"fixture RSR bytes\n").hexdigest(),
+        },
+        {
+            "relative_path": "nested/a-first.h5",
+            "bytes": len(b"first bytes"),
+            "sha256": hashlib.sha256(b"first bytes").hexdigest(),
+        },
+        {
+            "relative_path": "z-last.h5",
+            "bytes": len(b"last\x00bytes"),
+            "sha256": hashlib.sha256(b"last\x00bytes").hexdigest(),
+        },
+    ]
+
+    def canonical_bytes(value: object) -> bytes:
+        return (
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+
+    file_set_sha256 = hashlib.sha256(
+        canonical_bytes(
+            {
+                "schema": gates.RAYLEIGH_DATA_INVENTORY_SCHEMA,
+                "relative_paths": [row["relative_path"] for row in rows],
+            }
+        )
+    ).hexdigest()
+    inventory_sha256 = hashlib.sha256(
+        canonical_bytes(
+            {
+                "schema": gates.RAYLEIGH_DATA_INVENTORY_SCHEMA,
+                "file_count": 3,
+                "total_bytes": sum(row["bytes"] for row in rows),
+                "file_set_sha256": file_set_sha256,
+                "files": rows,
+            }
+        )
+    ).hexdigest()
+    assert evidence.data_inventory_schema == gates.RAYLEIGH_DATA_INVENTORY_SCHEMA
+    assert evidence.data_inventory_file_count == 3
+    assert evidence.data_inventory_total_bytes == sum(row["bytes"] for row in rows)
+    assert evidence.data_inventory_file_set_sha256 == file_set_sha256
+    assert evidence.data_inventory_sha256 == inventory_sha256
+    assert evidence.passed
+    forged_files = (
+        dataclasses.replace(evidence.data_inventory_files[0], sha256="0" * 64),
+        *evidence.data_inventory_files[1:],
+    )
+    assert not dataclasses.replace(
+        evidence, data_inventory_files=forged_files
+    ).passed
+
+    first_summary = evidence.as_dict()
+    (data_directory / "z-last.h5").write_bytes(b"LAST\x00bytes")
+    changed_bytes = gates.run_rayleigh_startup_check(
+        data_directory,
+        config_file=config_file,
+        make_corrector=lambda _platform, _sensor: object(),
+    )
+    assert changed_bytes.data_inventory_file_set_sha256 == file_set_sha256
+    assert changed_bytes.data_inventory_sha256 != inventory_sha256
+    assert changed_bytes.as_dict() != first_summary
+
+    (data_directory / "new-file.h5").write_bytes(b"new")
+    changed_set = gates.run_rayleigh_startup_check(
+        data_directory,
+        config_file=config_file,
+        make_corrector=lambda _platform, _sensor: object(),
+    )
+    assert changed_set.data_inventory_file_set_sha256 != file_set_sha256
+    assert changed_set.data_inventory_sha256 != changed_bytes.data_inventory_sha256
+
+
+def test_rayleigh_startup_rejects_zero_file_inventory_before_factory(
+    tmp_path: Path,
+) -> None:
+    data_directory, config_file = _rayleigh_environment(tmp_path)
+    (data_directory / "fixture-rsr.h5").unlink()
+    calls: list[tuple[str, str]] = []
+
+    with pytest.raises(gates.RayleighEnvironmentError, match="at least one"):
+        gates.run_rayleigh_startup_check(
+            data_directory,
+            config_file=config_file,
+            make_corrector=lambda platform, sensor: calls.append(
+                (platform, sensor)
+            ),
+        )
+    assert calls == []
+
+
+def test_rayleigh_startup_rejects_pre_post_inventory_drift(
+    tmp_path: Path,
+) -> None:
+    data_directory, config_file = _rayleigh_environment(tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    def mutating_factory(platform: str, sensor: str) -> object:
+        calls.append((platform, sensor))
+        if len(calls) == 1:
+            (data_directory / "fixture-rsr.h5").write_bytes(
+                b"mutated RSR bytes\n"
+            )
+        return object()
+
+    with pytest.raises(gates.RayleighEnvironmentError, match="changed while"):
+        gates.run_rayleigh_startup_check(
+            data_directory,
+            config_file=config_file,
+            make_corrector=mutating_factory,
+        )
+    assert tuple(calls) == gates.RAYLEIGH_STARTUP_SENSORS
+
+
+def test_production_rayleigh_startup_requires_fresh_cache_and_binds_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_directory, config_file = _rayleigh_environment(tmp_path)
+    monkeypatch.setenv("PSP_CONFIG_FILE", str(config_file))
+
+    class FakeTruecolor:
+        _RAYLEIGH_CACHE: dict[tuple[str, str], object] = {}
+
+        @classmethod
+        def _make_rayleigh(cls, platform: str, sensor: str) -> object:
+            key = (platform, sensor)
+            if key not in cls._RAYLEIGH_CACHE:
+                cls._RAYLEIGH_CACHE[key] = object()
+            return cls._RAYLEIGH_CACHE[key]
+
+    monkeypatch.setattr(
+        gates.production_adapter,
+        "production_modules",
+        lambda: {"truecolor": FakeTruecolor},
+    )
+
+    FakeTruecolor._RAYLEIGH_CACHE[("GOES-16", "abi")] = object()
+    with pytest.raises(gates.RayleighEnvironmentError, match="must be empty"):
+        gates.run_rayleigh_startup_check(
+            data_directory,
+            config_file=config_file,
+        )
+
+    FakeTruecolor._RAYLEIGH_CACHE.clear()
+    initial = gates.run_rayleigh_startup_check(
+        data_directory,
+        config_file=config_file,
+    )
+    assert initial.passed
+    assert initial.factory_binding == "production_fresh_cache_session"
+    assert initial.production_cache_session_started_empty is True
+    assert "_production_cache_object_ids" not in initial.as_dict()
+    assert set(FakeTruecolor._RAYLEIGH_CACHE) == set(
+        gates.RAYLEIGH_STARTUP_SENSORS
+    )
+
+    rechecked = gates.run_rayleigh_startup_check(
+        data_directory,
+        config_file=config_file,
+        expected_production_evidence=initial,
+    )
+    assert rechecked == initial
+    assert rechecked.as_dict() == initial.as_dict()
+
+    FakeTruecolor._RAYLEIGH_CACHE[("GOES-19", "abi")] = object()
+    with pytest.raises(
+        gates.RayleighEnvironmentError,
+        match="evidence changed before publication",
+    ):
+        gates.run_rayleigh_startup_check(
+            data_directory,
+            config_file=config_file,
+            expected_production_evidence=initial,
+        )
+
+
+@pytest.mark.parametrize(
+    "link_kind", ("file", "directory", "root", "configured_root")
+)
+def test_rayleigh_startup_inventory_rejects_every_symlink_kind(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    data_directory, config_file = _rayleigh_environment(tmp_path)
+    (data_directory / "real-file.h5").write_bytes(b"bound")
+    declared_directory = data_directory
+    if link_kind == "file":
+        (data_directory / "linked-file.h5").symlink_to(
+            data_directory / "real-file.h5"
+        )
+    elif link_kind == "directory":
+        real_directory = data_directory / "real-directory"
+        real_directory.mkdir()
+        (data_directory / "linked-directory").symlink_to(
+            real_directory, target_is_directory=True
+        )
+    elif link_kind == "root":
+        declared_directory = tmp_path / "linked-root"
+        declared_directory.symlink_to(data_directory, target_is_directory=True)
+        config_file.write_text(
+            f"rsr_dir: {declared_directory}\nrayleigh_dir: {declared_directory}\n",
+            encoding="utf-8",
+        )
+    else:
+        configured_directory = tmp_path / "linked-configured-root"
+        configured_directory.symlink_to(data_directory, target_is_directory=True)
+        config_file.write_text(
+            f"rsr_dir: {configured_directory}\n"
+            f"rayleigh_dir: {configured_directory}\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(gates.RayleighEnvironmentError, match="symlink"):
+        gates.run_rayleigh_startup_check(
+            declared_directory,
+            config_file=config_file,
+            make_corrector=lambda _platform, _sensor: object(),
+        )
+
+
 def test_rayleigh_startup_rejects_git_worktree_and_unwritable_data_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -362,9 +755,12 @@ def test_cli_baseline_and_m0_enforcement_write_external_evidence(
 
     def factory(platform: str, sensor: str) -> object:
         rayleigh_calls.append((platform, sensor))
-        return object()
+        corrector = object()
+        truecolor._RAYLEIGH_CACHE[(platform, sensor)] = corrector
+        return corrector
 
     truecolor = gates.production_adapter.production_modules()["truecolor"]
+    monkeypatch.setattr(truecolor, "_RAYLEIGH_CACHE", {})
     monkeypatch.setattr(truecolor, "_make_rayleigh", factory)
     output = tmp_path / "cli-evidence"
     exit_code = tat_truecolor_validate.main(

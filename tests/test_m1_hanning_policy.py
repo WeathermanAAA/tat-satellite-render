@@ -12,7 +12,7 @@ import pytest
 
 import app
 import render
-from render_policy import M0_POLICY, M1_POLICY
+from render_policy import M0_POLICY, M1_POLICY, M2_POLICY
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -157,11 +157,39 @@ def test_m0_cache_key_is_legacy_and_m1_opens_reversible_generation():
     assert m1 != m0
 
 
-def test_worker_resolves_one_policy_for_cache_render_and_provenance():
-    assert app.PROCESS_RENDER_POLICY is M1_POLICY
+def test_worker_resolves_one_request_policy_for_cache_render_and_provenance():
+    assert app.PROCESS_RENDER_POLICY is M2_POLICY
     source = inspect.getsource(app)
     tree = ast.parse(source)
-    policy_targets = {"_request_key": [], "render_png": []}
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "request_policy"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    resolver = assignments[0].value
+    assert isinstance(resolver, ast.Call)
+    assert isinstance(resolver.func, ast.Name)
+    assert resolver.func.id == "_effective_render_policy"
+    process_keyword = next(
+        item.value for item in resolver.keywords if item.arg == "process_policy"
+    )
+    assert isinstance(process_keyword, ast.Name)
+    assert process_keyword.id == "PROCESS_RENDER_POLICY"
+
+    # The same resolved singleton must bind every cache/render-facing policy
+    # boundary. A mutant that reuses the process default for just one consumer
+    # would let M1 and M2 share bytes under a lying identity.
+    policy_targets = {
+        "_request_key": [],
+        "_fetch_true_color_for_policy": [],
+        "_reported_point_stride": [],
+        "render_png": [],
+    }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -178,10 +206,93 @@ def test_worker_resolves_one_policy_for_cache_render_and_provenance():
         )
         policy_targets[target].append(keyword)
 
-    assert set(policy_targets) == {"_request_key", "render_png"}
+    assert set(policy_targets) == {
+        "_request_key",
+        "_fetch_true_color_for_policy",
+        "_reported_point_stride",
+        "render_png",
+    }
     for target, values in policy_targets.items():
         assert len(values) == 1, f"unexpected {target} call count"
         assert isinstance(values[0], ast.Name)
-        assert values[0].id == "PROCESS_RENDER_POLICY"
-    assert '"X-Algorithm-Version": PROCESS_RENDER_POLICY.algo_version' in source
+        assert values[0].id == "request_policy"
+
+    algorithm_headers = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == "X-Algorithm-Version":
+                algorithm_headers.append(value)
+    assert len(algorithm_headers) == 1
+    header_value = algorithm_headers[0]
+    assert isinstance(header_value, ast.Attribute)
+    assert header_value.attr == "algo_version"
+    assert isinstance(header_value.value, ast.Name)
+    assert header_value.value.id == "request_policy"
+
+    # Health reports the configured process generation; response provenance
+    # reports the request-scoped effective generation proven above.
     assert '"algorithm_version": PROCESS_RENDER_POLICY.algo_version' in source
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    (
+        ({"process_policy": M1_POLICY, "is_true_color": True}, M1_POLICY),
+        ({"is_true_color": True, "use_archive": False}, M2_POLICY),
+        (
+            {"is_true_color": True, "crosses_antimeridian": True},
+            M1_POLICY,
+        ),
+        (
+            {"is_true_color": True, "m2_truecolor_supported": False},
+            M1_POLICY,
+        ),
+        ({"is_true_color": False, "use_archive": True}, M2_POLICY),
+        (
+            {
+                "is_true_color": False,
+                "use_archive": True,
+                "m2_archive_scalar_supported": False,
+            },
+            M1_POLICY,
+        ),
+        ({"is_true_color": False, "use_archive": False}, M1_POLICY),
+        (
+            {
+                "is_true_color": False,
+                "use_archive": True,
+                "crosses_antimeridian": True,
+            },
+            M1_POLICY,
+        ),
+        (
+            {"is_true_color": False, "use_archive": True, "is_backdrop": True},
+            M1_POLICY,
+        ),
+        (
+            {"is_true_color": False, "use_archive": True, "output_format": "btpng"},
+            M1_POLICY,
+        ),
+    ),
+)
+def test_request_policy_preserves_m1_on_paths_outside_m2_authority(
+    changes, expected
+):
+    arguments = {
+        "process_policy": M2_POLICY,
+        "is_true_color": False,
+        "use_archive": False,
+        "crosses_antimeridian": False,
+        "is_backdrop": False,
+        "output_format": "png",
+        "m2_truecolor_supported": True,
+        "m2_archive_scalar_supported": True,
+    }
+    arguments.update(changes)
+    assert app._effective_render_policy(**arguments) is expected
+
+    lookalike = dataclasses.replace(arguments["process_policy"])
+    with pytest.raises(RuntimeError, match="unregistered render policy object"):
+        app._effective_render_policy(**(arguments | {"process_policy": lookalike}))

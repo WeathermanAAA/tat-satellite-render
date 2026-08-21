@@ -238,7 +238,8 @@ class MergIRSatellite(Satellite):
                 cmi=tb, lats=LAT.astype(np.float32), lons=LON.astype(np.float32),
                 channel=1, generic_channel=generic_channel,
                 scan_start=slot, product="MERGIR", bucket="gesdisc-mergir",
-                sat_name="MergIR", sub_sat_lon=0.0, units="K")
+                sat_name="MergIR", sub_sat_lon=0.0, units="K",
+                source_s3_key=url)
         raise RuntimeError(
             f"no MergIR granule within ±2 h of {resolved.scan_start.isoformat()}"
             + (f" (last: {last_err})" if last_err else ""))
