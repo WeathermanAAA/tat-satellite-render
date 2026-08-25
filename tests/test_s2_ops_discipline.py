@@ -8,7 +8,11 @@ every pass. These tests pin the replacement behavior:
 
   * complete_stamps(after=...) tail-bounds the stamp listing (StartAfter);
   * the backfill loops re-check coverage IN MEMORY from each emit's returned
-    stamp (exactly one _covered_times listing per pass);
+    stamp (exactly one _covered_times listing per pass -- and since
+    2026-08-25 that one listing is the FALLBACK: pass-level coverage comes
+    from the product's manifest with one GET and zero listings whenever the
+    manifest can stand in; tests/test_s2_cover_manifest.py pins that path,
+    the tests here pin the listing contract it falls back to);
   * the per-product manifest is maintained INCREMENTALLY (one GET + append),
     with the full rebuild-from-R2 reserved for cold/geometry/heal passes --
     and the geometry refuse-to-clobber guard preserved verbatim;
@@ -255,6 +259,12 @@ class TestEmitOneManifestDiscipline(unittest.TestCase):
 # The backfill loop lists coverage exactly ONCE per pass
 # ---------------------------------------------------------------------------
 class TestSingleListingPerPass(unittest.TestCase):
+    """UPDATED 2026-08-25 (coverage from the manifest): the 'exactly one
+    listing per pass' assertion below is now the LISTING-FALLBACK contract
+    -- the /tmp/nope store holds no manifest, so the pass takes the fallback
+    and must still list exactly once. Its counterpart: with a usable
+    manifest in the store the pass lists ZERO times."""
+
     def test_product_pass_lists_once(self):
         entry = next(e for e in R.REGISTRY
                      if e.tiled and e.sector_key == "conus")
@@ -275,6 +285,44 @@ class TestSingleListingPerPass(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertGreaterEqual(len(stamps), 2)   # several slots emitted...
         self.assertEqual(cs.call_count, 1)        # ...ONE coverage listing
+
+    def test_product_pass_with_manifest_lists_zero(self):
+        # the 2026-08-25 counterpart: a usable manifest in the store means
+        # the pass makes NO coverage listing at all (the GET count, the
+        # fallback reasons and the orphan path live in
+        # tests/test_s2_cover_manifest.py)
+        entry = next(e for e in R.REGISTRY
+                     if e.tiled and e.sector_key == "conus")
+        tmp = tempfile.mkdtemp()
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.addCleanup(shutil.rmtree, state, True)
+        store = P.FilesystemStore(tmp)
+        now = dt.datetime.now(UTC)
+        # a 50 min coverage window: the manifest must reach past it (the
+        # 100-min stamp) and the periodic verify gate must be fresh, or the
+        # pass takes the listing path by design (tests/test_s2_cover_manifest)
+        stamps = [(now - dt.timedelta(minutes=m)).strftime("%Y%m%dT%H%M%SZ")
+                  for m in (2, 12, 22, 32, 42, 100)]
+        for s in stamps:
+            store.put_json(entry.ready_key("shadow", s), {"maxzoom": 0}, "c")
+        store.put_json(entry.latest_times_key("shadow"),
+                       entry.build_tiled_latest_times(
+                           stamps, bounds=[-125.0, 15.0, -66.0, 49.0],
+                           image_px=[256, 256], maxzoom=0, as_of=now), "c")
+
+        with mock.patch.object(E, "STATE_DIR", state), \
+             mock.patch.object(E, "emit_one") as eo, \
+             mock.patch.object(E.P, "complete_stamps",
+                               wraps=P.complete_stamps) as cs, \
+             mock.patch.object(E, "_write_products_index"):
+            E._state_touch(E._state_path("cover", "shadow", entry.product_id))
+            rc = E.main(["--product", entry.product_id,
+                         "--store", f"local:{tmp}",
+                         "--step", "10", "--backfill", "30"])
+        self.assertEqual(rc, 0)
+        eo.assert_not_called()                    # every slot covered...
+        self.assertEqual(cs.call_count, 0)        # ...and ZERO listings
 
 
 # ---------------------------------------------------------------------------

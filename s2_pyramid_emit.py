@@ -30,6 +30,60 @@ Examples
 
   # the WHOLE CONUS imagery suite (one scan, shared band fetches), cron-tiered:
   python s2_pyramid_emit.py --suite conus --store r2 --prefix shadow --max-zoom 5
+
+COVERAGE FROM THE MANIFEST (2026-08-25 cost audit: ~378K of the fleet's ~385K
+ListObjects/day were the --step loops' per-stamp coverage probes)
+---------------------------------------------------------------------------
+Both --step loops (product mode, suite mode) decide which slots are missing
+from `covered`, which used to come from `_covered_times` -> `complete_stamps`:
+one delimiter listing of the stamp tail + ONE LIST request (Class A) per stamp
+in the window, every pass, idle or not. Each product's writer-maintained
+`latest_times.json` already advertises exactly the complete frames this lane
+(its SOLE writer, fleet.yml) has landed, so `_pass_coverage` now reads
+coverage from it with ONE Class B GET per product (`_covered_from_manifest`).
+The listing path -- `_covered_times` + `_reconcile_manifest`, byte-for-byte
+the previous behaviour -- still runs in three cases: (1) as a periodic VERIFY,
+once per S2_COVER_VERIFY_S (default 1800 s) per product and always on a fresh
+container (empty STATE_DIR), re-squaring the manifest with R2 reality in both
+directions on a bounded cadence instead of only at the 6 h heal tick; (2) as
+the fallback whenever a manifest cannot stand in (missing / invalid / not
+demonstrably reaching back past the coverage window -- a cold product, or
+the one window after a geometry migration's rebuild, whose short manifest
+cannot prove that the older frames at the previous geometry are missing);
+(3) unconditionally under S2_COVER_FROM_MANIFEST=0, the rollback lever that
+needs no redeploy. Nothing in the render / tiling path changed.
+
+WHAT THE MANIFEST PATH CANNOT SEE, and what catches it:
+* An ORPHAN (a complete frame whose _ready.json landed but whose manifest PUT
+  did not -- a kill between the two) just looks like a missing slot. The loop
+  calls emit_one for it: the source scan is fetched, the stamp resolved
+  (I.produce_*), and P.emit_pyramid(skip_if_present=True) HEADs the frame's
+  marker and returns outcome='duplicate' BEFORE any tile is cut or PUT.
+  emit_one then reads the frame's OWN geometry from that marker (one Class B
+  GET, `_frame_maxzoom`): the same maxzoom as the live manifest -> the
+  incremental 'append' (one PUT; no listing), so the orphan is re-advertised
+  in the pass that first sees it for one source download, never a duplicate
+  render or tile PUT. An orphan whose slot has already fallen off the
+  backfill grid (the kill landed on the oldest slot of a pass) is invisible
+  to the grid; the verify listing's `_reconcile_manifest` re-advertises it
+  within S2_COVER_VERIFY_S.
+* A STRAY -- a complete frame at a DIFFERENT pyramid geometry inside the
+  window (a deep-zoom cut into the cron prefix, the documented trap; or an
+  old-geometry frame in the window after a migration) -- is left alone:
+  emit_one logs `[manifest] stray geometry ...`, does NOT rebuild the
+  manifest around it (the pre-review code did, flipping the live loop to the
+  stray's geometry and back every pass), and memos the stamp in STATE_DIR
+  (`_stray_note`) so the coverage step counts its slot as covered -- what the
+  listing path always did. Cost: one source download per stray per container
+  lifetime.
+* A frame DELETED under a live manifest (an operator purge, the container
+  canary watchdog's rollback cleanup) stays advertised and its slot looks
+  covered until the next verify listing re-renders it -- if the slot is
+  still in the grid. Deleting frames therefore means ALSO dropping their
+  stamps from latest_times.json (s2_prune.rewrite_manifest is the pattern),
+  or recreating the lane: a fresh container lists on its first pass and its
+  next emit is heal-due, so the ghosts are dropped and re-rendered within
+  about one step.
 """
 from __future__ import annotations
 
@@ -63,6 +117,12 @@ STATE_DIR = os.environ.get("S2_STATE_DIR", "/var/tmp/s2_state")
 MANIFEST_HEAL_S = int(os.environ.get("S2_MANIFEST_HEAL_S", "21600"))
 #: products.json rebuild throttle per sector (it probes every sibling product).
 INDEX_MIN_S = int(os.environ.get("S2_INDEX_MIN_S", "1800"))
+#: Periodic listing VERIFY on the manifest coverage path (2026-08-25): once
+#: per product per this many seconds -- and always on a fresh container --
+#: the --step pass takes the listing path (coverage listing + orphan
+#: reconcile) so R2 reality and the manifest are re-squared on a bounded
+#: cadence, not only at the heal tick. 0 = list every pass.
+COVER_VERIFY_S = int(os.environ.get("S2_COVER_VERIFY_S", "1800"))
 
 
 def _state_path(kind: str, *parts: str) -> str:
@@ -153,6 +213,151 @@ def _covered_times(entries, store, prefix: str,
                 pass                     # legacy/foreign stamp shape: ignore
         out.append(sorted(ts))
     return out
+
+
+def _stray_stamps(prefix: str, product_id: str) -> list:
+    """Stamps this container has seen as COMPLETE frames at a foreign pyramid
+    geometry (emit_one's stray guard). The manifest coverage path counts
+    their slots as covered -- exactly what the listing path did (a complete
+    frame at ANY maxzoom covered its slot); without the memo each stray would
+    cost a source download per pass until it aged out of the window."""
+    try:
+        with open(_state_path("stray", prefix, product_id)) as fh:
+            return [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def _stray_note(prefix: str, product_id: str, stamp: str) -> None:
+    known = [s for s in _stray_stamps(prefix, product_id) if s != stamp]
+    keep = sorted(known + [stamp])[-50:]      # strays are rare; bounded anyway
+    try:
+        with open(_state_path("stray", prefix, product_id), "w") as fh:
+            fh.write("\n".join(keep) + "\n")
+    except OSError:
+        pass                                  # state is an optimization only
+
+
+def _covered_from_manifest(entries, store, prefix: str, window_min) -> tuple:
+    """Per entry: the sorted datetimes of its COMPLETE frames in the window,
+    read from the product's own latest_times.json (ONE Class B GET per
+    entry) instead of probing every stamp in the window with a LIST (Class
+    A, 6-30 per entry per pass; ~378K of the fleet's ~385K ListObjects/day,
+    measured 2026-08-25). Returns ``(covered, reason)``: ``covered`` has the
+    shape `_covered_times` returns (one sorted list per entry, bounded to
+    stamps >= now - window_min -- the same inclusive StartAfter bound the
+    listing uses, compared on the stamp string; plus this container's
+    memoed stray-geometry stamps in the window, see `_stray_stamps`), or
+    ``None`` when ANY entry's manifest cannot stand in for the listing, with
+    ``reason`` = ``"<product> (<why>)"`` for the caller's fallback line. The
+    caller then takes the listing path for the WHOLE call.
+
+    WHY THE MANIFEST CAN STAND IN: each lane is the SOLE writer of its
+    products (fleet.yml); the writer appends every frame it lands to times[]
+    (emit_one -> _manifest_action 'append') and rebuilds times[] from a full
+    listing on cold start / geometry change / the heal tick. What it cannot
+    know -- orphans, strays, frames deleted underneath it -- is covered in
+    the module docstring (WHAT THE MANIFEST PATH CANNOT SEE).
+
+    VALID iff: a JSON object with scheme + maxzoom, times[] a list of
+    STAMP_FMT stamps, AND its oldest stamp is at or before the window start
+    -- the manifest demonstrably reaches back past the window. A manifest
+    that cannot prove that (a cold product; a manifest trimmed to `keep`
+    whose oldest stamp is inside the window; the one-frame manifest a
+    geometry migration's rebuild leaves behind, whose older-geometry frames
+    are still complete in R2 and would otherwise look like missing slots
+    every pass) is refused rather than trusted. S2_COVER_FROM_MANIFEST=0
+    refuses unconditionally."""
+    n = len(entries)
+    label = entries[0].product_id if n == 1 else f"{n} products"
+    if os.environ.get("S2_COVER_FROM_MANIFEST", "1") == "0":
+        return None, f"{label} (S2_COVER_FROM_MANIFEST=0)"
+    if not window_min:
+        return None, f"{label} (no coverage window)"
+    get = getattr(store, "get_bytes", None)
+    if get is None:
+        return None, f"{label} (store has no get_bytes)"
+    after = (dt.datetime.now(UTC)
+             - dt.timedelta(minutes=window_min)).strftime(P.STAMP_FMT)
+    out, lines = [], []
+    for e in entries:
+        try:
+            raw = get(e.latest_times_key(prefix))
+        except Exception:                    # noqa: BLE001 -- any bad read
+            raw = None                       # is just the listing path
+        if not raw:
+            return None, f"{e.product_id} (missing)"
+        try:
+            cur = json.loads(raw)
+        except Exception:                    # noqa: BLE001
+            return None, f"{e.product_id} (unparseable JSON)"
+        if (not isinstance(cur, dict) or cur.get("scheme") is None
+                or cur.get("maxzoom") is None):
+            return None, f"{e.product_id} (no scheme/maxzoom)"
+        times = cur.get("times")
+        if (not isinstance(times, list)
+                or not all(isinstance(s, str) for s in times)):
+            return None, f"{e.product_id} (times[] is not a list of stamps)"
+        try:
+            parsed = [(s, _parse_stamp(s)) for s in times]
+        except ValueError:
+            return None, f"{e.product_id} (unparseable stamp in times[])"
+        oldest = min(times) if times else None
+        if oldest is None or oldest > after:
+            return None, (f"{e.product_id} (does not reach past the window: "
+                          f"{len(times)} stamps, oldest={oldest}, "
+                          f"window_start={after})")
+        ts = sorted(t for s, t in parsed if s >= after)
+        strays = []
+        for s in _stray_stamps(prefix, e.product_id):
+            if s >= after and s not in times:
+                try:
+                    strays.append(_parse_stamp(s))
+                except ValueError:
+                    pass                     # a corrupt memo line: ignore
+        out.append(sorted(ts + strays))
+        lines.append(f"[cover] {e.product_id}: manifest ({len(ts)} stamps "
+                     f"in window) get=1"
+                     + (f" stray={len(strays)}" if strays else ""))
+    for line in lines:                       # only once EVERY entry passed:
+        print(line)                          # no success lines before a fallback
+    return out, "manifest"
+
+
+def _pass_coverage(entries, store, prefix: str, window_min: int, keep) -> list:
+    """The --step loops' pass-level `covered` (one sorted datetime list per
+    entry): from the manifests (`_covered_from_manifest`, one Class B GET
+    each) whenever they can stand in, else the listing path exactly as it
+    was before 2026-08-25 -- `_covered_times` + `_reconcile_manifest` per
+    entry (the reconcile is only meaningful against a LISTED covered set).
+    The listing path also runs as the periodic VERIFY: once per
+    COVER_VERIFY_S per product, and always on a fresh container (no gate
+    file), because the manifest path alone cannot see an orphan whose slot
+    already fell off the grid, nor a frame deleted under a live manifest
+    (module docstring). Every listing pass re-arms the gates."""
+    n = len(entries)
+    label = entries[0].product_id if n == 1 else f"{n} products"
+    gates = [_state_path("cover", prefix, e.product_id) for e in entries]
+    due = [e.product_id for e, g in zip(entries, gates)
+           if not _state_fresh(g, COVER_VERIFY_S)]
+    covered = None
+    if due:
+        print(f"[cover] listing verify for {label}: {len(due)}/{n} gate(s) "
+              f"due (every {COVER_VERIFY_S}s per product)")
+    else:
+        covered, reason = _covered_from_manifest(entries, store, prefix,
+                                                 window_min)
+        if covered is None:
+            print(f"[cover] manifest unusable for {reason} "
+                  f"-- listing fallback")
+    if covered is None:
+        covered = _covered_times(entries, store, prefix,
+                                 window_min=window_min)
+        for i, e in enumerate(entries):
+            _reconcile_manifest(e, store, prefix, covered[i], keep)
+        for g in gates:
+            _state_touch(g)
+    return covered
 
 
 def _cover_window_min(args) -> int:
@@ -304,6 +509,27 @@ def _manifest_action(cur, stamp: str, frame_mz, scheme: str,
     return "skip" if stamp in cur["times"] else "append"
 
 
+def _manifest_live(cur, scheme: str) -> bool:
+    """The manifest `_manifest_action` would append to: its own first-clause
+    shape test, minus the heal tick."""
+    return (isinstance(cur, dict) and cur.get("scheme") == scheme
+            and isinstance(cur.get("times"), list)
+            and cur.get("maxzoom") is not None)
+
+
+def _frame_maxzoom(entry, store, prefix: str, stamp: str):
+    """The pyramid maxzoom a COMPLETE frame was cut at, read from its own
+    _ready.json (emit_pyramid has written {'maxzoom', ...} into the marker
+    since the first pyramid emit). ONE Class B GET; None when the marker is
+    unreadable or carries no maxzoom (= unknown geometry: the rebuild path)."""
+    try:
+        raw = store.get_bytes(entry.ready_key(prefix, stamp))
+        mz = json.loads(raw).get("maxzoom") if raw else None
+    except Exception:                        # noqa: BLE001 -- any bad read
+        return None
+    return mz if isinstance(mz, int) and not isinstance(mz, bool) else None
+
+
 def emit_one(entry, when, store, args, band_cache=None) -> dict:
     """Fetch+render+tile+manifest for ONE tiled entry. Returns the manifest."""
     spec = P.PyramidSpec(tile_size=entry.tile_size, quality=args.quality)
@@ -368,9 +594,42 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
             cur = json.loads(raw)
     except Exception:                          # noqa: BLE001 -- any bad read
         cur = None                             # is just the rebuild path
-    action = _manifest_action(cur, img.stamp, meta.get("maxzoom"), scheme,
-                              heal_due=not _state_fresh(heal_path,
-                                                        MANIFEST_HEAL_S))
+    heal_due = not _state_fresh(heal_path, MANIFEST_HEAL_S)
+    frame_mz = meta.get("maxzoom")
+    if (meta["outcome"] == "duplicate" and getattr(args, "step", None)
+            and _manifest_live(cur, scheme) and img.stamp not in cur["times"]):
+        # A duplicate the LIVE manifest does not advertise, met by a --step
+        # loop (2026-08-25, the coverage-from-manifest review): under the
+        # manifest coverage path such a slot looks missing and lands here
+        # after the source fetch. (A single-tick --time/latest emit keeps the
+        # rebuild below untouched: that is the operator's explicit request --
+        # e.g. the sanctioned --allow-geometry-change retry of a refused
+        # migration emit whose frame already landed.)
+        # Learn the frame's OWN geometry from its ready marker (one Class B
+        # GET) before deciding. Same maxzoom = an orphan (a kill between the
+        # marker PUT and the manifest PUT) -> the incremental append below,
+        # one PUT instead of a min(keep*2,200)-probe rebuild. A different
+        # maxzoom = a STRAY (a deep-zoom cut into the cron prefix, or an
+        # old-geometry frame after a migration) -> leave the manifest alone:
+        # the rebuild below anchors on the emitted frame's geometry and
+        # would flip the live loop to the stray's geometry (dropping every
+        # real frame) and back on the next rendered frame, every pass until
+        # the stray aged out of the window. The stray is memoed in STATE_DIR
+        # so the coverage step counts its slot as covered -- what the
+        # listing path always did. A marker without maxzoom keeps the
+        # rebuild (unknown geometry, as before).
+        frame_mz = _frame_maxzoom(entry, store, args.prefix, img.stamp)
+        if frame_mz is not None and frame_mz != cur["maxzoom"]:
+            print(f"[manifest] stray geometry {img.stamp} (maxzoom {frame_mz} "
+                  f"!= {cur['maxzoom']}) -- not advertised, manifest left as is")
+            _stray_note(args.prefix, entry.product_id, img.stamp)
+            print(f"[done] {entry.product_id}: frames={cur.get('count')} "
+                  f"latest={cur.get('latest')} "
+                  f"zoom={cur.get('minzoom')}..{cur.get('maxzoom')}")
+            return {"stamp": img.stamp, "outcome": meta["outcome"],
+                    "manifest": cur}
+    action = _manifest_action(cur, img.stamp, frame_mz, scheme,
+                              heal_due=heal_due)
     if action == "skip":
         print(f"[manifest] unchanged -- {img.stamp} already advertised, "
               f"PUT skipped")
@@ -616,10 +875,8 @@ def main(argv=None) -> int:
         if args.step:
             slots = _backfill_slots(args.step, args.backfill or args.step * 6)
             tol = dt.timedelta(minutes=args.step / 2.0)
-            covered = _covered_times([entry], store, args.prefix,
-                                     window_min=_cover_window_min(args))
-            _reconcile_manifest(entry, store, args.prefix, covered[0],
-                                args.keep)
+            covered = _pass_coverage([entry], store, args.prefix,
+                                     _cover_window_min(args), args.keep)
             todo = [s for s in slots if _slot_missing(s, covered, tol)]
             print(f"[backfill] {entry.product_id}: {len(todo)}/{len(slots)} "
                   f"slot(s) missing at step {args.step}m")
@@ -714,10 +971,8 @@ def main(argv=None) -> int:
     if args.step:
         slots = _backfill_slots(args.step, args.backfill or args.step * 6)
         tol = dt.timedelta(minutes=args.step / 2.0)
-        covered = _covered_times(entries, store, args.prefix,
-                                 window_min=_cover_window_min(args))
-        for i, e in enumerate(entries):
-            _reconcile_manifest(e, store, args.prefix, covered[i], args.keep)
+        covered = _pass_coverage(entries, store, args.prefix,
+                                 _cover_window_min(args), args.keep)
         todo = [s for s in slots if _slot_missing(s, covered, tol)]
         print(f"[backfill] suite {args.suite}: {len(todo)}/{len(slots)} "
               f"slot(s) missing at step {args.step}m")

@@ -188,3 +188,33 @@ scripts/fleet.sh setenv <box|all> K=V   # secret propagation
 Health page: `/fleet/` (unlinked, noindexed, robots-disallowed).
 Per-lane cadence design and the grid arithmetic: the header comment of each
 `docker-compose.s2.*-lane.yml`.
+
+**Backfill coverage comes from the manifest (2026-08-25).** Each `--step`
+pass learns which slots already have a complete frame from the product's own
+`latest_times.json` (one Class B GET) instead of LISTing every stamp in the
+window (those probes were ~98% of the fleet's ListObjects). The listing path
+(coverage listing + orphan reconcile, byte-for-byte the previous behaviour)
+still runs as a periodic VERIFY -- once per `S2_COVER_VERIFY_S` (default
+1800 s) per product and on every container start -- and as the automatic
+fallback when a manifest cannot stand in (missing / invalid / not reaching
+past the coverage window, e.g. for one window after a geometry migration;
+logged as `[cover] manifest unusable for <product> (<why>) -- listing
+fallback`). Two consequences to know: a complete frame at a foreign pyramid
+geometry inside the window is left out of the manifest (`[manifest] stray
+geometry ...`) and memoed in the container's STATE_DIR so its slot counts as
+covered; and DELETING frames under a live manifest no longer re-renders them
+on the next pass -- strip the stamps from `latest_times.json` too
+(`s2_prune.rewrite_manifest` is the pattern) or recreate the lane (its first
+pass lists, its next emit heal-rebuilds; that is what the container-canary
+watchdog's rollback gets, so its deleted frames re-render within about one
+step + one pass); otherwise the slots re-render only at the next verify
+listing, if still in the backfill grid. Rollback lever: `S2_COVER_FROM_MANIFEST=0`
+in the box `.env` and recreate the lane (its compose header's
+`up -d --no-build` line, or `fleet.sh deploy <box>`) -- no code redeploy.
+Judge it by the `[ops]` line: an idle pass reads `get=1` with no
+`list_pages`; the verify pass shows the old `list_pages=1+n`. Pre-canary gate,
+read-only, run INSIDE the image (the box host python3 has no numpy):
+`cd /root/tsr-s2 && docker compose -f docker-compose.s2.yml build -q emit-cron
+&& docker compose -f docker-compose.s2.yml run --rm --entrypoint python emit
+scripts/s2_coverage_equivalence.py` must print `EQUIVALENT` for the lane's
+products (building does not touch running lanes).
