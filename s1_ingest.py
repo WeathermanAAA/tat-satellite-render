@@ -58,6 +58,15 @@ import s1_slots as S
 import s1_sources as SRC
 from poller_framework import FAILING, FRESH, SourceHealth, process_mem_mb
 
+# The R2 write kill switch (tat_killswitch.py at the repo root, mirrored in
+# TAT). Optional on purpose: a missing or broken module means "allowed" --
+# the switch can only ever STOP writes, never break a lane. Deletes are
+# never guarded (free on R2; prune must keep reducing storage).
+try:
+    import tat_killswitch
+except Exception:  # noqa: BLE001
+    tat_killswitch = None
+
 UTC = dt.timezone.utc
 
 
@@ -207,6 +216,12 @@ class R2:
             self.ops[name] = self.ops.get(name, 0) + n
 
     def put_bytes(self, key: str, data: bytes, content_type: str, cache: str) -> bool:
+        # Kill switch FIRST: a blocked put is not a put and must not be
+        # counted as one (the ops ledger is the bill's ground truth). fleet/*
+        # keys are allowlisted inside the switch, so the heartbeat, the roster
+        # and the breaker mirror always land.
+        if tat_killswitch is not None and not tat_killswitch.writes_allowed(key):
+            return False
         self._op("put")
         try:
             self.s3.put_object(Bucket=R2_BUCKET, Key=key, Body=data,

@@ -7,6 +7,11 @@
 #   fleet.sh deploy <box|all>    pull main, rebuild image, recreate its lanes
 #   fleet.sh setenv <box|all> K=V   write a secret to .env and restart lanes
 #   fleet.sh lanes <box>         what fleet.yml says this box should run
+#   fleet.sh writes off|on [box|all]   R2 WRITE kill switch: set TAT_R2_WRITES
+#                                and recreate every write lane, same image; verifies
+#                                env + guard presence per container (~30-60 s)
+#   fleet.sh breaker status|arm|disarm|trip|reset   the r2-breaker Worker
+#                                (admin verbs need TAT_BREAKER_ADMIN_KEY)
 #
 # Reads fleet.yml as the assignment map -- never hardcode a box or a lane here.
 # Run from a checkout of tat-satellite-render (Codespace or any box).
@@ -153,6 +158,13 @@ cmd_deploy() {
   done < <(_boxes)
 }
 
+# write/replace one KEY=VALUE in a box's .env (mode 600). The value never
+# echoes; the caller reports success/failure per box.
+_setenv_on() {
+  local host="$1" kv="$2" key="${2%%=*}"
+  on "$host" "touch /root/tsr-s2/.env && chmod 600 /root/tsr-s2/.env && sed -i '/^${key}=/d' /root/tsr-s2/.env && printf '%s\n' '$kv' >> /root/tsr-s2/.env"
+}
+
 # Secret propagation: write/replace a key in every target box's .env, then
 # restart that box's lanes so the new value is actually in the containers.
 cmd_setenv() {
@@ -166,7 +178,9 @@ cmd_setenv() {
   while IFS=$'\t' read -r name host; do
     [ "$target" != "all" ] && [ "$target" != "$name" ] && continue
     n=$((n + 1))
-    if on "$host" "touch /root/tsr-s2/.env && chmod 600 /root/tsr-s2/.env && sed -i '/^${key}=/d' /root/tsr-s2/.env && printf '%s\n' '$kv' >> /root/tsr-s2/.env && echo '  $name: $key set'"; then :; else
+    if _setenv_on "$host" "$kv"; then
+      echo "  $name: $key set"
+    else
       echo "  $name: FAILED to set $key (ssh/write error)"; bad=1
     fi
   done < <(_boxes)
@@ -179,6 +193,98 @@ cmd_setenv() {
   return "$bad"
 }
 
+# ---- R2 write kill switch (PHASE0 spec, 2026-08-25) -------------------------
+# The 30-second manual path: put TAT_R2_WRITES=0|1 into every .env the write
+# lanes load, then bring each write container back up from its own compose
+# labels with the SAME image (--no-build, --no-deps, --force-recreate), so
+# every process re-imports tat_killswitch and reads the new env. The box half
+# is scripts/box_writes.sh (piped over ssh like provision_box.sh); read its
+# header for why a plain `docker restart` cannot do this (compose bakes
+# env_file in at create time) and how the result is VERIFIED per container:
+# the env value AND a probe that runs tat_killswitch inside the container
+# (a lane whose image predates the file would take the env and keep
+# writing; that reports `guard: ABSENT` and fails the box).
+# Derived from `docker ps` with name filters: an absent container is skipped,
+# never an error, so the same command is right on an emit-only box and box1.
+#
+# WRITE_RE is a positive allowlist of the lanes that PUT to R2; NEVER_RE is a
+# second gate over everything that SERVES (caddy, render, meso-render*,
+# s1-render, radar-render, centerfix/objfix) plus prune. Recreating a serving
+# stack to stop a bill would trade a cost incident for an outage, so a name
+# has to pass BOTH. tests/test_killswitch.py pins both lists against the
+# container inventory in the spec.
+WRITE_RE='^(tat-s2-[a-z0-9-]+-emit-cron-[0-9]+|tat-render-(floater|intensity|guidance)-poller-[0-9]+|tat-s1-s1-ingest(-[a-z0-9]+)?-[0-9]+|tat-satellite-render-meso-poller-[0-9]+|tat-overlays-[a-z0-9]+-poller-[0-9]+)$'
+NEVER_RE='^(tat-s2-prune-|tat-render-(caddy|render|centerfix-plot|objfix-collector|ens-watchdog)-|tat-satellite-render-meso-render|tat-s1-s1-render|tat-radar-render)'
+
+cmd_writes() {
+  local mode="${1:-}" target="${2:-all}" val
+  case "$mode" in
+    off) val=0 ;;
+    on)  val=1 ;;
+    *) echo "usage: fleet.sh writes off|on [box|all]"; return 2 ;;
+  esac
+  # Same discipline as setenv: every box reports, one failure never aborts
+  # the rest, and the exit code says whether the fleet is uniform.
+  local bad=0 n=0
+  while IFS=$'\t' read -r name host; do
+    [ "$target" != "all" ] && [ "$target" != "$name" ] && continue
+    n=$((n + 1))
+    echo "=== writes $mode  $name"
+    # ssh's stdin IS the script here, so it cannot swallow the box list (the
+    # -n trap documented on `on`); the regexes travel as env assignments.
+    if ssh "${SSH_OPTS[@]}" "$host" "VAL=$val WRITE_RE='$WRITE_RE' NEVER_RE='$NEVER_RE' bash -s" < "$REPO_DIR/scripts/box_writes.sh"; then
+      echo "  $name: writes $mode (env + guard verified in every write container)"
+    else
+      echo "  $name: INCOMPLETE -- see the lines above; a lane may still hold the old setting, or lacks the guard and still writes"; bad=1
+    fi
+  done < <(_boxes)
+  [ "$n" -eq 0 ] && { echo "[writes] no box matched '$target'"; return 1; }
+  if [ "$bad" -ne 0 ]; then
+    echo "[writes] INCOMPLETE -- re-run for the failed box; check with: fleet.sh status"
+  else
+    echo "[writes] R2 writes $mode on $target (heartbeats keep publishing: fleet/* is allowlisted; deletes/prune untouched)"
+  fi
+  return "$bad"
+}
+
+# ---- the r2-breaker Worker --------------------------------------------------
+# `status` is public. arm/disarm/trip/reset POST with X-Admin-Key, read from
+# the caller's env (TAT_BREAKER_ADMIN_KEY) or else from box1's .env (put it
+# there with: fleet.sh setenv box1 TAT_BREAKER_ADMIN_KEY=<key>). Never printed.
+# Remember: `reset` is the ONLY path that re-enables writes; `disarm` just
+# drops to alert-only and does NOT re-enable them.
+_breaker_call() {   # method path [admin-key] -> prints the body; rc 0 iff 2xx
+  local method="$1" path="$2" key="${3:-}" base="${TAT_BREAKER_URL:-https://triple-a-tropics.com/r2-breaker}"
+  local out code
+  if [ -n "$key" ]; then
+    out="$(curl -sS -m 15 -X "$method" -H "X-Admin-Key: $key" -w $'\n%{http_code}' "$base$path")" || { echo "[breaker] curl failed for $path"; return 1; }
+  else
+    out="$(curl -sS -m 15 -X "$method" -w $'\n%{http_code}' "$base$path")" || { echo "[breaker] curl failed for $path"; return 1; }
+  fi
+  code="${out##*$'\n'}"
+  printf '%s\n' "${out%$'\n'*}"
+  case "$code" in 2*) return 0 ;; *) echo "[breaker] HTTP $code from $path"; return 1 ;; esac
+}
+
+cmd_breaker() {
+  local verb="${1:-}"
+  case "$verb" in
+    status) _breaker_call GET /status ;;
+    arm|disarm|trip|reset)
+      local key="${TAT_BREAKER_ADMIN_KEY:-}"
+      if [ -z "$key" ]; then
+        key="$(on "$(_host_of box1)" "sed -n 's/^TAT_BREAKER_ADMIN_KEY=//p' /root/tsr-s2/.env | head -1" 2>/dev/null || true)"
+      fi
+      if [ -z "$key" ]; then
+        echo "[breaker] no admin key: export TAT_BREAKER_ADMIN_KEY, or  fleet.sh setenv box1 TAT_BREAKER_ADMIN_KEY=<key>"
+        return 1
+      fi
+      [ "$verb" = "trip" ] && echo "[breaker] TRIP: writes_enabled=false in ANY mode (alert too); every box stops R2 writes within ~2 min (mirror + poll). Only 'reset' re-enables ('disarm' does not)."
+      _breaker_call POST "/$verb" "$key" ;;
+    *) echo "usage: fleet.sh breaker status|arm|disarm|trip|reset"; return 2 ;;
+  esac
+}
+
 case "${1:-}" in
   status)    shift; cmd_status "$@" ;;
   drift)     shift; cmd_drift "$@" ;;
@@ -186,5 +292,7 @@ case "${1:-}" in
   deploy)    shift; cmd_deploy "$@" ;;
   setenv)    shift; cmd_setenv "$@" ;;
   lanes)     shift; cmd_lanes "$@" ;;
-  *) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 2 ;;
+  writes)    shift; cmd_writes "$@" ;;
+  breaker)   shift; cmd_breaker "$@" ;;
+  *) sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/!p}' "${BASH_SOURCE[0]}"; exit 2 ;;
 esac

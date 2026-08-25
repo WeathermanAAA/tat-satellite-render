@@ -86,6 +86,15 @@ from botocore.config import Config as BotoConfig
 
 from meso_sectors import MESO_SECTORS, MesoSector
 
+# The R2 write kill switch (tat_killswitch.py at the repo root, mirrored in
+# TAT). Optional on purpose: a missing or broken module means "allowed" --
+# the switch can only ever STOP writes, never break a lane. Deletes are
+# never guarded (free on R2; prune must keep reducing storage).
+try:
+    import tat_killswitch
+except Exception:  # noqa: BLE001
+    tat_killswitch = None
+
 # poller_framework is dependency-free (no requests/boto3); import its health +
 # freshness primitives for the per-sector isolation + heartbeat. Imported at
 # module load (cheap, stdlib-only) so a missing framework fails fast + loud.
@@ -503,6 +512,8 @@ class R2:
             return None
 
     def put_bytes(self, key: str, data: bytes, content_type: str, cache: str) -> bool:
+        if tat_killswitch is not None and not tat_killswitch.writes_allowed(key):
+            return False
         try:
             self.s3.put_object(Bucket=R2_BUCKET, Key=key, Body=data,
                                ContentType=content_type, CacheControl=cache)

@@ -56,6 +56,28 @@ import poller_framework as pf
 import feed_recompute as fr
 import storm_ids
 
+# The R2 write kill switch (tat_killswitch.py at the repo root, mirrored in
+# TAT). Optional on purpose: a missing or broken module means "allowed" --
+# the switch can only ever STOP writes, never break a lane. Deletes are
+# never guarded (free on R2; prune must keep reducing storage).
+try:
+    import tat_killswitch
+except Exception:  # noqa: BLE001
+    tat_killswitch = None
+
+
+class WritesDisabled(RuntimeError):
+    """Raised by R2Sink when the R2 write kill switch refuses a PUT. A
+    RuntimeError on purpose: to the poller engine it is just a failed
+    process(), so the source's change signature is HELD and the feed is
+    retried (re-emitted) on the first cycle after writes resume."""
+
+
+def _check_writes(key: str) -> None:
+    if tat_killswitch is not None and not tat_killswitch.writes_allowed(key):
+        raise WritesDisabled("R2 writes disabled by kill switch: "
+                             + str(tat_killswitch.reason()))
+
 # ---------------------------------------------------------------------------
 # Config (env-driven, safe defaults)
 # ---------------------------------------------------------------------------
@@ -869,7 +891,17 @@ class R2Sink(pf.Sink):
     (application/json, max-age=30) so the frontend's cache behavior is unchanged.
     Raises on failure -> the engine records a process failure, holds the change
     signature, and retries the feed next cycle (a heartbeat-write failure is
-    swallowed by emit_health, so a transient R2 blip never crashes the loop)."""
+    swallowed by emit_health, so a transient R2 blip never crashes the loop).
+    The R2 write kill switch uses the SAME contract: a blocked PUT raises
+    WritesDisabled rather than returning quietly. A silent no-op would let
+    the engine advance the signature, and every feed that changed during the
+    block (tracks/ACE feeds, the global geojson, cyclolab adv/formation/
+    pages) would stay at its pre-trip bytes after `breaker reset` until the
+    upstream's NEXT real change -- hours, or never for a storm that
+    dissipated meanwhile. Raising costs one throttled 'process FAILED
+    (signature held for retry)' line per source per cycle while blocked and
+    buys a full re-emit on the first cycle after writes resume, with no
+    container recreate."""
 
     def __init__(self) -> None:
         import boto3
@@ -890,6 +922,7 @@ class R2Sink(pf.Sink):
             config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
 
     def write(self, key: str, payload: dict) -> None:
+        _check_writes(key)          # kill switch: raise, never a silent no-op
         body = json.dumps(payload, separators=(",", ":")).encode()
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=body,
                            ContentType="application/json",
@@ -900,6 +933,7 @@ class R2Sink(pf.Sink):
         """CycloLab page writer (CYCLOLAB_DESIGN.md §3.1): per-storm HTML
         PUT with text/html so the cyclolab-router Worker serves it as a
         real document. Same raise-on-failure semantics as write()."""
+        _check_writes(key)
         self.s3.put_object(Bucket=self.bucket, Key=key,
                            Body=html.encode("utf-8"),
                            ContentType="text/html; charset=utf-8",
@@ -909,6 +943,7 @@ class R2Sink(pf.Sink):
                   cache: str = "public, max-age=300") -> None:
         """Binary PNG PUT (the CycloLab intensity OG card). Same
         raise-on-failure semantics as write()."""
+        _check_writes(key)
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=data,
                            ContentType="image/png", CacheControl=cache)
 

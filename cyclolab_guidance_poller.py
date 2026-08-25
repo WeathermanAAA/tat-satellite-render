@@ -32,6 +32,15 @@ import requests
 
 import cyclolab_guidance as cg
 
+# The R2 write kill switch (tat_killswitch.py at the repo root, mirrored in
+# TAT). Optional on purpose: a missing or broken module means "allowed" --
+# the switch can only ever STOP writes, never break a lane. Deletes are
+# never guarded (free on R2; prune must keep reducing storage).
+try:
+    import tat_killswitch
+except Exception:  # noqa: BLE001
+    tat_killswitch = None
+
 UTC = dt.timezone.utc
 log = logging.getLogger("cyclolab_guidance")
 
@@ -429,6 +438,8 @@ class _R2:
             config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}))
 
     def put_json(self, key: str, obj: dict) -> bool:
+        if tat_killswitch is not None and not tat_killswitch.writes_allowed(key):
+            return False
         try:
             self.s3.put_object(Bucket=self.bucket, Key=key,
                                Body=json.dumps(obj, separators=(",", ":")).encode(),

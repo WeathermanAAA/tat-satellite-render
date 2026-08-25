@@ -147,6 +147,144 @@ means a dead box no matter how healthy its contents look — the page treats
 
 ---
 
+## The R2 write kill switch
+
+R2 bills Class A operations (PUT/LIST) per million; the 2026-08-03 incident
+ran ~445,000/h against a ~29,000/h norm. The defence has two halves, and the
+boxes only ever see the second:
+
+* **The r2-breaker Worker** (TAT `workers/r2-breaker.js`, cron every 5 min)
+  reads the R2 analytics and publishes a status document. In `alert` mode it
+  opens a GitHub issue when it *would have* tripped; in `armed` mode it also
+  sets `writes_enabled:false`. It never resumes on its own: `reset` is the only
+  way back, and it is manual.
+* **`tat_killswitch.py`** (repo root, byte-identical copy in TAT) gates every
+  R2 PUT on the boxes. Each writer asks `writes_allowed(key)` first. It reads
+  the CDN mirror `fleet/breaker.json` (never the Worker -- free-plan request
+  budget) at most once a minute per process, and blocks only on a fresh
+  (`worker_ts` within 15 min) document that says `writes_enabled:false`.
+  That flag is the Worker's one gate: it goes false only on an auto-trip
+  while `armed` or on a manual `trip` (any mode, alert included), and only
+  `reset` turns it back on -- `disarm` does not, and the boxes do not look
+  at `mode` for the decision (gating on `armed` as well would make `disarm`
+  a silent second path back to writing and a manual trip in alert mode a
+  no-op). Anything else -- unreachable CDN, stale copy, missing fields, an
+  exception -- **fails open**.
+  Deletes are never gated, so prune keeps reducing storage. Keys under
+  `fleet/` are always allowed, so the heartbeat, the roster and the mirror
+  itself keep landing while writes are stopped: a darkened box must never
+  look like a dead one.
+
+The heartbeat is the mirror: every minute each box fetches `/r2-breaker/status`
+once, stamps `breaker_age_s` + `breaker_mode` into its own `fleet/<box>.json`,
+and (only after that PUT succeeds, only for a valid `v:1` document) copies the
+status to `fleet/breaker.json`. A failed or garbage fetch writes nothing to the
+mirror; the last good copy stands.
+
+### The 30-second manual path
+
+When you need writes stopped NOW and do not want to depend on the Worker:
+
+```bash
+scripts/fleet.sh writes off all        # or: writes off box2
+# ... investigate, fix, then:
+scripts/fleet.sh writes on all
+```
+
+`writes off` writes `TAT_R2_WRITES=0` into every `.env` the write lanes load
+(box1 runs stacks out of more than one checkout, so that is more than
+`/root/tsr-s2/.env`), then brings every **write** container present back up
+from its own compose labels with the **same image** (`--no-build --no-deps
+--force-recreate`; the box half is `scripts/box_writes.sh`) -- emit-cron lanes
+(not prune), `s1-ingest*`, `meso-poller`, the floater/intensity/guidance
+pollers, every overlays poller. The list comes from `docker ps` with name
+filters, so a lane that is not running is skipped, not an error. It then
+**verifies**, per container, that `TAT_R2_WRITES` is inside it AND that the
+guard is really there (`guard: present`): it runs `tat_killswitch` with the
+container's own python from the container's own cwd and makes it refuse a
+probe key (or, for `on`, import and allow). Either failure exits non-zero:
+success means the value is in the process and the process has something that
+reads it, not that a command returned 0. It **never** touches anything that
+serves: caddy, render, `meso-render*`, `s1-render`, `radar-render`,
+centerfix/objfix, prune. Expect ~30-60 s per box.
+
+### Guard presence: the switch is inert on an image that predates it
+
+Every writer imports the switch as `try: import tat_killswitch except
+Exception: tat_killswitch = None` and treats None as ALLOWED (the switch can
+only ever stop writes, never break a lane). So a lane whose **image** was
+built before `tat_killswitch.py` existed takes `TAT_R2_WRITES=0`, shows it in
+`docker inspect`, and keeps writing. `writes off` reports that lane as
+`guard: ABSENT` and fails the box; do not read the env value alone as a stop.
+As of 2026-08-25 that is every lane on both boxes (all four image families
+were checked on box1). The images that must be rebuilt, and from where:
+
+* **s2 emit lanes** (`tat-s2-*-emit-cron-1`, both boxes): `scripts/fleet.sh
+  deploy all` (pull main, rebuild `tat-s2`, recreate the lanes).
+* **tat-render pollers** (`tat-render-{floater,intensity,guidance}-poller-1`,
+  box1): `docker compose -p tat-render -f docker-compose.render.yml build
+  && ... up -d` from `/root/tsr-s2` (RUNBOOK-RENDER.md).
+* **meso-poller** (`tat-satellite-render-meso-poller-1`, box1): rebuild from
+  its own checkout `/root/tat-satellite-render` (it is NOT `/root/tsr-s2`,
+  and `fleet.sh deploy` never touches it) -- pull main there first.
+* **s1 ingest** (`tat-s1-s1-ingest*-1`, box1): rebuild from `/root/tat-sat-s1`
+  per RUNBOOK-S1-MULTISAT.md -- same caveat, a separate checkout.
+* **tat-overlays pollers** (box1) need no rebuild: they hard-reset a sparse
+  checkout of TAT main every tick and import the TAT copy from `/work/tat`,
+  so the guard arrives on its own once TAT main carries
+  `tat_killswitch.py`. Until then they too report `guard: ABSENT`.
+* **hafs-worker** builds from the pinned `hafs-render-worker` branch; its
+  guard lands only when that branch is updated.
+
+After any rebuild, `scripts/fleet.sh writes on <box>` is a cheap way to see
+`guard: present` on every lane without stopping anything.
+
+### While writes are stopped
+
+* **s2 emit lanes**: each pass exits immediately after building its store
+  (`[emit] R2 writes disabled by kill switch (...) -- skipping this pass`,
+  rc 0) -- no coverage LISTs, no NOAA fetches, no renders. Without that a
+  blocked pass would re-fetch and re-render every uncovered slot in its
+  window every tick, since nothing ever becomes covered.
+* **s1 ingest, meso/floater/hafs pollers, guidance poller**: the PUT returns
+  False and the lane retries on its own cadence; nothing is retained.
+* **intensity poller** (`R2Sink`): a blocked PUT *raises*, so the engine
+  holds every changed feed's signature (`process FAILED (signature held for
+  retry)`, one line per source per cycle) and re-emits all of them --
+  tracks/ACE feeds, the global geojson, cyclolab adv/formation/pages -- on
+  the first cycle after writes resume. No recreate is needed after
+  `breaker reset`. (A silent no-op would have marked those feeds as written
+  and left R2 at the pre-trip bytes until the next real upstream change.)
+* **heartbeats** (`fleet/*`) keep landing; deletes/prune keep running.
+
+Why recreate and not `docker restart`: compose bakes `env_file` into the
+container when it is created, so a restart keeps the old env (verified
+2026-08-25), and `tat_killswitch` reads the env once at import. Recreate
+with the same image is the smallest action that actually changes the value
+the process sees. Because it re-reads the compose file on disk, keep boxes
+clean on main (`fleet.sh drift`) so a recreate deploys nothing you did not
+mean to.
+
+### The breaker verbs
+
+```bash
+scripts/fleet.sh breaker status        # the status JSON (public)
+scripts/fleet.sh breaker arm           # mode=armed: a trip now stops writes
+scripts/fleet.sh breaker disarm        # mode=alert (does NOT re-enable writes: boxes gate on writes_enabled, not mode)
+scripts/fleet.sh breaker trip          # writes_enabled=false in ANY mode (alert too), fleet-wide, ~2 min
+scripts/fleet.sh breaker reset         # the ONLY way back to writing
+```
+
+The admin verbs send `X-Admin-Key` from `TAT_BREAKER_ADMIN_KEY` in your env,
+or else from box1's `.env` (`fleet.sh setenv box1 TAT_BREAKER_ADMIN_KEY=...`).
+`trip`/`reset` reach the boxes through the mirror: up to 1 min for the next
+heartbeat plus up to 1 min for each process's poll. Verify with
+`fleet.sh status`, the `/fleet/` page's breaker card, or a lane's log lines
+(`[killswitch] R2 writes DISABLED (...)`, one per minute at most, and one
+`ENABLED again` line when they resume).
+
+---
+
 ## Capacity: how to decide what goes where
 
 The currency is **cut CPU**, measured per product-slot, and the binding
@@ -183,6 +321,8 @@ scripts/fleet.sh lanes <box>            # assignment map for one box
 scripts/fleet.sh provision <box>        # bare box -> ready (idempotent)
 scripts/fleet.sh deploy <box|all>       # pull main, rebuild, recreate lanes
 scripts/fleet.sh setenv <box|all> K=V   # secret propagation
+scripts/fleet.sh writes off|on [box|all]   # R2 write kill switch (env + recreate of write lanes)
+scripts/fleet.sh breaker status|arm|disarm|trip|reset   # the r2-breaker Worker
 ```
 
 Health page: `/fleet/` (unlinked, noindexed, robots-disallowed).

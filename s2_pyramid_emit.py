@@ -46,6 +46,17 @@ import s2_imagery as I
 import s2_pyramid as P
 import s2_registry as R
 
+# The R2 write kill switch (tat_killswitch.py at the repo root, mirrored in
+# TAT). Optional on purpose: a missing or broken module means "allowed".
+# The store's put_bytes (s1_ingest.R2) already refuses every PUT while
+# blocked; the pass-level check in main() exists so a blocked pass exits
+# BEFORE its coverage LISTs and NOAA fetches instead of fetching+rendering
+# every uncovered slot in the window each tick for nothing.
+try:
+    import tat_killswitch
+except Exception:  # noqa: BLE001
+    tat_killswitch = None
+
 UTC = dt.timezone.utc
 CDN = "https://cdn.triple-a-tropics.com"
 
@@ -603,6 +614,23 @@ def main(argv=None) -> int:
             when = when.replace(tzinfo=UTC)
 
     store, is_r2 = _make_store(args.store)
+
+    if is_r2 and tat_killswitch is not None and not tat_killswitch.writes_allowed(
+            args.prefix.rstrip("/") + "/"):
+        # Every PUT of this pass would be refused (emit_pyramid raises before
+        # its ready marker, so nothing half-lands), but the backfill loops
+        # below deliberately continue past a failed slot and no slot ever
+        # becomes covered while blocked -- so a blocked pass would re-fetch
+        # and re-render EVERY uncovered slot in the window every tick (plus
+        # one hygiene LIST per slot in container mode; ~800 MB per young
+        # FCI slot). Exit clean before any LIST or fetch; the lane's shell
+        # loop sleeps its interval and asks again next tick. rc 0 on purpose:
+        # the compose loop must not log a "failed" line per product per tick.
+        # Local stores are never gated (no R2 cost). Algorithm-neutral: no
+        # emit, listing or manifest code path changes.
+        print(f"[emit] R2 writes disabled by kill switch "
+              f"({tat_killswitch.reason()}) -- skipping this pass")
+        return 0
 
     if args.product:
         entry = R.REGISTRY_BY_ID.get(args.product)
