@@ -80,10 +80,10 @@ WHAT THE MANIFEST PATH CANNOT SEE, and what catches it:
   canary watchdog's rollback cleanup) stays advertised and its slot looks
   covered until the next verify listing re-renders it -- if the slot is
   still in the grid. Deleting frames therefore means ALSO dropping their
-  stamps from latest_times.json (s2_prune.rewrite_manifest is the pattern),
-  or recreating the lane: a fresh container lists on its first pass and its
-  next emit is heal-due, so the ghosts are dropped and re-rendered within
-  about one step.
+  stamps from latest_times.json (s2_prune.rewrite_manifest is the pattern).
+  Recreating the lane heals them too, but ONLY if the deletion lands BEFORE
+  the fresh container's first pass (it lists once and spends its heal
+  rebuild on that pass): delete, then recreate, never the reverse.
 """
 from __future__ import annotations
 
@@ -93,6 +93,7 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import re
 import sys
 import traceback
 
@@ -123,6 +124,7 @@ INDEX_MIN_S = int(os.environ.get("S2_INDEX_MIN_S", "1800"))
 #: reconcile) so R2 reality and the manifest are re-squared on a bounded
 #: cadence, not only at the heal tick. 0 = list every pass.
 COVER_VERIFY_S = int(os.environ.get("S2_COVER_VERIFY_S", "1800"))
+_STAMP_SHAPE = re.compile(r"^\d{8}T\d{6}Z$")   # stray memo lines must be stamps
 
 
 def _state_path(kind: str, *parts: str) -> str:
@@ -222,9 +224,11 @@ def _stray_stamps(prefix: str, product_id: str) -> list:
     frame at ANY maxzoom covered its slot); without the memo each stray would
     cost a source download per pass until it aged out of the window."""
     try:
-        with open(_state_path("stray", prefix, product_id)) as fh:
-            return [ln.strip() for ln in fh if ln.strip()]
-    except OSError:
+        with open(_state_path("stray", prefix, product_id),
+                  encoding="utf-8", errors="ignore") as fh:
+            return [ln.strip() for ln in fh
+                    if _STAMP_SHAPE.match(ln.strip())]   # corrupt lines: ignored
+    except (OSError, ValueError):             # unreadable/corrupt memo: no strays
         return []
 
 
@@ -619,7 +623,22 @@ def emit_one(entry, when, store, args, band_cache=None) -> dict:
         # listing path always did. A marker without maxzoom keeps the
         # rebuild (unknown geometry, as before).
         frame_mz = _frame_maxzoom(entry, store, args.prefix, img.stamp)
-        if frame_mz is not None and frame_mz != cur["maxzoom"]:
+        if frame_mz is None:
+            # Markers have carried 'maxzoom' since the first pyramid emit, so
+            # None here means the GET failed (R2.get_bytes swallows errors),
+            # not "unknown geometry". Routing that into the rebuild would let
+            # one transient read failure on a STRAY re-anchor the live
+            # manifest on the stray's geometry (re-review 2026-08-25). Leave
+            # the manifest alone; the next pass, the verify listing or the
+            # heal tick settles it.
+            print(f"[manifest] duplicate {img.stamp} not advertised and its "
+                  f"marker was unreadable -- manifest left as is")
+            print(f"[done] {entry.product_id}: frames={cur.get('count')} "
+                  f"latest={cur.get('latest')} "
+                  f"zoom={cur.get('minzoom')}..{cur.get('maxzoom')}")
+            return {"stamp": img.stamp, "outcome": meta["outcome"],
+                    "manifest": cur}
+        if frame_mz != cur["maxzoom"]:
             print(f"[manifest] stray geometry {img.stamp} (maxzoom {frame_mz} "
                   f"!= {cur['maxzoom']}) -- not advertised, manifest left as is")
             _stray_note(args.prefix, entry.product_id, img.stamp)

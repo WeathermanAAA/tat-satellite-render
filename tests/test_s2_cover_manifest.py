@@ -546,17 +546,43 @@ class TestOrphanSelfHeals(_EmitBase):
 
 
 class TestOrphanLegacyMarker(_EmitBase):
-    """A marker WITHOUT maxzoom (unknown geometry) keeps the pre-review
-    rebuild: the listing derives the geometry from the frame's own tiles."""
+    """A marker whose maxzoom cannot be read (R2.get_bytes swallows errors
+    to None; markers have carried 'maxzoom' since the first pyramid emit)
+    must NOT reach the rebuild under a --step loop: one transient read
+    failure on a STRAY would otherwise re-anchor the live manifest on the
+    stray's geometry (re-review finding 1, 2026-08-25). The manifest is left
+    alone; the verify listing or the heal tick settles the frame."""
     B_MARKER = {}
 
-    def test_unknown_geometry_orphan_rebuilds_as_before(self):
+    def test_unreadable_marker_leaves_the_manifest_alone(self):
         rc, listings = self._pass()
         self.assertEqual(rc, 0)
-        self.assertEqual(self.fetched, [self.B, self.C])
-        self.assertEqual(listings, 1)
-        self.assertEqual(self._times(), [self.D, self.C, self.B, self.A])
-        self.assertEqual(self._live()["maxzoom"], 0)
+        self.assertEqual(self.fetched, [self.B, self.C])   # visited once
+        self.assertEqual(listings, 0)                      # no rebuild listing
+        self.assertIn(f"[manifest] duplicate {self.B} not advertised and its "
+                      "marker was unreadable", self.out)
+        live = self._live()
+        self.assertEqual(live["maxzoom"], 0)
+        self.assertEqual(live["times"], [self.D, self.C, self.A])   # B not adopted
+        b_dir = self.entry.tile_stamp_prefix(PREFIX, self.B)
+        self.assertEqual([k for k in self.store.put_log
+                          if k.startswith(b_dir)], [])           # no tile PUT
+        self.assertEqual(len(self._manifest_puts()), 1)          # C's append only
+
+
+class TestCorruptStrayMemo(_EmitBase):
+    """A corrupt (non-UTF-8) stray memo file must not raise out of the hot
+    path (re-review finding 3, 2026-08-25): it reads as 'no strays'."""
+
+    def test_corrupt_memo_reads_as_empty_and_the_pass_runs(self):
+        path = E._state_path("stray", PREFIX, self.entry.product_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\xff\xfe\x00garbage\n")
+        self.assertEqual(E._stray_stamps(PREFIX, self.entry.product_id), [])
+        rc, _ = self._pass()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("Traceback", self.out)
 
 
 # ---------------------------------------------------------------------------

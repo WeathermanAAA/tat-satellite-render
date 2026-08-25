@@ -204,11 +204,13 @@ geometry inside the window is left out of the manifest (`[manifest] stray
 geometry ...`) and memoed in the container's STATE_DIR so its slot counts as
 covered; and DELETING frames under a live manifest no longer re-renders them
 on the next pass -- strip the stamps from `latest_times.json` too
-(`s2_prune.rewrite_manifest` is the pattern) or recreate the lane (its first
-pass lists, its next emit heal-rebuilds; that is what the container-canary
-watchdog's rollback gets, so its deleted frames re-render within about one
-step + one pass); otherwise the slots re-render only at the next verify
-listing, if still in the backfill grid. Rollback lever: `S2_COVER_FROM_MANIFEST=0`
+(`s2_prune.rewrite_manifest` is the pattern), or delete the frames and THEN
+recreate the lane (a fresh container lists once on its first pass and spends
+its heal rebuild there, so a deletion that lands after that first pass waits
+for the verify listing like any other; `s2_canary_watchdog.sh` currently
+recreates first and deletes second, which is the wrong order under this
+path); otherwise the slots re-render only at the next verify listing (<= 30
+min), if still in the backfill grid. Rollback lever: `S2_COVER_FROM_MANIFEST=0`
 in the box `.env` and recreate the lane (its compose header's
 `up -d --no-build` line, or `fleet.sh deploy <box>`) -- no code redeploy.
 Judge it by the `[ops]` line: an idle pass reads `get=1` with no
