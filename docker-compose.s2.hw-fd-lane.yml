@@ -33,7 +33,7 @@ services:
         BROWSE="b01 b02 b03 b04 b05 b06 b07 b09 b10 b11 b12 b14 b15 b16 \
                 ash dust nightmicro firetemp daycloudphase dayconvection \
                 daylandcloud snowfog"
-        echo "[s2-hwfd] himawari9-fd browse catalog: 22 bands @20min (z5 native)"
+        echo "[s2-hwfd] himawari9-fd browse catalog: 22 bands @20min (z5 native), sweep sleep $${S2_HWFD_SWEEP_SLEEP_S:-900}s"
         while true; do
           for prod in $$BROWSE; do
             python s2_pyramid_emit.py --product himawari9-fd-$$prod \
@@ -41,5 +41,13 @@ services:
               --allow-geometry-change --step 20 --backfill 120 \
               || echo "[s2-hwfd] $$prod failed rc=$$? (next tick retries)"
           done
-          sleep 30
+          # Sweep cadence = the product cadence. This lane once slept 30 s
+          # between sweeps, so an idle sweep (22 products x ~1.6 s of
+          # coverage probes, 0/6 slots missing) ran 21x/hour: 11,415 passes
+          # and ~149K LIST pages a day for a 20-min product -- 39% of the
+          # fleet's entire listing (cost audit 2026-08-25). --backfill 120
+          # covers 6 slots, so nothing is missed at any sweep phase; a slot
+          # waits at most one sweep. 900 s keeps the sweep period under the
+          # 20-min grid step (sweep ~35 s idle, ~7 min when 22 frames land).
+          sleep "$${S2_HWFD_SWEEP_SLEEP_S:-900}"
         done
