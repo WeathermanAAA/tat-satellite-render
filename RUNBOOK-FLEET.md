@@ -172,6 +172,33 @@ Placement rules of thumb:
   animated products in their own container get a ~3 min pass (latency tracks
   the scan) while the 22 browse bands sweep separately.
 
+### The catch-up governor (after the 2026-09-02 box1 incident)
+
+A box that has been starved -- a provider bandwidth shaper, a long upstream
+outage -- will try to refill every lane's hole at once the moment the starving
+stops, alongside the render apps and the s1 queues. On box1 that was 6-7 cores
+for 3.5 h and Hostinger's automated CPU limiter followed (steal 95 % for 33+ h).
+`s2_pyramid_emit.py` therefore carries three overlap guards, all env-driven:
+
+* **slots** -- `S2_SLOTS=N` in the box `.env` bounds concurrent emits across
+  ALL lanes on that box via fcntl locks on `/run/tat-emit/slotK` (bind-mounted
+  into every lane by the base compose). `slot0` is reserved for lanes whose
+  file declares `S2_SLOT_CLASS: leads`; browse lanes take slots `1..N-1` only,
+  so leads are never queued behind browse. Locks die with the process.
+* **gate** -- `S2_GATE_STEAL_MAX=P` (box `.env`): a browse pass does not start
+  while hypervisor steal exceeds P % (two `/proc/stat` reads; never
+  `/proc/loadavg`, which cannot see steal and would stall the leads too). It
+  re-checks every `S2_GATE_SLEEP_S` (60) up to `S2_GATE_MAX_WAIT_S` (900), then
+  skips the pass. Leads are exempt.
+* **cap** -- `S2_MAX_REBUILD_PER_PASS=K` in a lane file: at most K slots
+  rebuilt per product per pass, newest first, so a hole refills over hours
+  instead of in one burst and freshness is unaffected.
+
+box1's values: `.env` `S2_SLOTS=2`, `S2_GATE_STEAL_MAX=50`; lane files
+g19fd-leads + conus-fast2 = `leads`, g19fd (cap 2) + conus (cap 3) = `browse`.
+Unset = off, so box2 and any new box run exactly as before until their `.env`
+opts in. Judge a governed box by steal % on `/fleet/`, not by load.
+
 ---
 
 ## Reference

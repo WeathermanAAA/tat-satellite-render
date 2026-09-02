@@ -20,6 +20,8 @@ services:
       # container-publish flip switch (see conus-fast + 
       # scripts/s2_canary_watchdog.sh; position lives in the box .env)
       S2_CONTAINER_TILES: "${S2_CONTAINER_TILES_CONUS_FAST2:-0}"
+      # governor: the native-5-min common bands are user-facing; leads class
+      S2_SLOT_CLASS: leads
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

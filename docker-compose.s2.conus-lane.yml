@@ -13,6 +13,9 @@ services:
       # container-publish flip switch (see conus-fast + 
       # scripts/s2_canary_watchdog.sh; position lives in the box .env)
       S2_CONTAINER_TILES: "${S2_CONTAINER_TILES_CONUS:-0}"
+      # governor: rare set = browse class, shared slots only, 3 slots/pass
+      S2_SLOT_CLASS: browse
+      S2_MAX_REBUILD_PER_PASS: "3"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

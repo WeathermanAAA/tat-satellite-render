@@ -90,11 +90,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import fcntl
 import datetime as dt
 import json
 import os
 import re
 import sys
+import time
 import traceback
 
 import s2_imagery as I
@@ -151,6 +153,202 @@ def _state_touch(path: str) -> None:
             fh.write(dt.datetime.now(UTC).isoformat())
     except OSError:
         pass                                  # state is an optimization only
+
+
+# ---------------------------------------------------------------------------
+# Box-wide catch-up governor (2026-09-02 box1 incident)
+#
+# WHY: after a 35 h host-side ingress throttle lifted at the month boundary,
+# every lane on box1 backfilled its window at once alongside the render apps
+# and the s1 queues -- 6-7 cores for 3.5 h -- and the provider's automated CPU
+# limiter followed (steal 95 % for 33+ h). Nothing bounded how many emits ran
+# concurrently across lanes, how deep one pass would dig, or whether a pass
+# should start at all while the hypervisor was already withholding CPU.
+#
+# Three overlap guards, all env-driven so a lane file only declares WHAT it is
+# (S2_SLOT_CLASS) and the box declares HOW MUCH it can carry (its .env):
+#   * slots  -- S2_SLOTS=N slot files under S2_SLOT_DIR (a host dir bind-mounted
+#               into every lane); an emit holds one fcntl lock for its whole
+#               run, released by the kernel on ANY exit (SIGKILL included).
+#               slot0 is RESERVED for S2_SLOT_CLASS=leads (the loop-lead
+#               products users watch); browse lanes may take slots 1..N-1 only,
+#               so an unordered semaphore can never demote leads. N=1 means
+#               "leads only" on that box. S2_SLOTS unset/0 = off.
+#   * gate   -- S2_GATE_STEAL_MAX=P: a browse pass does not START while steal
+#               exceeds P % (two /proc/stat reads, host-wide, visible from
+#               inside a container); it re-checks every S2_GATE_SLEEP_S up to
+#               S2_GATE_MAX_WAIT_S then skips the pass. NEVER /proc/loadavg:
+#               load under a cap is the run queue behind the hypervisor and
+#               would stall the leads lanes too. Leads are exempt. 0 = off.
+#   * cap    -- S2_MAX_REBUILD_PER_PASS=K: at most K slots rebuilt per product
+#               per pass (newest first, so freshness is unaffected); an outage
+#               hole refills over many passes instead of one burst. 0 = off.
+# A skipped pass exits 0 with a "[gate]"/"[slot]" line: the lane loop simply
+# moves to its next product; nothing is retried in a tight loop.
+# ---------------------------------------------------------------------------
+GOV_SLOT_DIR_DEFAULT = "/run/tat-emit"
+_GOV_LEASE = None            # module-level so the lock lives until exit
+
+
+def _env_num(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[gov] {name}={raw!r} is not a number -- using {default}")
+        return default
+
+
+def _cpu_fields(line: str):
+    parts = line.split()
+    if len(parts) < 9 or parts[0] != "cpu":
+        return None
+    try:
+        return [int(x) for x in parts[1:9]]     # user nice sys idle iowait irq softirq steal
+    except ValueError:
+        return None
+
+
+def steal_pct_from(line1: str, line2: str):
+    """Steal % of all CPU time between two /proc/stat `cpu` lines, or None."""
+    a, b = _cpu_fields(line1), _cpu_fields(line2)
+    if a is None or b is None:
+        return None
+    d = [max(0, y - x) for x, y in zip(a, b)]
+    tot = sum(d)
+    if tot <= 0:
+        return None
+    return 100.0 * d[7] / tot
+
+
+def read_cpu_steal_pct(sample_s: float = 1.0, stat_path: str = "/proc/stat",
+                       sleeper=time.sleep):
+    try:
+        with open(stat_path) as f:
+            l1 = f.readline()
+        sleeper(sample_s)
+        with open(stat_path) as f:
+            l2 = f.readline()
+    except OSError:
+        return None
+    return steal_pct_from(l1, l2)
+
+
+def gate_wait(slot_class: str, max_steal: float, sleep_s: float, max_wait_s: float,
+              sampler=None, sleeper=time.sleep, log=print) -> bool:
+    """True = start the pass. Browse passes wait while steal > max_steal;
+    leads never wait here. An unreadable sample counts as clear (the gate is
+    a brake, not a dependency)."""
+    if max_steal <= 0 or slot_class == "leads":
+        return True
+    if sampler is None:
+        sampler = read_cpu_steal_pct      # looked up at call time (patchable)
+    waited = 0.0
+    while True:
+        steal = sampler()
+        if steal is None or steal <= max_steal:
+            if waited:
+                log(f"[gate] steal {steal:.1f} % <= {max_steal:g} % after {waited:.0f}s -- starting")
+            return True
+        if waited >= max_wait_s:
+            log(f"[gate] steal {steal:.1f} % > {max_steal:g} % for {waited:.0f}s -- skipping this pass")
+            return False
+        log(f"[gate] steal {steal:.1f} % > {max_steal:g} % -- waiting {sleep_s:g}s")
+        sleeper(sleep_s)
+        waited += sleep_s
+
+
+class SlotLease:
+    def __init__(self, path: str, fd):
+        self.path, self._fd = path, fd
+
+    def release(self) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                self._fd.close()
+                self._fd = None
+
+
+def slot_order(n_slots: int, slot_class: str) -> list:
+    """leads: slot0 first, then the shared ones; browse: shared ones only."""
+    if n_slots <= 0:
+        return []
+    shared = list(range(1, n_slots))
+    return [0] + shared if slot_class == "leads" else shared
+
+
+def acquire_slot(slot_dir: str, n_slots: int, slot_class: str, wait_s: float,
+                 poll_s: float = 5.0, sleeper=time.sleep, clock=time.monotonic,
+                 log=print):
+    """Hold one slot file with an exclusive non-blocking flock, polling for up
+    to wait_s. Returns a SlotLease, or None when no slot came free (the caller
+    skips the pass). The lease must stay referenced for the run's lifetime."""
+    order = slot_order(n_slots, slot_class)
+    if not order:
+        log(f"[slot] class {slot_class!r} has no slot on a {n_slots}-slot box -- skipping this pass")
+        return None
+    os.makedirs(slot_dir, exist_ok=True)
+    t0 = clock()
+    announced = False
+    while True:
+        for k in order:
+            path = os.path.join(slot_dir, f"slot{k}")
+            fd = open(path, "a+")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fd.close()
+                continue
+            try:
+                fd.seek(0); fd.truncate()
+                fd.write(f"{os.getpid()} {slot_class} {dt.datetime.now(UTC).isoformat()}\n")
+                fd.flush()
+            except OSError:
+                pass
+            if announced:
+                log(f"[slot] slot{k} acquired after {clock() - t0:.0f}s")
+            return SlotLease(path, fd)
+        waited = clock() - t0
+        if waited >= wait_s:
+            log(f"[slot] no {slot_class} slot free within {waited:.0f}s -- skipping this pass")
+            return None
+        if not announced:
+            log(f"[slot] all {slot_class} slots busy -- waiting up to {wait_s:g}s")
+            announced = True
+        sleeper(poll_s)
+
+
+def governor_admit(log=print) -> bool:
+    """Run the gate then take a slot, per the box .env. True = proceed."""
+    global _GOV_LEASE
+    slot_class = os.environ.get("S2_SLOT_CLASS", "browse").strip().lower() or "browse"
+    if slot_class not in ("leads", "browse"):
+        log(f"[gov] S2_SLOT_CLASS={slot_class!r} unknown -- treating as browse")
+        slot_class = "browse"
+    max_steal = _env_num("S2_GATE_STEAL_MAX", 0)
+    if max_steal > 0:
+        ok = gate_wait(slot_class, max_steal,
+                       _env_num("S2_GATE_SLEEP_S", 60), _env_num("S2_GATE_MAX_WAIT_S", 900),
+                       log=log)
+        if not ok:
+            return False
+    n_slots = int(_env_num("S2_SLOTS", 0))
+    if n_slots > 0:
+        lease = acquire_slot(os.environ.get("S2_SLOT_DIR", GOV_SLOT_DIR_DEFAULT).strip()
+                             or GOV_SLOT_DIR_DEFAULT,
+                             n_slots, slot_class, _env_num("S2_SLOT_WAIT_S", 1800), log=log)
+        if lease is None:
+            return False
+        _GOV_LEASE = lease
+    return True
+
+
+def rebuild_cap() -> int:
+    return max(0, int(_env_num("S2_MAX_REBUILD_PER_PASS", 0)))
 
 
 def _print_ops(store, label: str) -> None:
@@ -854,7 +1052,7 @@ def main(argv=None) -> int:
     ap.add_argument("--step", type=int, default=None, metavar="MIN",
                     help="target loop cadence: instead of emitting ONLY the newest "
                          "scan, emit every missing MIN-minute slot in the trailing "
-                         "--backfill window (oldest first). A slot already covered "
+                         "--backfill window (newest first). A slot already covered "
                          "by a complete frame within MIN/2 is skipped, so re-runs "
                          "are cheap and a slow/killed pass self-heals next tick. "
                          "Without --step the old newest-scan-only behavior holds.")
@@ -879,6 +1077,9 @@ def main(argv=None) -> int:
         when = dt.datetime.fromisoformat(args.time)
         if when.tzinfo is None:
             when = when.replace(tzinfo=UTC)
+
+    if not governor_admit():
+        return 0                 # skipped pass: the lane loop moves on
 
     store, is_r2 = _make_store(args.store)
 
@@ -943,6 +1144,12 @@ def main(argv=None) -> int:
                     n_fail += 1          # kill the rest of the window
                     print(f"[FAIL] {entry.product_id} @ {slot.isoformat()}: {e}")
                     traceback.print_exc()
+                cap = rebuild_cap()
+                if cap and n_ok >= cap:
+                    left = len(todo) - todo.index(slot) - 1
+                    print(f"[backfill] rebuild cap {cap} reached -- {left} older "
+                          f"slot(s) left for the next pass")
+                    break
             if n_ok:
                 # index membership only changes when a frame actually landed
                 # (a product enters products.json on its FIRST complete
@@ -1062,6 +1269,12 @@ def main(argv=None) -> int:
                 failed_all.append(entry.product_id)
                 print(f"[FAIL] {entry.product_id}: {e}")
                 traceback.print_exc()
+        cap = rebuild_cap()
+        if args.step and cap and len(rendered_pins) >= cap:
+            left = len(todo) - todo.index(slot) - 1
+            print(f"[suite] rebuild cap {cap} reached -- {left} older slot(s) "
+                  f"left for the next pass")
+            break
     if ok_all:
         _write_products_index(store, args.prefix, suite_sat, suite_sector,
                               force=not args.step)

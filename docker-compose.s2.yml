@@ -122,6 +122,13 @@ services:
     profiles: ["cron"]
     restart: always
     mem_limit: 8g
+    # Box-wide catch-up governor (s2_pyramid_emit.py "governor"): every lane
+    # on a box shares this host dir for its fcntl slot files, so S2_SLOTS in
+    # the box .env bounds concurrent emits ACROSS lanes (slot0 reserved for
+    # S2_SLOT_CLASS=leads lanes). Docker creates the host path; the locks die
+    # with their process, so nothing here survives a lane restart or reboot.
+    volumes:
+      - /run/tat-emit:/run/tat-emit
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "5" }
