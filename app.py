@@ -9,7 +9,9 @@ X-Forwarded-For header (the compose-network meso poller, Railway private
 networking) — are exempt: our own pollers must never be 429'd by our own
 render service. Every public request arrives through an edge proxy that
 appends X-Forwarded-For, so public traffic cannot claim the exemption.
-Concurrency: max 2 simultaneous renders via asyncio.Semaphore.
+Concurrency: max 2 simultaneous renders via asyncio.Semaphore; a request that
+gets no slot within RENDER_QUEUE_WAIT_S (40 s) is refused with 503 instead
+of queueing past its caller's timeout (see render_slot).
 CORS: origins from ALLOWED_ORIGINS env var.
 
 NOTE: do not enable `from __future__ import annotations` here — FastAPI
@@ -117,6 +119,80 @@ WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "90"))
 
 render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
 cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
+
+# --- render queue deadline ---------------------------------------------------
+# WHY (2026-09-02 box1 incident): every poller gives up on a /render after its
+# own timeout (meso 45 s, s1 60 s, floater 300 s) but the request kept its
+# place in the semaphore queue and was rendered anyway, output discarded.
+# Under a provider CPU cap the queue grew for 33 h -- meso-render was completing
+# requests queued 27.7 h earlier -- and at the previous month-end shaper lift
+# render-1 drained a 14-21 h queue at 30x its normal rate, the largest single
+# contributor to the catch-up burst that tripped the cap. A request that will
+# not START before its client stops listening must not be rendered.
+#
+# RENDER_QUEUE_WAIT_S bounds the wait for a slot (not the render itself: the S3
+# fetch and the draw still run to completion once started, so a client timeout
+# mid-render still wastes at most one render, never a queue). A client that
+# will wait longer may say so with X-Render-Wait-S, capped at
+# RENDER_QUEUE_WAIT_MAX_S. Past the deadline the caller gets 503 + Retry-After,
+# which every poller already treats as a retry-then-circuit failure.
+# Requires Python >= 3.11.1 (Semaphore.acquire is cancellation-safe there;
+# 3.11.0 could leak a slot when wait_for cancelled a just-woken waiter).
+RENDER_QUEUE_WAIT_S = float(os.getenv("RENDER_QUEUE_WAIT_S", "40"))
+RENDER_QUEUE_WAIT_MAX_S = float(os.getenv("RENDER_QUEUE_WAIT_MAX_S", "300"))
+render_queue_depth = 0   # requests currently waiting for a slot (for the log line)
+
+
+def requested_wait_s(request: Optional[Request]) -> float:
+    """Queue-wait budget for this request: X-Render-Wait-S if sane, else the
+    server default; never above RENDER_QUEUE_WAIT_MAX_S, never <= 0."""
+    raw = request.headers.get("x-render-wait-s") if request is not None else None
+    wait = RENDER_QUEUE_WAIT_S
+    if raw:
+        try:
+            wait = float(raw)
+        except ValueError:
+            wait = RENDER_QUEUE_WAIT_S
+    if not (wait > 0):
+        wait = RENDER_QUEUE_WAIT_S
+    return min(wait, RENDER_QUEUE_WAIT_MAX_S)
+
+
+def retry_after_s(wait_s: float) -> str:
+    """Retry-After for a queue refusal: the caller's own wait budget (it just
+    proved the queue is that deep), floored at 1 s and capped at 60 s so a
+    long-waiting client is not told to sleep for five minutes."""
+    return str(int(max(1.0, min(float(wait_s), 60.0))))
+
+
+@asynccontextmanager
+async def render_slot(wait_s: float):
+    """Hold one render slot for the body of the `async with`, or raise 503 if
+    none frees up within wait_s. The slot is always released, whatever the body
+    raises; a timed-out waiter never holds a slot."""
+    global render_queue_depth
+    render_queue_depth += 1
+    t0 = time.perf_counter()
+    try:
+        try:
+            await asyncio.wait_for(render_semaphore.acquire(), timeout=wait_s)
+        except asyncio.TimeoutError:
+            waited = time.perf_counter() - t0
+            log.warning(
+                "render queue: no slot within %.1fs (waiting=%d slots=%d) -> 503",
+                waited, render_queue_depth - 1, MAX_CONCURRENT_RENDERS,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"render queue full: no slot within {wait_s:g}s",
+                headers={"Retry-After": retry_after_s(wait_s)},
+            )
+    finally:
+        render_queue_depth -= 1
+    try:
+        yield
+    finally:
+        render_semaphore.release()
 
 # ---------------------------------------------------------------------------
 # Server-side loop export (POST /export) -- ffmpeg-encoded mp4 (primary) + a
@@ -915,7 +991,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         return _response(cached, "HIT", elapsed_ms)
 
-    async with render_semaphore:
+    async with render_slot(requested_wait_s(request)):
         # Re-check cache inside the semaphore in case a concurrent request
         # already produced this same image.
         cached = cache.get(cache_key)
