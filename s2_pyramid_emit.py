@@ -170,10 +170,11 @@ def _state_touch(path: str) -> None:
 #   * slots  -- S2_SLOTS=N slot files under S2_SLOT_DIR (a host dir bind-mounted
 #               into every lane); an emit holds one fcntl lock for its whole
 #               run, released by the kernel on ANY exit (SIGKILL included).
-#               slot0 is RESERVED for S2_SLOT_CLASS=leads (the loop-lead
-#               products users watch); browse lanes may take slots 1..N-1 only,
-#               so an unordered semaphore can never demote leads. N=1 means
-#               "leads only" on that box. S2_SLOTS unset/0 = off.
+#               the first S2_SLOTS_RESERVED slots (default 1; set it to the
+#               NUMBER OF LEADS LANES on the box) are reserved for
+#               S2_SLOT_CLASS=leads; browse lanes may take the others only, so
+#               an unordered semaphore can never demote leads. Reserved == N
+#               means "leads only" on that box. S2_SLOTS unset/0 = off.
 #   * gate   -- S2_GATE_STEAL_MAX=P: a browse pass does not START while steal
 #               exceeds P % (two /proc/stat reads, host-wide, visible from
 #               inside a container); it re-checks every S2_GATE_SLEEP_S up to
@@ -223,7 +224,7 @@ def steal_pct_from(line1: str, line2: str):
     return 100.0 * d[7] / tot
 
 
-def read_cpu_steal_pct(sample_s: float = 1.0, stat_path: str = "/proc/stat",
+def read_cpu_steal_pct(sample_s: float = 3.0, stat_path: str = "/proc/stat",
                        sleeper=time.sleep):
     try:
         with open(stat_path) as f:
@@ -245,17 +246,19 @@ def gate_wait(slot_class: str, max_steal: float, sleep_s: float, max_wait_s: flo
         return True
     if sampler is None:
         sampler = read_cpu_steal_pct      # looked up at call time (patchable)
+    sleep_s = max(1.0, float(sleep_s))    # 0 would spin at the sampler cadence forever
     waited = 0.0
     while True:
         steal = sampler()
+        shown = "n/a" if steal is None else f"{steal:.1f} %"
         if steal is None or steal <= max_steal:
             if waited:
-                log(f"[gate] steal {steal:.1f} % <= {max_steal:g} % after {waited:.0f}s -- starting")
+                log(f"[gate] steal {shown} <= {max_steal:g} % after {waited:.0f}s -- starting")
             return True
         if waited >= max_wait_s:
-            log(f"[gate] steal {steal:.1f} % > {max_steal:g} % for {waited:.0f}s -- skipping this pass")
+            log(f"[gate] steal {shown} > {max_steal:g} % for {waited:.0f}s -- skipping this pass")
             return False
-        log(f"[gate] steal {steal:.1f} % > {max_steal:g} % -- waiting {sleep_s:g}s")
+        log(f"[gate] steal {shown} > {max_steal:g} % -- waiting {sleep_s:g}s")
         sleeper(sleep_s)
         waited += sleep_s
 
@@ -273,31 +276,52 @@ class SlotLease:
                 self._fd = None
 
 
-def slot_order(n_slots: int, slot_class: str) -> list:
-    """leads: slot0 first, then the shared ones; browse: shared ones only."""
+def slot_order(n_slots: int, slot_class: str, reserved: int = 1) -> list:
+    """leads: every slot, reserved ones first; browse: only the unreserved
+    slots. `reserved` must equal the number of leads lanes on the box, or a
+    leads lane can still queue behind a browse pass (review 2026-09-02)."""
     if n_slots <= 0:
         return []
-    shared = list(range(1, n_slots))
-    return [0] + shared if slot_class == "leads" else shared
+    reserved = max(0, min(int(reserved), n_slots))
+    if slot_class == "leads":
+        return list(range(n_slots))
+    return list(range(reserved, n_slots))
 
 
 def acquire_slot(slot_dir: str, n_slots: int, slot_class: str, wait_s: float,
                  poll_s: float = 5.0, sleeper=time.sleep, clock=time.monotonic,
-                 log=print):
+                 log=print, reserved: int = 1):
     """Hold one slot file with an exclusive non-blocking flock, polling for up
     to wait_s. Returns a SlotLease, or None when no slot came free (the caller
-    skips the pass). The lease must stay referenced for the run's lifetime."""
-    order = slot_order(n_slots, slot_class)
+    skips the pass). The lease must stay referenced for the run's lifetime.
+    A slot dir that cannot be used at all is logged loudly and the pass runs
+    UNGOVERNED (an empty lease): the governor is a brake, not a dependency."""
+    order = slot_order(n_slots, slot_class, reserved)
     if not order:
-        log(f"[slot] class {slot_class!r} has no slot on a {n_slots}-slot box -- skipping this pass")
+        log(f"[slot] class {slot_class!r} has no slot on a {n_slots}-slot box "
+            f"({reserved} reserved for leads) -- skipping this pass")
         return None
-    os.makedirs(slot_dir, exist_ok=True)
+    try:
+        os.makedirs(slot_dir, exist_ok=True)
+        probe = os.path.join(slot_dir, ".probe")
+        with open(probe, "a"):
+            pass
+    except OSError as e:
+        log(f"[slot] WARNING cannot use {slot_dir} ({e}) -- this pass runs UNGOVERNED")
+        return SlotLease(None, None)
+    if slot_dir == GOV_SLOT_DIR_DEFAULT and not os.path.ismount(slot_dir):
+        log(f"[slot] WARNING {slot_dir} is not a mount: slots are container-local, "
+            f"S2_SLOTS is NOT box-wide (base compose bind-mounts it; recreate the lane)")
     t0 = clock()
     announced = False
     while True:
         for k in order:
             path = os.path.join(slot_dir, f"slot{k}")
-            fd = open(path, "a+")
+            try:
+                fd = open(path, "a+")
+            except OSError as e:
+                log(f"[slot] WARNING cannot open {path} ({e}) -- this pass runs UNGOVERNED")
+                return SlotLease(None, None)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -309,8 +333,7 @@ def acquire_slot(slot_dir: str, n_slots: int, slot_class: str, wait_s: float,
                 fd.flush()
             except OSError:
                 pass
-            if announced:
-                log(f"[slot] slot{k} acquired after {clock() - t0:.0f}s")
+            log(f"[slot] slot{k} ({slot_class}) acquired after {clock() - t0:.0f}s")
             return SlotLease(path, fd)
         waited = clock() - t0
         if waited >= wait_s:
@@ -338,12 +361,23 @@ def governor_admit(log=print) -> bool:
             return False
     n_slots = int(_env_num("S2_SLOTS", 0))
     if n_slots > 0:
+        t0 = time.monotonic()
         lease = acquire_slot(os.environ.get("S2_SLOT_DIR", GOV_SLOT_DIR_DEFAULT).strip()
                              or GOV_SLOT_DIR_DEFAULT,
-                             n_slots, slot_class, _env_num("S2_SLOT_WAIT_S", 1800), log=log)
+                             n_slots, slot_class, _env_num("S2_SLOT_WAIT_S", 1800), log=log,
+                             reserved=int(_env_num("S2_SLOTS_RESERVED", 1)))
         if lease is None:
             return False
         _GOV_LEASE = lease
+        # a cap can engage during a long slot wait: one more sample before
+        # committing a browse pass (leads stay exempt)
+        if max_steal > 0 and slot_class != "leads" and time.monotonic() - t0 > 30:
+            steal = read_cpu_steal_pct()
+            if steal is not None and steal > max_steal:
+                log(f"[gate] steal {steal:.1f} % > {max_steal:g} % after the slot wait -- skipping this pass")
+                lease.release()
+                _GOV_LEASE = None
+                return False
     return True
 
 
@@ -1078,6 +1112,10 @@ def main(argv=None) -> int:
         if when.tzinfo is None:
             when = when.replace(tzinfo=UTC)
 
+    if args.product and args.product not in R.REGISTRY_BY_ID:
+        sys.exit(f"ERROR: unknown product {args.product!r}. Tiled products: "
+                 + ", ".join(e.product_id for e in R.REGISTRY if e.tiled))
+
     if not governor_admit():
         return 0                 # skipped pass: the lane loop moves on
 
@@ -1100,7 +1138,7 @@ def main(argv=None) -> int:
             todo = [s for s in slots if _slot_missing(s, covered, tol)]
             print(f"[backfill] {entry.product_id}: {len(todo)}/{len(slots)} "
                   f"slot(s) missing at step {args.step}m")
-            n_ok = n_fail = 0
+            n_ok = n_fail = n_deferred = 0
             for slot in todo:
                 # re-check against frames written THIS run: two adjacent slots
                 # can resolve to the same scan near the sat's native cadence.
@@ -1145,10 +1183,10 @@ def main(argv=None) -> int:
                     print(f"[FAIL] {entry.product_id} @ {slot.isoformat()}: {e}")
                     traceback.print_exc()
                 cap = rebuild_cap()
-                if cap and n_ok >= cap:
-                    left = len(todo) - todo.index(slot) - 1
-                    print(f"[backfill] rebuild cap {cap} reached -- {left} older "
-                          f"slot(s) left for the next pass")
+                if cap and (n_ok + n_fail) >= cap:
+                    n_deferred = len(todo) - todo.index(slot) - 1
+                    print(f"[backfill] rebuild cap {cap} reached -- {n_deferred} older "
+                          f"slot(s) deferred to the next pass")
                     break
             if n_ok:
                 # index membership only changes when a frame actually landed
@@ -1164,7 +1202,7 @@ def main(argv=None) -> int:
                 print("[index] SKIPPED (idle pass: no frame rendered)")
             _print_ops(store, f"{entry.product_id} pass")
             print(f"\n=== BACKFILL SUMMARY === ok={n_ok} failed={n_fail} "
-                  f"skipped={len(slots) - len(todo)}")
+                  f"skipped={len(slots) - len(todo)} deferred={n_deferred}")
             return 1 if (n_fail and not n_ok) else 0
         manifest = emit_one(entry, when, store, args)["manifest"]
         _write_products_index(store, args.prefix, entry.sat_key,
@@ -1208,6 +1246,7 @@ def main(argv=None) -> int:
     ok_all, failed_all = [], []
     rendered_pins: set = set()
     pin_failures = 0
+    n_deferred = 0
     for slot in todo:
         if args.step:
             # per-slot pin isolation: one transient resolve failure (an
@@ -1271,9 +1310,9 @@ def main(argv=None) -> int:
                 traceback.print_exc()
         cap = rebuild_cap()
         if args.step and cap and len(rendered_pins) >= cap:
-            left = len(todo) - todo.index(slot) - 1
-            print(f"[suite] rebuild cap {cap} reached -- {left} older slot(s) "
-                  f"left for the next pass")
+            n_deferred = len(todo) - todo.index(slot) - 1
+            print(f"[suite] rebuild cap {cap} reached -- {n_deferred} older slot(s) "
+                  f"deferred to the next pass")
             break
     if ok_all:
         _write_products_index(store, args.prefix, suite_sat, suite_sector,
@@ -1293,6 +1332,8 @@ def main(argv=None) -> int:
     print(f" slots  : {len(todo)}")
     print(f" ok     : {len(ok_all)}  {sorted(set(ok_all))}")
     print(f" failed : {len(failed_all)}  {sorted(set(failed_all))}")
+    if n_deferred:
+        print(f" deferred: {n_deferred} older slot(s) (rebuild cap)")
     if is_r2 and ok_all:
         print(f" index  : {CDN}/{R.products_index_key(args.prefix, suite_sat, suite_sector)}")
     if pin_failures:

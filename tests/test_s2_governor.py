@@ -79,6 +79,18 @@ class Gate(unittest.TestCase):
     def test_unreadable_sample_is_clear(self):
         self.assertTrue(E.gate_wait("browse", 50, 60, 900, sampler=lambda: None, sleeper=lambda s: None, log=lambda m: None))
 
+    def test_unreadable_sample_after_a_wait_does_not_crash(self):
+        logs = []
+        sampler = mock.Mock(side_effect=[90.0, None])
+        self.assertTrue(E.gate_wait("browse", 50, 60, 900, sampler=sampler, sleeper=lambda s: None, log=logs.append))
+        self.assertTrue(any("n/a" in m and "starting" in m for m in logs))
+
+    def test_zero_sleep_is_clamped(self):
+        slept = []
+        sampler = mock.Mock(side_effect=[90.0, 10.0])
+        self.assertTrue(E.gate_wait("browse", 50, 0, 900, sampler=sampler, sleeper=slept.append, log=lambda m: None))
+        self.assertEqual(slept, [1.0])
+
 
 class Slots(unittest.TestCase):
     def test_order(self):
@@ -87,6 +99,36 @@ class Slots(unittest.TestCase):
         self.assertEqual(E.slot_order(1, "leads"), [0])
         self.assertEqual(E.slot_order(1, "browse"), [])
         self.assertEqual(E.slot_order(0, "leads"), [])
+        # box1: two leads lanes -> reserve two of three; browse gets slot2 only
+        self.assertEqual(E.slot_order(3, "leads", reserved=2), [0, 1, 2])
+        self.assertEqual(E.slot_order(3, "browse", reserved=2), [2])
+        self.assertEqual(E.slot_order(2, "browse", reserved=5), [])      # over-reserved = leads only
+
+    def test_two_leads_never_wait_behind_browse(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = E.acquire_slot(d, 3, "browse", 1, reserved=2, sleeper=lambda s: None, log=lambda m: None)
+            self.assertTrue(b.path.endswith("slot2"))
+            l1 = E.acquire_slot(d, 3, "leads", 1, reserved=2, sleeper=lambda s: None, log=lambda m: None)
+            l2 = E.acquire_slot(d, 3, "leads", 1, reserved=2, sleeper=lambda s: None, log=lambda m: None)
+            self.assertEqual({os.path.basename(l1.path), os.path.basename(l2.path)}, {"slot0", "slot1"})
+            for x in (b, l1, l2):
+                x.release()
+
+    def test_unusable_dir_runs_ungoverned_with_a_warning(self):
+        logs = []
+        lease = E.acquire_slot("/proc/definitely-not-writable/tat-emit", 2, "browse", 1,
+                               sleeper=lambda s: None, log=logs.append)
+        self.assertIsNotNone(lease)
+        self.assertIsNone(lease.path)
+        lease.release()                                    # no-op, must not raise
+        self.assertTrue(any("UNGOVERNED" in m for m in logs))
+
+    def test_acquire_always_logs_the_slot(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = []
+            a = E.acquire_slot(d, 2, "leads", 1, sleeper=lambda s: None, log=logs.append)
+            self.assertTrue(any("slot0 (leads) acquired" in m for m in logs))
+            a.release()
 
     def test_leads_take_slot0_browse_never(self):
         with tempfile.TemporaryDirectory() as d:
@@ -164,11 +206,13 @@ class Admit(unittest.TestCase):
 class RebuildCap(unittest.TestCase):
     """End to end through main(): fake emit_one, empty coverage, local store."""
 
-    def _run(self, cap, backfill_min=60):
+    def _run(self, cap, backfill_min=60, fail_first=False):
         calls = []
 
         def fake_emit_one(entry, when, store, args, **kw):
             calls.append(when)
+            if fail_first and len(calls) == 1:
+                raise RuntimeError("upstream flake")
             return {"stamp": when.strftime("%Y%m%dT%H%M%SZ"), "manifest": {}}
         env = {"S2_MAX_REBUILD_PER_PASS": str(cap), "S2_SLOTS": "", "S2_GATE_STEAL_MAX": ""}
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env, clear=False), \
@@ -186,6 +230,11 @@ class RebuildCap(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls), 2)
         self.assertGreater(calls[0], calls[1])            # newest first
+
+    def test_cap_counts_attempts_not_successes(self):
+        rc, calls = self._run(2, fail_first=True)
+        self.assertEqual(rc, 0)                            # one ok, one failed -> not a total failure
+        self.assertEqual(len(calls), 2)
 
     def test_zero_means_unlimited(self):
         rc, calls = self._run(0)

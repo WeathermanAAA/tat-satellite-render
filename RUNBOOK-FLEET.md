@@ -182,9 +182,13 @@ for 3.5 h and Hostinger's automated CPU limiter followed (steal 95 % for 33+ h).
 
 * **slots** -- `S2_SLOTS=N` in the box `.env` bounds concurrent emits across
   ALL lanes on that box via fcntl locks on `/run/tat-emit/slotK` (bind-mounted
-  into every lane by the base compose). `slot0` is reserved for lanes whose
-  file declares `S2_SLOT_CLASS: leads`; browse lanes take slots `1..N-1` only,
-  so leads are never queued behind browse. Locks die with the process.
+  into every lane by the base compose). The first `S2_SLOTS_RESERVED` slots
+  (default 1) are reserved for lanes whose file declares
+  `S2_SLOT_CLASS: leads`; browse lanes take the remaining slots only. Set
+  `S2_SLOTS_RESERVED` to the NUMBER OF LEADS LANES on the box, or a leads
+  lane can still queue behind one browse pass. Locks die with the process.
+  Inspect: `flock -n /run/tat-emit/slot1 true; echo $?` (1 = held now);
+  `cat /run/tat-emit/slotK` shows the last holder (its container pid).
 * **gate** -- `S2_GATE_STEAL_MAX=P` (box `.env`): a browse pass does not start
   while hypervisor steal exceeds P % (two `/proc/stat` reads; never
   `/proc/loadavg`, which cannot see steal and would stall the leads too). It
@@ -194,10 +198,21 @@ for 3.5 h and Hostinger's automated CPU limiter followed (steal 95 % for 33+ h).
   rebuilt per product per pass, newest first, so a hole refills over hours
   instead of in one burst and freshness is unaffected.
 
-box1's values: `.env` `S2_SLOTS=2`, `S2_GATE_STEAL_MAX=50`; lane files
-g19fd-leads + conus-fast2 = `leads`, g19fd (cap 2) + conus (cap 3) = `browse`.
-Unset = off, so box2 and any new box run exactly as before until their `.env`
-opts in. Judge a governed box by steal % on `/fleet/`, not by load.
+box1's values: `.env` `S2_SLOTS=3`, `S2_SLOTS_RESERVED=2`,
+`S2_GATE_STEAL_MAX=50` (two leads lanes, one browse emit at a time); lane
+files g19fd-leads + conus-fast2 = `leads`, g19fd (cap 2) + conus (cap 3) =
+`browse`. Unset = off, so box2 and any new box run exactly as before until
+their `.env` opts in -- and CLASSIFY THE LANES FIRST: an unclassified lane is
+`browse`, so opting a box in with only reserved slots idles every lane on it.
+Judge a governed box by steal % on `/fleet/`, not by load.
+
+Deploying it: `fleet.sh setenv <box> KEY=VALUE` only writes `.env`;
+`fleet.sh deploy <box>` then recreates EVERY lane assigned to the box (the
+bind mount changed the compose hash), including lanes you had stopped by
+hand. Either accept the governed simultaneous return or `docker stop` the
+browse lanes right after the deploy and start them one at a time. Never
+canary the governor on a browse lane: the canary watchdogs' no-`[done]` and
+stale-manifest checks trip on a lane that is legitimately gated or waiting.
 
 ---
 

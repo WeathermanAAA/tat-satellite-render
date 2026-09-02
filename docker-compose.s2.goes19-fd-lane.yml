@@ -35,9 +35,10 @@ services:
       # container-publish flip switch (see conus-fast + 
       # scripts/s2_canary_watchdog.sh; position lives in the box .env)
       S2_CONTAINER_TILES: "${S2_CONTAINER_TILES_G19FD:-0}"
-      # governor: browse bands take shared slots only, do not start a pass
-      # while steal > S2_GATE_STEAL_MAX, and refill at most 2 slots per
-      # product per pass (a 33 h hole then fills over hours, not in a burst)
+      # governor: browse bands take unreserved slots only, do not start a pass
+      # while steal > S2_GATE_STEAL_MAX, and rebuild at most 2 of the window's
+      # 6 slots per product per pass (the window's worth spreads over ~3
+      # passes instead of one burst; nothing older than the window refills)
       S2_SLOT_CLASS: browse
       S2_MAX_REBUILD_PER_PASS: "2"
       S2_CUT_WORKERS: "3"
