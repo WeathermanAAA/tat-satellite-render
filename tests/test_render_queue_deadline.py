@@ -25,12 +25,19 @@ from fastapi import HTTPException  # noqa: E402
 
 
 class _Req:
-    def __init__(self, headers=None):
+    """Enough of starlette.Request for requested_wait_s: headers + a client
+    address so is_internal_request() can classify it."""
+    def __init__(self, headers=None, internal=True):
         self.headers = headers or {}
+        self.client = type("C", (), {"host": "172.22.0.5" if internal else "203.0.113.9"})()
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class RenderSlot(unittest.TestCase):
@@ -143,6 +150,30 @@ class RequestedWait(unittest.TestCase):
     def test_header_honored_and_capped(self):
         self.assertEqual(app.requested_wait_s(_Req({"x-render-wait-s": "120"})), 120.0)
         self.assertEqual(app.requested_wait_s(_Req({"x-render-wait-s": "9999"})), app.RENDER_QUEUE_WAIT_MAX_S)
+
+    def test_public_caller_cannot_extend_wait(self):
+        # public traffic always traverses the edge proxy, which appends XFF
+        public = _Req({"x-render-wait-s": "120", "x-forwarded-for": "203.0.113.9"}, internal=False)
+        self.assertEqual(app.requested_wait_s(public), app.RENDER_QUEUE_WAIT_S)
+
+    def test_external_cancel_while_waiting_leaks_nothing(self):
+        async def scenario():
+            async with app.render_slot(5.0):
+                t = asyncio.ensure_future(_hold_slot_briefly())
+                await asyncio.sleep(0.05)
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            async with app.render_slot(0.1):
+                return "ok"
+
+        async def _hold_slot_briefly():
+            async with app.render_slot(5.0):
+                await asyncio.sleep(1)
+        self.assertEqual(_run(scenario()), "ok")
+        self.assertEqual(app.render_queue_depth, 0)
 
     def test_garbage_and_nonpositive_fall_back(self):
         for raw in ("abc", "", "0", "-5", "nan"):

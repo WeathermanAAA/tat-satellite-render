@@ -47,6 +47,11 @@ services:
       # for a manual probe. No NOAA/R2 creds needed (NOAA is anonymous; this
       # service writes nothing).
       ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8082"
+      # render queue deadline (app.py render_slot): a request that gets no
+      # slot within this many seconds is refused with 503 -- under the ingest
+      # worker's 60 s timeout minus a typical render, so a slot is never spent
+      # on a caller that has already hung up.
+      RENDER_QUEUE_WAIT_S: "25"
     # Loopback host port 8082 for manual probing; compose-internal name
     # s1-render:8080 is what the ingest worker calls.
     ports:

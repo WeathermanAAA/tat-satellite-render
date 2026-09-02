@@ -134,19 +134,24 @@ cache = RenderCache(max_entries=200, max_bytes=100 * 1024 * 1024)
 # fetch and the draw still run to completion once started, so a client timeout
 # mid-render still wastes at most one render, never a queue). A client that
 # will wait longer may say so with X-Render-Wait-S, capped at
-# RENDER_QUEUE_WAIT_MAX_S. Past the deadline the caller gets 503 + Retry-After,
-# which every poller already treats as a retry-then-circuit failure.
-# Requires Python >= 3.11.1 (Semaphore.acquire is cancellation-safe there;
-# 3.11.0 could leak a slot when wait_for cancelled a just-woken waiter).
+# RENDER_QUEUE_WAIT_MAX_S. Past the deadline the caller gets 503 + Retry-After:
+# meso/floater retry then trip their circuit, s1 leaves the SQS slot for
+# redelivery -- the same paths a client timeout took, minus the wasted render.
+# Requires Python >= 3.11.0 (gh-90155, in 3.11.0 final: pre-release 3.11
+# could wedge the semaphore when a woken acquire() was cancelled).
 RENDER_QUEUE_WAIT_S = float(os.getenv("RENDER_QUEUE_WAIT_S", "40"))
 RENDER_QUEUE_WAIT_MAX_S = float(os.getenv("RENDER_QUEUE_WAIT_MAX_S", "300"))
 render_queue_depth = 0   # requests currently waiting for a slot (for the log line)
 
 
 def requested_wait_s(request: Optional[Request]) -> float:
-    """Queue-wait budget for this request: X-Render-Wait-S if sane, else the
-    server default; never above RENDER_QUEUE_WAIT_MAX_S, never <= 0."""
-    raw = request.headers.get("x-render-wait-s") if request is not None else None
+    """Queue-wait budget for this request: X-Render-Wait-S if sane AND the
+    caller is compose-internal (a public client has no business extending its
+    FIFO reservation), else the server default; never above
+    RENDER_QUEUE_WAIT_MAX_S, never <= 0."""
+    raw = None
+    if request is not None and is_internal_request(request):
+        raw = request.headers.get("x-render-wait-s")
     wait = RENDER_QUEUE_WAIT_S
     if raw:
         try:
@@ -992,6 +997,16 @@ async def render(request: Request, body: RenderRequest = Body(...)):
         return _response(cached, "HIT", elapsed_ms)
 
     async with render_slot(requested_wait_s(request)):
+        # A client that hung up while we queued (its own timeout: meso 45 s,
+        # s1 60 s) must not be rendered for: urllib3 closes the socket on
+        # ReadTimeout and Caddy cancels upstream on a browser abort, so
+        # uvicorn already holds the http.disconnect and this probe does not
+        # block. Under sustained overload this is what keeps the slot for a
+        # caller that is still listening.
+        if await request.is_disconnected():
+            waited_ms = int((time.perf_counter() - t0) * 1000)
+            log.warning("render: client gone before slot (waited %d ms) -> skipped", waited_ms)
+            raise HTTPException(status_code=503, detail="client disconnected while queued")
         # Re-check cache inside the semaphore in case a concurrent request
         # already produced this same image.
         cached = cache.get(cache_key)

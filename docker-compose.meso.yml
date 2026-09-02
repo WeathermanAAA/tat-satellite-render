@@ -51,6 +51,8 @@ x-meso-render: &meso-render-base
 services:
   meso-render:
     <<: *meso-render-base
+    environment:
+      RENDER_QUEUE_WAIT_S: "15"
     # Loopback-only host binding: reachable on the compose network as
     # http://meso-render:8080 but NOT published to the public internet.
     ports:
@@ -58,6 +60,8 @@ services:
 
   meso-render-cold:
     <<: *meso-render-base
+    environment:
+      RENDER_QUEUE_WAIT_S: "15"
     # Loopback host port 8081 for manual probing; compose-internal name
     # meso-render-cold:8080 is what the poller's cold lane calls.
     ports:
