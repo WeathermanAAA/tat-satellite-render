@@ -190,10 +190,12 @@ def _resample(field: np.ndarray, lats: np.ndarray, lons: np.ndarray,
 
 
 R_EARTH = 6371000.0
-FILL = 0.97       # square half-side as a fraction of the box's shorter half-span
-HORIZON = 1.35    # projected horizon radius / square half-side. Corners sit at
-                  # 1.414, so only they fall off the planet; the centre is drawn
-                  # ~1.75x the scale of the frame edge.
+FILL = 0.92       # square half-side as a fraction of the box's shorter half-span
+                  # (meso sectors are not exact lat/lon boxes; this keeps the
+                  # disc inside the scanned footprint)
+HORIZON = 1.35    # camera: projected horizon / square half-side (sets curvature;
+                  # the centre is drawn ~1.75x the scale of the frame edge)
+DISC = 1.0        # visible disc radius / square half-side: a full round disc
 
 
 def _camera_height(a: float) -> float:
@@ -214,9 +216,8 @@ def _camera_height(a: float) -> float:
 
 
 def _view(bbox: list[float], lon0: float, lat0: float):
-    """Near-side perspective camera low enough that the horizon is a circle a
-    little bigger than the frame: edges filled, corners off the planet.
-    Returns (projection, square extent, half-side in degrees)."""
+    """Near-side perspective camera centred on the box. Returns (projection,
+    square extent, half-side in degrees)."""
     w, s, e, n = bbox
     lon_half = (((e - w) % 360.0) or 360.0) / 2.0 * np.cos(np.radians(lat0))
     lat_half = (n - s) / 2.0
@@ -389,6 +390,15 @@ def render_globe_png(
         (MAP[0], MAP[1]), MAP[2], MAP[3], transform=fig.transFigure,
         fill=False, edgecolor=FRAME, linewidth=0.8, zorder=20))
 
+    half = ext[1]
+    yy, xx = np.mgrid[0:GRID_PX, 0:GRID_PX]
+    rr = np.hypot((xx + 0.5) / GRID_PX * 2.0 - 1.0, (yy + 0.5) / GRID_PX * 2.0 - 1.0)
+    outside = rr > DISC
+    if img.ndim == 3:
+        img[outside] = np.nan
+    else:
+        img = np.where(outside, np.nan, img)
+
     mappable = None
     if is_rgb:
         rgb = np.nan_to_num(img, nan=0.0)
@@ -408,6 +418,16 @@ def render_globe_png(
     ax.add_feature(cfeature.BORDERS.with_scale(scale), edgecolor=COAST,
                    linewidth=0.45, alpha=0.4, zorder=3)
     _graticule(ax, fig, proj, ext, lon0, lat0, half_deg)
+    # space outside the disc: a black square with a round hole, over the
+    # coastlines and graticule
+    from matplotlib.path import Path
+    ring = Path.circle((0.0, 0.0), DISC * half)
+    sq = Path([(-half, -half), (half, -half), (half, half), (-half, half),
+               (-half, -half)], [Path.MOVETO] + [Path.LINETO] * 3 + [Path.CLOSEPOLY])
+    hole = Path(ring.vertices[::-1], ring.codes)
+    ax.add_patch(matplotlib.patches.PathPatch(
+        Path.make_compound_path(sq, hole), facecolor=BG, edgecolor="none",
+        transform=proj, zorder=8))
 
     # colorbar (scalar products)
     if mappable is not None:
