@@ -226,6 +226,12 @@ DEACTIVATE_GRACE_H = float(_env("DEACTIVATE_GRACE_H", "24"))  # keep frames afte
 # predates the format param -- or a rollback flip -- stays self-consistent:
 # whatever /render actually sent is what gets keyed and served.
 FRAME_FORMAT = (_env("FRAME_FORMAT", "webp") or "webp").strip().lower()
+# Loop-frame layout sent to /render: "globe" (square near-side-perspective
+# frame, globe_render.py) or "classic" (the PlateCarree title-strip frame).
+# Globe frames are stored under a "g/" segment inside the band folder so a loop
+# never mixes the two looks across a switch (the viewer plays only the newest
+# frame's style). FRAME_STYLE=classic reverts with no rebuild.
+FRAME_STYLE = (_env("FRAME_STYLE", "globe") or "globe").strip().lower()
 
 # PART 4 - clean Clean-IR BACKDROP for the ASCAT viewer. For the IR band only,
 # the poller renders a SECOND, bare GRAYSCALE raster (no chrome) at the same
@@ -448,6 +454,40 @@ class Storm:
     current_wind_kt: Optional[float] = None
     current_pressure_mb: Optional[float] = None
     nature: Optional[str] = None
+
+
+_ATCF_LETTER = {"AL": "L", "EP": "E", "CP": "C", "WP": "W", "SP": "P", "SI": "S"}
+
+
+def atcf_label(storm: "Storm") -> Optional[str]:
+    """Short ATCF designation for the globe frame header: 13L, 04C, 31W, 96E.
+    The number comes from the stable sid (…BBNNYYYY); North Indian and
+    southern-hemisphere storms take their letter from position."""
+    m = re.search(r"([A-Z]{2})(\d{2})(\d{4})$", storm.sid or "")
+    if not m:
+        return None
+    basin, num = m.group(1), m.group(2)
+    letter = _ATCF_LETTER.get(basin)
+    if letter is None:
+        if basin in ("IO", "NI"):
+            letter = "A" if storm.lon < 77.0 else "B"
+        elif basin in ("SH", "SS"):
+            letter = "P" if storm.lon > 135.0 or storm.lon < -100.0 else "S"
+        else:
+            return None
+    return f"{num}{letter}"
+
+
+def fix_label(storm: "Storm") -> Optional[str]:
+    """Source of the intensity on the frame: "NHC 1800Z 08 NOV"."""
+    t = parse_iso(storm.last_fix) if storm.last_fix else None
+    if t is None:
+        return None
+    b = (storm.basin or "").upper()
+    agency = "NHC" if b in ("AL", "EP") else "CPHC" if b == "CP" else "JTWC"
+    if (storm.sid or "").startswith("NHC_CP"):
+        agency = "CPHC"
+    return f"{agency} {t:%H%MZ %d %b}".upper()
 
 
 def _extrapolate(points: list[dict], now: dt.datetime) -> tuple[float, float]:
@@ -1115,7 +1155,9 @@ def call_render(session: requests.Session, bbox: list[float], channel: str,
         # PART 4: bare grayscale Clean-IR backdrop (WebP, no chrome, no badge).
         body["backdrop"] = True
         body["enhancement"] = "grayscale"
-    elif storm is not None:
+    else:
+        body["style"] = FRAME_STYLE
+    if not backdrop and storm is not None:
         # When supplied, /render burns a color-coded intensity badge into the
         # rendered frame's title strip (left side). Only sent from the poller
         # path; legacy draw-a-box /satellite/ UI omits it and gets the plain
@@ -1191,14 +1233,16 @@ def frame_ext(headers: dict) -> tuple[str, str]:
     return ".png", "image/png"
 
 
-def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png") -> str:
+def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png",
+              style: str | None = None) -> str:
     # SECOND precision (mirrors meso_poller.frame_key). Frames now stamp the
     # TRUE scan time (header_get fixed the X-Source-Time lookup), and GOES
     # meso scans jitter 57-63 s apart -- two distinct scans in one wall-clock
     # minute would collide under a minute key: the second overwrites the
     # first's object while the manifest lists both entries, and the floater
     # has no reconcile loop to heal the resulting 404 phantom.
-    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%M%SZ')}{ext}"
+    sub = "g/" if (style or FRAME_STYLE) == "globe" else ""
+    return f"{R2_PREFIX}/{slug}/{band_key}/{sub}{ts.strftime('%Y%m%dT%H%M%SZ')}{ext}"
 
 
 def storm_manifest_key(slug: str) -> str:
@@ -1540,6 +1584,8 @@ class Poller:
             "nature": storm.nature,
             "wind_kt": storm.current_wind_kt,
             "pressure_mb": storm.current_pressure_mb,
+            "atcf": atcf_label(storm),
+            "fix_time": fix_label(storm),
         }
         self.limiter.acquire()
         try:
@@ -1594,7 +1640,8 @@ class Poller:
                 bd_frame, _bd_headers = call_render(
                     self.session, bd_bbox, bd_channel, "grayscale", backdrop=True,
                 )
-                bd_candidate = frame_key(storm.slug, band.key + "/backdrop", ts, ".webp")
+                bd_candidate = frame_key(storm.slug, band.key + "/backdrop", ts, ".webp",
+                                         style="classic")
                 if self.r2.put_bytes(bd_candidate, bd_frame, "image/webp", CACHE_FRAME):
                     bd_key = bd_candidate
                     bounds = bd_bbox

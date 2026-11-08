@@ -171,6 +171,12 @@ RECONCILE_S = float(_env("MESO_RECONCILE_S", "900"))
 # predates the format param -- or a rollback flip -- stays self-consistent:
 # whatever /render actually sent is what gets keyed and served.
 FRAME_FORMAT = (_env("FRAME_FORMAT", "webp") or "webp").strip().lower()
+# Loop-frame layout sent to /render: "globe" (square near-side-perspective
+# frame, globe_render.py) or "classic" (the PlateCarree title-strip frame).
+# Globe frames are stored under a "g/" segment inside the band folder so a loop
+# never mixes the two looks across a switch (the viewer plays only the newest
+# frame's style). FRAME_STYLE=classic reverts with no rebuild.
+FRAME_STYLE = (_env("FRAME_STYLE", "globe") or "globe").strip().lower()
 
 # HTTP timeouts / retries (render + extent discovery).
 RENDER_TIMEOUT_S = float(_env("RENDER_TIMEOUT_S", "45"))
@@ -572,9 +578,13 @@ class RenderSkip(Exception):
 def call_render(session: requests.Session, bbox: list[float], channel: str,
                 enhancement: str, storm: Optional[dict] = None,
                 product: Optional[str] = None, satellite: Optional[str] = None,
-                url: str = RENDER_URL) -> tuple[bytes, dict]:
+                url: str = RENDER_URL,
+                caption: Optional[str] = None) -> tuple[bytes, dict]:
     body: dict = {"bbox": bbox, "time": "latest", "channel": channel,
-                  "enhancement": enhancement, "format": FRAME_FORMAT}
+                  "enhancement": enhancement, "format": FRAME_FORMAT,
+                  "style": FRAME_STYLE}
+    if caption:
+        body["caption"] = caption
     if storm is not None:
         body["storm"] = storm
     if product is not None:
@@ -633,14 +643,16 @@ def frame_ext(headers: dict) -> tuple[str, str]:
     return ".png", "image/png"
 
 
-def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png") -> str:
+def frame_key(slug: str, band_key: str, ts: dt.datetime, ext: str = ".png",
+              style: str | None = None) -> str:
     # SECOND precision. GOES meso scans are ~60 s apart but jitter (the public
     # bucket shows 57-63 s gaps), so two DISTINCT scans can land in the same
     # wall-clock minute; a minute-resolution key would collide and the second
     # scan's frame would overwrite the first under the same key (the content-hash
     # dedup can't catch it -- different bytes both pass). Seconds make every scan
     # a distinct key. SectorExtent.key already uses %Y%m%dT%H%M%SZ.
-    return f"{R2_PREFIX}/{slug}/{band_key}/{ts.strftime('%Y%m%dT%H%M%SZ')}{ext}"
+    sub = "g/" if (style or FRAME_STYLE) == "globe" else ""
+    return f"{R2_PREFIX}/{slug}/{band_key}/{sub}{ts.strftime('%Y%m%dT%H%M%SZ')}{ext}"
 
 
 def sector_manifest_key(slug: str) -> str:
@@ -1008,7 +1020,8 @@ class MesoPoller:
             png, headers = call_render(lane.session, bbox, band.channel,
                                        band.enhancement, product=product,
                                        satellite=sat_hint,
-                                       url=lane.render_url)
+                                       url=lane.render_url,
+                                       caption=sector.label)
         except RenderSkip as e:
             log.info("skip %s/%s: %s", sector.slug, band.key, e)
             lane.consec_fail = 0

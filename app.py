@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
+from globe_render import render_globe_png
 from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
 import gridsat
@@ -593,6 +594,10 @@ class StormInfo(BaseModel):
     nature: Optional[str] = Field(default=None, max_length=8)    # "TS", "TD", "HU", "EX", ...
     wind_kt: Optional[float] = Field(default=None, ge=0, le=250)
     pressure_mb: Optional[float] = Field(default=None, ge=850, le=1050)
+    # Globe-style frames only: ATCF number for the header ("13L") and the
+    # advisory/fix stamp for the source line ("NHC 0000Z 28 OCT").
+    atcf: Optional[str] = Field(default=None, max_length=8)
+    fix_time: Optional[str] = Field(default=None, max_length=32)
 
 
 class RenderRequest(BaseModel):
@@ -616,6 +621,12 @@ class RenderRequest(BaseModel):
     # Optional storm context. When supplied, render.py draws a color-coded
     # intensity badge (name · category · wind · pressure) on the title strip.
     storm: Optional[StormInfo] = None
+    # Frame layout. "classic" = the PlateCarree frame with the title strip;
+    # "globe" = the square near-side-perspective loop frame (globe_render.py)
+    # used by the floater + meso pollers. ``caption`` is the globe headline when
+    # there is no storm (the meso sector name).
+    style: str = "classic"
+    caption: Optional[str] = Field(default=None, max_length=48)
     # Output codec. "png" (default) is the full-resolution lossless render --
     # the draw-a-box panel and every legacy caller keep getting exactly what
     # they got. "webp" is the loop-frame path used by the floater + meso
@@ -637,6 +648,11 @@ class RenderRequest(BaseModel):
     # normal render path; the enhancement is forced to grayscale. Additive +
     # opt-in: every existing caller omits it -> False -> unchanged.
     backdrop: bool = False
+
+    @field_validator("style")
+    @classmethod
+    def _style_known(cls, v: str) -> str:
+        return v if v in ("classic", "globe") else "classic"
 
     @field_validator("quality")
     @classmethod
@@ -803,8 +819,15 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     # PART 4: the bare grayscale backdrop is a DISTINCT artifact from the chromed
     # render at the same bbox/channel -> its own cache slot (never clobbers it).
     backdrop_part = "|bd" if body.backdrop else ""
+    # Globe frames are a distinct artifact; classic keys stay byte-identical.
+    style_part = ""
+    if body.style == "globe":
+        style_part = f"|globe|{body.caption or ''}"
+        if body.storm is not None:
+            style_part += f"|{body.storm.atcf or ''}|{body.storm.fix_time or ''}"
     raw = (f"{body.bbox}|{snapped_iso}|{generic_channel}|{body.enhancement}"
-           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}")
+           f"|{bucket}{storm_part}{fmt_part}{q_part}{overlay_part}{backdrop_part}"
+           f"{style_part}")
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -1050,6 +1073,20 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                         data, body.bbox, enhancement=bd_enh,
                         downsample=render_downsample, dpi=tier_dpi,
                     )
+                if body.style == "globe":
+                    out = render_globe_png(
+                        data,
+                        body.bbox,
+                        native_band,
+                        resolved.scan_start,
+                        body.enhancement,
+                        render_downsample,
+                        storm=body.storm.model_dump() if body.storm is not None else None,
+                        caption=body.caption,
+                    )
+                    if body.format == "webp":
+                        out = transcode_frame(out, WEBP_FRAME_WIDTH, WEBP_QUALITY)
+                    return out
                 out = render_png(
                     data,
                     body.bbox,
