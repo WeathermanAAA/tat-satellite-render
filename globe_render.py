@@ -1,20 +1,24 @@
-"""Globe-style loop frames for the storm floaters and mesoscale sectors.
+"""Globe loop frames for the storm floaters and mesoscale sectors.
 
-Each frame is a square orthographic view centred on the storm (floater) or on
-the sector (meso), so the curvature of the Earth shows at the corners. Chrome:
-storm class line + big name top-left, date + HH:MM:SS UTC top-right, lat/lon
-labels outside the map, a thin vertical colorbar on the right, intensity and a
-source line along the bottom, @WeathermanAAA_ bottom-right.
+Ported from the globe-loop series (the Melissa GOES-19 and Champi Himawari-9
+loops): the same general vertical perspective camera, globe basemap (navy
+ocean, charcoal land, darkening toward the limb, limb glow, night side shaded),
+the house enhancement composited over the globe with warm clear sky letting the
+globe show through, dotted 2-degree graticule labelled where it meets the
+panel, and the same chrome (stage and ATCF number, name, date and HH:MM:SS UTC,
+vertical degrees-C bar, intensity, product line, watermark).
 
-The source field is resampled straight onto the output pixel grid (nearest
-source pixel in projected space) and drawn with imshow, so a frame costs about
-the same as the classic PlateCarree frame even at 500 m true color.
+Data: the storm box (``data``: the 1-minute mesoscale sector, Himawari target
+area or the floater crop) is feathered over a wider ``context`` field of the
+same band (full disk / CONUS), which fills the rest of the globe.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import io
 import logging
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -22,11 +26,10 @@ from typing import Optional
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches
 import numpy as np
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
 from matplotlib import font_manager
+from matplotlib.collections import LineCollection, PolyCollection
+from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
 
 from colormaps import get_enhancement, enhancement_norm, normalize_visible
@@ -34,57 +37,304 @@ from satellites import FetchResult
 
 log = logging.getLogger("globe_render")
 
-BG = "#000000"
-INK = "#f2f4f7"
-DIM = "#8d96a3"
-FRAME = "#3b4250"
-GRAT = "#c9d1dc"
-COAST = "#e8edf3"
+# layout (pixels, the 1400-px square of the loop series)
+W, H = 1400, 1400
+PANEL = (90, 118, 1150, 1150)          # globe panel x, y, w, h (top-left origin)
+SPAN_KM = 2000.0                        # ground distance across the panel
+LIMB_FRAC = 0.86                        # horizon at this fraction of the corner radius
+FEATHER_PX = 30                         # storm box fades into the context field
 
-FIG_IN = 10.8      # 10.8 in x 100 dpi = 1080 px square
-DPI = 100
-MAP = [0.062, 0.088, 0.836, 0.836]   # left, bottom, width, height (square)
-GRID_PX = 900                         # resample grid (map is ~903 px wide)
+BLACK, KEY, WHITE, GREY = "#000000", "#5a6578", "#f2f4f8", "#8d97a8"
+R_EARTH_KM = 6371.0088
+COL_SPACE = np.array([0.020, 0.022, 0.030])
+COL_OCEAN = np.array([0.055, 0.085, 0.150])
+COL_LAND = np.array([0.150, 0.155, 0.165])
+COL_GLOW = np.array([0.35, 0.50, 0.75])
 
 _FONT_DIR = Path(__file__).parent / "vendor" / "fonts"
 
 
+# --------------------------------------------------------------------------- #
+# camera
+# --------------------------------------------------------------------------- #
+def solve_camera(span_km: float, limb_frac: float, aspect: float) -> tuple[float, float]:
+    """Camera distance P (Earth radii from the centre) and image-plane half width
+    (km) so that ground distance span/2 from the centre lands on the left/right
+    frame edge and the horizon sits at limb_frac of the corner radius."""
+    c = (span_km / 2.0) / R_EARTH_KM
+    corner = math.sqrt(1.0 + aspect * aspect)
+
+    def f(P):
+        rh = R_EARTH_KM * math.sqrt((P - 1) / (P + 1))
+        Wd = rh / (limb_frac * corner)
+        proj = R_EARTH_KM * math.sin(c) * (P - 1) / (P - math.cos(c))
+        return proj - Wd
+
+    Ps = np.geomspace(1.0005, 200.0, 2000)
+    vals = np.array([f(p) for p in Ps])
+    idx = np.where(np.sign(vals[:-1]) != np.sign(vals[1:]))[0]
+    if len(idx) == 0:
+        raise RuntimeError("could not solve camera distance")
+    lo, hi = Ps[idx[-1]], Ps[idx[-1] + 1]
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if np.sign(f(mid)) == np.sign(f(lo)):
+            lo = mid
+        else:
+            hi = mid
+    P = 0.5 * (lo + hi)
+    rh = R_EARTH_KM * math.sqrt((P - 1) / (P + 1))
+    return P, rh / (limb_frac * corner)
+
+
+class Perspective:
+    def __init__(self, P: float, half_w_km: float, width: int, height: int):
+        self.P = P
+        self.half_w = half_w_km
+        self.half_h = half_w_km * height / width
+        self.w, self.h = width, height
+        self.scale = 2 * half_w_km / width  # km per pixel
+        self.rho_h = R_EARTH_KM * math.sqrt((P - 1) / (P + 1))
+        self.ext = (-self.half_w, self.half_w, -self.half_h, self.half_h)
+        xs = (np.arange(width) + 0.5 - width / 2) * self.scale
+        ys = (height / 2 - np.arange(height) - 0.5) * self.scale
+        self.X, self.Y = np.meshgrid(xs, ys)
+        self.rho_km = np.hypot(self.X, self.Y)
+        rho = self.rho_km / R_EARTH_KM
+        self.visible = rho <= math.sqrt((P - 1) / (P + 1)) * (1 - 1e-9)
+        rho_s = np.where(self.visible, rho, 0.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            arg = 1.0 - rho_s * rho_s * (P + 1) / (P - 1)
+            num = P - np.sqrt(np.clip(arg, 0, None))
+            den = (P - 1) / np.where(rho_s > 0, rho_s, 1e-12) + rho_s / (P - 1)
+            c = np.arcsin(np.clip(num / den, -1, 1))
+        c[rho_s == 0] = 0.0
+        self.sin_c, self.cos_c = np.sin(c), np.cos(c)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            self.xr = np.where(rho_s > 0, self.X / self.rho_km, 0.0)
+            self.yr = np.where(rho_s > 0, self.Y / self.rho_km, 0.0)
+
+    def inverse(self, lat0: float, lon0: float):
+        """Pixel grid -> (lat, lon) in degrees; lon continuous around lon0."""
+        p1, l0 = math.radians(lat0), math.radians(lon0)
+        sp, cp = math.sin(p1), math.cos(p1)
+        lat = np.arcsin(np.clip(self.cos_c * sp + self.yr * self.sin_c * cp, -1, 1))
+        lon = l0 + np.arctan2(self.xr * self.sin_c, cp * self.cos_c - self.yr * sp * self.sin_c)
+        return np.degrees(lat), np.degrees(lon)
+
+    def forward(self, lat, lon, lat0: float, lon0: float):
+        """(lat, lon) degrees -> (x, y) km in the image plane + visible mask.
+        Hidden points are pushed to the horizon along their azimuth."""
+        P = self.P
+        p1, l0 = math.radians(lat0), math.radians(lon0)
+        phi = np.radians(np.asarray(lat, float))
+        dl = np.radians(np.asarray(lon, float)) - l0
+        cos_c = math.sin(p1) * np.sin(phi) + math.cos(p1) * np.cos(phi) * np.cos(dl)
+        vis = cos_c >= 1.0 / P
+        kp = (P - 1) / (P - cos_c)
+        x = R_EARTH_KM * kp * np.cos(phi) * np.sin(dl)
+        y = R_EARTH_KM * kp * (math.cos(p1) * np.sin(phi) - math.sin(p1) * np.cos(phi) * np.cos(dl))
+        ax = np.cos(phi) * np.sin(dl)
+        ay = math.cos(p1) * np.sin(phi) - math.sin(p1) * np.cos(phi) * np.cos(dl)
+        an = np.hypot(ax, ay)
+        an = np.where(an > 0, an, 1.0)
+        x = np.where(vis, x, self.rho_h * 1.02 * ax / an)
+        y = np.where(vis, y, self.rho_h * 1.02 * ay / an)
+        return x, y, vis
+
+
+@lru_cache(maxsize=2)
+def _camera(span_km: float = SPAN_KM) -> Perspective:
+    P, half_w = solve_camera(span_km, LIMB_FRAC, PANEL[3] / PANEL[2])
+    return Perspective(P, half_w, PANEL[2], PANEL[3])
+
+
+def view_radius_deg(span_km: float = SPAN_KM) -> float:
+    """Great-circle radius (deg) of the visible disc: the area a context field must cover."""
+    P, _ = solve_camera(span_km, LIMB_FRAC, PANEL[3] / PANEL[2])
+    return math.degrees(math.acos(1.0 / P))
+
+
+# --------------------------------------------------------------------------- #
+# basemap
+# --------------------------------------------------------------------------- #
 @lru_cache(maxsize=1)
-def _fonts() -> dict:
-    out = {}
-    for w in (400, 500, 700, 800):
-        p = _FONT_DIR / f"Metropolis-{w}.ttf"
-        if p.exists():
-            font_manager.fontManager.addfont(str(p))
-            out[w] = font_manager.FontProperties(fname=str(p))
+def _ne_polys():
+    """Natural Earth 50 m land rings as (lon/lat array, bounds)."""
+    import cartopy.io.shapereader as shp
+    out = []
+    for g in shp.Reader(shp.natural_earth("50m", "physical", "land")).geometries():
+        for poly in getattr(g, "geoms", [g]):
+            a = np.asarray(poly.exterior.coords, float)
+            out.append((a, (a[:, 0].min(), a[:, 1].min(), a[:, 0].max(), a[:, 1].max())))
     return out
 
 
-def _fp(weight: int, size: float):
-    f = _fonts().get(weight)
-    if f is None:
-        return {"fontsize": size, "fontweight": "bold" if weight >= 700 else "normal"}
-    fp = f.copy()
-    fp.set_size(size)
-    return {"fontproperties": fp}
+@lru_cache(maxsize=1)
+def _ne_coast():
+    import cartopy.io.shapereader as shp
+    out = []
+    for g in shp.Reader(shp.natural_earth("10m", "physical", "coastline")).geometries():
+        for line in getattr(g, "geoms", [g]):
+            a = np.asarray(line.coords, float)
+            out.append((a, (a[:, 0].min(), a[:, 1].min(), a[:, 0].max(), a[:, 1].max())))
+    return out
 
 
-# ---------------------------------------------------------------------------
+def _in_view(items, lat0, lon0, rad_deg):
+    """Rings/lines whose bounds touch the view, shifted by 360 where needed."""
+    la_lo, la_hi = lat0 - rad_deg, lat0 + rad_deg
+    lon_rad = rad_deg / max(math.cos(math.radians(min(abs(lat0) + rad_deg, 85.0))), 0.08)
+    lo_lo, lo_hi = lon0 - lon_rad, lon0 + lon_rad
+    out = []
+    for a, (x0, y0, x1, y1) in items:
+        if y1 < la_lo or y0 > la_hi:
+            continue
+        for shift in (-360.0, 0.0, 360.0):
+            if x1 + shift < lo_lo or x0 + shift > lo_hi:
+                continue
+            b = a.copy()
+            b[:, 0] += shift
+            out.append(b)
+    return out
+
+
+def _project_lines(proj, lines, lat0, lon0):
+    segs = []
+    for arr in lines:
+        x, y, vis = proj.forward(arr[:, 1], arr[:, 0], lat0, lon0)
+        if not vis.any():
+            continue
+        idx = np.where(~vis)[0]
+        for s, e in zip(np.r_[0, idx + 1], np.r_[idx, len(x)]):
+            if e - s >= 2:
+                segs.append(np.column_stack([x[s:e], y[s:e]]))
+    return segs
+
+
+def _land_mask(proj, lat0, lon0, rad_deg) -> np.ndarray:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(proj.w / 100.0, proj.h / 100.0), dpi=100)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(proj.ext[0], proj.ext[1])
+    ax.set_ylim(proj.ext[2], proj.ext[3])
+    ax.axis("off")
+    fig.patch.set_facecolor("white")
+    rings = []
+    for r in _in_view(_ne_polys(), lat0, lon0, rad_deg):
+        x, y, _ = proj.forward(r[:, 1], r[:, 0], lat0, lon0)
+        rings.append(np.column_stack([x, y]))
+    if rings:
+        ax.add_collection(PolyCollection(rings, facecolors="black", edgecolors="black",
+                                         linewidths=0.3, antialiased=False))
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba())[:, :, 0] < 128
+
+
+def compose_base(proj: Perspective, land: np.ndarray, darken: float = 0.42) -> np.ndarray:
+    img = np.empty((proj.h, proj.w, 3), np.float32)
+    img[:] = COL_SPACE
+    vis = proj.visible
+    img[vis] = COL_OCEAN
+    img[land & vis] = COL_LAND
+    r = proj.rho_km / proj.rho_h
+    img *= (1.0 - darken * np.clip(r, 0, 1) ** 3)[..., None]
+    rim = np.exp(-np.clip(proj.rho_h - proj.rho_km, 0, None) / (0.015 * proj.rho_h)) * vis
+    img += (0.16 * rim)[..., None] * COL_GLOW
+    outside = np.clip(proj.rho_km - proj.rho_h, 0, None)
+    img += (0.30 * np.exp(-outside / (0.05 * proj.rho_h)) * (~vis))[..., None] * COL_GLOW
+    return np.clip(img, 0, 1)
+
+
+def subsolar(t: dt.datetime) -> tuple[float, float]:
+    """(lat, lon) of the subsolar point, degrees. Low-precision solar position (NOAA)."""
+    n = (t - dt.datetime(2000, 1, 1, 12, tzinfo=dt.timezone.utc)).total_seconds() / 86400.0
+    L = (280.460 + 0.9856474 * n) % 360.0
+    g = math.radians((357.528 + 0.9856003 * n) % 360.0)
+    lam = math.radians(L + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g))
+    eps = math.radians(23.439 - 0.0000004 * n)
+    dec = math.degrees(math.asin(math.sin(eps) * math.sin(lam)))
+    ra = math.degrees(math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))) % 360.0
+    eot_deg = ((L - ra + 180.0) % 360.0) - 180.0
+    ut_h = t.hour + t.minute / 60.0 + t.second / 3600.0
+    lon = ((-15.0 * (ut_h - 12.0) - eot_deg + 180.0) % 360.0) - 180.0
+    return dec, lon
+
+
+def terminator_shade(lat, lon, t: dt.datetime, depth: float = 0.5) -> np.ndarray:
+    dec, lon_s = subsolar(t)
+    cosz = (np.sin(np.radians(lat)) * math.sin(math.radians(dec)) +
+            np.cos(np.radians(lat)) * math.cos(math.radians(dec)) * np.cos(np.radians(lon - lon_s)))
+    night = np.clip((-cosz + 0.02) / 0.16, 0.0, 1.0)
+    night = night * night * (3 - 2 * night)
+    return (1.0 - depth * night).astype(np.float32)
+
+
+def edge_feather(mask: np.ndarray, width_px: int) -> np.ndarray:
+    """1.0 deep inside a boolean mask, ramping linearly to 0 at its edge over width_px (0 outside)."""
+    if width_px <= 0 or not mask.any():
+        return mask.astype(np.float32)
+    d = distance_transform_edt(mask)
+    return np.clip(d / float(width_px), 0.0, 1.0).astype(np.float32) * mask
+
+
+# --------------------------------------------------------------------------- #
+# sampling a curvilinear satellite field onto the panel
+# --------------------------------------------------------------------------- #
+def sample(fr: FetchResult, proj: Perspective, lat0: float, lon0: float, field: np.ndarray) -> np.ndarray:
+    """Nearest source pixel for each panel pixel (NaN where the source has no data)."""
+    lats, lons = fr.lats, fr.lons
+    if lats.ndim == 1 and lons.ndim == 1:
+        lons, lats = np.meshgrid(lons, lats)
+    field = np.ma.filled(field, np.nan) if np.ma.isMaskedArray(field) else np.asarray(field)
+    out_shape = (proj.h, proj.w) + field.shape[2:]
+    out = np.full((proj.h * proj.w,) + field.shape[2:], np.nan, np.float32)
+    h, w = lats.shape
+    ok = np.isfinite(lats) & np.isfinite(lons)
+    if not ok.any():
+        return out.reshape(out_shape)
+    x, y, vis = proj.forward(lats[ok], lons[ok], lat0, lon0)
+    col = (x - proj.ext[0]) / proj.scale - 0.5
+    row = (proj.ext[3] - y) / proj.scale - 0.5
+    vals = field[ok]
+    # source denser than ~1.4x the panel only costs time
+    span_px = max(float(np.ptp(col[vis])) if vis.any() else 1.0, float(np.ptp(row[vis])) if vis.any() else 1.0)
+    stride = max(1, int(min(h, w) / max(span_px * 1.4, 1.0)))
+    if stride > 1:
+        sub = np.zeros_like(ok)
+        sub[::stride, ::stride] = True
+        keep = sub[ok]
+        col, row, vis, vals = col[keep], row[keep], vis[keep], vals[keep]
+    inside = vis & (col > -2) & (col < proj.w + 1) & (row > -2) & (row < proj.h + 1)
+    col, row, vals = col[inside], row[inside], vals[inside]
+    if col.size < 4:
+        return out.reshape(out_shape)
+    tree = cKDTree(np.column_stack([col, row]))
+    step = max(1, col.size // 3000)
+    d2, _ = tree.query(np.column_stack([col[::step], row[::step]]), k=2)
+    tol = max(1.5, 1.6 * float(np.nanpercentile(d2[:, 1], 90)))
+    c0, c1 = max(0, int(col.min()) - 1), min(proj.w, int(col.max()) + 2)
+    r0, r1 = max(0, int(row.min()) - 1), min(proj.h, int(row.max()) + 2)
+    gc, gr = np.meshgrid(np.arange(c0, c1), np.arange(r0, r1))
+    dist, idx = tree.query(np.column_stack([gc.ravel(), gr.ravel()]), distance_upper_bound=tol, workers=2)
+    hit = np.isfinite(dist)
+    flat = gr.ravel() * proj.w + gc.ravel()
+    out[flat[hit]] = vals[idx[hit]]
+    return out.reshape(out_shape)
+
+
+# --------------------------------------------------------------------------- #
 # labels
-# ---------------------------------------------------------------------------
-_BAND_NAMES = {
-    "clean_ir": "IR", "ir_window": "IR", "wv_upper": "UPPER WV",
-    "wv_lower": "LOWER WV", "shortwave_ir": "SHORTWAVE IR",
-}
-_ENH_NAMES = {"dvorak": "DVORAK BD", "rainbow_ir": None, "wv_tat": None,
-              "grayscale": None, "ir_gray": None}
+# --------------------------------------------------------------------------- #
+_BAND_NAMES = {"clean_ir": "IR", "ir_window": "IR", "wv_upper": "UPPER WV",
+               "wv_lower": "LOWER WV", "shortwave_ir": "SHORTWAVE IR"}
 
 
-def storm_class(nature: Optional[str], wind_kt: Optional[float],
-                basin: Optional[str]) -> str:
-    """Header class line, e.g. CATEGORY 5 HURRICANE / SUPER TYPHOON."""
+def stage_word(nature: Optional[str], v: Optional[float], basin: Optional[str]) -> str:
     n = (nature or "").upper()
-    b = (basin or "").upper()
+    b = (basin or "").lower()
     if n in ("EX", "PT"):
         return "POST-TROPICAL CYCLONE"
     if n in ("LO", "DB", "WV"):
@@ -93,219 +343,105 @@ def storm_class(nature: Optional[str], wind_kt: Optional[float],
         return "SUBTROPICAL STORM"
     if n == "SD":
         return "SUBTROPICAL DEPRESSION"
-    w = wind_kt or 0.0
-    if w < 34:
-        return "TROPICAL DEPRESSION"
-    if w < 64:
-        return "TROPICAL STORM"
-    if b == "WP":
-        return "SUPER TYPHOON" if w >= 130 else "TYPHOON"
-    if b in ("IO", "SH", "NI", "SI", "AU", "SP"):
-        return "TROPICAL CYCLONE"
-    cat = 1 if w < 83 else 2 if w < 96 else 3 if w < 113 else 4 if w < 137 else 5
-    return f"CATEGORY {cat} HURRICANE"
+    v = v or 0
+    if b in ("al", "ep", "cp"):
+        if v >= 64:
+            cat = 5 if v >= 137 else 4 if v >= 113 else 3 if v >= 96 else 2 if v >= 83 else 1
+            return f"CATEGORY {cat} HURRICANE"
+        return "TROPICAL STORM" if v >= 34 else "TROPICAL DEPRESSION"
+    if b == "wp":
+        return ("SUPER TYPHOON" if v >= 130 else "TYPHOON" if v >= 64
+                else "TROPICAL STORM" if v >= 34 else "TROPICAL DEPRESSION")
+    return "TROPICAL CYCLONE" if v >= 64 else "TROPICAL STORM" if v >= 34 else "TROPICAL DEPRESSION"
 
 
-def _band_label(data: FetchResult, channel: int, enhancement: str) -> str:
-    if data.units == "rgb":
-        return "TRUE COLOR"
-    gen = getattr(data, "generic_channel", "") or ""
-    name = _BAND_NAMES.get(gen, "VISIBLE" if data.units == "1" else "")
-    s = f"BAND {channel} {name}".strip()
-    extra = _ENH_NAMES.get(enhancement)
-    return f"{s} · {extra}" if extra else s
-
-
-def _product_word(product: str) -> str:
-    p = (product or "").upper()
-    if p.startswith("CMIPM") or "TARGET" in p:
+def sector_word(fr: FetchResult) -> str:
+    p = (fr.product or "").upper()
+    if p.startswith("CMIPM"):
         return "MESOSCALE"
-    if p in ("FLDK",) or p.startswith("CMIPF"):
-        return "FULL DISK"
+    if "TARGET" in p or p.startswith("R30"):
+        return "TARGET AREA"
     if p.startswith("CMIPC"):
         return "CONUS"
     if p.startswith("CMIPP"):
         return "PACUS"
-    return p
+    return "FULL DISK"
 
 
-# ---------------------------------------------------------------------------
-# geometry
-# ---------------------------------------------------------------------------
-def _center(bbox: list[float]) -> tuple[float, float]:
+def band_word(fr: FetchResult, channel: int, enhancement: str) -> str:
+    if fr.units == "rgb":
+        return "TRUE COLOR"
+    name = _BAND_NAMES.get(getattr(fr, "generic_channel", "") or "", "VISIBLE" if fr.units == "1" else "")
+    s = f"BAND {channel} {name}".strip()
+    return f"{s}  ·  DVORAK BD" if enhancement == "dvorak" else s
+
+
+def graticule(ax, proj, lat0, lon0, step=2.0):
+    """Dotted lat/lon lines on the globe; returns label positions where each line meets the panel edge."""
+    ext = proj.ext
+    labels = []
+    for k in (0, 1):
+        vals = np.arange(-80, 81, step) if k == 0 else np.arange(-360, 360, step)
+        for v in vals:
+            if k == 0:
+                lo = np.linspace(lon0 - 40, lon0 + 40, 800)
+                la = np.full_like(lo, v)
+            else:
+                if abs(((v - lon0 + 180) % 360) - 180) > 40:
+                    continue
+                la = np.linspace(-80, 80, 800)
+                lo = np.full_like(la, v)
+            x, y, vis = proj.forward(la, lo, lat0, lon0)
+            inside = vis & (x >= ext[0]) & (x <= ext[1]) & (y >= ext[2]) & (y <= ext[3])
+            if inside.sum() < 2:
+                continue
+            ax.plot(np.where(vis, x, np.nan), np.where(vis, y, np.nan), color="white", lw=0.7,
+                    ls=(0, (1.2, 2.4)), alpha=0.35, zorder=4)
+            out_edge = vis & ((x < ext[0]) if k == 0 else (y < ext[2]))
+            cross = np.where((out_edge[:-1] & inside[1:]) | (inside[:-1] & out_edge[1:]))[0]
+            if len(cross):
+                i = cross[0]
+                if k == 0:
+                    f = (ext[0] - x[i]) / (x[i + 1] - x[i])
+                    labels.append(("lat", float(y[i] + f * (y[i + 1] - y[i])), v))
+                else:
+                    f = (ext[2] - y[i]) / (y[i + 1] - y[i])
+                    labels.append(("lon", float(x[i] + f * (x[i + 1] - x[i])), v))
+    return labels
+
+
+@lru_cache(maxsize=1)
+def _fonts() -> dict:
+    out = {}
+    for role, name in (("black", "Black"), ("bold", "Bold"), ("medium", "Medium"), ("regular", "Regular")):
+        p = _FONT_DIR / f"Metropolis-{name}.ttf"
+        out[role] = font_manager.FontProperties(fname=str(p)) if p.exists() else font_manager.FontProperties()
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# frame
+# --------------------------------------------------------------------------- #
+def bbox_center(bbox: list[float]) -> tuple[float, float]:
     w, s, e, n = bbox
     span = (e - w) % 360.0 or 360.0
-    lon = ((w + span / 2.0 + 180.0) % 360.0) - 180.0
-    return lon, (s + n) / 2.0
+    return ((w + span / 2.0 + 180.0) % 360.0) - 180.0, (s + n) / 2.0
 
 
-def _resample(field: np.ndarray, lats: np.ndarray, lons: np.ndarray,
-              proj: ccrs.Projection, n_out: int, ext: list[float]):
-    """Nearest-source-pixel resample of a curvilinear field onto a square
-    n_out x n_out grid covering ``ext`` in ``proj`` coords."""
-    field = np.ma.filled(field, np.nan) if np.ma.isMaskedArray(field) else field
-    ok = np.isfinite(lats) & np.isfinite(lons)
-    # keep the source density near 2x the output so the tree stays small
-    h, w = lats.shape
-    stride = max(1, int(min(h, w) / (2.0 * n_out)))
-    if stride > 1:
-        field = field[::stride, ::stride]
-        lats = lats[::stride, ::stride]
-        lons = lons[::stride, ::stride]
-        ok = ok[::stride, ::stride]
-    pc = ccrs.PlateCarree()
-    xyz = proj.transform_points(pc, lons[ok].astype(np.float64),
-                                lats[ok].astype(np.float64))
-    xs, ys = xyz[:, 0], xyz[:, 1]
-    vis = np.isfinite(xs) & np.isfinite(ys)
-    xs, ys = xs[vis], ys[vis]
-    vals = field[ok][vis]
-    if xs.size == 0:
-        raise RuntimeError("no source pixels visible from this globe view")
-    # local source spacing (projected metres) -> gap tolerance. Measured
-    # between row neighbours near the middle of the source grid, so the
-    # compression toward the horizon only widens the tolerance there.
-    half = (ext[1] - ext[0]) / 2.0
-    cell = 2.0 * half / n_out
-    tree = cKDTree(np.column_stack([xs, ys]))
-    probe = np.column_stack([xs[:: max(1, xs.size // 4000)], ys[:: max(1, xs.size // 4000)]])
-    d2, _ = tree.query(probe, k=2, workers=-1)
-    spacing = float(np.nanpercentile(d2[:, 1], 90))
-    tol = 1.5 * max(spacing, cell)
-    gx = ext[0] + (np.arange(n_out) + 0.5) * cell
-    gy = ext[3] - (np.arange(n_out) + 0.5) * cell
-    GX, GY = np.meshgrid(gx, gy)
-    dist, idx = tree.query(np.column_stack([GX.ravel(), GY.ravel()]),
-                           distance_upper_bound=tol, workers=-1)
-    hit = np.isfinite(dist)
-    if vals.ndim == 1:
-        img = np.full(GX.size, np.nan, dtype=np.float32)
-        img[hit] = vals[idx[hit]]
-        img = img.reshape(n_out, n_out)
-    else:
-        img = np.full((GX.size, vals.shape[-1]), np.nan, dtype=np.float32)
-        img[hit] = vals[idx[hit]]
-        img = img.reshape(n_out, n_out, vals.shape[-1])
-    return img
+def _strided(fr: FetchResult, d: int) -> FetchResult:
+    kw = {"cmi": fr.cmi[::d, ::d], "lats": fr.lats[::d, ::d], "lons": fr.lons[::d, ::d]}
+    if fr.geom_valid is not None:
+        kw["geom_valid"] = fr.geom_valid[::d, ::d]
+    return dataclasses.replace(fr, **kw)
 
 
-R_EARTH = 6371000.0
-FILL = 0.92       # square half-side as a fraction of the box's shorter half-span
-                  # (meso sectors are not exact lat/lon boxes; this keeps the
-                  # disc inside the scanned footprint)
-HORIZON = 1.35    # camera: projected horizon / square half-side (sets curvature;
-                  # the centre is drawn ~1.75x the scale of the frame edge)
-DISC = 1.0        # visible disc radius / square half-side: a full round disc
+def _bt_c(fr: FetchResult) -> np.ndarray:
+    bt = np.asarray(np.ma.filled(fr.cmi, np.nan) if np.ma.isMaskedArray(fr.cmi) else fr.cmi, np.float32)
+    if fr.units in ("C", "celsius", "degC"):
+        bt = bt + 273.15
+    return bt - 273.15
 
 
-def _camera_height(a: float) -> float:
-    """Satellite height (m) whose horizon lands at HORIZON x the projected
-    radius of a point ``a`` radians from the centre."""
-    def ratio(P: float) -> float:
-        th = np.arccos(1.0 / P)
-        r = lambda p: np.sin(p) * (P - 1.0) / (P - np.cos(p))  # noqa: E731
-        return r(th) / r(a)
-    lo, hi = 1.0 / np.cos(a) + 1e-9, 50.0
-    for _ in range(80):
-        mid = 0.5 * (lo + hi)
-        if ratio(mid) < HORIZON:
-            lo = mid
-        else:
-            hi = mid
-    return R_EARTH * (0.5 * (lo + hi) - 1.0)
-
-
-def _view(bbox: list[float], lon0: float, lat0: float):
-    """Near-side perspective camera centred on the box. Returns (projection,
-    square extent, half-side in degrees)."""
-    w, s, e, n = bbox
-    lon_half = (((e - w) % 360.0) or 360.0) / 2.0 * np.cos(np.radians(lat0))
-    lat_half = (n - s) / 2.0
-    a = FILL * min(lon_half, lat_half)               # great-circle degrees
-    h = _camera_height(np.radians(a))
-    proj = ccrs.NearsidePerspective(central_longitude=lon0,
-                                    central_latitude=lat0, satellite_height=h)
-    pt = proj.transform_point(lon0, min(lat0 + a, 89.9), ccrs.PlateCarree())
-    half = abs(pt[1])
-    return proj, [-half, half, -half, half], a
-
-
-def _nice_step(span_deg: float) -> float:
-    for s in (1, 2, 5, 10, 15, 20):
-        if span_deg / s <= 7:
-            return float(s)
-    return 30.0
-
-
-def _fmt_lat(v: float) -> str:
-    v = round(v, 4)
-    return "0°" if v == 0 else f"{abs(v):g}°{'N' if v > 0 else 'S'}"
-
-
-def _fmt_lon(v: float) -> str:
-    v = ((v + 180.0) % 360.0) - 180.0
-    v = round(v, 4)
-    if v in (0.0, -180.0) or abs(v) == 180.0:
-        return f"{abs(v):g}°"
-    return f"{abs(v):g}°{'E' if v > 0 else 'W'}"
-
-
-def _graticule(ax, fig, proj, ext, lon0, lat0, half_deg):
-    """Dotted lat/lon lines + labels outside the map (lat left, lon bottom),
-    each label placed where its line actually meets that map edge."""
-    pc = ccrs.PlateCarree()
-    step = _nice_step(2.0 * half_deg)
-    span = 2.5 * half_deg / max(np.cos(np.radians(min(abs(lat0) + half_deg, 85.0))), 0.1)
-    lat_lo = max(-88.0, np.floor((lat0 - span) / step) * step)
-    lat_hi = min(88.0, np.ceil((lat0 + span) / step) * step)
-    lon_lo = np.floor((lon0 - span) / step) * step
-    lon_hi = np.ceil((lon0 + span) / step) * step
-    xmin, xmax, ymin, ymax = ext
-    kw = dict(color=GRAT, linewidth=0.7, alpha=0.55, linestyle=(0, (1.0, 2.2)),
-              zorder=4)
-    tlab = _fp(500, 8.6)
-    left_used, bottom_used = [], []
-    t = np.linspace(-180.0, 180.0, 1441)
-    for la in np.arange(lat_lo, lat_hi + step / 2, step):
-        lo = lon0 + t
-        la_arr = np.full_like(lo, la)
-        xy = proj.transform_points(pc, lo, la_arr)
-        ax.plot(xy[:, 0], xy[:, 1], **kw)
-        # left-edge crossing
-        x, y = xy[:, 0], xy[:, 1]
-        fin = np.isfinite(x) & np.isfinite(y)
-        sgn = np.sign(x - xmin)
-        for i in np.where(fin[:-1] & fin[1:] & (sgn[:-1] != sgn[1:]))[0]:
-            fy = y[i] + (y[i + 1] - y[i]) * (xmin - x[i]) / (x[i + 1] - x[i])
-            if ymin < fy < ymax:
-                fyn = MAP[1] + MAP[3] * (fy - ymin) / (ymax - ymin)
-                if all(abs(fyn - u) > 0.03 for u in left_used):
-                    left_used.append(fyn)
-                    fig.text(MAP[0] - 0.006, fyn, _fmt_lat(la), ha="right",
-                             va="center", color=DIM, **tlab)
-                break
-    for lo in np.arange(lon_lo, lon_hi + step / 2, step):
-        la = np.linspace(-89.0, 89.0, 1441)
-        lo_arr = np.full_like(la, lo)
-        xy = proj.transform_points(pc, lo_arr, la)
-        ax.plot(xy[:, 0], xy[:, 1], **kw)
-        x, y = xy[:, 0], xy[:, 1]
-        fin = np.isfinite(x) & np.isfinite(y)
-        sgn = np.sign(y - ymin)
-        for i in np.where(fin[:-1] & fin[1:] & (sgn[:-1] != sgn[1:]))[0]:
-            fx = x[i] + (x[i + 1] - x[i]) * (ymin - y[i]) / (y[i + 1] - y[i])
-            if xmin < fx < xmax:
-                fxn = MAP[0] + MAP[2] * (fx - xmin) / (xmax - xmin)
-                if all(abs(fxn - u) > 0.06 for u in bottom_used):
-                    bottom_used.append(fxn)
-                    fig.text(fxn, MAP[1] - 0.008, _fmt_lon(lo), ha="center",
-                             va="top", color=DIM, **tlab)
-                break
-
-
-# ---------------------------------------------------------------------------
-# main entry
-# ---------------------------------------------------------------------------
 def render_globe_png(
     data: FetchResult,
     bbox: list[float],
@@ -315,189 +451,178 @@ def render_globe_png(
     downsample: int = 1,
     storm: Optional[dict] = None,
     caption: Optional[str] = None,
+    context: Optional[FetchResult] = None,
 ) -> bytes:
-    """One square globe frame. ``storm`` (floater) carries name / basin /
-    nature / wind_kt / pressure_mb and optionally atcf + fix_time; ``caption``
-    (meso) is the sector name used as the headline when there is no storm."""
-    is_rgb = data.units == "rgb"
-    is_vis = data.units == "1"
-    cmi, lats, lons = data.cmi, data.lats, data.lons
+    """One 1400-px square globe frame (PNG)."""
     if downsample > 1:
-        cmi = cmi[::downsample, ::downsample]
-        lats = lats[::downsample, ::downsample]
-        lons = lons[::downsample, ::downsample]
-    if lats.ndim == 1 and lons.ndim == 1:
-        lons, lats = np.meshgrid(lons, lats)
+        data = _strided(data, downsample)
+    t = scan_time if scan_time.tzinfo else scan_time.replace(tzinfo=dt.timezone.utc)
+    t = t.astimezone(dt.timezone.utc)
+    is_rgb, is_vis = data.units == "rgb", data.units == "1"
+    proj = _camera()
+    lon0, lat0 = bbox_center(bbox)
+    lat, lon = proj.inverse(lat0, lon0)
+    rad_deg = view_radius_deg() + 2.0
+    land = _land_mask(proj, lat0, lon0, rad_deg)
+    base = compose_base(proj, land) * terminator_shade(lat, lon, t)[..., None]
 
-    bt_min_c = None
+    enh = None if is_rgb else get_enhancement(enhancement)
+    tmin = None
     if is_rgb:
-        field = np.clip(np.asarray(cmi, dtype=np.float32), 0.0, 1.0)
-        geom = data.geom_valid
-        if geom is not None and downsample > 1:
-            geom = geom[::downsample, ::downsample]
-        fin = np.isfinite(field).all(axis=-1)
-        if geom is not None and geom.shape == fin.shape:
-            n_geom = float(geom.sum())
-            nan_frac = float((~fin & geom).sum() / n_geom) if n_geom else 1.0
-        else:
-            nan_frac = float((~fin).mean())
-        vmax = float(field[fin].max(axis=-1).mean()) if fin.any() else 0.0
-        if nan_frac > 0.50 or vmax < 0.04:
-            raise RuntimeError(
-                f"truecolor render produced degenerate RGB (nan={nan_frac * 100:.0f}%, "
-                f"mean_valid_max={vmax:.3f})")
-        cmap = norm = None
-    elif is_vis:
-        field = np.asarray(normalize_visible(cmi), dtype=np.float32)
-        cmap = plt.get_cmap("gray")
-        from matplotlib.colors import Normalize
-        norm = Normalize(0.0, 1.0)
+        rgb_src = np.clip(np.asarray(data.cmi, np.float32), 0.0, 1.0)
+        fin_src = np.isfinite(rgb_src).all(axis=-1)
+        if not fin_src.any() or float(rgb_src[fin_src].max(axis=-1).mean()) < 0.04:
+            raise RuntimeError("truecolor render produced degenerate RGB")
+        v = sample(data, proj, lat0, lon0, rgb_src)
+        fin = np.isfinite(v).all(axis=-1)
+        if context is not None:
+            # outside the true-color box: the clean-IR context in grey (cold
+            # cloud white), over the globe like the IR frames
+            c = sample(context, proj, lat0, lon0, _bt_c(context))
+            okc = np.isfinite(c)
+            grey = np.clip((25.0 - np.nan_to_num(c, nan=25.0)) / 95.0, 0.0, 1.0) ** 0.8
+            ac = (np.where(okc, np.clip((22.0 - np.nan_to_num(c, nan=40.0)) / 17.0, 0.15, 1.0), 0.0) * proj.visible)[..., None]
+            base = base * (1 - ac) + grey[..., None] * ac
+        a = (edge_feather(fin, FEATHER_PX) * proj.visible)[..., None]
+        rgb = base * (1 - a) + np.nan_to_num(v) * a
     else:
-        bt = np.asarray(cmi, dtype=np.float32)
-        if data.units in ("C", "celsius", "degC"):
-            bt = bt + 273.15
-        bt_c = bt - 273.15
-        geo_ok = np.isfinite(lats) & np.isfinite(lons)
-        n_ok = float(geo_ok.sum())
-        if n_ok == 0:
-            raise RuntimeError("bbox has no on-disk pixels to render")
-        nan_frac = float((~np.isfinite(bt_c) & geo_ok).sum() / n_ok)
-        if nan_frac > 0.55:
-            raise RuntimeError(
-                f"scalar render produced a mostly-NaN field (nan={nan_frac * 100:.0f}%)")
-        if np.isfinite(bt_c).any():
-            bt_min_c = float(np.nanmin(bt_c))
-        field = bt_c
-        enh = get_enhancement(enhancement)
-        cmap = enh["cmap"]
-        norm = enhancement_norm(enhancement)
-
-    lon0, lat0 = _center(bbox)
-    proj, ext, half_deg = _view(bbox, lon0, lat0)
-    img = _resample(field, lats, lons, proj, GRID_PX, ext)
-
-    fig = plt.figure(figsize=(FIG_IN, FIG_IN), dpi=DPI, facecolor=BG)
-    ax = fig.add_axes(MAP, projection=proj)
-    ax.set_facecolor(BG)
-    ax.set_extent(ext, crs=proj)
-    # the projection boundary is the horizon circle; hide it and frame the
-    # square map instead
-    try:
-        ax.spines["geo"].set_visible(False)
-    except Exception:  # noqa: BLE001
-        pass
-    fig.patches.append(matplotlib.patches.Rectangle(
-        (MAP[0], MAP[1]), MAP[2], MAP[3], transform=fig.transFigure,
-        fill=False, edgecolor=FRAME, linewidth=0.8, zorder=20))
-
-    half = ext[1]
-    yy, xx = np.mgrid[0:GRID_PX, 0:GRID_PX]
-    rr = np.hypot((xx + 0.5) / GRID_PX * 2.0 - 1.0, (yy + 0.5) / GRID_PX * 2.0 - 1.0)
-    outside = rr > DISC
-    if img.ndim == 3:
-        img[outside] = np.nan
-    else:
-        img = np.where(outside, np.nan, img)
-
-    mappable = None
-    if is_rgb:
-        rgb = np.nan_to_num(img, nan=0.0)
-        alpha = np.isfinite(img).all(axis=-1).astype(np.float32)
-        rgba = np.dstack([rgb, alpha])
-        ax.imshow(rgba, origin="upper", extent=ext, transform=proj,
-                  interpolation="nearest", zorder=1)
-    else:
-        mappable = ax.imshow(np.ma.masked_invalid(img), origin="upper",
-                             extent=ext, transform=proj, cmap=cmap, norm=norm,
-                             interpolation="nearest", zorder=1)
-
-    span = max(((bbox[2] - bbox[0]) % 360.0) or 360.0, bbox[3] - bbox[1])
-    scale = "10m" if span < 25 else "50m"
-    ax.add_feature(cfeature.COASTLINE.with_scale(scale), edgecolor=COAST,
-                   linewidth=0.6, alpha=0.55, zorder=3)
-    ax.add_feature(cfeature.BORDERS.with_scale(scale), edgecolor=COAST,
-                   linewidth=0.45, alpha=0.4, zorder=3)
-    _graticule(ax, fig, proj, ext, lon0, lat0, half_deg)
-    # space outside the disc: a black square with a round hole, over the
-    # coastlines and graticule
-    from matplotlib.path import Path
-    ring = Path.circle((0.0, 0.0), DISC * half)
-    sq = Path([(-half, -half), (half, -half), (half, half), (-half, half),
-               (-half, -half)], [Path.MOVETO] + [Path.LINETO] * 3 + [Path.CLOSEPOLY])
-    hole = Path(ring.vertices[::-1], ring.codes)
-    ax.add_patch(matplotlib.patches.PathPatch(
-        Path.make_compound_path(sq, hole), facecolor=BG, edgecolor="none",
-        transform=proj, zorder=8))
-
-    # colorbar (scalar products)
-    if mappable is not None:
-        cax = fig.add_axes([0.918, 0.20, 0.0115, 0.62])
-        cb = fig.colorbar(mappable, cax=cax)
         if is_vis:
-            cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
-            cb.set_ticklabels(["0", "25", "50", "75", "100"])
+            fld = np.asarray(normalize_visible(data.cmi), np.float32)
+        else:
+            fld = _bt_c(data)
+            geo = np.isfinite(data.lats) & np.isfinite(data.lons)
+            if geo.any() and float((~np.isfinite(fld) & geo).sum() / geo.sum()) > 0.55:
+                raise RuntimeError("scalar render produced a mostly-NaN field")
+        v = sample(data, proj, lat0, lon0, fld)
+        fin = np.isfinite(v)
+        if not fin.any():
+            raise RuntimeError("no data inside the globe view")
+        if not is_vis:
+            tmin = float(np.nanmin(v[fin]))
+        fa = edge_feather(fin, FEATHER_PX)
+        if context is not None and not is_vis:
+            c = sample(context, proj, lat0, lon0, _bt_c(context))
+            both = fin & np.isfinite(c)
+            v = np.where(both, fa * v + (1 - fa) * c, np.where(fin, v, c))
+            fade = np.ones_like(v)
+        else:
+            fade = fa
+        ok = np.isfinite(v)
+        if is_vis:
+            rgba = np.repeat(np.nan_to_num(v, nan=0.0)[..., None], 3, axis=2)
+            alpha = np.ones_like(v)
+        else:
+            rgba = np.asarray(enh["cmap"](enhancement_norm(enhancement)(np.nan_to_num(v, nan=40.0))), np.float32)[..., :3]
+            if enhancement in ("rainbow_ir", "dvorak", "ir_gray"):
+                alpha = np.clip((22.0 - v) / 17.0, 0.15, 1.0)   # warm clear sky lets the globe show through
+            else:
+                alpha = np.ones_like(v)                         # WV / SWIR: the whole field is the product
+        a = (np.where(ok, alpha * fade, 0.0) * proj.visible)[..., None]
+        rgb = base * (1 - a) + rgba * a
+
+    fp = _fonts()
+    fig = plt.figure(figsize=(W / 100, H / 100), dpi=100, facecolor=BLACK)
+    px, py, pw, ph = PANEL
+    ax = fig.add_axes([px / W, 1 - (py + ph) / H, pw / W, ph / H])
+    ax.set_facecolor(BLACK)
+    ax.imshow(np.clip(rgb, 0, 1), extent=proj.ext, origin="upper", interpolation="bicubic")
+    labels = graticule(ax, proj, lat0, lon0)
+    coast = _project_lines(proj, _in_view(_ne_coast(), lat0, lon0, rad_deg), lat0, lon0)
+    ax.add_collection(LineCollection(coast, colors=["#e8ecf2"], linewidths=0.8, alpha=0.55, zorder=5))
+    ax.set_xlim(proj.ext[0], proj.ext[1])
+    ax.set_ylim(proj.ext[2], proj.ext[3])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_color(KEY)
+        sp.set_linewidth(1.2)
+    dx, dy = (proj.ext[1] - proj.ext[0]), (proj.ext[3] - proj.ext[2])
+    kept = []                                                      # clear of the corners, at least 6% apart
+    for kind, pos, v_ in sorted(labels, key=lambda r: (r[0], r[1])):
+        lo_, hi_ = (proj.ext[2], proj.ext[3]) if kind == "lat" else (proj.ext[0], proj.ext[1])
+        span = hi_ - lo_
+        if pos < lo_ + 0.08 * span or pos > hi_ - 0.08 * span:
+            continue
+        if kept and kept[-1][0] == kind and pos - kept[-1][1] < 0.06 * span:
+            continue
+        kept.append((kind, pos, v_))
+    for kind, pos, v_ in kept:
+        if kind == "lat":
+            ax.text(proj.ext[0] - dx * 0.010, pos, f"{abs(v_):.0f}°{'N' if v_ >= 0 else 'S'}", ha="right", va="center",
+                    fontproperties=fp["medium"], fontsize=12, color=GREY, clip_on=False)
+        else:
+            lo = ((v_ + 180) % 360) - 180
+            ax.text(pos, proj.ext[2] - dy * 0.010, f"{abs(lo):.0f}°{'E' if lo >= 0 else 'W'}", ha="center", va="top",
+                    fontproperties=fp["medium"], fontsize=12, color=GREY, clip_on=False)
+
+    # top border: storm left, date and time right
+    X0, X1 = px / W, (px + pw) / W
+    if storm:
+        kicker = stage_word(storm.get("nature"), storm.get("wind_kt"), storm.get("basin"))
+        if storm.get("atcf"):
+            kicker += f"  ·  {storm['atcf']}"
+        name = (storm.get("name") or "").strip()
+        title = name if name.upper().startswith("INVEST") else name.title()
+    else:
+        kicker = f"{data.sat_name}  ·  {sector_word(data)}"
+        title = caption or data.sat_name
+    fig.text(X0, 1 - 30 / H, kicker.upper(), fontproperties=fp["medium"], fontsize=14, color=GREY, ha="left", va="center")
+    fig.text(X0, 1 - 72 / H, title, fontproperties=fp["black"], fontsize=38, color=WHITE, ha="left", va="center")
+    fig.text(X1, 1 - 30 / H, f"{t:%d %b %Y}".upper(), fontproperties=fp["medium"], fontsize=14, color=GREY, ha="right", va="center")
+    fig.text(X1, 1 - 72 / H, f"{t:%H:%M:%S} UTC", fontproperties=fp["bold"], fontsize=30, color=WHITE, ha="right", va="center")
+
+    # bottom border: intensity, product, credit
+    yb = 1 - (py + ph + 58) / H
+    stats = []
+    if storm and storm.get("wind_kt") is not None:
+        stats.append(f"{int(round(storm['wind_kt']))} KT")
+    if storm and storm.get("pressure_mb") is not None:
+        stats.append(f"{int(round(storm['pressure_mb']))} MB")
+    prod = [data.sat_name.upper(), band_word(data, channel, enhancement), sector_word(data)]
+    if tmin is not None:
+        prod.append(f"MIN {tmin:.1f}°C")
+    if storm and storm.get("fix_time"):
+        prod.append(str(storm["fix_time"]).upper())
+    prod_s = "  ·  ".join(prod)
+    if stats:
+        fig.text(X0, yb, "   ".join(stats), fontproperties=fp["bold"], fontsize=22, color=WHITE, ha="left", va="center")
+        fig.text(X0, yb - 30 / H, prod_s, fontproperties=fp["medium"], fontsize=11.5, color=GREY, ha="left", va="center")
+    else:
+        fig.text(X0, yb, prod_s, fontproperties=fp["medium"], fontsize=11.5, color=GREY, ha="left", va="center")
+    fig.text(X1, yb, "@WeathermanAAA_", fontproperties=fp["bold"], fontsize=18, color=WHITE, ha="right", va="center")
+
+    # right border: colour bar
+    if not is_rgb:
+        cb = fig.add_axes([(px + pw + 22) / W, 1 - (py + ph) / H + 0.12, 18 / W, ph / H - 0.24])
+        if is_vis:
+            vv = np.linspace(0, 1, 600)
+            cb.imshow(np.repeat(vv[::-1, None, None], 3, axis=2), aspect="auto", extent=(0, 1, 0, 100))
+            ticks = list(np.arange(0, 101, 20))
+            lo_, hi_ = 0, 100
             unit = "%"
         else:
-            enh = get_enhancement(enhancement)
-            ticks = list(enh["ticks"])
-            if len(ticks) > 14:
-                ticks = ticks[::2]
-            cb.set_ticks(ticks)
-            cb.set_ticklabels([f"{t:g}" for t in ticks])
+            ticks = sorted(float(x) for x in enh["ticks"])
+            lo_, hi_ = ticks[0], ticks[-1]
+            vals = np.linspace(lo_, hi_, 1200)
+            cb.imshow(np.asarray(enh["cmap"](enhancement_norm(enhancement)(vals)))[::-1, None, :3],
+                      aspect="auto", extent=(0, 1, lo_, hi_))
             unit = "°C"
-        cb.outline.set_edgecolor(FRAME)
-        cb.outline.set_linewidth(0.6)
-        cb.ax.tick_params(colors=DIM, length=2.5, width=0.6, pad=3)
-        for lab in cb.ax.get_yticklabels():
-            lab.set_fontproperties(_fp(500, 8.2).get("fontproperties"))
-            lab.set_color(DIM)
-        fig.text(0.918 + 0.0058, 0.828, unit, ha="center", va="bottom",
-                 color=DIM, **_fp(500, 9))
-
-    # header
-    ts = scan_time.astimezone(dt.timezone.utc) if scan_time.tzinfo else scan_time
-    date_s = ts.strftime("%d %b %Y").upper()
-    time_s = ts.strftime("%H:%M:%S UTC")
-    if storm:
-        cls = storm_class(storm.get("nature"), storm.get("wind_kt"), storm.get("basin"))
-        atcf = (storm.get("atcf") or "").upper()
-        line1 = f"{cls} · {atcf}" if atcf else cls
-        name = (storm.get("name") or "").strip()
-        headline = name.title() if name.isupper() and not name.startswith("INVEST") else name
-    else:
-        line1 = f"{_product_word(data.product)} SECTOR" if caption else data.sat_name.upper()
-        headline = caption or f"{data.sat_name} {_product_word(data.product).title()}"
-    fig.text(MAP[0], 0.975, line1, ha="left", va="center", color=DIM, **_fp(500, 11))
-    fig.text(MAP[0], 0.945, headline, ha="left", va="center", color=INK, **_fp(800, 27))
-    right = MAP[0] + MAP[2]
-    fig.text(right, 0.975, date_s, ha="right", va="center", color=DIM, **_fp(500, 11))
-    fig.text(right, 0.945, time_s, ha="right", va="center", color=INK, **_fp(800, 22))
-
-    # footer
-    meta = [data.sat_name.upper(), _band_label(data, channel, enhancement),
-            _product_word(data.product)]
-    if bt_min_c is not None:
-        meta.append(f"MIN {bt_min_c:.1f}°C")
-    if storm and storm.get("fix_time"):
-        meta.append(str(storm["fix_time"]).upper())
-    stats = []
-    if storm:
-        if storm.get("wind_kt") is not None:
-            stats.append(f"{int(round(storm['wind_kt']))} KT")
-        if storm.get("pressure_mb") is not None:
-            stats.append(f"{int(round(storm['pressure_mb']))} MB")
-    if stats:
-        fig.text(MAP[0], 0.040, "   ".join(stats), ha="left", va="center",
-                 color=INK, **_fp(800, 20))
-        fig.text(MAP[0], 0.014, "  ·  ".join(m for m in meta if m), ha="left",
-                 va="center", color=DIM, **_fp(500, 8.8))
-    else:
-        fig.text(MAP[0], 0.030, "  ·  ".join(m for m in meta if m), ha="left",
-                 va="center", color=DIM, **_fp(500, 9.5))
-    fig.text(right, 0.040 if stats else 0.030, "@WeathermanAAA_", ha="right",
-             va="center", color=INK, **_fp(700, 15))
+        cb.set_yticks(ticks)
+        cb.set_yticklabels([f"{x:g}" for x in ticks])
+        cb.set_ylim(lo_, hi_)
+        cb.set_xticks([])
+        cb.yaxis.tick_right()
+        cb.tick_params(colors=GREY, labelsize=11, length=3, width=0.8)
+        for lab in cb.get_yticklabels():
+            lab.set_fontproperties(fp["medium"])
+            lab.set_fontsize(11)
+        for sp in cb.spines.values():
+            sp.set_color(KEY)
+            sp.set_linewidth(0.8)
+        cb.text(0.5, 1.02, unit, transform=cb.transAxes, fontproperties=fp["medium"], fontsize=12, color=GREY,
+                ha="center", va="bottom")
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=DPI, facecolor=BG)
+    fig.savefig(buf, format="png", dpi=100, facecolor=BLACK)
     plt.close(fig)
     return buf.getvalue()

@@ -43,13 +43,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from cache import RenderCache
 from poller_framework import process_mem_mb
-from globe_render import render_globe_png
+from globe_render import render_globe_png, view_radius_deg, bbox_center
 from render import (render_png, render_backdrop_webp, transcode_frame,
                     encode_webp, state_lines_status)
 import gridsat
 import gridsat_goes
 import mergir
 from satellites import (
+    FetchResult,
     ALL_SATELLITES,
     CoverageError,
     GENERIC_CHANNELS,
@@ -831,6 +832,62 @@ def _request_key(body: RenderRequest, generic_channel: str, snapped_iso: str, bu
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+# ---- globe frames: the wider context field ---------------------------------
+# A globe frame shows ~18 deg of planet around the storm, wider than the storm
+# box, so the rest of the disc is filled from the full disk (or CONUS) of the
+# same band, feathered under the box. One fetch serves every frame of that
+# satellite/band/scan, so the poller's 1-minute meso frames reuse it for the
+# 10 minutes the full disk holds. True color fills its context with clean IR.
+_GLOBE_CTX: "dict[tuple, FetchResult]" = {}
+_GLOBE_CTX_MAX = int(os.getenv("GLOBE_CTX_MAX", "24"))
+_GLOBE_CTX_LOCK = asyncio.Lock()
+
+
+def _globe_ctx_bbox(bbox: list[float]) -> list[float]:
+    lon0, lat0 = bbox_center(bbox)
+    r = view_radius_deg() + 1.0
+    # snap the centre to 2 deg so neighbouring frames (a moving floater) share a fetch
+    lon0, lat0 = round(lon0 / 2.0) * 2.0, round(lat0 / 2.0) * 2.0
+    hl = min(r / max(math.cos(math.radians(min(abs(lat0) + r, 80.0))), 0.2), 179.0)
+    w = ((lon0 - hl + 180.0) % 360.0) - 180.0
+    e = ((lon0 + hl + 180.0) % 360.0) - 180.0
+    return [round(w, 2), max(-80.0, lat0 - r), round(e, 2), min(80.0, lat0 + r)]
+
+
+async def _globe_context(body: "RenderRequest", generic_channel: str, resolved, satellite):
+    """Wide same-band field for a globe frame, or None (the frame then shows
+    the storm box over the bare globe)."""
+    ch = "clean_ir" if generic_channel == "true_color" else generic_channel
+    wb = _globe_ctx_bbox(body.bbox)
+    try:
+        sat = pick_satellite(wb, resolved.scan_start, family_hint=satellite.family)
+        rf = await sat.find_file(resolved.scan_start, ch, wb, True, product_hint=None)
+    except Exception as e:  # noqa: BLE001 -- context is decoration, never fail the frame
+        log.info("globe context: no file (%s)", e)
+        return None
+    key = (rf.bucket, rf.s3_key, ch, tuple(wb))
+    hit = _GLOBE_CTX.get(key)
+    if hit is not None:
+        return hit
+    async with _GLOBE_CTX_LOCK:
+        hit = _GLOBE_CTX.get(key)
+        if hit is not None:
+            return hit
+        try:
+            fr = await sat.fetch(rf, wb, ch)
+        except Exception as e:  # noqa: BLE001
+            log.info("globe context: fetch failed (%s)", e)
+            return None
+        d = max(1, int(min(fr.cmi.shape[:2]) // 1400))
+        if d > 1:
+            fr = FetchResult(**{**fr.__dict__, "cmi": fr.cmi[::d, ::d], "lats": fr.lats[::d, ::d],
+                                "lons": fr.lons[::d, ::d]})
+        _GLOBE_CTX[key] = fr
+        while len(_GLOBE_CTX) > _GLOBE_CTX_MAX:
+            _GLOBE_CTX.pop(next(iter(_GLOBE_CTX)))
+        return fr
+
+
 @app.post("/render")
 async def render(request: Request, body: RenderRequest = Body(...)):
     t0 = time.perf_counter()
@@ -1057,6 +1114,10 @@ async def render(request: Request, body: RenderRequest = Body(...)):
             else:
                 data = await satellite.fetch(resolved, body.bbox, generic_channel)
                 render_downsample = downsample
+            context = None
+            if body.style == "globe" and body.format != "btpng" and not body.backdrop:
+                context = await _globe_context(body, generic_channel, resolved, satellite)
+
             def _render_job() -> bytes:
                 if body.format == "btpng":
                     # calibrated-BT u16 raster (objfix / TC-Diagnostics
@@ -1083,6 +1144,7 @@ async def render(request: Request, body: RenderRequest = Body(...)):
                         render_downsample,
                         storm=body.storm.model_dump() if body.storm is not None else None,
                         caption=body.caption,
+                        context=context,
                     )
                     if body.format == "webp":
                         out = transcode_frame(out, WEBP_FRAME_WIDTH, WEBP_QUALITY)
